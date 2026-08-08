@@ -23,6 +23,8 @@ import { skvRequest } from './api-client'
 import { writeSkatteverketAudit } from './audit'
 import { buildMomsuppgift } from './declaration-prep'
 import type { SkatteverketKontroll, SkatteverketKontrollResultat, SkatteverketUtkastResponse } from '../types'
+import { evaluateVatFilingGate } from '@/lib/reports/vat-filing-gate'
+import { createVatSubmissionState, vatSubmissionIdentity } from './vat-submission-state'
 
 export interface VatSubmitChainParams {
   periodType: VatPeriodType
@@ -30,6 +32,8 @@ export interface VatSubmitChainParams {
   period: number
   /** Räkenskapsår for helårsmoms: broken FYs end in their own month, not December. */
   fiscalPeriodId?: string
+  resolvedPeriodStart?: string
+  resolvedPeriodEnd?: string
 }
 
 export type VatSubmitChainResult =
@@ -62,8 +66,37 @@ export async function submitVatDeclarationChain(
   options: { validate?: boolean } = {}
 ): Promise<VatSubmitChainResult> {
   const { supabase, userId } = ctx
-  const { redovisare, redovisningsperiod, momsuppgift } =
-    await buildMomsuppgift(supabase, ctx.companyId, params)
+  const prep = await buildMomsuppgift(supabase, ctx.companyId, params)
+  const {
+    redovisare,
+    redovisningsperiod,
+    momsuppgift,
+    declaration,
+    fiscalPeriodId,
+  } = prep
+  const submissionIdentity = vatSubmissionIdentity(params, prep)
+
+  const localGate = await evaluateVatFilingGate(
+    supabase,
+    ctx.companyId,
+    declaration.rutor,
+    params.periodType,
+    params.year,
+    params.period,
+    undefined,
+    { fiscalPeriodId },
+  )
+  if (localGate.blocked) {
+    const blockers = localGate.checks.filter((check) => check.status === 'ERROR')
+    return {
+      ok: false,
+      stage: 'validation',
+      httpStatus: 422,
+      error: blockers.map((check) => `${check.code}: ${check.message}`).join('\n'),
+      kontrollresultat: null,
+      draftSaved: false,
+    }
+  }
 
   // 0. Optional kontrollera pre-step: SKV validates the arithmetic without
   //    saving anything. ERROR-level findings abort the chain here, before
@@ -119,11 +152,9 @@ export async function submitVatDeclarationChain(
   // the period's moms deadline without reverse-parsing redovisningsperiod.
   await ctx.settings.set(
     `submission_${redovisningsperiod}`,
-    JSON.stringify({
-      status: 'draft_saved', redovisare, redovisningsperiod,
-      periodType: params.periodType, year: params.year, period: params.period,
-      kontrollresultat: utkastData.kontrollResultat, updatedAt: new Date().toISOString(),
-    }),
+    JSON.stringify(createVatSubmissionState(submissionIdentity, 'draft_saved', {
+      kontrollresultat: utkastData.kontrollResultat,
+    })),
   )
 
   // 2. PUT /las: lock for signing; returns the BankID signeringslänk.
@@ -154,11 +185,9 @@ export async function submitVatDeclarationChain(
   // Persist locked state so the UI/poller can resume (mirrors /declaration/lock).
   await ctx.settings.set(
     `submission_${redovisningsperiod}`,
-    JSON.stringify({
-      status: 'draft_locked', redovisare, redovisningsperiod,
-      periodType: params.periodType, year: params.year, period: params.period,
-      signeringsLank: lasData.signeringsLank, updatedAt: new Date().toISOString(),
-    }),
+    JSON.stringify(createVatSubmissionState(submissionIdentity, 'draft_locked', {
+      signeringsLank: lasData.signeringsLank,
+    })),
   )
 
   return {

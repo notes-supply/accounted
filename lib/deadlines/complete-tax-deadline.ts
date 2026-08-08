@@ -16,20 +16,56 @@ const log = createLogger('complete-tax-deadline')
  * quarterly, `YYYY` for annual. Build it from the caller's own period params;
  * do not reverse-parse Skatteverket's redovisningsperiod strings.
  *
- * Pass every deadline type that can represent the filing (e.g. both
- * `moms_monthly` and `moms_quarterly` for a VAT filing): the company's
- * settings decide which one exists, and the `IN` filter makes the wrong one
- * a no-op.
+ * The caller must pass the one exact generated deadline type represented by
+ * the authoritative filing identity. Ambiguous or unavailable evidence is a
+ * no-op: this helper never broad-updates candidate rows.
  */
 export async function completeTaxDeadline(
   supabase: SupabaseClient,
   companyId: string,
-  taxDeadlineTypes: string[],
+  taxDeadlineType: string,
   taxPeriod: string,
-  newStatus: 'submitted' | 'confirmed'
+  newStatus: 'submitted' | 'confirmed',
+  options: {
+    fiscalPeriodId?: string
+    fiscalPeriodStart?: string
+    fiscalPeriodEnd?: string
+  } = {},
 ): Promise<{ completed: number }> {
+  let candidatesQuery = supabase
+    .from('deadlines')
+    .select('id')
+    .eq('company_id', companyId)
+    .eq('deadline_type', 'tax')
+    .eq('source', 'system')
+    .eq('tax_deadline_type', taxDeadlineType)
+    .eq('tax_period', taxPeriod)
+    .eq('is_completed', false)
+    .is('dismissed_at', null)
+
+  if (options.fiscalPeriodId) {
+    candidatesQuery = candidatesQuery.contains('linked_report_period', {
+      fiscalPeriodId: options.fiscalPeriodId,
+      ...(options.fiscalPeriodStart ? { fiscalPeriodStart: options.fiscalPeriodStart } : {}),
+      ...(options.fiscalPeriodEnd ? { fiscalPeriodEnd: options.fiscalPeriodEnd } : {}),
+    })
+  }
+
+  const { data: candidates, error: candidateError } = await candidatesQuery.limit(2)
+
+  if (candidateError || candidates?.length !== 1) {
+    log.warn('Tax deadline completion candidate was unavailable or ambiguous', {
+      companyId,
+      taxDeadlineType,
+      taxPeriod,
+      candidateCount: candidates?.length ?? 0,
+      error: candidateError?.message,
+    })
+    return { completed: 0 }
+  }
+
   const now = new Date().toISOString()
-  const { data, error } = await supabase
+  let query = supabase
     .from('deadlines')
     .update({
       is_completed: true,
@@ -37,21 +73,34 @@ export async function completeTaxDeadline(
       status: newStatus,
       status_changed_at: now,
     })
+    .eq('id', candidates[0].id)
     .eq('company_id', companyId)
-    .in('tax_deadline_type', taxDeadlineTypes)
+    .eq('deadline_type', 'tax')
+    .eq('source', 'system')
+    .eq('tax_deadline_type', taxDeadlineType)
     .eq('tax_period', taxPeriod)
     .eq('is_completed', false)
-    .select('id')
+    .is('dismissed_at', null)
+
+  if (options.fiscalPeriodId) {
+    query = query.contains('linked_report_period', {
+      fiscalPeriodId: options.fiscalPeriodId,
+      ...(options.fiscalPeriodStart ? { fiscalPeriodStart: options.fiscalPeriodStart } : {}),
+      ...(options.fiscalPeriodEnd ? { fiscalPeriodEnd: options.fiscalPeriodEnd } : {}),
+    })
+  }
+
+  const { data, error } = await query.select('id')
 
   if (error) {
     log.warn('Failed to auto-complete tax deadline', {
       companyId,
-      taxDeadlineTypes,
+      taxDeadlineType,
       taxPeriod,
       error: error.message,
     })
     return { completed: 0 }
   }
 
-  return { completed: data?.length ?? 0 }
+  return { completed: data?.length === 1 ? 1 : 0 }
 }

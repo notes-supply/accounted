@@ -50,11 +50,31 @@ describe('resolveRedovisare', () => {
 })
 
 describe('buildMomsuppgift', () => {
+  it.each([
+    { periodType: 'monthly', year: 2025, period: 1.5 },
+    { periodType: 'quarterly', year: 2025, period: 5 },
+    { periodType: 'yearly', year: 2025, period: 2 },
+  ])('rejects invalid VAT period input before company or declaration reads: $periodType $year $period', async (input) => {
+    const { supabase } = createQueuedMockSupabase()
+
+    await expect(buildMomsuppgift(
+      supabase as never,
+      'company-1',
+      input as never,
+    )).rejects.toThrow()
+
+    expect(supabase.from).not.toHaveBeenCalled()
+    expect(mockCalculateVatDeclaration).not.toHaveBeenCalled()
+  })
+
   it('produces the same momsuppgift the route handler would (rutorToMomsuppgift over the GL rutor)', async () => {
     const rutor = zeroRutor()
     rutor.ruta10 = 250 // output VAT 25%
     rutor.ruta48 = 100 // input VAT
-    mockCalculateVatDeclaration.mockResolvedValue({ rutor })
+    mockCalculateVatDeclaration.mockResolvedValue({
+      period: { type: 'monthly', year: 2025, period: 3, start: '2025-03-01', end: '2025-03-31' },
+      rutor,
+    })
 
     const { supabase, enqueue } = createQueuedMockSupabase()
     enqueue({ data: { org_number: '5560000000', entity_type: 'aktiebolag' } }) // resolveRedovisare
@@ -76,9 +96,17 @@ describe('buildMomsuppgift', () => {
   })
 
   it('targets the FY-end month for a broken-FY yearly filer (SFL 26 kap 10-11 §§)', async () => {
-    mockCalculateVatDeclaration.mockResolvedValue({ rutor: zeroRutor() })
-    // Räkenskapsår 2025-07-01 → 2026-06-30: redovisningsperiod is 202606, not 202612.
-    mockResolvePeriodDates.mockResolvedValue({ start: '2025-07-01', end: '2026-06-30' })
+    mockCalculateVatDeclaration.mockResolvedValue({
+      rutor: zeroRutor(),
+      period: {
+        type: 'yearly',
+        year: 2026,
+        period: 1,
+        start: '2025-07-01',
+        end: '2026-06-30',
+        fiscalPeriodId: 'fp-1',
+      },
+    })
 
     const { supabase, enqueue } = createQueuedMockSupabase()
     enqueue({ data: { org_number: '5560000000', entity_type: 'aktiebolag' } }) // resolveRedovisare
@@ -88,18 +116,25 @@ describe('buildMomsuppgift', () => {
     })
 
     expect(result.redovisningsperiod).toBe('202606')
-    expect(mockResolvePeriodDates).toHaveBeenCalledWith(
-      expect.anything(), 'company-1', 'yearly', 2026, 1, 'fp-1',
-    )
+    expect(mockResolvePeriodDates).not.toHaveBeenCalled()
     // The figures must describe the same räkenskapsår as the period id.
     expect(mockCalculateVatDeclaration).toHaveBeenCalledWith(
       expect.anything(), 'company-1', 'yearly', 2026, 1, { fiscalPeriodId: 'fp-1' },
     )
   })
 
-  it('keeps the calendar-year fallback for yearly without a fiscal period', async () => {
-    mockCalculateVatDeclaration.mockResolvedValue({ rutor: zeroRutor() })
-    mockResolvePeriodDates.mockResolvedValue({ start: '2025-01-01', end: '2025-12-31' })
+  it('returns the uniquely resolved fiscal period identity when the caller omits it', async () => {
+    mockCalculateVatDeclaration.mockResolvedValue({
+      rutor: zeroRutor(),
+      period: {
+        type: 'yearly',
+        year: 2025,
+        period: 1,
+        start: '2025-01-01',
+        end: '2025-12-31',
+        fiscalPeriodId: 'fp-resolved',
+      },
+    })
 
     const { supabase, enqueue } = createQueuedMockSupabase()
     enqueue({ data: { org_number: '5560000000', entity_type: 'aktiebolag' } })
@@ -109,6 +144,35 @@ describe('buildMomsuppgift', () => {
     })
 
     expect(result.redovisningsperiod).toBe('202512')
+    expect(result.fiscalPeriodId).toBe('fp-resolved')
+    expect(result.resolvedPeriodStart).toBe('2025-01-01')
+    expect(result.resolvedPeriodEnd).toBe('2025-12-31')
+    expect(mockResolvePeriodDates).not.toHaveBeenCalled()
+  })
+
+  it('fails when the prepared period drifts from the staged annual bounds', async () => {
+    mockCalculateVatDeclaration.mockResolvedValue({
+      rutor: zeroRutor(),
+      period: {
+        type: 'yearly',
+        year: 2026,
+        period: 1,
+        start: '2025-11-01',
+        end: '2026-04-30',
+        fiscalPeriodId: 'fp-1',
+      },
+    })
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { org_number: '5560000000', entity_type: 'aktiebolag' } })
+
+    await expect(buildMomsuppgift(supabase as never, 'company-1', {
+      periodType: 'yearly',
+      year: 2026,
+      period: 1,
+      fiscalPeriodId: 'fp-1',
+      resolvedPeriodStart: '2025-10-01',
+      resolvedPeriodEnd: '2026-03-31',
+    })).rejects.toThrow(/changed since staging/)
   })
 })
 

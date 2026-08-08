@@ -4,6 +4,7 @@ import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import type { VatPeriodType } from '@/types'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+import { parseVatPeriodInput, VatPeriodInputError } from '@/lib/vat/period-input'
 
 /**
  * GET /api/reports/vat-declaration/settlement-proposal
@@ -42,27 +43,19 @@ export const GET = withRouteContext(
       })
     }
 
-    const year = parseInt(yearStr, 10)
-    const period = parseInt(periodStr, 10)
-
-    if (isNaN(year) || year < 2000 || year > 2100) {
-      return errorResponseFromCode('VAT_REPORT_INVALID_YEAR', log, {
-        requestId,
-        details: { received: yearStr },
-      })
-    }
-
-    if (
-      isNaN(period) ||
-      (periodType === 'monthly' && (period < 1 || period > 12)) ||
-      (periodType === 'quarterly' && (period < 1 || period > 4)) ||
-      (periodType === 'yearly' && period !== 1)
-    ) {
-      return errorResponseFromCode('VAT_REPORT_INVALID_PERIOD', log, {
+    let parsedPeriod: ReturnType<typeof parseVatPeriodInput>
+    try {
+      parsedPeriod = parseVatPeriodInput({ periodType, year: yearStr, period: periodStr })
+    } catch (error) {
+      const code = error instanceof VatPeriodInputError && error.field === 'year'
+        ? 'VAT_REPORT_INVALID_YEAR'
+        : 'VAT_REPORT_INVALID_PERIOD'
+      return errorResponseFromCode(code, log, {
         requestId,
         details: { periodType, received: periodStr },
       })
     }
+    const { year, period } = parsedPeriod
 
     try {
       const proposal = await buildVatSettlementProposal(

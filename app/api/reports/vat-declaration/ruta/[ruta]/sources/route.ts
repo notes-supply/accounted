@@ -8,6 +8,7 @@ import {
 import { fetchDynamicRuta05Accounts } from '@/lib/reports/vat-revenue-accounts'
 import type { ReportSourceLine } from '@/lib/reports/source-lines'
 import type { VatDeclarationRutor, VatPeriodType } from '@/types'
+import { parseVatPeriodInput } from '@/lib/vat/period-input'
 
 /**
  * GET /api/reports/vat-declaration/ruta/[ruta]/sources
@@ -82,11 +83,13 @@ export const GET = withRouteContext<{ params: Promise<{ ruta: string }> }>(
     if (!['monthly', 'quarterly', 'yearly'].includes(periodType)) {
       return NextResponse.json({ error: 'Invalid periodType' }, { status: 400 })
     }
-    const year = parseInt(yearStr, 10)
-    const periodNum = parseInt(periodStr, 10)
-    if (isNaN(year) || isNaN(periodNum)) {
+    let parsedPeriod: ReturnType<typeof parseVatPeriodInput>
+    try {
+      parsedPeriod = parseVatPeriodInput({ periodType, year: yearStr, period: periodStr })
+    } catch {
       return NextResponse.json({ error: 'Invalid period' }, { status: 400 })
     }
+    const { year, period: periodNum } = parsedPeriod
     const dates = await resolvePeriodDates(
       supabase,
       companyId,

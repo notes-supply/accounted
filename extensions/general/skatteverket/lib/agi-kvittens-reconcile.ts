@@ -201,7 +201,7 @@ export async function reconcileAgiDeclaration(
     await completeTaxDeadline(
       supabase,
       companyId,
-      ['arbetsgivardeklaration'],
+      'arbetsgivardeklaration',
       `${decl.period_year}-${String(decl.period_month).padStart(2, '0')}`,
       'confirmed'
     )

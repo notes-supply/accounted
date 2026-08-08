@@ -25,6 +25,7 @@ import {
 import { roundOre } from '@/lib/money'
 import { validateVatNumber } from '@/lib/vat/vies-client'
 import { normalizeVatRateToDecimal } from '@/lib/vat/supplier-invoice-line-checks'
+import { parseVatPeriodInput } from '@/lib/vat/period-input'
 import {
   createInvoicePaymentJournalEntry,
   createInvoiceCashEntry,
@@ -5010,8 +5011,41 @@ async function commitSubmitVatDeclaration(
   if (!params.period_type || !params.year || !params.period) {
     return { error: 'period_type, year och period krävs', status: 400 }
   }
+  let validatedPeriod: ReturnType<typeof parseVatPeriodInput>
+  try {
+    validatedPeriod = parseVatPeriodInput({
+      periodType: params.period_type,
+      year: params.year,
+      period: params.period,
+    })
+  } catch (error) {
+    return {
+      error: error instanceof Error ? error.message : 'Ogiltig momsperiod',
+      status: 400,
+    }
+  }
+  if (
+    validatedPeriod.periodType === 'yearly' &&
+    (!params.fiscal_period_id || !params.resolved_period_start || !params.resolved_period_end)
+  ) {
+    return {
+      error: 'fiscal_period_id och resolved period bounds krävs för en staged årlig momsdeklaration',
+      status: 409,
+    }
+  }
+  const validatedParams = {
+    ...params,
+    period_type: validatedPeriod.periodType,
+    year: validatedPeriod.year,
+    period: validatedPeriod.period,
+  }
   const services = getSkatteverketServices()
-  const result = await services.commitSubmitVatDeclaration(supabase, userId, companyId, params)
+  const result = await services.commitSubmitVatDeclaration(
+    supabase,
+    userId,
+    companyId,
+    validatedParams,
+  )
   return handleSkvSubmitResult(result)
 }
 

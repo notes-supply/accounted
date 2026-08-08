@@ -7,6 +7,8 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
+vi.mock('@/lib/reports/rc-basis-gaps', () => ({ findRcBasisGaps: vi.fn(async () => []) }))
+
 const mockSkvRequest = vi.fn()
 vi.mock('../lib/api-client', async (importOriginal) => {
   const actual = (await importOriginal()) as Record<string, unknown>
@@ -48,6 +50,20 @@ beforeEach(() => {
   process.env.SKATTEVERKET_ENABLED = 'true'
   mockBuildMomsuppgift.mockResolvedValue({
     redovisare: '165560000000', redovisningsperiod: '202503', momsuppgift: { summaMoms: 150 },
+    declaration: {
+      period: { type: 'monthly', year: 2025, period: 3, start: '2025-03-01', end: '2025-03-31' },
+      rutor: {
+        ruta05: 0, ruta06: 0, ruta07: 0, ruta08: 0,
+        ruta10: 0, ruta11: 0, ruta12: 0,
+        ruta20: 0, ruta21: 0, ruta22: 0, ruta23: 0, ruta24: 0,
+        ruta30: 0, ruta31: 0, ruta32: 0,
+        ruta35: 0, ruta36: 0, ruta37: 0, ruta38: 0,
+        ruta39: 0, ruta40: 0, ruta41: 0, ruta42: 0,
+        ruta48: 0, ruta49: 0, ruta50: 0, ruta60: 0, ruta61: 0, ruta62: 0,
+      },
+    },
+    resolvedPeriodStart: '2025-03-01',
+    resolvedPeriodEnd: '2025-03-31',
   })
 })
 afterEach(() => {
@@ -90,5 +106,30 @@ describe('commitSubmitVatDeclaration', () => {
     mockSkvRequest.mockRejectedValueOnce(new SkatteverketAuthError('ingen anslutning', 'NOT_CONNECTED'))
     const result = await commitSubmitVatDeclaration({}, 'user-1', 'company-1', VAT_PARAMS)
     expect(result).toMatchObject({ ok: false, code: 'SKATTEVERKET_NOT_CONNECTED', recoverable: true })
+  })
+
+  it('passes immutable staged bounds to prep and makes no SKV call on drift', async () => {
+    mockBuildMomsuppgift.mockRejectedValueOnce(new Error('Annual VAT period changed since staging'))
+    const params = {
+      period_type: 'yearly',
+      year: 2026,
+      period: 1,
+      fiscal_period_id: 'fp-1',
+      resolved_period_start: '2025-10-01',
+      resolved_period_end: '2026-03-31',
+    }
+
+    const result = await commitSubmitVatDeclaration({}, 'user-1', 'company-1', params)
+
+    expect(result).toMatchObject({ ok: false, recoverable: false })
+    expect(mockBuildMomsuppgift).toHaveBeenCalledWith(expect.anything(), 'company-1', {
+      periodType: 'yearly',
+      year: 2026,
+      period: 1,
+      fiscalPeriodId: 'fp-1',
+      resolvedPeriodStart: '2025-10-01',
+      resolvedPeriodEnd: '2026-03-31',
+    })
+    expect(mockSkvRequest).not.toHaveBeenCalled()
   })
 })

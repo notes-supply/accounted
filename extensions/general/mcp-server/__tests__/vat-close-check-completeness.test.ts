@@ -44,6 +44,15 @@ interface MockChartAccount {
   default_vat_rate: number | null
 }
 
+const VAT_SETTINGS = {
+  moms_period: 'monthly',
+  entity_type: 'aktiebolag',
+  vat_taxable_base_over_40m: false,
+  vat_has_eu_trade: false,
+  vat_filing_method: 'electronic',
+  vat_liability_start_date: null,
+}
+
 /**
  * Table-routed Supabase double. journal_entries / journal_entry_lines serve the
  * fixture; everything else (transactions, supplier_invoices, company_settings)
@@ -77,12 +86,12 @@ function mockSupabase(lines: MockLine[], chartAccounts: MockChartAccount[] = [])
     credit_amount: l.credit_amount ?? 0,
   }))
 
-  const makeChain = (rows: unknown[]): Record<string, unknown> => {
+  const makeChain = (rows: unknown[], singleRow: unknown = null): Record<string, unknown> => {
     const chain: Record<string, unknown> = {}
     const settled = { data: rows, error: null, count: rows.length }
     chain.range = () => settled
-    chain.single = async () => ({ data: null, error: null })
-    chain.maybeSingle = async () => ({ data: null, error: null })
+    chain.single = async () => ({ data: singleRow, error: null })
+    chain.maybeSingle = async () => ({ data: singleRow, error: null })
     chain.then = (resolve: (v: unknown) => void) => resolve(settled)
     for (const m of [
       'order', 'lte', 'gte', 'neq', 'in', 'eq', 'is', 'select',
@@ -98,6 +107,7 @@ function mockSupabase(lines: MockLine[], chartAccounts: MockChartAccount[] = [])
       if (table === 'journal_entries') return makeChain(entries)
       if (table === 'journal_entry_lines') return makeChain(bareLines)
       if (table === 'chart_of_accounts') return makeChain(chartAccounts)
+      if (table === 'company_settings') return makeChain([], VAT_SETTINGS)
       return makeChain([])
     },
     // The missing-underlag blocker reads the verifikat_without_documents RPC,

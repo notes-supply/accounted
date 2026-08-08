@@ -4,6 +4,7 @@ import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import { findRcBasisGaps } from '@/lib/reports/rc-basis-gaps'
 import type { VatPeriodType } from '@/types'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+import { parseVatPeriodInput } from '@/lib/vat/period-input'
 
 export const GET = withRouteContext(
   'report.vat_declaration.rc_basis_gaps',
@@ -28,14 +29,16 @@ export const GET = withRouteContext(
       })
     }
 
-    const year = parseInt(yearStr, 10)
-    const period = parseInt(periodStr, 10)
-    if (isNaN(year) || isNaN(period)) {
+    let parsedPeriod: ReturnType<typeof parseVatPeriodInput>
+    try {
+      parsedPeriod = parseVatPeriodInput({ periodType, year: yearStr, period: periodStr })
+    } catch {
       return errorResponseFromCode('VAT_REPORT_INVALID_PERIOD', log, {
         requestId,
         details: { year: yearStr, period: periodStr },
       })
     }
+    const { year, period } = parsedPeriod
 
     try {
       const gaps = await findRcBasisGaps(supabase, companyId, periodType, year, period, {

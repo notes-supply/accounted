@@ -32,6 +32,11 @@ import { computeVatCloseCheck } from '../server'
 
 const COMPANY_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 const PERIOD = { period_type: 'monthly', year: 2026, period: 1 }
+const VAT_SETTINGS = {
+  moms_period: 'monthly', entity_type: 'aktiebolag',
+  vat_taxable_base_over_40m: false, vat_has_eu_trade: false,
+  vat_filing_method: 'electronic', vat_liability_start_date: null,
+}
 
 /**
  * Table-routed Supabase double with an EMPTY ledger: every table read settles
@@ -41,12 +46,12 @@ const PERIOD = { period_type: 'monthly', year: 2026, period: 1 }
  * (period start, day after period end) get their own totals.
  */
 function mockSupabase(rpcResults: Record<string, unknown>) {
-  const makeChain = (rows: unknown[]): Record<string, unknown> => {
+  const makeChain = (rows: unknown[], singleRow: unknown = null): Record<string, unknown> => {
     const chain: Record<string, unknown> = {}
     const settled = { data: rows, error: null, count: rows.length }
     chain.range = () => settled
-    chain.single = async () => ({ data: null, error: null })
-    chain.maybeSingle = async () => ({ data: null, error: null })
+    chain.single = async () => ({ data: singleRow, error: null })
+    chain.maybeSingle = async () => ({ data: singleRow, error: null })
     chain.then = (resolve: (v: unknown) => void) => resolve(settled)
     for (const m of [
       'order', 'lte', 'gte', 'neq', 'in', 'eq', 'is', 'select',
@@ -66,7 +71,10 @@ function mockSupabase(rpcResults: Record<string, unknown>) {
   })
 
   return {
-    supabase: { from: () => makeChain([]), rpc } as never,
+    supabase: {
+      from: (table: string) => makeChain([], table === 'company_settings' ? VAT_SETTINGS : null),
+      rpc,
+    } as never,
     rpc,
   }
 }

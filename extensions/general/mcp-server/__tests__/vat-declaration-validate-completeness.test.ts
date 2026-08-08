@@ -23,12 +23,35 @@ vi.mock('@/extensions/general/skatteverket/lib/api-client', async (importOrigina
   return { ...actual, skvRequest: (...a: unknown[]) => mockSkvRequest(...a) }
 })
 
-vi.mock('@/extensions/general/skatteverket/lib/declaration-prep', () => ({
-  buildMomsuppgift: vi.fn(async () => ({
+const mockBuildMomsuppgift = vi.fn(async (...args: unknown[]) => {
+  const input = args[2] as {
+    periodType: string
+    year: number
+    period: number
+    fiscalPeriodId?: string
+  }
+  const declaration = await mockCalculateVatDeclaration(
+    args[0],
+    args[1],
+    input.periodType,
+    input.year,
+    input.period,
+    { fiscalPeriodId: input.fiscalPeriodId },
+  )
+  return {
     redovisare: '165560000000',
     redovisningsperiod: '202601',
     momsuppgift: { summaMoms: 2500 },
-  })),
+    declaration,
+    ...(input.fiscalPeriodId ? {
+      fiscalPeriodId: input.fiscalPeriodId,
+      resolvedPeriodStart: '2025-01-01',
+      resolvedPeriodEnd: '2026-12-31',
+    } : {}),
+  }
+})
+vi.mock('@/extensions/general/skatteverket/lib/declaration-prep', () => ({
+  buildMomsuppgift: (...args: unknown[]) => mockBuildMomsuppgift(...args),
   resolveRedovisare: vi.fn(async () => '165560000000'),
 }))
 
@@ -49,8 +72,9 @@ vi.mock('@/lib/reports/vat-declaration', async (importOriginal) => {
 
 // The per-verifikat FK004 scan has its own coverage in lib/reports/__tests__;
 // here it must simply not add findings of its own.
+const mockFindRcBasisGaps = vi.fn(async (..._args: unknown[]) => [])
 vi.mock('@/lib/reports/rc-basis-gaps', () => ({
-  findRcBasisGaps: vi.fn(async () => []),
+  findRcBasisGaps: (...args: unknown[]) => mockFindRcBasisGaps(...args),
 }))
 
 import { tools } from '../server'
@@ -139,6 +163,41 @@ async function run(): Promise<ValidateResult> {
 }
 
 describe('gnubok_vat_declaration_validate', () => {
+  it('threads the annual fiscal period through calculation, completeness, and filing prep', async () => {
+    const fiscalPeriodId = '11111111-1111-4111-8111-111111111111'
+    setDeclaration(CLEAN)
+    skvOk()
+
+    await validate.execute({
+      period_type: 'yearly',
+      year: 2026,
+      period: 1,
+      fiscal_period_id: fiscalPeriodId,
+    }, 'company-1', 'user-1', supabase, { type: 'api_key' })
+
+    expect(mockCalculateVatDeclaration).toHaveBeenCalledWith(
+      supabase,
+      'company-1',
+      'yearly',
+      2026,
+      1,
+      { fiscalPeriodId },
+    )
+    expect(mockFindRcBasisGaps).toHaveBeenCalledWith(
+      supabase,
+      'company-1',
+      'yearly',
+      2026,
+      1,
+      { fiscalPeriodId },
+    )
+    expect(mockBuildMomsuppgift).toHaveBeenCalledWith(
+      supabase,
+      'company-1',
+      { periodType: 'yearly', year: 2026, period: 1, fiscalPeriodId },
+    )
+  })
+
   it('separates arithmetic (Skatteverket) from completeness (local) on an incomplete declaration', async () => {
     setDeclaration(INCOMPLETE)
     skvOk()

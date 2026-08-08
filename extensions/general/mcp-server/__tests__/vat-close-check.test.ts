@@ -45,29 +45,47 @@ describe('gnubok_vat_close_check', () => {
 })
 
 describe('computeMomsDeadline', () => {
-  it('monthly: March 2026 → 12 April 2026', () => {
-    const d = computeMomsDeadline('monthly', 2026, 3)
-    expect(d?.date).toBe('2026-04-12')
-    expect(d?.label).toBe('12 april 2026')
+  const settings = {
+    entity_type: 'aktiebolag' as const,
+    vat_taxable_base_over_40m: false,
+    vat_has_eu_trade: false,
+    vat_filing_method: 'electronic' as const,
+  }
+
+  it('monthly: March 2026 uses the canonical second following month', () => {
+    const d = computeMomsDeadline('monthly', 2026, 3, { settings })
+    expect(d?.date).toBe('2026-05-12')
+    expect(d?.label).toBe('12 maj 2026')
   })
 
-  it('monthly: December rolls into next year', () => {
-    const d = computeMomsDeadline('monthly', 2026, 12)
-    expect(d?.date).toBe('2027-01-12')
+  it('monthly: December uses February of the next year', () => {
+    const d = computeMomsDeadline('monthly', 2026, 12, { settings })
+    expect(d?.date).toBe('2027-02-12')
   })
 
-  it('quarterly: Q1 2026 → 26 April 2026', () => {
-    const d = computeMomsDeadline('quarterly', 2026, 1)
-    expect(d?.date).toBe('2026-04-26')
+  it('quarterly: Q1 2026 is due in May', () => {
+    const d = computeMomsDeadline('quarterly', 2026, 1, { settings })
+    expect(d?.date).toBe('2026-05-12')
   })
 
-  it('quarterly: Q4 2026 → 26 January 2027', () => {
-    const d = computeMomsDeadline('quarterly', 2026, 4)
-    expect(d?.date).toBe('2027-01-26')
+  it('quarterly: Q4 2026 is due in February 2027', () => {
+    const d = computeMomsDeadline('quarterly', 2026, 4, { settings })
+    expect(d?.date).toBe('2027-02-12')
   })
 
-  it('yearly: 2026 → 26 February 2027', () => {
-    const d = computeMomsDeadline('yearly', 2026, 1)
+  it('yearly: selected 2026 fiscal period with EU trade is due 26 February 2027', () => {
+    const d = computeMomsDeadline('yearly', 2026, 1, {
+      settings: {
+        ...settings,
+        entity_type: 'enskild_firma',
+        vat_has_eu_trade: true,
+      },
+      fiscalPeriod: {
+        id: 'fp-2026',
+        period_start: '2026-01-01',
+        period_end: '2026-12-31',
+      },
+    })
     expect(d?.date).toBe('2027-02-26')
   })
 })

@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { NextResponse } from 'next/server'
 import { createMockRequest, parseJsonResponse, createQueuedMockSupabase } from '@/tests/helpers'
 
-const { supabase, enqueue, enqueueMany, reset } = createQueuedMockSupabase()
+const { supabase, enqueue, enqueueMany, reset, findCall } = createQueuedMockSupabase()
 
 const requireAuthMock = vi.fn()
 vi.mock('@/lib/auth/require-auth', () => ({
@@ -463,6 +463,56 @@ describe('PUT /api/settings', () => {
     expect(deadlineMocks.regenerate).toHaveBeenCalledOnce()
   })
 
+  it('preserves the historical VAT liability start when registration is turned off', async () => {
+    const settings = {
+      company_id: 'company-1',
+      entity_type: 'aktiebolag',
+      vat_registered: true,
+      vat_number: 'SE556012579001',
+      moms_period: 'quarterly',
+      vat_liability_start_date: '2023-07-01',
+      onboarding_complete: true,
+    }
+    enqueueMany([
+      { data: settings },
+      { data: { ...settings, id: 's1', vat_registered: false } },
+    ])
+
+    const request = createMockRequest('/api/settings', {
+      method: 'PUT',
+      body: {
+        vat_registered: false,
+        // The tax settings form sends null because the field is hidden after
+        // deregistration. That must not erase historical liability evidence.
+        vat_liability_start_date: null,
+      },
+    })
+    const response = await PUT(request, { params: Promise.resolve({}) })
+    const { status } = await parseJsonResponse(response)
+
+    expect(status).toBe(200)
+    expect(findCall('company_settings', 'update')?.[0]).toMatchObject({
+      vat_registered: false,
+      vat_liability_start_date: '2023-07-01',
+    })
+  })
+
+  it('fails closed without updating when VAT provenance cannot be read', async () => {
+    enqueue({
+      data: null,
+      error: { code: '57014', message: 'statement timeout' },
+    })
+
+    const response = await PUT(createMockRequest('/api/settings', {
+      method: 'PUT',
+      body: { vat_registered: false, vat_liability_start_date: null },
+    }), { params: Promise.resolve({}) })
+
+    expect(response.status).toBe(500)
+    expect(findCall('company_settings', 'update')).toBeUndefined()
+    expect(supabase.from).toHaveBeenCalledTimes(1)
+  })
+
   it('still rejects explicitly enabling the EU sales list without EU trade', async () => {
     enqueue({
       data: {
@@ -576,7 +626,7 @@ describe('PUT /api/settings', () => {
 
   it('returns 404 when the settings row does not exist', async () => {
     enqueueMany([
-      { data: { onboarding_complete: false } },
+      { data: null, error: { code: 'PGRST116', message: 'No rows returned' } },
       { data: null, error: { code: 'PGRST116', message: 'No rows returned' } },
     ])
 

@@ -140,6 +140,19 @@ describe('GET /api/reports/vat-declaration', () => {
     expect(mockSupabase.rpc).not.toHaveBeenCalled()
   })
 
+  it('rejects fractional, scientific, partial, and overflowing period input', async () => {
+    for (const query of [
+      '?periodType=monthly&year=2026&period=1.5',
+      '?periodType=monthly&year=2e3&period=1',
+      '?periodType=monthly&year=2026junk&period=1',
+      '?periodType=monthly&year=999999999999999999999&period=1',
+    ]) {
+      const res = await GET(makeRequest(query), { params: Promise.resolve({}) })
+      expect(res.status).toBe(400)
+    }
+    expect(mockSupabase.rpc).not.toHaveBeenCalled()
+  })
+
   it('happy path quarterly: öre-exact rutor from a single RPC round trip', async () => {
     const res = await GET(
       makeRequest('?periodType=quarterly&year=2026&period=3'),

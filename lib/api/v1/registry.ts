@@ -388,6 +388,19 @@ export function generateOpenApiSpec(serverUrl: string): OpenApiSpec {
       },
     }
 
+    if (def.request?.query) {
+      const querySchema = zodToJsonSchema(def.request.query)
+      const required = new Set(querySchema.required ?? [])
+      operationDef.parameters = Object.entries(querySchema.properties ?? {}).map(
+        ([name, schema]) => ({
+          name,
+          in: 'query',
+          required: required.has(name),
+          schema,
+        }),
+      )
+    }
+
     if (!paths[openApiPath]) paths[openApiPath] = {}
     paths[openApiPath][def.method.toLowerCase()] = operationDef
   }

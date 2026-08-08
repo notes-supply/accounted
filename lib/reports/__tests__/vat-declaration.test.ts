@@ -161,16 +161,49 @@ describe('calculatePeriodDates', () => {
     expect(start).toBe('2024-01-01')
     expect(end).toBe('2024-12-31')
   })
+
+  it('accepts the supported legal year and monthly period boundaries', () => {
+    expect(calculatePeriodDates('monthly', 2000, 1)).toEqual({
+      start: '2000-01-01',
+      end: '2000-01-31',
+    })
+    expect(calculatePeriodDates('monthly', 2100, 12)).toEqual({
+      start: '2100-12-01',
+      end: '2100-12-31',
+    })
+  })
+
+  it.each([
+    ['monthly', 2026, 1.5],
+    ['quarterly', 2026, 5],
+    ['yearly', 2026, 2],
+    ['monthly', Number.NaN, 1],
+    ['monthly', 2101, 1],
+  ] as const)('rejects invalid period calculation input: %s %s %s', (periodType, year, period) => {
+    expect(() => calculatePeriodDates(periodType, year, period)).toThrow(/VAT period|year|period/i)
+  })
 })
 
 describe('resolvePeriodDates', () => {
+  it('rejects invalid input before resolving or applying a liability boundary', async () => {
+    await expect(
+      resolvePeriodDates(supabase, 'company-1', 'quarterly', 2026, 5),
+    ).rejects.toThrow(/period/i)
+    expect(supabase.from).not.toHaveBeenCalled()
+  })
+
   it('clamps the first annual VAT period to the VAT liability start date', async () => {
     vatLiabilityStartDate = '2026-05-01'
     results.push({ data: { period_start: '2026-04-15', period_end: '2026-12-31' }, error: null })
 
     const dates = await resolvePeriodDates(supabase, 'company-1', 'yearly', 2026, 1)
 
-    expect(dates).toEqual({ start: '2026-05-01', end: '2026-12-31' })
+    expect(dates).toEqual({
+      start: '2026-05-01',
+      end: '2026-12-31',
+      fiscalPeriodStart: '2026-04-15',
+      fiscalPeriodEnd: '2026-12-31',
+    })
   })
 
   it('does not clamp an annual period after VAT liability has started', async () => {
@@ -179,7 +212,12 @@ describe('resolvePeriodDates', () => {
 
     const dates = await resolvePeriodDates(supabase, 'company-1', 'yearly', 2027, 1)
 
-    expect(dates).toEqual({ start: '2027-01-01', end: '2027-12-31' })
+    expect(dates).toEqual({
+      start: '2027-01-01',
+      end: '2027-12-31',
+      fiscalPeriodStart: '2027-01-01',
+      fiscalPeriodEnd: '2027-12-31',
+    })
   })
 
   it.each([
@@ -208,6 +246,29 @@ describe('resolvePeriodDates', () => {
 
     await expect(resolvePeriodDates(supabase, 'company-1', 'yearly', 2026, 1))
       .rejects.toThrow('No fiscal period found')
+  })
+
+  it('rejects an explicit fiscal period from another company through the company-scoped lookup', async () => {
+    results.push({ data: null, error: null })
+
+    await expect(resolvePeriodDates(
+      supabase, 'company-1', 'yearly', 2026, 1, 'period-from-company-2',
+    )).rejects.toThrow('No fiscal period found')
+
+    const builder = supabase.from.mock.results[0].value
+    expect(builder.eq).toHaveBeenCalledWith('id', 'period-from-company-2')
+    expect(builder.eq).toHaveBeenCalledWith('company_id', 'company-1')
+  })
+
+  it('rejects an explicit fiscal period ending in a different requested year', async () => {
+    results.push({
+      data: { id: 'fp-2025', period_start: '2025-01-01', period_end: '2025-12-31' },
+      error: null,
+    })
+
+    await expect(resolvePeriodDates(
+      supabase, 'company-1', 'yearly', 2026, 1, 'fp-2025',
+    )).rejects.toThrow('does not end in 2026')
   })
 
   it('clamps when VAT liability starts on the last day of the period', async () => {
@@ -334,6 +395,14 @@ describe('getVatDeclarationSummary', () => {
 // ============================================================
 
 describe('calculateVatDeclaration', () => {
+  it('rejects invalid input before any report read', async () => {
+    await expect(
+      calculateVatDeclaration(supabase, 'company-1', 'monthly', 2026, 1.5),
+    ).rejects.toThrow(/period/i)
+    expect(supabase.from).not.toHaveBeenCalled()
+    expect(supabase.rpc).not.toHaveBeenCalled()
+  })
+
   it('returns all zeros when no ledger lines exist', async () => {
     seedLedger([])
 
@@ -1372,7 +1441,7 @@ describe('calculateVatDeclaration: annual VAT spans the räkenskapsår', () => {
     ])
 
     const result = await calculateVatDeclaration(
-      supabase, 'company-1', 'yearly', 2026, 1, 'accrual', { fiscalPeriodId: 'fp-1' },
+      supabase, 'company-1', 'yearly', 2026, 1, { fiscalPeriodId: 'fp-1' },
     )
 
     expect(result.period.start).toBe('2025-07-03')
@@ -1388,7 +1457,7 @@ describe('calculateVatDeclaration: annual VAT spans the räkenskapsår', () => {
     ]
 
     await expect(calculateVatDeclaration(
-      supabase, 'company-1', 'yearly', 2026, 1, 'accrual', { fiscalPeriodId: 'missing' },
+      supabase, 'company-1', 'yearly', 2026, 1, { fiscalPeriodId: 'missing' },
     )).rejects.toThrow('No fiscal period found')
   })
 
@@ -1403,7 +1472,7 @@ describe('calculateVatDeclaration: annual VAT spans the räkenskapsår', () => {
     seedLedger([])
 
     const result = await calculateVatDeclaration(
-      supabase, 'company-1', 'yearly', 2026, 1, 'accrual',
+      supabase, 'company-1', 'yearly', 2026, 1,
     )
 
     expect(result.period.start).toBe('2025-07-01')
@@ -1416,7 +1485,7 @@ describe('calculateVatDeclaration: annual VAT spans the räkenskapsår', () => {
     ]
 
     await expect(calculateVatDeclaration(
-      supabase, 'company-1', 'yearly', 2026, 1, 'accrual',
+      supabase, 'company-1', 'yearly', 2026, 1,
     )).rejects.toThrow('No fiscal period found')
   })
 
@@ -1424,7 +1493,7 @@ describe('calculateVatDeclaration: annual VAT spans the räkenskapsår', () => {
     seedLedger([])
 
     const result = await calculateVatDeclaration(
-      supabase, 'company-1', 'monthly', 2026, 3, 'accrual', { fiscalPeriodId: 'fp-1' },
+      supabase, 'company-1', 'monthly', 2026, 3, { fiscalPeriodId: 'fp-1' },
     )
 
     expect(result.period.start).toBe('2026-03-01')

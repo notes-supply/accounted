@@ -16,6 +16,7 @@ import {
   type VatDeclarationRutor,
 } from '@/types'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+import { parseVatPeriodInput } from '@/lib/vat/period-input'
 
 interface RutaRow {
   ruta: string
@@ -41,11 +42,13 @@ export const GET = withRouteContext('report.vat_declaration.xlsx', async (reques
     return NextResponse.json({ error: 'Invalid periodType' }, { status: 400 })
   }
 
-  const year = parseInt(yearStr, 10)
-  const period = parseInt(periodStr, 10)
-  if (isNaN(year) || isNaN(period)) {
+  let parsedPeriod: ReturnType<typeof parseVatPeriodInput>
+  try {
+    parsedPeriod = parseVatPeriodInput({ periodType, year: yearStr, period: periodStr })
+  } catch {
     return NextResponse.json({ error: 'Invalid year or period' }, { status: 400 })
   }
+  const { year, period } = parsedPeriod
 
   const { data: companyRow } = await supabase
     .from('company_settings')

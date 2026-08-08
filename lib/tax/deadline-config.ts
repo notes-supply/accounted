@@ -4,7 +4,7 @@
  */
 
 import type { TaxDeadlineType, EntityType, MomsPeriod, TaxFilingMethod } from '@/types'
-import { isBankingDay } from './swedish-holidays'
+import { adjustDeadlineToNextBankingDay, isBankingDay } from './swedish-holidays'
 
 // Condition function type for determining if a deadline applies
 export type DeadlineCondition = (settings: CompanySettingsForDeadlines) => boolean
@@ -16,6 +16,13 @@ export interface TaxAssessmentNoticeForDeadline {
   paymentDueDate: string
 }
 
+export interface FiscalPeriodForDeadlines {
+  id: string
+  name: string
+  period_start: string
+  period_end: string
+}
+
 // Subset of company settings needed for deadline generation
 export interface CompanySettingsForDeadlines {
   entity_type: EntityType
@@ -23,6 +30,7 @@ export interface CompanySettingsForDeadlines {
   f_skatt: boolean
   preliminary_tax_monthly: number | null
   vat_registered: boolean
+  vat_liability_start_date: string | null
   pays_salaries: boolean
   // null = never attested; the generator falls back to pays_salaries so
   // rows saved before the registration flag existed keep their deadlines.
@@ -52,6 +60,32 @@ export interface CompanySettingsForDeadlines {
   rot_rut_payment_years?: number[]
   /** Derived from active tax_assessment_notices rows by the generator. */
   tax_assessment_notices?: TaxAssessmentNoticeForDeadline[]
+  /** Derived from company-scoped fiscal_periods rows by the generator. */
+  fiscal_periods?: FiscalPeriodForDeadlines[]
+}
+
+export type AnnualVatDeadlineSettings = Pick<
+  CompanySettingsForDeadlines,
+  'entity_type' | 'vat_has_eu_trade' | 'vat_filing_method'
+>
+
+export type VatDeadlineSettings = Pick<
+  CompanySettingsForDeadlines,
+  | 'entity_type'
+  | 'vat_taxable_base_over_40m'
+  | 'vat_has_eu_trade'
+  | 'vat_filing_method'
+>
+
+export interface VatDeadlineFiscalPeriod {
+  id: string
+  period_start: string
+  period_end: string
+}
+
+export interface CanonicalVatDeadline {
+  date: string
+  instance: DeadlineInstance
 }
 
 // Configuration for a single tax deadline type
@@ -81,6 +115,9 @@ export interface DeadlineInstance {
   period: string   // e.g., "2025-Q1", "2025-01", "2025"
   periodLabel: string // Human-readable, e.g., "Q1 2025", "januari 2025"
   taxAssessmentNoticeId?: string
+  fiscalPeriodId?: string
+  fiscalPeriodStart?: string
+  fiscalPeriodEnd?: string
 }
 
 /**
@@ -108,10 +145,24 @@ function getFiscalYearLabel(fiscalYearEndMonth: number, fiscalYearEndYear: numbe
     : `${fiscalYearEndYear - 1}/${fiscalYearEndYear}`
 }
 
-function getAnnualVatDeadline(
+export function getActualFiscalPeriodLabel(periodStart: string, periodEnd: string): string {
+  const start = new Date(`${periodStart}T00:00:00Z`)
+  const regularEnd = new Date(start)
+  regularEnd.setUTCFullYear(regularEnd.getUTCFullYear() + 1)
+  regularEnd.setUTCDate(regularEnd.getUTCDate() - 1)
+  const regularEndIso = regularEnd.toISOString().slice(0, 10)
+  if (regularEndIso === periodEnd) {
+    const startYear = Number(periodStart.slice(0, 4))
+    const endYear = Number(periodEnd.slice(0, 4))
+    return startYear === endYear ? `${endYear}` : `${startYear}/${endYear}`
+  }
+  return `${periodStart}/${periodEnd}`
+}
+
+export function getAnnualVatDeadline(
   fiscalYearEndMonth: number,
   fiscalYearEndYear: number,
-  settings: CompanySettingsForDeadlines,
+  settings: AnnualVatDeadlineSettings,
 ): { day: number; month: number; year: number } {
   // Enskild firma (calendar year only, BFL 3 kap.): without EU trade the
   // annual momsdeklaration follows the income tax return (12 May); with EU
@@ -150,20 +201,33 @@ function generateAnnualVatDates(
   deadlineYear: number,
   settings: CompanySettingsForDeadlines,
 ): DeadlineInstance[] {
-  const fiscalYearEndMonth = settings.entity_type === 'enskild_firma'
-    ? 12
-    : (settings.fiscal_year_start_month === 1 ? 12 : settings.fiscal_year_start_month - 1)
+  if (!settings.fiscal_periods) {
+    throw new Error('Actual fiscal periods are required for yearly VAT deadlines')
+  }
   const results: DeadlineInstance[] = []
 
-  for (const fiscalYearEndYear of [deadlineYear - 1, deadlineYear]) {
+  for (const fiscalPeriod of settings.fiscal_periods) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fiscalPeriod.period_start) ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(fiscalPeriod.period_end) ||
+        fiscalPeriod.period_start > fiscalPeriod.period_end) {
+      throw new Error(`Invalid fiscal period ${fiscalPeriod.id}`)
+    }
+    const fiscalYearEndYear = Number(fiscalPeriod.period_end.slice(0, 4))
+    const fiscalYearEndMonth = Number(fiscalPeriod.period_end.slice(5, 7))
     const deadline = getAnnualVatDeadline(fiscalYearEndMonth, fiscalYearEndYear, settings)
     if (deadline.year !== deadlineYear) continue
 
-    const period = getFiscalYearLabel(fiscalYearEndMonth, fiscalYearEndYear)
+    const period = getActualFiscalPeriodLabel(
+      fiscalPeriod.period_start,
+      fiscalPeriod.period_end,
+    )
     results.push({
       ...deadline,
       period,
       periodLabel: period,
+      fiscalPeriodId: fiscalPeriod.id,
+      fiscalPeriodStart: fiscalPeriod.period_start,
+      fiscalPeriodEnd: fiscalPeriod.period_end,
     })
   }
 
@@ -764,6 +828,86 @@ export const TAX_DEADLINE_CONFIGS: TaxDeadlineConfig[] = [
     },
   },
 ]
+
+/**
+ * Resolve one VAT obligation through the same configuration and Swedish
+ * banking-day adjustment used by the deadline generator.
+ */
+export function resolveCanonicalVatDeadline(
+  periodType: 'monthly' | 'quarterly' | 'yearly',
+  year: number,
+  period: number,
+  settings: VatDeadlineSettings,
+  fiscalPeriod?: VatDeadlineFiscalPeriod,
+): CanonicalVatDeadline {
+  if (periodType === 'yearly' && !fiscalPeriod) {
+    throw new Error('Actual fiscal period is required for yearly VAT deadline')
+  }
+
+  const deadlineSettings: CompanySettingsForDeadlines = {
+    entity_type: settings.entity_type,
+    moms_period: periodType,
+    f_skatt: false,
+    preliminary_tax_monthly: null,
+    vat_registered: true,
+    vat_liability_start_date: null,
+    pays_salaries: false,
+    employer_registered: null,
+    employer_seasonal: false,
+    fiscal_year_start_month: 1,
+    vat_taxable_base_over_40m: settings.vat_taxable_base_over_40m,
+    vat_has_eu_trade: settings.vat_has_eu_trade,
+    vat_filing_method: settings.vat_filing_method,
+    periodisk_sammanstallning_enabled: false,
+    periodisk_sammanstallning_period: 'monthly',
+    periodisk_sammanstallning_filing_method: 'electronic',
+    kontrolluppgifter_enabled: false,
+    rot_rut_enabled: false,
+    oss_enabled: false,
+    ioss_enabled: false,
+    intrastat_enabled: false,
+    punktskatt_enabled: false,
+    fyllnadsinbetalning_enabled: false,
+    fiscal_periods: fiscalPeriod ? [{
+      ...fiscalPeriod,
+      name: getActualFiscalPeriodLabel(fiscalPeriod.period_start, fiscalPeriod.period_end),
+    }] : undefined,
+  }
+  const type = periodType === 'monthly'
+    ? 'moms_monthly'
+    : periodType === 'quarterly'
+      ? 'moms_quarterly'
+      : 'moms_yearly'
+  const config = TAX_DEADLINE_CONFIGS.find((candidate) => candidate.type === type)
+  if (!config) throw new Error(`Canonical VAT deadline config is unavailable for ${periodType}`)
+
+  const generationYears = periodType === 'yearly' ? [year, year + 1] : [year]
+  const instances = generationYears.flatMap((generationYear) =>
+    config.generateDates(generationYear, deadlineSettings),
+  )
+  const expectedPeriod = periodType === 'monthly'
+    ? `${year}-${String(period).padStart(2, '0')}`
+    : periodType === 'quarterly'
+      ? `${year}-Q${period}`
+      : null
+  const matches = instances.filter((instance) => periodType === 'yearly'
+    ? instance.fiscalPeriodId === fiscalPeriod?.id &&
+      instance.fiscalPeriodStart === fiscalPeriod?.period_start &&
+      instance.fiscalPeriodEnd === fiscalPeriod?.period_end
+    : instance.period === expectedPeriod)
+  if (matches.length !== 1) {
+    throw new Error(`Canonical VAT deadline identity is unavailable for ${periodType} ${year}/${period}`)
+  }
+
+  const instance = matches[0]
+  const adjusted = adjustDeadlineToNextBankingDay(
+    new Date(instance.year, instance.month, instance.day),
+  )
+  return {
+    date: `${adjusted.getFullYear()}-${String(adjusted.getMonth() + 1).padStart(2, '0')}-${String(adjusted.getDate()).padStart(2, '0')}`,
+    instance,
+  }
+}
 
 /**
  * Helper to get month label in Swedish

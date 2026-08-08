@@ -70,7 +70,7 @@ function buildSupabase(
         or: vi.fn().mockReturnThis(),
         maybeSingle: vi.fn().mockResolvedValue(fiscalPeriodResult),
         range: vi.fn().mockResolvedValue(linesResult),
-        then: (resolve: (v: unknown) => void) => resolve(linesResult),
+        then: (resolve: (v: unknown) => void) => resolve(fiscalPeriodResult),
       }
     }),
   }
@@ -116,6 +116,25 @@ describe('GET /api/reports/vat-declaration/ruta/[ruta]/sources', () => {
     )
     const res = await GET(req, createMockRouteParams({ ruta: '10' }))
     expect(res.status).toBe(400)
+  })
+
+  it.each([
+    { periodType: 'monthly', year: '2026', period: '1.5' },
+    { periodType: 'quarterly', year: '2026', period: '5' },
+    { periodType: 'yearly', year: '2026', period: '2' },
+    { periodType: 'monthly', year: '2026tail', period: '1' },
+  ])('rejects invalid VAT source period input before querying lines: $periodType $year $period', async (searchParams) => {
+    const supabase = buildSupabase({ data: [], error: null })
+    authOk(supabase)
+    const req = createMockRequest(
+      '/api/reports/vat-declaration/ruta/10/sources',
+      { searchParams },
+    )
+
+    const res = await GET(req, createMockRouteParams({ ruta: '10' }))
+
+    expect(res.status).toBe(400)
+    expect(supabase.rpc).not.toHaveBeenCalled()
   })
 
   it('returns 404 when ruta has no underlying BAS accounts', async () => {
@@ -332,7 +351,10 @@ describe('GET /api/reports/vat-declaration/ruta/[ruta]/sources: period resolutio
       2026,
       1
     )
-    expect(rpcPeriod(supabase)).toEqual(declarationPeriod)
+    expect(rpcPeriod(supabase)).toEqual({
+      start: declarationPeriod.start,
+      end: declarationPeriod.end,
+    })
   })
 
   it('yearly: an explicit fiscal_period_id selects that räkenskapsår', async () => {

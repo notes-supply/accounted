@@ -2094,6 +2094,16 @@ describe('VatDeclarationQuerySchema', () => {
     })
     expect(result.success).toBe(false)
   })
+
+  it.each([
+    { periodType: 'monthly', year: '2025', period: '1.5' },
+    { periodType: 'monthly', year: '2e3', period: '1' },
+    { periodType: 'monthly', year: '2025tail', period: '1' },
+    { periodType: 'quarterly', year: '2025', period: '5' },
+    { periodType: 'yearly', year: '2025', period: '2' },
+  ])('rejects non-canonical or type-specific VAT period input: $periodType $year $period', (input) => {
+    expect(VatDeclarationQuerySchema.safeParse(input).success).toBe(false)
+  })
 })
 
 describe('PaginationQuerySchema', () => {

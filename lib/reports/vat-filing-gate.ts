@@ -1,4 +1,11 @@
-import type { VatDeclarationCheck } from './vat-declaration-checks'
+import type { SupabaseClient } from '@supabase/supabase-js'
+import type { VatDeclarationRutor, VatPeriodType } from '@/types'
+import {
+  runVatDeclarationChecks,
+  type VatCheckAccountTotals,
+  type VatDeclarationCheck,
+} from './vat-declaration-checks'
+import { findRcBasisGaps } from './rc-basis-gaps'
 
 /**
  * The filing gate for the momsdeklaration: ONE derived value that the
@@ -79,16 +86,15 @@ export function rcBasisGapFinding(gapCount: number): VatDeclarationCheck {
 }
 
 /**
- * Shown when the per-verifikat scan could not run. A WARNING, not an ERROR: a
- * network hiccup must not lock a user out of a statutory filing deadline, and
- * there is nothing for them to correct. But it must exist, because an empty
- * check list renders as "Inga fel hittades i underlaget för perioden", and
- * that is a claim we have not earned when the scan never answered.
+ * Shown when the required per-verifikat scan could not run. Filing and close
+ * checks fail closed because an unavailable scan cannot establish that the
+ * declaration is complete. The stable code distinguishes unavailable evidence
+ * from an observed missing basis amount.
  */
 export function rcBasisScanUnavailableFinding(): VatDeclarationCheck {
   return {
-    code: 'RC_BASIS_MISSING',
-    status: 'WARNING',
+    code: 'RC_BASIS_SCAN_UNAVAILABLE',
+    status: 'ERROR',
     message:
       'Kontrollen av enskilda verifikationer kunde inte köras, så vi vet inte ' +
       'om någon verifikation har fiktiv moms (2614/2624/2634) utan basbelopp ' +
@@ -122,4 +128,41 @@ export function withRcBasisGapFindings(
  */
 export function isFilingBlocked(checks: VatDeclarationCheck[]): boolean {
   return checks.some((c) => c.status === 'ERROR')
+}
+
+/**
+ * Run the complete local filing gate for one exact company and legal period.
+ * Required per-voucher evidence fails closed; advisory findings remain
+ * warnings and therefore do not block filing.
+ */
+export async function evaluateVatFilingGate(
+  supabase: SupabaseClient,
+  companyId: string,
+  rutor: VatDeclarationRutor,
+  periodType: VatPeriodType,
+  year: number,
+  period: number,
+  accountTotals?: VatCheckAccountTotals,
+  options: { fiscalPeriodId?: string } = {},
+): Promise<{ checks: VatDeclarationCheck[]; blocked: boolean }> {
+  let scan: RcBasisGapScan
+  try {
+    const gaps = await findRcBasisGaps(
+      supabase,
+      companyId,
+      periodType,
+      year,
+      period,
+      options,
+    )
+    scan = { status: 'scanned', gapCount: gaps.length }
+  } catch {
+    scan = { status: 'unavailable' }
+  }
+
+  const checks = withRcBasisGapFindings(
+    runVatDeclarationChecks(rutor, accountTotals),
+    scan,
+  )
+  return { checks, blocked: isFilingBlocked(checks) }
 }

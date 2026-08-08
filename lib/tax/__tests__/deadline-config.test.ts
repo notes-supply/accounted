@@ -13,6 +13,7 @@ function makeSettings(overrides: Partial<CompanySettingsForDeadlines> = {}): Com
     f_skatt: true,
     preliminary_tax_monthly: 5000,
     vat_registered: true,
+    vat_liability_start_date: null,
     pays_salaries: false,
     employer_registered: null,
     employer_seasonal: false,
@@ -68,20 +69,52 @@ describe('VAT filing deadlines', () => {
 
   it('uses the entity, EU-trade and filing-method rules for yearly VAT', () => {
     const config = getConfig('moms_yearly')
+    const fiscalPeriods = [{
+      id: 'fp-2026',
+      name: '2026',
+      period_start: '2026-01-01',
+      period_end: '2026-12-31',
+    }]
 
     expect(config.generateDates(2027, makeSettings({
       entity_type: 'enskild_firma',
       moms_period: 'yearly',
+      fiscal_periods: fiscalPeriods,
     }))[0]).toMatchObject({ day: 12, month: 4, year: 2027, period: '2026' })
     expect(config.generateDates(2027, makeSettings({
       entity_type: 'enskild_firma',
       moms_period: 'yearly',
       vat_has_eu_trade: true,
+      fiscal_periods: fiscalPeriods,
     }))[0]).toMatchObject({ day: 26, month: 1, year: 2027, period: '2026' })
     expect(config.generateDates(2027, makeSettings({
       moms_period: 'yearly',
       vat_filing_method: 'paper',
+      fiscal_periods: fiscalPeriods,
     }))[0]).toMatchObject({ day: 12, month: 6, year: 2027, period: '2026' })
+  })
+
+  it('uses the actual end of an extended fiscal period and keeps its exact identity', () => {
+    const dates = getConfig('moms_yearly').generateDates(2027, makeSettings({
+      moms_period: 'yearly',
+      fiscal_year_start_month: 1,
+      fiscal_periods: [{
+        id: 'fp-extended',
+        name: 'Extended period',
+        period_start: '2025-01-01',
+        period_end: '2026-06-30',
+      }],
+    }))
+
+    expect(dates).toContainEqual(expect.objectContaining({
+      day: 17,
+      month: 0,
+      year: 2027,
+      period: '2025-01-01/2026-06-30',
+      fiscalPeriodId: 'fp-extended',
+      fiscalPeriodStart: '2025-01-01',
+      fiscalPeriodEnd: '2026-06-30',
+    }))
   })
 })
 

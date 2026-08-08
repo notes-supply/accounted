@@ -2,7 +2,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import {
   ANNUAL_HORIZON_DAYS,
+  DEADLINE_SETTINGS_SELECT,
   RECURRING_HORIZON_DAYS,
+  TAX_RELEVANT_FIELDS,
+  didTaxFieldsChange,
   findSettingsMissingUpcomingDeadlines,
   generateTaxDeadlinesForUser,
   getExpectedUpcomingDeadlineKeys,
@@ -16,6 +19,7 @@ const SETTINGS: CompanySettingsForDeadlines = {
   f_skatt: true,
   preliminary_tax_monthly: 5000,
   vat_registered: true,
+  vat_liability_start_date: null,
   pays_salaries: true,
   employer_registered: null,
   employer_seasonal: false,
@@ -52,14 +56,17 @@ function nextMonthPeriod(): string {
 
 /** A live system row the generator is about to replace. */
 type SupersededRow = {
+  id?: string
   tax_deadline_type: string
   tax_period: string
+  due_date?: string
   status?: string
   status_changed_at?: string | null
   notes?: string | null
   due_time?: string | null
   priority?: string | null
   customer_id?: string | null
+  linked_report_period?: Record<string, unknown> | null
 }
 
 /**
@@ -69,13 +76,27 @@ type SupersededRow = {
  */
 function makeRecordingSupabase(opts: {
   insertError?: { code: string; message: string }
-  completedRows?: Array<{ tax_deadline_type: string; tax_period: string }>
+  completedRows?: Array<{
+    tax_deadline_type: string
+    tax_period: string
+    linked_report_period?: Record<string, unknown> | null
+  }>
   supersededRows?: SupersededRow[]
+  fiscalPeriods?: Array<{
+    id: string
+    name: string
+    period_start: string
+    period_end: string
+  }>
+  fiscalPeriodsError?: { code: string; message: string }
 } = {}) {
   const calls: string[] = []
+  const deleteOrFilters: string[] = []
+  const deleteEqFilters: Array<[string, unknown]> = []
+  const deleteIsFilters: Array<[string, unknown]> = []
   let insertPayload: Array<Record<string, unknown>> | null = null
 
-  const from = vi.fn(() => {
+  const from = vi.fn((table: string) => {
     const chain: Record<string, ReturnType<typeof vi.fn>> = {}
     let isDelete = false
     // The completed/dismissed lookup is the only read that uses .or();
@@ -98,14 +119,31 @@ function makeRecordingSupabase(opts: {
       isDelete = true
       return chain
     })
-    chain.eq = vi.fn(self)
-    chain.or = vi.fn(() => {
-      isCompletedQuery = true
+    chain.eq = vi.fn((column: string, value: unknown) => {
+      if (isDelete) deleteEqFilters.push([column, value])
       return chain
     })
-    chain.is = vi.fn(self)
+    chain.or = vi.fn((filter: string) => {
+      if (isDelete) deleteOrFilters.push(filter)
+      else isCompletedQuery = true
+      return chain
+    })
+    chain.is = vi.fn((column: string, value: unknown) => {
+      if (isDelete) deleteIsFilters.push([column, value])
+      return chain
+    })
     chain.gte = vi.fn(self)
     chain.lte = vi.fn(self)
+    chain.order = vi.fn(self)
+    chain.range = vi.fn(() => {
+      if (table === 'fiscal_periods') {
+        return Promise.resolve({
+          data: opts.fiscalPeriods ?? [],
+          error: opts.fiscalPeriodsError ?? null,
+        })
+      }
+      return chain
+    })
     chain.not = vi.fn((...args: unknown[]) => {
       calls.push(`not(${String(args[2]).slice(0, 20)}…)`)
       return chain
@@ -126,6 +164,9 @@ function makeRecordingSupabase(opts: {
   return {
     supabase: { from } as unknown as SupabaseClient,
     calls,
+    getDeleteOrFilters: () => deleteOrFilters,
+    getDeleteEqFilters: () => deleteEqFilters,
+    getDeleteIsFilters: () => deleteIsFilters,
     getInsertPayload: () => insertPayload,
   }
 }
@@ -135,6 +176,380 @@ beforeEach(() => {
 })
 
 describe('generateTaxDeadlinesForUser', () => {
+  it('generates yearly VAT from the actual short fiscal period, not current settings', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-08T00:00:00Z'))
+    try {
+      const { supabase, getInsertPayload } = makeRecordingSupabase({
+        fiscalPeriods: [{
+          id: 'fp-short',
+          name: 'Short 2026',
+          period_start: '2026-01-01',
+          period_end: '2026-03-31',
+        }],
+      })
+
+      await generateTaxDeadlinesForUser(supabase, 'company-1', {
+        ...SETTINGS,
+        moms_period: 'yearly',
+        fiscal_year_start_month: 7,
+      }, [2026])
+
+      expect(getInsertPayload()).toContainEqual(expect.objectContaining({
+        tax_deadline_type: 'moms_yearly',
+        due_date: '2026-12-14',
+        linked_report_period: expect.objectContaining({
+          fiscalPeriodId: 'fp-short',
+          fiscalPeriodStart: '2026-01-01',
+          fiscalPeriodEnd: '2026-03-31',
+        }),
+      }))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('generates two distinct yearly obligations for two periods ending in the same year', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-18T00:00:00Z'))
+    try {
+      const { supabase, getInsertPayload } = makeRecordingSupabase({
+        fiscalPeriods: [
+          {
+            id: 'fp-first',
+            name: 'First short period',
+            period_start: '2025-07-01',
+            period_end: '2026-03-31',
+          },
+          {
+            id: 'fp-second',
+            name: 'Second short period',
+            period_start: '2026-04-01',
+            period_end: '2026-06-30',
+          },
+        ],
+      })
+
+      await generateTaxDeadlinesForUser(supabase, 'company-1', {
+        ...SETTINGS,
+        moms_period: 'yearly',
+      }, [2026, 2027])
+
+      const annual = getInsertPayload()!.filter((row) => row.tax_deadline_type === 'moms_yearly')
+      expect(annual).toHaveLength(2)
+      expect(annual.map((row) =>
+        (row.linked_report_period as { fiscalPeriodId: string }).fiscalPeriodId,
+      )).toEqual(['fp-first', 'fp-second'])
+      expect(new Set(annual.map((row) => row.tax_period)).size).toBe(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('preserves one completed same-year obligation without suppressing the other period', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-18T00:00:00Z'))
+    try {
+      const { supabase, getInsertPayload } = makeRecordingSupabase({
+        fiscalPeriods: [
+          {
+            id: 'fp-completed',
+            name: 'Completed short period',
+            period_start: '2025-07-01',
+            period_end: '2026-03-31',
+          },
+          {
+            id: 'fp-pending',
+            name: 'Pending short period',
+            period_start: '2026-04-01',
+            period_end: '2026-06-30',
+          },
+        ],
+        completedRows: [{
+          tax_deadline_type: 'moms_yearly',
+          tax_period: '2025-07-01/2026-03-31',
+          linked_report_period: { fiscalPeriodId: 'fp-completed' },
+        }],
+      })
+
+      await generateTaxDeadlinesForUser(supabase, 'company-1', {
+        ...SETTINGS,
+        moms_period: 'yearly',
+      }, [2026, 2027])
+
+      const annual = getInsertPayload()!.filter((row) => row.tax_deadline_type === 'moms_yearly')
+      expect(annual).toHaveLength(1)
+      expect(annual[0].linked_report_period).toEqual(expect.objectContaining({
+        fiscalPeriodId: 'fp-pending',
+      }))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('uses the actual annual period end for pre-liability cleanup', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-08T00:00:00Z'))
+    try {
+      const { supabase, getDeleteOrFilters } = makeRecordingSupabase({
+        fiscalPeriods: [{
+          id: 'fp-short',
+          name: 'Short 2026',
+          period_start: '2026-01-01',
+          period_end: '2026-03-31',
+        }],
+        supersededRows: [{
+          id: 'stale-annual',
+          tax_deadline_type: 'moms_yearly',
+          tax_period: '2026-01-01/2026-03-31',
+          linked_report_period: {
+            fiscalPeriodId: 'fp-short',
+            fiscalPeriodStart: '2026-01-01',
+            fiscalPeriodEnd: '2026-03-31',
+          },
+        }],
+      })
+
+      await generateTaxDeadlinesForUser(supabase, 'company-1', {
+        ...SETTINGS,
+        moms_period: 'yearly',
+        fiscal_year_start_month: 1,
+        vat_liability_start_date: '2026-05-01',
+      }, [2026])
+
+      expect(getDeleteOrFilters()[0]).toContain('stale-annual')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('fails closed when actual fiscal periods cannot be queried for yearly VAT', async () => {
+    const { supabase } = makeRecordingSupabase({
+      fiscalPeriodsError: { code: '08006', message: 'connection failed' },
+    })
+
+    await expect(generateTaxDeadlinesForUser(supabase, 'company-1', {
+      ...SETTINGS,
+      moms_period: 'yearly',
+    }, [2026])).rejects.toMatchObject({ code: '08006' })
+  })
+
+  it('fails closed before writes when yearly VAT fiscal-period lookup returns no rows', async () => {
+    const { supabase, calls, getInsertPayload } = makeRecordingSupabase({
+      fiscalPeriods: [],
+      supersededRows: [{
+        id: 'existing-yearly-vat',
+        tax_deadline_type: 'moms_yearly',
+        tax_period: '2025/2026',
+        due_date: '2026-12-14',
+      }],
+    })
+
+    await expect(generateTaxDeadlinesForUser(supabase, 'company-1', {
+      ...SETTINGS,
+      moms_period: 'yearly',
+    }, [2026])).rejects.toThrow(
+      'No fiscal periods found for yearly VAT deadline generation',
+    )
+
+    expect(getInsertPayload()).toBeNull()
+    expect(calls).not.toContain('insert')
+    expect(calls).not.toContain('delete')
+  })
+
+  it('accepts fiscal periods with no yearly VAT deadline in the requested years', async () => {
+    const { supabase } = makeRecordingSupabase()
+
+    await expect(generateTaxDeadlinesForUser(supabase, 'company-1', {
+      ...SETTINGS,
+      moms_period: 'yearly',
+      fiscal_periods: [{
+        id: 'fp-outside-request',
+        name: 'Earlier period',
+        period_start: '2020-01-01',
+        period_end: '2020-12-31',
+      }],
+    }, [2026])).resolves.toEqual(expect.objectContaining({
+      created: expect.any(Number),
+      deleted: expect.any(Number),
+    }))
+  })
+
+  it('suppresses and removes stale pre-liability VAT periods without targeting non-VAT rows', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-08T00:00:00Z'))
+    try {
+      const { supabase, getInsertPayload, getDeleteOrFilters } = makeRecordingSupabase({
+        supersededRows: [
+          {
+            id: 'vat-april',
+            tax_deadline_type: 'moms_monthly',
+            tax_period: '2026-04',
+          },
+          {
+            id: 'vat-june',
+            tax_deadline_type: 'moms_monthly',
+            tax_period: '2026-06',
+          },
+          {
+            id: 'non-vat-april',
+            tax_deadline_type: 'f_skatt',
+            tax_period: '2026-04',
+          },
+        ],
+      })
+
+      await generateTaxDeadlinesForUser(supabase, 'company-1', {
+        ...SETTINGS,
+        vat_liability_start_date: '2026-05-01',
+      }, [2026])
+
+      const rows = getInsertPayload()!
+      expect(rows).not.toContainEqual(expect.objectContaining({
+        tax_deadline_type: 'moms_monthly',
+        tax_period: '2026-04',
+      }))
+      expect(rows).toContainEqual(expect.objectContaining({
+        tax_deadline_type: 'moms_monthly',
+        tax_period: '2026-06',
+      }))
+      expect(rows.some((row) => row.tax_deadline_type === 'f_skatt')).toBe(true)
+      expect(getDeleteOrFilters()).toHaveLength(1)
+      expect(getDeleteOrFilters()[0]).toContain('vat-april')
+      expect(getDeleteOrFilters()[0]).not.toContain('non-vat-april')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it.each([
+    {
+      label: 'monthly',
+      momsPeriod: 'monthly' as const,
+      fiscalYearStartMonth: 1,
+      deadlineType: 'moms_monthly',
+      stalePeriod: '2026-04',
+      staleDueDate: '2026-06-12',
+      applicablePeriod: '2026-06',
+    },
+    {
+      label: 'quarterly',
+      momsPeriod: 'quarterly' as const,
+      fiscalYearStartMonth: 1,
+      deadlineType: 'moms_quarterly',
+      stalePeriod: '2026-Q1',
+      staleDueDate: '2026-05-12',
+      applicablePeriod: '2026-Q2',
+    },
+    {
+      label: 'yearly',
+      momsPeriod: 'yearly' as const,
+      fiscalYearStartMonth: 7,
+      deadlineType: 'moms_yearly',
+      stalePeriod: '2024/2025',
+      staleDueDate: '2026-01-19',
+      applicablePeriod: '2025/2026',
+    },
+  ])('deletes every duplicate stale $label VAT row without widening cleanup', async ({
+    momsPeriod,
+    fiscalYearStartMonth,
+    deadlineType,
+    stalePeriod,
+    staleDueDate,
+    applicablePeriod,
+  }) => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-08T00:00:00Z'))
+    try {
+      const {
+        supabase,
+        getDeleteOrFilters,
+        getDeleteEqFilters,
+        getDeleteIsFilters,
+      } = makeRecordingSupabase({
+        fiscalPeriods: momsPeriod === 'yearly'
+          ? [
+              {
+                id: 'fp-stale',
+                name: 'Earlier period',
+                period_start: '2024-07-01',
+                period_end: '2025-06-30',
+              },
+              {
+                id: 'fp-applicable',
+                name: 'Overlapping period',
+                period_start: '2025-07-01',
+                period_end: '2026-06-30',
+              },
+            ]
+          : undefined,
+        supersededRows: [
+          {
+            id: 'stale-vat-1',
+            tax_deadline_type: deadlineType,
+            tax_period: stalePeriod,
+            due_date: staleDueDate,
+            linked_report_period: momsPeriod === 'yearly' ? {
+              fiscalPeriodId: 'fp-stale',
+              fiscalPeriodStart: '2024-07-01',
+              fiscalPeriodEnd: '2025-06-30',
+            } : null,
+          },
+          {
+            id: 'stale-vat-2',
+            tax_deadline_type: deadlineType,
+            tax_period: stalePeriod,
+            due_date: staleDueDate,
+            linked_report_period: momsPeriod === 'yearly' ? {
+              fiscalPeriodId: 'fp-stale',
+              fiscalPeriodStart: '2024-07-01',
+              fiscalPeriodEnd: '2025-06-30',
+            } : null,
+          },
+          {
+            id: 'applicable-vat',
+            tax_deadline_type: deadlineType,
+            tax_period: applicablePeriod,
+            due_date: '2026-09-01',
+            linked_report_period: momsPeriod === 'yearly' ? {
+              fiscalPeriodId: 'fp-applicable',
+              fiscalPeriodStart: '2025-07-01',
+              fiscalPeriodEnd: '2026-06-30',
+            } : null,
+          },
+          {
+            id: 'past-non-vat',
+            tax_deadline_type: 'f_skatt',
+            tax_period: '2026-04',
+            due_date: '2026-05-12',
+          },
+        ],
+      })
+
+      await generateTaxDeadlinesForUser(supabase, 'company-1', {
+        ...SETTINGS,
+        moms_period: momsPeriod,
+        fiscal_year_start_month: fiscalYearStartMonth,
+        vat_liability_start_date: '2026-05-01',
+      }, [2026])
+
+      expect(staleDueDate < '2026-08-08').toBe(true)
+      expect(getDeleteOrFilters()).toHaveLength(1)
+      expect(getDeleteOrFilters()[0]).toContain('stale-vat-1')
+      expect(getDeleteOrFilters()[0]).toContain('stale-vat-2')
+      expect(getDeleteOrFilters()[0]).not.toContain('applicable-vat')
+      expect(getDeleteOrFilters()[0]).not.toContain('past-non-vat')
+      expect(getDeleteEqFilters()).toEqual(expect.arrayContaining([
+        ['company_id', 'company-1'],
+        ['source', 'system'],
+        ['is_completed', false],
+      ]))
+      expect(getDeleteIsFilters()).toContainEqual(['dismissed_at', null])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('inserts replacement rows before deleting the old set', async () => {
     const { supabase, calls } = makeRecordingSupabase()
 
@@ -272,6 +687,63 @@ describe('generateTaxDeadlinesForUser', () => {
       due_date: paymentDueDate,
       tax_assessment_notice_id: 'notice-1',
     }))
+  })
+})
+
+describe('VAT liability deadline boundary', () => {
+  it('keeps the overlapping annual fiscal year and suppresses the wholly earlier year', () => {
+    const keys = getExpectedUpcomingDeadlineKeys({
+      ...SETTINGS,
+      moms_period: 'yearly',
+      fiscal_year_start_month: 7,
+      vat_liability_start_date: '2026-05-01',
+      fiscal_periods: [
+        {
+          id: 'fp-earlier',
+          name: 'Earlier period',
+          period_start: '2024-07-01',
+          period_end: '2025-06-30',
+        },
+        {
+          id: 'fp-overlap',
+          name: 'Overlapping period',
+          period_start: '2025-07-01',
+          period_end: '2026-06-30',
+        },
+      ],
+    }, [2026, 2027], new Date(2026, 0, 18))
+    const annualKeys = Array.from(keys).filter((key) => key.startsWith('moms_yearly:'))
+
+    expect(annualKeys.some((key) => key.includes('fp-earlier'))).toBe(false)
+    expect(annualKeys.some((key) => key.includes('fp-overlap'))).toBe(true)
+  })
+
+  it('keeps the first overlapping monthly and quarterly periods but suppresses earlier periods', () => {
+    const fromDate = new Date(2026, 2, 1)
+    const monthly = getExpectedUpcomingDeadlineKeys({
+      ...SETTINGS,
+      moms_period: 'monthly',
+      vat_liability_start_date: '2026-05-01',
+    }, [2026], fromDate)
+    const quarterly = getExpectedUpcomingDeadlineKeys({
+      ...SETTINGS,
+      moms_period: 'quarterly',
+      vat_liability_start_date: '2026-05-01',
+    }, [2026], fromDate)
+
+    expect(Array.from(monthly).some((key) => key.startsWith('moms_monthly:2026-04:'))).toBe(false)
+    expect(Array.from(monthly).some((key) => key.startsWith('moms_monthly:2026-05:'))).toBe(true)
+    expect(Array.from(quarterly).some((key) => key.startsWith('moms_quarterly:2026-Q1:'))).toBe(false)
+    expect(Array.from(quarterly).some((key) => key.startsWith('moms_quarterly:2026-Q2:'))).toBe(true)
+  })
+
+  it('treats the VAT liability date as tax-relevant settings data', () => {
+    expect(TAX_RELEVANT_FIELDS).toContain('vat_liability_start_date')
+    expect(DEADLINE_SETTINGS_SELECT).toContain('vat_liability_start_date')
+    expect(didTaxFieldsChange(
+      { vat_liability_start_date: null },
+      { vat_liability_start_date: '2026-05-01' },
+    )).toBe(true)
   })
 })
 
@@ -589,6 +1061,32 @@ describe('findSettingsMissingUpcomingDeadlines', () => {
     expect(findSettingsMissingUpcomingDeadlines(
       settings,
       fTaxRows,
+      years,
+      fromDate,
+    )).toEqual(settings)
+  })
+
+  it('selects yearly VAT recovery when global fiscal-period hydration found no company rows', () => {
+    const settings = [{
+      company_id: 'company-1',
+      ...SETTINGS,
+      moms_period: 'yearly' as const,
+      fiscal_periods: [],
+    }]
+    const nonVatSettings = {
+      ...settings[0],
+      vat_registered: false,
+      moms_period: null,
+      fiscal_periods: undefined,
+    }
+    const nonVatRows = rowsFor(
+      'company-1',
+      getExpectedUpcomingDeadlineKeys(nonVatSettings, years, fromDate),
+    )
+
+    expect(findSettingsMissingUpcomingDeadlines(
+      settings,
+      nonVatRows,
       years,
       fromDate,
     )).toEqual(settings)

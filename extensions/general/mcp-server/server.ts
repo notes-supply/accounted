@@ -17,6 +17,11 @@ import {
 import { createLogger } from '@/lib/logger'
 import { roundOre, sumOre } from '@/lib/money'
 import type { SupabaseClient } from '@supabase/supabase-js'
+import {
+  resolveCanonicalVatDeadline,
+  type VatDeadlineFiscalPeriod,
+  type VatDeadlineSettings,
+} from '@/lib/tax/deadline-config'
 import { buildMappingResultFromCategory } from '@/lib/bookkeeping/category-mapping'
 import { buildTransactionEntryLines, createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
 import { upsertCounterpartyTemplate, findCounterpartyTemplatesBatch, formatCounterpartyName } from '@/lib/bookkeeping/counterparty-templates'
@@ -44,22 +49,24 @@ import {
   resolvePeriodDates,
 } from '@/lib/reports/vat-declaration'
 import { fetchDynamicRuta05Accounts } from '@/lib/reports/vat-revenue-accounts'
+import {
+  parseVatPeriodInput,
+  VAT_PERIOD_MAX_YEAR,
+  VAT_PERIOD_MIN_YEAR,
+} from '@/lib/vat/period-input'
 // The momsdeklaration completeness checks live in core (lib/reports) and are
 // shared with the web UI's "Kontroll av underlaget" gate. The MCP surface
 // imports them instead of mirroring them: a hand-rolled copy here is exactly
 // how the reverse-charge check drifted into an unreachable `ruta48 === 0` test.
 import {
-  runVatDeclarationChecks,
   type VatCheckAccountTotals,
   type VatDeclarationCheck,
   type VatDeclarationCheckStatus,
 } from '@/lib/reports/vat-declaration-checks'
 import {
-  withRcBasisGapFindings,
+  evaluateVatFilingGate,
   isFilingBlocked,
-  type RcBasisGapScan,
 } from '@/lib/reports/vat-filing-gate'
-import { findRcBasisGaps } from '@/lib/reports/rc-basis-gaps'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import { fetchEntryLines, fetchLinesByEntryIds, type EntryLinesQuery } from '@/lib/bookkeeping/entry-lines'
 import { generateARLedger } from '@/lib/reports/ar-ledger'
@@ -182,7 +189,13 @@ import { buildMomsuppgift, resolveRedovisare } from '@/extensions/general/skatte
 import { writeSkatteverketAudit } from '@/extensions/general/skatteverket/lib/audit'
 import { skvAuthCodeToStructured } from '@/extensions/general/skatteverket/lib/error-map'
 import { formatRedovisningsperiod } from '@/lib/skatteverket/format'
+import {
+  assertVatSubmissionIdentity,
+  parseVatSubmissionState,
+  resolveVatSubmissionDeadlineIdentity,
+} from '@/extensions/general/skatteverket/lib/vat-submission-state'
 import { createExtensionContext } from '@/lib/extensions/context-factory'
+import { completeTaxDeadline } from '@/lib/deadlines/complete-tax-deadline'
 import { commitPendingOperation } from '@/lib/pending-operations/commit'
 import { appendProcessingHistory } from '@/lib/processing-history/append'
 import { getUserCompanies } from '@/lib/company/context'
@@ -1078,6 +1091,26 @@ const VAT_REPORT_OUTPUT_SCHEMA = {
   required: ['period', 'period_label', 'rutor', 'summary', 'warnings'],
 } as const
 
+const VAT_FISCAL_PERIOD_ID_INPUT_SCHEMA = {
+  type: 'string',
+  format: 'uuid',
+  description: 'Optional fiscal period UUID for yearly VAT. Required when multiple fiscal periods end in the requested year; ignored for monthly and quarterly periods.',
+} as const
+
+const VAT_YEAR_INPUT_SCHEMA = {
+  type: 'integer',
+  minimum: VAT_PERIOD_MIN_YEAR,
+  maximum: VAT_PERIOD_MAX_YEAR,
+  description: 'Year (e.g. 2025)',
+} as const
+
+const VAT_PERIOD_INPUT_SCHEMA = {
+  type: 'integer',
+  minimum: 1,
+  maximum: 12,
+  description: '1-12 for monthly, 1-4 for quarterly, 1 for yearly',
+} as const
+
 // ── Skatteverket filing read-tool output schemas (PR5) ──
 // Kept shallow (opaque object/null sub-objects) to stay within the tools/list
 // payload budget; the SKV response shapes live in the extension types.
@@ -1220,6 +1253,13 @@ export interface VatReportResult {
 
 export interface VatReportWithRutor {
   report: VatReportResult
+  resolvedPeriod: {
+    start: string
+    end: string
+    fiscalPeriodId?: string
+    fiscalPeriodStart?: string
+    fiscalPeriodEnd?: string
+  }
   /**
    * The FULL SKV 4700 projection of the same ledger aggregate, via core's
    * `rutorFromTotals`. `report.rutor` is the trimmed agent-facing view: it has
@@ -1264,25 +1304,22 @@ export async function computeVatReportWithRutor(
   companyId: string,
   supabase: SupabaseClient
 ): Promise<VatReportWithRutor> {
-  const periodType = args.period_type as string
-  const year = Number(args.year)
-  const period = Number(args.period)
+  const { periodType, year, period } = parseVatPeriodInput({
+    periodType: args.period_type,
+    year: args.year,
+    period: args.period,
+  })
+  const fiscalPeriodId = args.fiscal_period_id as string | undefined
 
-  if (!['monthly', 'quarterly', 'yearly'].includes(periodType)) {
-    throw new Error('period_type must be: monthly, quarterly, yearly')
-  }
-  if (!year || year < 2000 || year > 2100) throw new Error('year must be between 2000 and 2100')
-  if (periodType === 'monthly' && (period < 1 || period > 12)) throw new Error('period must be 1-12 for monthly')
-  if (periodType === 'quarterly' && (period < 1 || period > 4)) throw new Error('period must be 1-4 for quarterly')
-  if (periodType === 'yearly' && period !== 1) throw new Error('period must be 1 for yearly')
-
-  const { start: startDate, end: endDate } = await resolvePeriodDates(
+  const resolvedDates = await resolvePeriodDates(
     supabase,
     companyId,
-    periodType as VatPeriodType,
+    periodType,
     year,
     period,
+    fiscalPeriodId,
   )
+  const { start: startDate, end: endDate } = resolvedDates
 
   // Two-step fetch (lib/bookkeeping/entry-lines.ts) rather than a
   // `journal_entries!inner` embed: PostgREST compiles that embed into a
@@ -1413,7 +1450,13 @@ export async function computeVatReportWithRutor(
   }
 
   const report: VatReportResult = {
-    period: { type: periodType, year, period, start: startDate, end: endDate },
+    period: {
+      type: periodType,
+      year,
+      period,
+      start: startDate,
+      end: endDate,
+    },
     period_label: periodLabel,
     rutor: {
       ruta05: Math.abs(ruta05),
@@ -1445,6 +1488,7 @@ export async function computeVatReportWithRutor(
   // (incl. rutor 20-24 and 50) instead of the trimmed report view.
   return {
     report,
+    resolvedPeriod: resolvedDates,
     declarationRutor: rutorFromTotals(accountTotals, dynamicRuta05.accounts),
     accountTotals,
   }
@@ -1460,10 +1504,9 @@ export async function computeVatReportWithRutor(
  * (lib/reports/vat-filing-gate.ts). One check list, one verdict: the MCP
  * surface can no longer give a green light the UI would refuse.
  *
- * The per-verifikat scan is allowed to degrade: a failure becomes
- * `{ status: 'unavailable' }`, which the gate turns into an explicit WARNING
- * finding rather than silence, because an empty list reads as "no problems"
- * and that claim is not earned when the scan never answered.
+ * A per-verifikat scan failure becomes `{ status: 'unavailable' }`, which the
+ * gate turns into a stable ERROR. Required evidence must fail closed for both
+ * readiness and filing even when every other finding is clean.
  *
  * `accountTotals` is the per-account debit/credit aggregate the rutor were
  * projected from. Passing it switches RC_INPUT_VAT_MISMATCH from the ruta 48
@@ -1479,15 +1522,19 @@ async function runVatCompletenessChecks(
   year: number,
   period: number,
   accountTotals?: VatCheckAccountTotals,
+  options: { fiscalPeriodId?: string } = {},
 ): Promise<VatDeclarationCheck[]> {
-  let scan: RcBasisGapScan
-  try {
-    const gaps = await findRcBasisGaps(supabase, companyId, periodType, year, period)
-    scan = { status: 'scanned', gapCount: gaps.length }
-  } catch {
-    scan = { status: 'unavailable' }
-  }
-  return withRcBasisGapFindings(runVatDeclarationChecks(rutor, accountTotals), scan)
+  const result = await evaluateVatFilingGate(
+    supabase,
+    companyId,
+    rutor,
+    periodType,
+    year,
+    period,
+    accountTotals,
+    options,
+  )
+  return result.checks
 }
 
 /** Wire shape for a completeness finding on the MCP surface. */
@@ -1591,47 +1638,33 @@ interface VatCloseCheckResult {
   summary: string
 }
 
-/** Compute the Skatteverket momsdeklaration deadline for a period.
- *  - monthly: due on the 12th of (period-end-month + 1)
- *  - quarterly: 26th of the month after quarter-end (Q4 → 26 Jan next year)
- *  - yearly: 26 Feb of next year
+export interface MomsDeadlineContext {
+  settings: VatDeadlineSettings
+  fiscalPeriod?: VatDeadlineFiscalPeriod
+}
+
+/**
+ * Compute one momsdeklaration deadline through the canonical tax deadline
+ * configuration, including Swedish banking-day adjustment.
  */
 export function computeMomsDeadline(
   periodType: 'monthly' | 'quarterly' | 'yearly',
   year: number,
-  period: number
+  period: number,
+  context: MomsDeadlineContext,
 ): { date: string; label: string } | null {
-  if (periodType === 'monthly') {
-    // period 1-12; deadline = 12th of next month
-    const deadlineMonth = period === 12 ? 1 : period + 1
-    const deadlineYear = period === 12 ? year + 1 : year
-    return {
-      date: `${deadlineYear}-${String(deadlineMonth).padStart(2, '0')}-12`,
-      label: `12 ${monthName(deadlineMonth)} ${deadlineYear}`,
-    }
+  const deadline = resolveCanonicalVatDeadline(
+    periodType,
+    year,
+    period,
+    context.settings,
+    context.fiscalPeriod,
+  )
+  const [deadlineYear, deadlineMonth, deadlineDay] = deadline.date.split('-').map(Number)
+  return {
+    date: deadline.date,
+    label: `${deadlineDay} ${monthName(deadlineMonth)} ${deadlineYear}`,
   }
-  if (periodType === 'quarterly') {
-    // Q1→26 apr, Q2→26 jul, Q3→26 okt, Q4→26 jan next year
-    const monthByQuarter: Record<number, { m: number; yOffset: number }> = {
-      1: { m: 4, yOffset: 0 },
-      2: { m: 7, yOffset: 0 },
-      3: { m: 10, yOffset: 0 },
-      4: { m: 1, yOffset: 1 },
-    }
-    const cfg = monthByQuarter[period]
-    if (!cfg) return null
-    return {
-      date: `${year + cfg.yOffset}-${String(cfg.m).padStart(2, '0')}-26`,
-      label: `26 ${monthName(cfg.m)} ${year + cfg.yOffset}`,
-    }
-  }
-  if (periodType === 'yearly') {
-    return {
-      date: `${year + 1}-02-26`,
-      label: `26 februari ${year + 1}`,
-    }
-  }
-  return null
 }
 
 function monthName(m: number): string {
@@ -1805,24 +1838,52 @@ export async function computeVatCloseCheck(
   //    step 4b: they need rutor 20-24 and 50, which the report view omits, plus
   //    the per-account totals so the RC input comparison reads 2645/2647
   //    instead of the ruta 48 aggregate.
-  const { report: vatReport, declarationRutor, accountTotals } =
+  const { report: vatReport, resolvedPeriod, declarationRutor, accountTotals } =
     await computeVatReportWithRutor(args, companyId, supabase)
   const { start, end, type: periodType, year, period } = vatReport.period
+  const fiscalPeriodId = resolvedPeriod.fiscalPeriodId ??
+    (args.fiscal_period_id as string | undefined)
 
-  // 2) Company settings: moms_period drives deadline labelling
-  const { data: settings } = await supabase
+  // 2) Company settings: every VAT frequency uses the canonical deadline
+  //    engine and therefore requires the complete VAT filing profile.
+  const { data: settings, error: settingsError } = await supabase
     .from('company_settings')
-    .select('moms_period')
+    .select('moms_period, entity_type, vat_taxable_base_over_40m, vat_has_eu_trade, vat_filing_method')
     .eq('company_id', companyId)
     .single()
+  if (settingsError) {
+    throw new Error(`Failed to resolve VAT deadline settings: ${settingsError.message}`)
+  }
+  if (
+    !settings ||
+    (settings.entity_type !== 'aktiebolag' && settings.entity_type !== 'enskild_firma') ||
+    typeof settings.vat_taxable_base_over_40m !== 'boolean' ||
+    typeof settings.vat_has_eu_trade !== 'boolean' ||
+    (settings.vat_filing_method !== 'electronic' && settings.vat_filing_method !== 'paper')
+  ) {
+    throw new Error('Complete company VAT deadline settings are required')
+  }
   const momsPeriod = (settings?.moms_period as 'monthly' | 'quarterly' | 'yearly' | null) ?? null
 
-  // 3) Deadline: based on the *requested* period type, not company setting,
-  //    so the model gets the right deadline even when querying ad-hoc periods.
+  // 3) Deadline: based on the requested period type, while yearly VAT keeps
+  //    the exact fiscal period selected by the report resolver.
   const deadline = computeMomsDeadline(
     periodType as 'monthly' | 'quarterly' | 'yearly',
     Number(year),
-    Number(period)
+    Number(period),
+    {
+      settings: {
+        entity_type: settings.entity_type,
+        vat_taxable_base_over_40m: settings.vat_taxable_base_over_40m,
+        vat_has_eu_trade: settings.vat_has_eu_trade,
+        vat_filing_method: settings.vat_filing_method,
+      },
+      fiscalPeriod: periodType === 'yearly' ? {
+        id: fiscalPeriodId ?? '',
+        period_start: resolvedPeriod.fiscalPeriodStart ?? start,
+        period_end: resolvedPeriod.fiscalPeriodEnd ?? end,
+      } : undefined,
+    },
   )
 
   // 4) Blocker scans: run in parallel
@@ -1849,6 +1910,17 @@ export async function computeVatCloseCheck(
     // scan that used to sit here got wrong.
     countMissingUnderlagInPeriod(supabase, companyId, start, end),
   ])
+
+  if (uncategorizedRes.error) {
+    throw new Error(
+      `VAT close check unavailable: failed to count uncategorized transactions: ${uncategorizedRes.error.message}`,
+    )
+  }
+  if (unapprovedRes.error) {
+    throw new Error(
+      `VAT close check unavailable: failed to count unapproved supplier invoices: ${unapprovedRes.error.message}`,
+    )
+  }
 
   const blockers: VatCloseBlocker[] = []
   const uncategorizedCount = uncategorizedRes.count ?? 0
@@ -1916,6 +1988,7 @@ export async function computeVatCloseCheck(
     Number(year),
     Number(period),
     accountTotals,
+    { fiscalPeriodId },
   )
 
   // Zero deductible input VAT against self-assessed utgående moms is
@@ -4991,8 +5064,9 @@ export const tools: McpTool[] = [
           enum: ['monthly', 'quarterly', 'yearly'],
           description: 'Period type',
         },
-        year: { type: 'number', description: 'Year (e.g. 2025)' },
-        period: { type: 'number', description: '1-12 for monthly, 1-4 for quarterly, 1 for yearly' },
+        year: VAT_YEAR_INPUT_SCHEMA,
+        period: VAT_PERIOD_INPUT_SCHEMA,
+        fiscal_period_id: VAT_FISCAL_PERIOD_ID_INPUT_SCHEMA,
         render_ui: {
           type: 'boolean',
           description: 'When true, also render the interactive momsdeklaration review widget (claude.ai / Claude Desktop). The structured rutor are returned either way. Default false.',
@@ -5024,8 +5098,9 @@ export const tools: McpTool[] = [
       additionalProperties: false,
       properties: {
         period_type: { type: 'string', enum: ['monthly', 'quarterly', 'yearly'], description: 'Period type' },
-        year: { type: 'number', description: 'Year (e.g. 2025)' },
-        period: { type: 'number', description: '1-12 for monthly, 1-4 for quarterly, 1 for yearly' },
+        year: VAT_YEAR_INPUT_SCHEMA,
+        period: VAT_PERIOD_INPUT_SCHEMA,
+        fiscal_period_id: VAT_FISCAL_PERIOD_ID_INPUT_SCHEMA,
       },
       required: ['period_type', 'year', 'period'],
     },
@@ -5051,8 +5126,9 @@ export const tools: McpTool[] = [
       additionalProperties: false,
       properties: {
         period_type: { type: 'string', enum: ['monthly', 'quarterly', 'yearly'], description: 'Period type' },
-        year: { type: 'number', description: 'Year (e.g. 2026)' },
-        period: { type: 'number', description: '1-12 for monthly, 1-4 for quarterly, 1 for yearly' },
+        year: VAT_YEAR_INPUT_SCHEMA,
+        period: VAT_PERIOD_INPUT_SCHEMA,
+        fiscal_period_id: VAT_FISCAL_PERIOD_ID_INPUT_SCHEMA,
       },
       required: ['period_type', 'year', 'period'],
     },
@@ -10433,8 +10509,9 @@ export const tools: McpTool[] = [
       additionalProperties: false,
       properties: {
         period_type: { type: 'string', enum: ['monthly', 'quarterly', 'yearly'], description: 'Period type' },
-        year: { type: 'number', description: 'Year (e.g. 2026)' },
-        period: { type: 'number', description: '1-12 for monthly, 1-4 for quarterly, 1 for yearly' },
+        year: VAT_YEAR_INPUT_SCHEMA,
+        period: VAT_PERIOD_INPUT_SCHEMA,
+        fiscal_period_id: VAT_FISCAL_PERIOD_ID_INPUT_SCHEMA,
       },
       required: ['period_type', 'year', 'period'],
     },
@@ -10442,9 +10519,12 @@ export const tools: McpTool[] = [
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     async execute(args, companyId, userId, supabase) {
       assertSkatteverketEnabled()
-      const periodType = args.period_type as VatPeriodType
-      const year = args.year as number
-      const period = args.period as number
+      const { periodType, year, period } = parseVatPeriodInput({
+        periodType: args.period_type,
+        year: args.year,
+        period: args.period,
+      })
+      const fiscalPeriodId = args.fiscal_period_id as string | undefined
       const ctx = createExtensionContext(supabase, userId, companyId, 'skatteverket')
 
       // LOCAL pre-flight first, and deliberately outside the SKV try/catch so a
@@ -10455,21 +10535,25 @@ export const tools: McpTool[] = [
       // that treated a green kontrollresultat as "safe to file" could submit a
       // momsdeklaration missing its beskattningsunderlag (FK004). Same checks,
       // same gate helper, same verdict as the web filing UI.
-      const declaration = await calculateVatDeclaration(
-        supabase, companyId, periodType, year, period,
-      )
+      const prepared = await buildMomsuppgift(supabase, companyId, {
+        periodType,
+        year,
+        period,
+        fiscalPeriodId,
+      })
+      const declaration = prepared.declaration
       // The 2645/2647 pair the declaration carries goes with it, so the RC input
       // comparison here is the sharp one too: ruta 48 alone would let ordinary
       // debiterad ingående moms hide a completely missing beräknad ingående moms.
       const completenessChecks = await runVatCompletenessChecks(
         supabase, companyId, declaration.rutor, periodType, year, period,
         rcInputTotalsFromDeclaration(declaration),
+        { fiscalPeriodId: prepared.fiscalPeriodId },
       )
       const completenessOk = !isFilingBlocked(completenessChecks)
 
       try {
-        const { redovisare, redovisningsperiod, momsuppgift } =
-          await buildMomsuppgift(supabase, companyId, { periodType, year, period })
+        const { redovisare, redovisningsperiod, momsuppgift } = prepared
         const res = await skvRequest(
           supabase, userId, 'POST', `/kontrollera/${redovisare}/${redovisningsperiod}`, momsuppgift,
         )
@@ -10520,8 +10604,9 @@ export const tools: McpTool[] = [
       additionalProperties: false,
       properties: {
         period_type: { type: 'string', enum: ['monthly', 'quarterly', 'yearly'], description: 'Period type' },
-        year: { type: 'number', description: 'Year (e.g. 2026)' },
-        period: { type: 'number', description: '1-12 for monthly, 1-4 for quarterly, 1 for yearly' },
+        year: VAT_YEAR_INPUT_SCHEMA,
+        period: VAT_PERIOD_INPUT_SCHEMA,
+        fiscal_period_id: VAT_FISCAL_PERIOD_ID_INPUT_SCHEMA,
       },
       required: ['period_type', 'year', 'period'],
     },
@@ -10529,9 +10614,12 @@ export const tools: McpTool[] = [
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     async execute(args, companyId, userId, supabase, actor) {
       assertSkatteverketEnabled()
-      const periodType = args.period_type as VatPeriodType
-      const year = args.year as number
-      const period = args.period as number
+      const { periodType, year, period } = parseVatPeriodInput({
+        periodType: args.period_type,
+        year: args.year,
+        period: args.period,
+      })
+      const fiscalPeriodId = args.fiscal_period_id as string | undefined
       const ctx = createExtensionContext(supabase, userId, companyId, 'skatteverket')
       // Mandatory stage-time validation: the preview carries the real
       // kontrollresultat and we never stage a declaration SKV would reject.
@@ -10539,7 +10627,29 @@ export const tools: McpTool[] = [
       // the commit executor so preview numbers == filed numbers.
       const prepared = await (async () => {
         try {
-          const prep = await buildMomsuppgift(supabase, companyId, { periodType, year, period })
+          const prep = await buildMomsuppgift(supabase, companyId, {
+            periodType,
+            year,
+            period,
+            fiscalPeriodId,
+          })
+          const completenessChecks = await runVatCompletenessChecks(
+            supabase,
+            companyId,
+            prep.declaration.rutor,
+            periodType,
+            year,
+            period,
+            rcInputTotalsFromDeclaration(prep.declaration),
+            { fiscalPeriodId: prep.fiscalPeriodId },
+          )
+          if (isFilingBlocked(completenessChecks)) {
+            const codes = completenessChecks
+              .filter((check) => check.status === 'ERROR')
+              .map((check) => check.code)
+              .join(',')
+            throw new Error(`VAT filing blocked: ${codes}`)
+          }
           const res = await skvRequest(
             supabase, userId, 'POST', `/kontrollera/${prep.redovisare}/${prep.redovisningsperiod}`, prep.momsuppgift,
           )
@@ -10556,22 +10666,41 @@ export const tools: McpTool[] = [
           throw mapSkatteverketError(err)
         }
       })()
+      const resolvedFiscalPeriodId = prepared.fiscalPeriodId
+      if (periodType === 'yearly' && !resolvedFiscalPeriodId) {
+        throw new Error('Annual VAT staging did not resolve fiscal_period_id')
+      }
       return stagePendingOperation(
         supabase, companyId, userId, 'submit_vat_declaration',
         `Lämna momsdeklaration: ${prepared.redovisningsperiod}`,
-        { period_type: periodType, year, period },
+        {
+          period_type: periodType,
+          year,
+          period,
+          ...(resolvedFiscalPeriodId ? {
+            fiscal_period_id: resolvedFiscalPeriodId,
+            resolved_period_start: prepared.resolvedPeriodStart,
+            resolved_period_end: prepared.resolvedPeriodEnd,
+          } : {}),
+        },
         {
           redovisningsperiod: prepared.redovisningsperiod,
           redovisare: prepared.redovisare,
           rutor: prepared.momsuppgift,
           kontrollresultat: prepared.kontrollresultat,
+          ...(resolvedFiscalPeriodId ? { fiscal_period_id: resolvedFiscalPeriodId } : {}),
           commit_action: 'Skickar för BankID-signering; lämnas inte in förrän du signerat.',
         },
         actor,
         {
           description: 'After approval, sign in Skatteverket via the returned BankID link, then poll gnubok_vat_declaration_status.',
           tool: 'gnubok_vat_declaration_status',
-          args: { period_type: periodType, year, period },
+          args: {
+            period_type: periodType,
+            year,
+            period,
+            ...(resolvedFiscalPeriodId ? { fiscal_period_id: resolvedFiscalPeriodId } : {}),
+          },
         },
         { dateForPeriodCheck: skvPeriodToEndDate(prepared.redovisningsperiod) },
       )
@@ -10587,8 +10716,9 @@ export const tools: McpTool[] = [
       additionalProperties: false,
       properties: {
         period_type: { type: 'string', enum: ['monthly', 'quarterly', 'yearly'], description: 'Period type' },
-        year: { type: 'number', description: 'Year (e.g. 2026)' },
-        period: { type: 'number', description: '1-12 for monthly, 1-4 for quarterly, 1 for yearly' },
+        year: VAT_YEAR_INPUT_SCHEMA,
+        period: VAT_PERIOD_INPUT_SCHEMA,
+        fiscal_period_id: VAT_FISCAL_PERIOD_ID_INPUT_SCHEMA,
         state: { type: 'string', enum: ['submitted', 'decided', 'both'], description: "Which view to fetch. Default 'both'." },
       },
       required: ['period_type', 'year', 'period'],
@@ -10597,14 +10727,83 @@ export const tools: McpTool[] = [
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     async execute(args, companyId, userId, supabase) {
       assertSkatteverketEnabled()
-      const periodType = args.period_type as VatPeriodType
-      const year = args.year as number
-      const period = args.period as number
+      const { periodType, year, period } = parseVatPeriodInput({
+        periodType: args.period_type,
+        year: args.year,
+        period: args.period,
+      })
+      const fiscalPeriodId = args.fiscal_period_id as string | undefined
       const state = (args.state as string) ?? 'both'
       const ctx = createExtensionContext(supabase, userId, companyId, 'skatteverket')
       try {
+        let resolvedAnnualPeriod: Awaited<ReturnType<typeof resolvePeriodDates>> | undefined
+        let redovisningsperiod: string
+        if (periodType === 'yearly') {
+          resolvedAnnualPeriod = await resolvePeriodDates(
+            supabase,
+            companyId,
+            periodType,
+            year,
+            period,
+            fiscalPeriodId,
+          )
+          const fiscalPeriodEnd = resolvedAnnualPeriod.fiscalPeriodEnd
+          if (!fiscalPeriodEnd || !resolvedAnnualPeriod.fiscalPeriodId) {
+            throw new Error('Annual VAT fiscal period identity is unavailable')
+          }
+          redovisningsperiod = formatRedovisningsperiod('yearly', year, period, {
+            year: Number(fiscalPeriodEnd.slice(0, 4)),
+            month: Number(fiscalPeriodEnd.slice(5, 7)),
+          })
+        } else {
+          if (fiscalPeriodId !== undefined) {
+            throw new Error('fiscal_period_id is only valid for annual VAT')
+          }
+          redovisningsperiod = formatRedovisningsperiod(periodType, year, period)
+        }
+
+        const rawSubmissionState = await ctx.settings.get<unknown>(
+          `submission_${redovisningsperiod}`,
+        )
+        const submissionState = parseVatSubmissionState(rawSubmissionState)
         const redovisare = await resolveRedovisare(supabase, companyId)
-        const redovisningsperiod = formatRedovisningsperiod(periodType, year, period)
+        assertVatSubmissionIdentity(submissionState, { redovisare, redovisningsperiod })
+        if (
+          submissionState.periodType !== periodType ||
+          submissionState.year !== year ||
+          submissionState.period !== period
+        ) {
+          throw new Error('VAT submission caller identity drift detected')
+        }
+        if (resolvedAnnualPeriod && (
+          submissionState.fiscalPeriodId !== resolvedAnnualPeriod.fiscalPeriodId ||
+          submissionState.fiscalPeriodStart !== resolvedAnnualPeriod.fiscalPeriodStart ||
+          submissionState.fiscalPeriodEnd !== resolvedAnnualPeriod.fiscalPeriodEnd ||
+          submissionState.resolvedPeriodStart !== resolvedAnnualPeriod.start ||
+          submissionState.resolvedPeriodEnd !== resolvedAnnualPeriod.end
+        )) {
+          throw new Error('VAT submission annual caller identity drift detected')
+        }
+        const deadlineIdentity = await resolveVatSubmissionDeadlineIdentity(
+          supabase,
+          companyId,
+          submissionState,
+        )
+
+        const completeFromReceipt = async (newStatus: 'submitted' | 'confirmed') => {
+          await completeTaxDeadline(
+            supabase,
+            companyId,
+            deadlineIdentity.type,
+            deadlineIdentity.taxPeriod,
+            newStatus,
+            deadlineIdentity.fiscalPeriodId ? {
+              fiscalPeriodId: deadlineIdentity.fiscalPeriodId,
+              fiscalPeriodStart: deadlineIdentity.fiscalPeriodStart,
+              fiscalPeriodEnd: deadlineIdentity.fiscalPeriodEnd,
+            } : undefined,
+          )
+        }
         let submitted: unknown = null
         let decided: unknown = null
         if (state === 'submitted' || state === 'both') {
@@ -10619,6 +10818,7 @@ export const tools: McpTool[] = [
               throw new Error(`Skatteverket svarade med ${res.status}: ${text}`)
             }
             submitted = await res.json()
+            await completeFromReceipt('submitted')
           }
         }
         if (state === 'decided' || state === 'both') {
@@ -10633,6 +10833,7 @@ export const tools: McpTool[] = [
               throw new Error(`Skatteverket svarade med ${res.status}: ${text}`)
             }
             decided = await res.json()
+            await completeFromReceipt('confirmed')
           }
         }
         return { redovisare, redovisningsperiod, submitted, decided }

@@ -46,7 +46,7 @@ export const PUT = withRouteContext(
   'settings.update',
   async (request, { supabase, companyId, log, requestId, user }) => {
     // Fetch current settings to check for tax-relevant changes
-    const { data: oldSettings } = await supabase
+    const { data: oldSettings, error: oldSettingsError } = await supabase
       .from('company_settings')
       .select(`${DEADLINE_SETTINGS_SELECT}, vat_number, onboarding_complete, salary_vacation_year_basis, reminder_days_level_1, reminder_days_level_2, reminder_days_level_3, aktiekapital, antal_aktier`)
       .eq('company_id', companyId)
@@ -55,6 +55,14 @@ export const PUT = withRouteContext(
     const validation = await validateBody(request, UpdateSettingsSchema)
     if (!validation.success) return validation.response
     const body = validation.data
+
+    // A missing row remains the normal 404 path from the update below. Any
+    // other read failure leaves the prior settings unknown, so fail before a
+    // write can erase preserved values such as VAT-liability provenance.
+    if (oldSettingsError && oldSettingsError.code !== 'PGRST116') {
+      log.error('failed to read current company settings', oldSettingsError)
+      return errorResponseFromCode('INTERNAL_ERROR', log, { requestId })
+    }
 
     const changesInvoiceEmailRecipients =
       body.invoice_email_cc_addresses !== undefined
@@ -163,13 +171,12 @@ export const PUT = withRouteContext(
       }
     }
 
-    // Turning VAT registration off retires the VAT-dependent flags, and
-    // dropping EU trade retires the EU sales list: stale true values would
-    // otherwise block the save below or silently resurrect wrong deadlines
-    // when registration is re-enabled later. Same coherence rule as the
-    // 20260717070000 migration and the tax settings form.
+    // Turning VAT registration off retires the current VAT-dependent flags,
+    // but the liability start is historical provenance and must survive
+    // deregistration. The tax settings form sends null for its hidden start
+    // field, so restore the stored value here before updating.
     if (body.vat_registered === false) {
-      body.vat_liability_start_date = null
+      body.vat_liability_start_date = oldSettings?.vat_liability_start_date ?? null
       body.vat_taxable_base_over_40m = false
       body.vat_has_eu_trade = false
       body.periodisk_sammanstallning_enabled = false

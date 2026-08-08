@@ -18,7 +18,9 @@ import { skvAuthCodeToStructured } from './lib/error-map'
 import {
   buildMomsuppgift,
   buildAgiUnderlag,
+  resolveRedovisare,
   type VatDeclarationPrep,
+  type VatDeclarationPrepInput,
   type AgiUnderlagPrep,
 } from './lib/declaration-prep'
 import { submitVatDeclarationChain } from './lib/vat-submit'
@@ -28,6 +30,7 @@ import { getConnection, markConnectionRevoked } from './lib/connection-store'
 import { currentSkvEnvironment, resolveReadAuth } from './lib/resolve-auth'
 import { probeCompanyGrants } from './lib/grant-probe'
 import { formatRedovisare } from '@/lib/skatteverket/format'
+import { parseVatPeriodInput, VatPeriodInputError } from '@/lib/vat/period-input'
 import { createExtensionContext } from '@/lib/extensions/context-factory'
 import type { SkvSubmitResult } from '@/lib/pending-operations/skatteverket-commit'
 import {
@@ -58,6 +61,17 @@ import { splitTransactions } from './lib/skattekonto-buckets'
 import type { SkattekontoBalanceSnapshot } from './types'
 import type { VatPeriodType } from '@/types'
 import { createLogger } from '@/lib/logger'
+import { evaluateVatFilingGate } from '@/lib/reports/vat-filing-gate'
+import type { VatDeclarationCheck } from '@/lib/reports/vat-declaration-checks'
+import {
+  assertSameVatSubmissionIdentity,
+  assertVatSubmissionIdentity,
+  createVatSubmissionState,
+  parseVatSubmissionState,
+  resolveVatSubmissionDeadlineIdentity,
+  vatSubmissionIdentity,
+  type VatSubmissionState,
+} from './lib/vat-submission-state'
 
 const log = createLogger('skatteverket')
 
@@ -727,8 +741,20 @@ export const skatteverketExtension: Extension = {
         if (blocked) return blocked
 
         try {
-          const { redovisare, redovisningsperiod, momsuppgift } =
-            await parseDeclarationRequest(request, ctx)
+          const prepared = await parseDeclarationRequest(request, ctx)
+          const { redovisare, redovisningsperiod, momsuppgift } = prepared
+          const identity = vatSubmissionIdentity(prepared.input, prepared)
+          const gate = await evaluateVatFilingGate(
+            ctx.supabase,
+            ctx.companyId,
+            prepared.declaration.rutor,
+            identity.periodType,
+            identity.year,
+            identity.period,
+            undefined,
+            { fiscalPeriodId: identity.fiscalPeriodId ?? undefined },
+          )
+          if (gate.blocked) return vatFilingGateResponse(gate.checks)
 
           console.log('[skatteverket] Validating:', {
             redovisare,
@@ -775,8 +801,20 @@ export const skatteverketExtension: Extension = {
         if (blocked) return blocked
 
         try {
-          const { redovisare, redovisningsperiod, momsuppgift } =
-            await parseDeclarationRequest(request, ctx)
+          const prepared = await parseDeclarationRequest(request, ctx)
+          const { redovisare, redovisningsperiod, momsuppgift } = prepared
+          const identity = vatSubmissionIdentity(prepared.input, prepared)
+          const gate = await evaluateVatFilingGate(
+            ctx.supabase,
+            ctx.companyId,
+            prepared.declaration.rutor,
+            identity.periodType,
+            identity.year,
+            identity.period,
+            undefined,
+            { fiscalPeriodId: identity.fiscalPeriodId ?? undefined },
+          )
+          if (gate.blocked) return vatFilingGateResponse(gate.checks)
 
           console.log('[skatteverket] Sending draft:', {
             redovisare,
@@ -806,13 +844,9 @@ export const skatteverketExtension: Extension = {
           // Track submission status
           await ctx.settings.set(
             `submission_${redovisningsperiod}`,
-            JSON.stringify({
-              status: 'draft_saved',
-              redovisare,
-              redovisningsperiod,
+            JSON.stringify(createVatSubmissionState(identity, 'draft_saved', {
               kontrollresultat: data.kontrollresultat,
-              updatedAt: new Date().toISOString(),
-            })
+            }))
           )
 
           return NextResponse.json({ data })
@@ -832,7 +866,9 @@ export const skatteverketExtension: Extension = {
         }
 
         try {
-          const { redovisare, redovisningsperiod } = parseQueryParams(request, ctx)
+          const { redovisare, redovisningsperiod } = await resolveVatRouteIdentity(request, ctx)
+          const state = await loadVatSubmissionState(ctx, redovisare, redovisningsperiod)
+          assertVatPickerMatchesState(request, state)
 
           const response = await skvRequest(
             ctx.supabase,
@@ -871,7 +907,9 @@ export const skatteverketExtension: Extension = {
         }
 
         try {
-          const { redovisare, redovisningsperiod } = parseQueryParams(request, ctx)
+          const { redovisare, redovisningsperiod } = await resolveVatRouteIdentity(request, ctx)
+          const state = await loadVatSubmissionState(ctx, redovisare, redovisningsperiod)
+          assertVatPickerMatchesState(request, state)
 
           const response = await skvRequest(
             ctx.supabase,
@@ -911,6 +949,35 @@ export const skatteverketExtension: Extension = {
 
         try {
           const { redovisare, redovisningsperiod } = parseQueryParams(request, ctx)
+          const state = await loadVatSubmissionState(ctx, redovisare, redovisningsperiod)
+          const prepared = await buildMomsuppgift(ctx.supabase, ctx.companyId, {
+            periodType: state.periodType,
+            year: state.year,
+            period: state.period,
+            fiscalPeriodId: state.fiscalPeriodId ?? undefined,
+            resolvedPeriodStart: state.resolvedPeriodStart,
+            resolvedPeriodEnd: state.resolvedPeriodEnd,
+          })
+          const identity = vatSubmissionIdentity({
+            periodType: state.periodType,
+            year: state.year,
+            period: state.period,
+            fiscalPeriodId: state.fiscalPeriodId ?? undefined,
+            resolvedPeriodStart: state.resolvedPeriodStart,
+            resolvedPeriodEnd: state.resolvedPeriodEnd,
+          }, prepared)
+          assertSameVatSubmissionIdentity(state, identity)
+          const gate = await evaluateVatFilingGate(
+            ctx.supabase,
+            ctx.companyId,
+            prepared.declaration.rutor,
+            identity.periodType,
+            identity.year,
+            identity.period,
+            undefined,
+            { fiscalPeriodId: identity.fiscalPeriodId ?? undefined },
+          )
+          if (gate.blocked) return vatFilingGateResponse(gate.checks)
 
           const response = await skvRequest(
             ctx.supabase,
@@ -932,9 +999,8 @@ export const skatteverketExtension: Extension = {
           await ctx.settings.set(
             `submission_${redovisningsperiod}`,
             JSON.stringify({
+              ...state,
               status: 'draft_locked',
-              redovisare,
-              redovisningsperiod,
               signeringsLank: data.signeringsLank,
               updatedAt: new Date().toISOString(),
             })
@@ -958,6 +1024,7 @@ export const skatteverketExtension: Extension = {
 
         try {
           const { redovisare, redovisningsperiod } = parseQueryParams(request, ctx)
+          const state = await loadVatSubmissionState(ctx, redovisare, redovisningsperiod)
 
           const response = await skvRequest(
             ctx.supabase,
@@ -977,9 +1044,8 @@ export const skatteverketExtension: Extension = {
           await ctx.settings.set(
             `submission_${redovisningsperiod}`,
             JSON.stringify({
+              ...state,
               status: 'draft_saved',
-              redovisare,
-              redovisningsperiod,
               updatedAt: new Date().toISOString(),
             })
           )
@@ -1063,7 +1129,9 @@ export const skatteverketExtension: Extension = {
         }
 
         try {
-          const { redovisare, redovisningsperiod } = parseQueryParams(request, ctx)
+          const { redovisare, redovisningsperiod } = await resolveVatRouteIdentity(request, ctx)
+          const state = await loadVatSubmissionState(ctx, redovisare, redovisningsperiod)
+          assertVatPickerMatchesState(request, state)
 
           // resolveReadAuth: post-signing checks should outlive the user's
           // 65-minute session when the company has a moms_ombud grant.
@@ -1100,8 +1168,8 @@ export const skatteverketExtension: Extension = {
           // A non-null inlamnat means the declaration is filed: complete the
           // period's moms deadline. Best-effort, gated on the caller passing
           // the picker params (older clients omit them).
-          if (data) {
-            await completeVatDeadlineFromRequest(request, ctx, 'submitted')
+          if (data && state) {
+            await completeVatDeadlineFromState(ctx, state, 'submitted')
           }
 
           return NextResponse.json({ data })
@@ -1121,7 +1189,9 @@ export const skatteverketExtension: Extension = {
         }
 
         try {
-          const { redovisare, redovisningsperiod } = parseQueryParams(request, ctx)
+          const { redovisare, redovisningsperiod } = await resolveVatRouteIdentity(request, ctx)
+          const state = await loadVatSubmissionState(ctx, redovisare, redovisningsperiod)
+          assertVatPickerMatchesState(request, state)
 
           const resolved = await resolveReadAuth(ctx.supabase, ctx.companyId, {
             requires: 'moms_ombud',
@@ -1155,8 +1225,8 @@ export const skatteverketExtension: Extension = {
 
           // A beslut means Skatteverket has processed the filing: confirm
           // the period's moms deadline (terminal state).
-          if (data) {
-            await completeVatDeadlineFromRequest(request, ctx, 'confirmed')
+          if (data && state) {
+            await completeVatDeadlineFromState(ctx, state, 'confirmed')
           }
 
           return NextResponse.json({ data })
@@ -2298,20 +2368,20 @@ export const skatteverketExtension: Extension = {
 async function parseDeclarationRequest(
   request: Request,
   ctx: ExtensionContext
-): Promise<VatDeclarationPrep> {
+): Promise<VatDeclarationPrep & { input: VatDeclarationPrepInput }> {
   const body = await request.json()
-  const { periodType, year, period, fiscalPeriodId } = body as {
-    periodType: VatPeriodType
-    year: number
-    period: number
+  const { periodType, year, period } = parseVatPeriodInput({
+    periodType: (body as Record<string, unknown>).periodType,
+    year: (body as Record<string, unknown>).year,
+    period: (body as Record<string, unknown>).period,
+  })
+  const { fiscalPeriodId } = body as {
     fiscalPeriodId?: string
   }
 
-  if (!periodType || !year || !period) {
-    throw new Error('Saknar obligatoriska fält: periodType, year, period')
-  }
-
-  return buildMomsuppgift(ctx.supabase, ctx.companyId, { periodType, year, period, fiscalPeriodId })
+  const input = { periodType, year, period, fiscalPeriodId }
+  const prep = await buildMomsuppgift(ctx.supabase, ctx.companyId, input)
+  return { ...prep, input }
 }
 
 /**
@@ -2336,63 +2406,82 @@ function parseQueryParams(
   return { redovisare, redovisningsperiod }
 }
 
-/**
- * Build the deadline generator's tax_period string (`YYYY-MM` monthly,
- * `YYYY-QN` quarterly) from the picker params. Yearly periods use the
- * fiscal-year label and need company settings; see yearlyVatTaxPeriod.
- */
-function vatTaxPeriod(periodType: VatPeriodType, year: number, period: number): string | null {
-  if (periodType === 'monthly') return `${year}-${String(period).padStart(2, '0')}`
-  if (periodType === 'quarterly') return `${year}-Q${period}`
-  return null
-}
-
-/**
- * The moms_yearly row's tax_period is the generator's fiscal-year label:
- * `YYYY` for calendar fiscal years and `YYYY-1/YYYY` for broken ones (year
- * = the FY-end year). Derived from company settings because the picker only
- * carries the year.
- */
-async function yearlyVatTaxPeriod(ctx: ExtensionContext, year: number): Promise<string> {
-  const { data } = await ctx.supabase
-    .from('company_settings')
-    .select('fiscal_year_start_month')
-    .eq('company_id', ctx.companyId)
-    .maybeSingle()
-  const startMonth = data?.fiscal_year_start_month ?? 1
-  return startMonth === 1 ? `${year}` : `${year - 1}/${year}`
-}
-
-/**
- * Complete the moms deadline for the period identified by the request's
- * optional periodType/year/period query params. Both monthly and quarterly
- * types are passed for sub-annual periods: company settings decide which one
- * exists, the other is a no-op. Best-effort by design (completeTaxDeadline
- * never throws).
- */
-async function completeVatDeadlineFromRequest(
+async function resolveVatRouteIdentity(
   request: Request,
   ctx: ExtensionContext,
-  newStatus: 'submitted' | 'confirmed'
-): Promise<void> {
-  const url = new URL(request.url)
-  const periodType = url.searchParams.get('periodType') as VatPeriodType | null
-  const year = Number(url.searchParams.get('year'))
-  const period = Number(url.searchParams.get('period'))
-  if (!periodType || !Number.isFinite(year) || !Number.isFinite(period) || !year || !period) {
-    return
+): Promise<{ redovisare: string; redovisningsperiod: string }> {
+  const supplied = parseQueryParams(request, ctx)
+  const redovisare = await resolveRedovisare(ctx.supabase, ctx.companyId)
+  if (supplied.redovisare !== redovisare) {
+    throw new Error('Redovisare matchar inte aktivt företag')
   }
-  const taxPeriod =
-    periodType === 'yearly'
-      ? await yearlyVatTaxPeriod(ctx, year)
-      : vatTaxPeriod(periodType, year, period)
-  if (!taxPeriod) return
+  return { redovisare, redovisningsperiod: supplied.redovisningsperiod }
+}
+
+function vatFilingGateResponse(checks: VatDeclarationCheck[]): NextResponse {
+  const blockers = checks.filter((check) => check.status === 'ERROR')
+  return NextResponse.json(
+    {
+      error: blockers.map((check) => `${check.code}: ${check.message}`).join('\n'),
+      checks: blockers,
+    },
+    { status: 422 },
+  )
+}
+
+async function loadVatSubmissionState(
+  ctx: ExtensionContext,
+  redovisare: string,
+  redovisningsperiod: string,
+): Promise<VatSubmissionState> {
+  const raw = await ctx.settings.get<unknown>(`submission_${redovisningsperiod}`)
+  const state = parseVatSubmissionState(raw)
+  assertVatSubmissionIdentity(state, { redovisare, redovisningsperiod })
+  return state
+}
+
+function assertVatPickerMatchesState(request: Request, state: VatSubmissionState): void {
+  const params = new URL(request.url).searchParams
+  const expected = {
+    periodType: state.periodType,
+    year: String(state.year),
+    period: String(state.period),
+    fiscalPeriodId: state.fiscalPeriodId,
+    fiscalPeriodStart: state.fiscalPeriodStart,
+    fiscalPeriodEnd: state.fiscalPeriodEnd,
+    resolvedPeriodStart: state.resolvedPeriodStart,
+    resolvedPeriodEnd: state.resolvedPeriodEnd,
+  }
+  for (const [key, value] of Object.entries(expected)) {
+    const supplied = params.get(key)
+    if (supplied !== null && supplied !== value) {
+      throw new Error(`VAT submission picker identity drift detected at ${key}`)
+    }
+  }
+}
+
+async function completeVatDeadlineFromState(
+  ctx: ExtensionContext,
+  state: VatSubmissionState,
+  newStatus: 'submitted' | 'confirmed',
+): Promise<void> {
+  const deadlineIdentity = await resolveVatSubmissionDeadlineIdentity(
+    ctx.supabase,
+    ctx.companyId,
+    state,
+  )
+
   await completeTaxDeadline(
     ctx.supabase,
     ctx.companyId,
-    periodType === 'yearly' ? ['moms_yearly'] : ['moms_monthly', 'moms_quarterly'],
-    taxPeriod,
-    newStatus
+    deadlineIdentity.type,
+    deadlineIdentity.taxPeriod,
+    newStatus,
+    deadlineIdentity.fiscalPeriodId ? {
+      fiscalPeriodId: deadlineIdentity.fiscalPeriodId,
+      fiscalPeriodStart: deadlineIdentity.fiscalPeriodStart,
+      fiscalPeriodEnd: deadlineIdentity.fiscalPeriodEnd,
+    } : undefined,
   )
 }
 
@@ -2416,6 +2505,9 @@ async function loadAGIXml(
  * Convert Skatteverket errors to appropriate HTTP responses.
  */
 function handleSkvError(err: unknown): NextResponse {
+  if (err instanceof VatPeriodInputError) {
+    return NextResponse.json({ error: err.message }, { status: 400 })
+  }
   if (err instanceof SkatteverketAuthError) {
     // MISSING_SCOPE returns 401: the existing token works, but it doesn't
     // grant access to this resource. Treating it as 401 (rather than 403)
@@ -2517,12 +2609,21 @@ async function commitSubmitVatDeclaration(
   const year = params.year as number
   const period = params.period as number
   const fiscalPeriodId = params.fiscal_period_id as string | undefined
+  const resolvedPeriodStart = params.resolved_period_start as string | undefined
+  const resolvedPeriodEnd = params.resolved_period_end as string | undefined
   const ctx = createExtensionContext(supabase, userId, companyId, 'skatteverket')
 
   try {
     // The staged figures were already reviewed at approval time, so the
     // chain starts at the utkast write (no kontrollera pre-step here).
-    const result = await submitVatDeclarationChain(ctx, { periodType, year, period, fiscalPeriodId })
+    const result = await submitVatDeclarationChain(ctx, {
+      periodType,
+      year,
+      period,
+      fiscalPeriodId,
+      resolvedPeriodStart,
+      resolvedPeriodEnd,
+    })
     if (!result.ok) {
       return {
         ok: false, code: 'SKATTEVERKET_SUBMIT_REJECTED', http_status: result.httpStatus,
