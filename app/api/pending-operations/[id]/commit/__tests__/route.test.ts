@@ -30,6 +30,12 @@ vi.mock('@/lib/bookkeeping/counterparty-templates', () => ({
   upsertCounterpartyTemplate: vi.fn().mockResolvedValue(undefined),
 }))
 
+// Duplicate detection has dedicated executor/core coverage; route tests isolate
+// the commit envelope and provide the explicit no-duplicate outcome.
+vi.mock('@/lib/transactions/booking-duplicate-detection', () => ({
+  detectBookingDuplicate: vi.fn().mockResolvedValue(null),
+}))
+
 // Mock createTransactionJournalEntry
 const mockCreateJournalEntry = vi.fn()
 vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
@@ -116,6 +122,8 @@ describe('POST /api/pending-operations/:id/commit', () => {
         transaction_id: 'tx-1',
         category: 'expense_office',
         vat_treatment: null,
+        cash_account_id: null,
+        settlement_account: '1930',
       },
       preview_data: {},
     }
@@ -130,7 +138,7 @@ describe('POST /api/pending-operations/:id/commit', () => {
         { data: tx },                                 // fetch transaction
         { data: settings },                           // fetch company settings
         { data: [{ id: 'fp-1' }] },                  // fiscal period check
-        { data: null, error: null },                  // update transaction
+        { data: true, error: null },                  // atomic settlement attachment
         { data: null, error: null },                  // upsert counterparty template
         { data: null, error: null },                  // update pending op status
       ])

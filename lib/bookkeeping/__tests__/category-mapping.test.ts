@@ -47,6 +47,26 @@ describe('getCategoryAccountMapping', () => {
       expect(result.debitAccount).toBe('6991')
     })
   })
+
+  describe('transaction-specific settlement account', () => {
+    it('credits the Revolut SEK ledger account for an outgoing bank fee', () => {
+      const result = getCategoryAccountMapping(
+        'expense_bank_fees', -150, true, 'aktiebolag', 'exempt', '1931',
+      )
+
+      expect(result.debitAccount).toBe('6570')
+      expect(result.creditAccount).toBe('1931')
+    })
+
+    it('debits the Revolut SEK ledger account for incoming AB owner funding', () => {
+      const result = getCategoryAccountMapping(
+        'private', 5000, false, 'aktiebolag', undefined, '1931',
+      )
+
+      expect(result.debitAccount).toBe('1931')
+      expect(result.creditAccount).toBe('2893')
+    })
+  })
 })
 
 describe('getExpenseAccountForCategory', () => {

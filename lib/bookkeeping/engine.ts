@@ -12,6 +12,7 @@ import {
   FiscalPeriodNotFoundError,
   JournalEntryNotBalancedError,
   JournalEntryNotFoundError,
+  PostCommitReadbackError,
 } from '@/lib/bookkeeping/errors'
 import { resolveDefaultSeriesForSource } from '@/lib/bookkeeping/voucher-series-resolver'
 import {
@@ -317,6 +318,8 @@ export async function createDraftEntry(
       description: input.description,
       source_type: input.source_type,
       source_id: input.source_id || null,
+      categorization_category: input.categorization_category || null,
+      categorization_is_business: input.categorization_is_business ?? null,
       notes: input.notes || null,
       status: 'draft',
     })
@@ -619,16 +622,29 @@ export async function commitEntry(
 
   // Atomic: increment voucher sequence + update status in one transaction.
   // Rolls back the sequence if the balance trigger or any constraint fails.
-  const { data: rpcResult, error: commitError } = await supabase.rpc('commit_journal_entry', {
-    p_company_id: companyId,
-    p_entry_id: entryId,
-    p_commit_method: commitMethod ?? null,
-    p_rubric_version: rubricVersion ?? null,
-    p_actor_type: actor?.type ?? null,
-    p_actor_label: actor?.label ?? null,
-  })
+  let rpcResult: unknown = null
+  let commitError: unknown = null
+  try {
+    const response = await supabase.rpc('commit_journal_entry', {
+      p_company_id: companyId,
+      p_entry_id: entryId,
+      p_commit_method: commitMethod ?? null,
+      p_rubric_version: rubricVersion ?? null,
+      p_actor_type: actor?.type ?? null,
+      p_actor_label: actor?.label ?? null,
+    })
+    rpcResult = response.data
+    commitError = response.error
+  } catch (error) {
+    commitError = error
+  }
 
   if (commitError) {
+    const commitCause =
+      typeof commitError === 'object' && commitError !== null && 'message' in commitError &&
+      typeof (commitError as { message?: unknown }).message === 'string'
+        ? (commitError as { message: string }).message
+        : String(commitError)
     log.error('commit_journal_entry RPC failed', commitError, {
       operation: 'commit_entry',
       companyId,
@@ -640,15 +656,93 @@ export async function commitEntry(
       pgDetails: (commitError as { details?: string }).details,
       pgHint: (commitError as { hint?: string }).hint,
     })
-    throw new BookkeepingDatabaseError('commit_entry', commitError.message)
+
+    let outcome: { status?: unknown; voucher_number?: unknown } | null = null
+    let outcomeError: unknown = null
+    try {
+      const readback = await supabase
+        .from('journal_entries')
+        .select('status, voucher_number')
+        .eq('id', entryId)
+        .eq('company_id', companyId)
+        .maybeSingle()
+      outcome = readback.data
+      outcomeError = readback.error
+    } catch (error) {
+      outcomeError = error
+    }
+
+    if (
+      !outcomeError &&
+      outcome?.status === 'draft' &&
+      outcome.voucher_number === 0
+    ) {
+      throw new BookkeepingDatabaseError('commit_entry', commitCause)
+    }
+
+    const rpcRow = Array.isArray(rpcResult) ? rpcResult[0] : rpcResult
+    const rpcVoucherNumber =
+      rpcRow && typeof rpcRow === 'object' && 'voucher_number' in rpcRow
+        ? (rpcRow as { voucher_number?: unknown }).voucher_number
+        : null
+    const rawVoucherNumber = outcome?.voucher_number ?? rpcVoucherNumber
+    const voucherNumber =
+      typeof rawVoucherNumber === 'number' && Number.isFinite(rawVoucherNumber) &&
+      rawVoucherNumber > 0
+        ? rawVoucherNumber
+        : null
+    const outcomeCause = outcomeError
+      ? `commit failed (${commitCause}); outcome readback failed (${String(
+          (outcomeError as { message?: unknown })?.message ?? outcomeError,
+        )})`
+      : !outcome
+        ? `commit failed (${commitCause}); outcome readback returned no row`
+        : `commit failed (${commitCause}); outcome status was ${String(outcome.status)}`
+    log.error(
+      'commit_journal_entry outcome could not be classified as draft',
+      outcomeError ?? new Error(outcomeCause),
+      {
+        operation: 'commit_entry.outcome_readback',
+        companyId,
+        userId,
+        entityType: 'journal_entry',
+        entityId: entryId,
+        outcomeStatus: outcome?.status ?? null,
+        voucherNumber,
+      },
+    )
+    throw new PostCommitReadbackError(entryId, voucherNumber, outcomeCause)
   }
 
   // Fetch complete posted entry with lines
-  const { data: completeEntry } = await supabase
+  const { data: completeEntry, error: readbackError } = await supabase
     .from('journal_entries')
     .select('*, lines:journal_entry_lines(*)')
     .eq('id', entryId)
     .single()
+
+  if (readbackError || !completeEntry) {
+    const rpcRow = Array.isArray(rpcResult) ? rpcResult[0] : rpcResult
+    const rawVoucherNumber =
+      rpcRow && typeof rpcRow === 'object' && 'voucher_number' in rpcRow
+        ? (rpcRow as { voucher_number?: unknown }).voucher_number
+        : null
+    const voucherNumber =
+      typeof rawVoucherNumber === 'number' && Number.isFinite(rawVoucherNumber)
+        ? rawVoucherNumber
+        : null
+    const cause = readbackError?.message ?? 'posted journal entry row was not returned'
+    log.error('posted journal entry readback failed', readbackError ?? new Error(cause), {
+      operation: 'commit_entry.readback',
+      companyId,
+      userId,
+      entityType: 'journal_entry',
+      entityId: entryId,
+      voucherNumber,
+      pgCode: (readbackError as { code?: string } | null)?.code,
+    })
+    throw new PostCommitReadbackError(entryId, voucherNumber, cause)
+  }
 
   const result = completeEntry as JournalEntry
 
@@ -682,6 +776,10 @@ export async function createJournalEntry(
   try {
     return await commitEntry(supabase, companyId, userId, draft.id, commitMethod, rubricVersion)
   } catch (commitError) {
+    // The RPC already posted this entry. It is immutable and must be handled
+    // through the caller's compensation path, never draft cancellation.
+    if (commitError instanceof PostCommitReadbackError) throw commitError
+
     // CAS guard: only cancel if still in draft. If the RPC actually posted
     // before failing downstream, immutability trigger blocks draft→cancelled
     // on a posted row anyway: the filter just avoids firing the trigger.
@@ -690,6 +788,7 @@ export async function createJournalEntry(
         .from('journal_entries')
         .update({ status: 'cancelled' })
         .eq('id', draft.id)
+        .eq('company_id', companyId)
         .eq('status', 'draft')
       if (cancelError) {
         log.error('orphan draft cleanup failed (phantom draft remains)', cancelError, {

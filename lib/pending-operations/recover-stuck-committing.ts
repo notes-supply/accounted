@@ -64,7 +64,14 @@ export interface StuckCommittingRow {
   company_id: string
   operation_type: string
   params: Record<string, unknown>
+  result_data?: Record<string, unknown> | null
   updated_at: string
+}
+
+function mayContainUnpersistedPartialFailure(row: StuckCommittingRow): boolean {
+  const marker = row.result_data?.commit_in_progress
+  return !!marker && typeof marker === 'object' && !Array.isArray(marker) &&
+    (marker as { partial_failure_possible?: unknown }).partial_failure_possible === true
 }
 
 /**
@@ -245,7 +252,7 @@ export async function recoverStuckCommittingOperations(
   const stuck = await fetchAllRows<StuckCommittingRow>(({ from, to }) =>
     supabase
       .from('pending_operations')
-      .select('id, company_id, operation_type, params, updated_at')
+      .select('id, company_id, operation_type, params, result_data, updated_at')
       .eq('status', 'committing')
       .lt('updated_at', cutoff.toISOString())
       .order('id', { ascending: true })
@@ -266,6 +273,19 @@ export async function recoverStuckCommittingOperations(
       operationType: row.operation_type,
       stuckSince: row.updated_at,
       ageMinutes: Math.round((now.getTime() - new Date(row.updated_at).getTime()) / 60_000),
+    }
+
+    // The dispatcher writes this marker in the same CAS that claims operation
+    // types capable of posting before failure. If their failed_partial terminal
+    // write later becomes unverifiable, the marker survives on the committing
+    // row. Never guess committed/rejected and erase that ambiguity.
+    if (mayContainUnpersistedPartialFailure(row)) {
+      summary.skipped++
+      log.warn('pending_op_recovery', {
+        ...baseCtx,
+        outcome: 'skipped_partial_failure_ambiguous',
+      })
+      continue
     }
 
     let evidence: PostedEvidence | null

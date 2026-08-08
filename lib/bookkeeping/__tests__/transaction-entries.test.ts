@@ -466,6 +466,25 @@ describe('createTransactionJournalEntry', () => {
     expect(input.source_id).toBe('tx-abc-123')
   })
 
+  it('persists the approved categorization as immutable journal metadata', async () => {
+    const tx = makeTransaction({ id: 'tx-metadata', amount: -100 })
+    const mapping = makeMappingResult()
+
+    await createTransactionJournalEntry(
+      null as never,
+      'company-1',
+      'user-1',
+      tx,
+      mapping,
+      undefined,
+      { category: 'expense_bank_fees', isBusiness: true },
+    )
+
+    const input = mockedCreateEntry.mock.calls[0][3]
+    expect(input.categorization_category).toBe('expense_bank_fees')
+    expect(input.categorization_is_business).toBe(true)
+  })
+
   it('uses transaction.date as entry_date', async () => {
     const tx = makeTransaction({ date: '2024-09-15', amount: -100 })
     const mapping = makeMappingResult()

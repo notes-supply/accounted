@@ -23,6 +23,19 @@ vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
     mockCreateTransactionJournalEntry(...args),
 }))
 
+const mockAttachCategorizedTransaction = vi.fn()
+const mockCompensatePostCommitReadbackFailure = vi.fn()
+vi.mock('@/lib/transactions/settlement-attachment', () => ({
+  attachCategorizedTransaction: (...args: unknown[]) => mockAttachCategorizedTransaction(...args),
+  compensatePostCommitReadbackFailure: (...args: unknown[]) =>
+    mockCompensatePostCommitReadbackFailure(...args),
+}))
+
+const mockUpsertCounterpartyTemplate = vi.fn()
+vi.mock('@/lib/bookkeeping/counterparty-templates', () => ({
+  upsertCounterpartyTemplate: (...args: unknown[]) => mockUpsertCounterpartyTemplate(...args),
+}))
+
 const mockGetBestInvoiceMatch = vi.fn()
 vi.mock('@/lib/invoices/invoice-matching', () => ({
   getBestInvoiceMatch: (...args: unknown[]) => mockGetBestInvoiceMatch(...args),
@@ -94,6 +107,17 @@ function createQueueMockSupabase() {
 
 const USER_ID = 'user-1'
 const COMPANY_ID = 'company-1'
+const postCommitReadbackError = () => {
+  const error = new Error('readback failed') as Error & {
+    name: string
+    journalEntryId: string
+    voucherNumber: number
+  }
+  error.name = 'PostCommitReadbackError'
+  error.journalEntryId = 'je-readback'
+  error.voucherNumber = 42
+  return error
+}
 
 function makeRaw(overrides: Partial<RawTransaction> = {}): RawTransaction {
   return {
@@ -140,6 +164,9 @@ function makeMappingResult(overrides: Record<string, unknown> = {}) {
 describe('ingestTransactions', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mockAttachCategorizedTransaction.mockResolvedValue({ ok: true })
+    mockCompensatePostCommitReadbackFailure.mockResolvedValue({ handled: false })
+    mockUpsertCounterpartyTemplate.mockResolvedValue(undefined)
   })
 
   // -----------------------------------------------------------------------
@@ -1646,7 +1673,7 @@ describe('ingestTransactions', () => {
   // 6. Auto-categorizes when mapping confidence >= 0.8
   // -----------------------------------------------------------------------
   it('auto-categorizes when mapping confidence is at least 0.8', async () => {
-    const { supabase, enqueue } = createQueueMockSupabase()
+    const { supabase, enqueue, updates } = createQueueMockSupabase()
     const raw = makeRaw({ amount: -500, mcc_code: 5411, merchant_name: 'ICA' })
     const inserted = makeTransaction({
       id: 'tx-cat',
@@ -1681,8 +1708,175 @@ describe('ingestTransactions', () => {
       COMPANY_ID,
       USER_ID,
       expect.objectContaining({ id: 'tx-cat' }),
-      expect.objectContaining({ confidence: 0.85 })
+      expect.objectContaining({ confidence: 0.85 }),
+      undefined,
+      { category: 'uncategorized', isBusiness: true },
     )
+    expect(mockAttachCategorizedTransaction).toHaveBeenCalledWith(
+      supabase,
+      expect.objectContaining({
+        transactionId: 'tx-cat',
+        expectedCashAccountId: null,
+        expectedSettlementAccount: '1930',
+        journalEntryId: 'je-1',
+      }),
+      expect.anything(),
+    )
+    expect(updates['transactions']).toBeUndefined()
+    expect(mockAttachCategorizedTransaction.mock.invocationCallOrder[0]).toBeLessThan(
+      mockUpsertCounterpartyTemplate.mock.invocationCallOrder[0],
+    )
+  })
+
+  it('uses atomic attachment and exposes every surviving posted id when auto-categorization attachment fails', async () => {
+    const { supabase, enqueue } = createQueueMockSupabase()
+    const raw = makeRaw({ amount: -500, mcc_code: 5411, merchant_name: 'ICA' })
+    const inserted = makeTransaction({
+      id: 'tx-cat-failed-attachment',
+      amount: -500,
+      external_id: raw.external_id,
+      cash_account_id: null,
+      journal_entry_id: null,
+    })
+    enqueue({ data: [], error: null })
+    enqueue({ data: [], error: null })
+    enqueue({ data: [], error: null })
+    enqueue({ data: [], error: null })
+    enqueue({ data: inserted, error: null })
+
+    mockEvaluateMappingRules.mockResolvedValue(
+      makeMappingResult({ confidence: 0.85, requires_review: false }),
+    )
+    mockCreateTransactionJournalEntry.mockResolvedValue(makeJournalEntry({ id: 'je-orphan' }))
+    mockAttachCategorizedTransaction.mockResolvedValue({
+      ok: false,
+      reason: 'database_error',
+      partialPostedIds: {
+        journal_entry_id: 'je-orphan',
+        reversal_journal_entry_id: 'je-storno-orphan',
+      },
+    })
+
+    const result = await ingestTransactions(supabase as never, COMPANY_ID, USER_ID, [raw])
+
+    expect(mockAttachCategorizedTransaction).toHaveBeenCalledWith(
+      supabase,
+      expect.objectContaining({
+        companyId: COMPANY_ID,
+        userId: USER_ID,
+        transactionId: inserted.id,
+        expectedJournalEntryId: null,
+        expectedCashAccountId: null,
+        expectedSettlementAccount: '1930',
+        journalEntryId: 'je-orphan',
+      }),
+      expect.anything(),
+    )
+    expect(result.auto_categorized).toBe(0)
+    expect(result.auto_categorization_failures).toEqual([
+      {
+        transaction_id: inserted.id,
+        code: 'ATTACHMENT_DATABASE_ERROR',
+        partial_posted_ids: {
+          journal_entry_id: 'je-orphan',
+          reversal_journal_entry_id: 'je-storno-orphan',
+        },
+      },
+    ])
+    expect(mockUpsertCounterpartyTemplate).not.toHaveBeenCalled()
+  })
+
+  it('compensates and reports a durable posted id after auto-categorization readback failure', async () => {
+    const { supabase, enqueue } = createQueueMockSupabase()
+    const raw = makeRaw({ amount: -500, mcc_code: 5411, merchant_name: 'ICA' })
+    const inserted = makeTransaction({
+      id: 'tx-readback-failure',
+      amount: -500,
+      external_id: raw.external_id,
+      cash_account_id: null,
+      journal_entry_id: null,
+    })
+    enqueue({ data: [], error: null })
+    enqueue({ data: [], error: null })
+    enqueue({ data: [], error: null })
+    enqueue({ data: [], error: null })
+    enqueue({ data: inserted, error: null })
+
+    const readbackError = postCommitReadbackError()
+    mockEvaluateMappingRules.mockResolvedValue(
+      makeMappingResult({ confidence: 0.85, requires_review: false }),
+    )
+    mockCreateTransactionJournalEntry.mockRejectedValueOnce(readbackError)
+    mockCompensatePostCommitReadbackFailure.mockResolvedValueOnce({
+      handled: true,
+      journalEntryId: 'je-readback',
+      voucherNumber: 42,
+      compensationVerified: false,
+      partialPostedIds: { journal_entry_id: 'je-readback' },
+    })
+
+    const result = await ingestTransactions(
+      supabase as never,
+      COMPANY_ID,
+      USER_ID,
+      [raw],
+    )
+
+    expect(result.auto_categorized).toBe(0)
+    expect(result.auto_categorization_failures).toEqual([
+      {
+        transaction_id: inserted.id,
+        code: 'POST_COMMIT_READBACK_FAILED',
+        partial_posted_ids: { journal_entry_id: 'je-readback' },
+      },
+    ])
+    expect(mockCompensatePostCommitReadbackFailure).toHaveBeenCalledWith(
+      supabase,
+      {
+        companyId: COMPANY_ID,
+        transactionId: inserted.id,
+        error: readbackError,
+      },
+      expect.anything(),
+    )
+    expect(mockAttachCategorizedTransaction).not.toHaveBeenCalled()
+  })
+
+  it('does not create a voucher when a requested settlement account lacks exact company cash-account provenance', async () => {
+    const { supabase, enqueue } = createQueueMockSupabase()
+    const raw = makeRaw({ amount: -500, merchant_name: 'ICA' })
+    const inserted = makeTransaction({
+      id: 'tx-unverified-settlement',
+      amount: -500,
+      external_id: raw.external_id,
+      cash_account_id: null,
+    })
+    enqueue({ data: [], error: null })
+    enqueue({ data: [], error: null })
+    enqueue({ data: [], error: null })
+    enqueue({ data: [], error: null })
+    enqueue({ data: null, error: { code: '42501', message: 'permission denied' } })
+    enqueue({ data: inserted, error: null })
+    mockEvaluateMappingRules.mockResolvedValue(
+      makeMappingResult({ confidence: 0.9, requires_review: false, credit_account: '1931' }),
+    )
+
+    const result = await ingestTransactions(
+      supabase as never,
+      COMPANY_ID,
+      USER_ID,
+      [raw],
+      { settlementAccount: '1931' },
+    )
+
+    expect(result.imported).toBe(1)
+    expect(result.auto_categorized).toBe(0)
+    expect(result.auto_categorization_failures).toEqual([{
+      transaction_id: inserted.id,
+      code: 'SETTLEMENT_PROVENANCE_UNAVAILABLE',
+    }])
+    expect(mockCreateTransactionJournalEntry).not.toHaveBeenCalled()
+    expect(mockAttachCategorizedTransaction).not.toHaveBeenCalled()
   })
 
   // -----------------------------------------------------------------------

@@ -12,6 +12,7 @@ import type {
   JournalEntry,
   MappingResult,
   Transaction,
+  TransactionCategory,
 } from '@/types'
 
 const log = createLogger('transaction-entries')
@@ -264,6 +265,7 @@ export async function createTransactionJournalEntry(
   // syfte directly on the journal entry (SKV's representationsregler /
   // ML 8 kap require the verifikation to document who attended and why).
   notes?: string,
+  categorization?: { category: TransactionCategory; isBusiness: boolean },
 ): Promise<JournalEntry | null> {
   // Build lines first — throws InvalidMappingResultError on a broken mapping
   // before any period lookup, preserving the original validation order.
@@ -292,6 +294,8 @@ export async function createTransactionJournalEntry(
     description: composedDescription,
     source_type: 'bank_transaction',
     source_id: transaction.id,
+    categorization_category: categorization?.category,
+    categorization_is_business: categorization?.isBusiness,
     lines,
   }
 

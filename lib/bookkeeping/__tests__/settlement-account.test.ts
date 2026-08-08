@@ -40,27 +40,33 @@ describe('resolveSettlementAccount', () => {
     })
   })
 
-  it('falls back to 1930 when cash_account_id does not match any row', async () => {
+  it('fails closed when cash_account_id does not match a company-scoped row', async () => {
     const { supabase, mockResult } = createMockSupabase()
     mockResult({ data: null, error: null })
 
-    const result = await resolveSettlementAccount(supabase as never, 'company-1', 'ca-unknown', noopLog)
-
-    expect(result).toBe('1930')
+    await expect(
+      resolveSettlementAccount(supabase as never, 'company-1', 'ca-unknown', noopLog),
+    ).rejects.toMatchObject({
+      operation: 'resolve_settlement_account',
+      message: expect.stringContaining('ca-unknown'),
+    })
   })
 
-  it('falls back to 1930 and warns when the row has no ledger_account', async () => {
+  it('fails closed and warns when the linked row has no ledger_account', async () => {
     const { supabase, mockResult } = createMockSupabase()
     mockResult({ data: { ledger_account: null }, error: null })
     const warn = vi.fn()
 
-    const result = await resolveSettlementAccount(supabase as never, 'company-1', 'ca-1', {
-      warn,
-    } as unknown as import('@/lib/logger').Logger)
-
-    expect(result).toBe('1930')
+    await expect(
+      resolveSettlementAccount(supabase as never, 'company-1', 'ca-1', {
+        warn,
+      } as unknown as import('@/lib/logger').Logger),
+    ).rejects.toMatchObject({
+      operation: 'resolve_settlement_account',
+      message: expect.stringContaining('ca-1'),
+    })
     expect(warn).toHaveBeenCalledWith(
-      'settlement-account lookup returned no ledger_account; defaulting to 1930',
+      'settlement-account lookup returned no ledger_account; refusing fallback',
       expect.objectContaining({ cashAccountId: 'ca-1' }),
     )
   })

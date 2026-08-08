@@ -122,27 +122,27 @@ export async function evaluateMappingRules(
   if (error || !rules || rules.length === 0) {
     // Try counterparty templates before static template fallback
     const counterpartyResult = await evaluateCounterpartyTemplates(supabase, companyId, transaction, entityType)
-    if (counterpartyResult) return applySettlementAccount(counterpartyResult, bankAccount)
+    if (counterpartyResult) return applySettlementAccount(counterpartyResult, bankAccount, transaction.amount)
 
     const templateResult = evaluateTemplateRules(transaction, entityType)
-    if (templateResult) return applySettlementAccount(templateResult, bankAccount)
+    if (templateResult) return applySettlementAccount(templateResult, bankAccount, transaction.amount)
     return getDefaultResult(transaction, bankAccount)
   }
 
   // Evaluate each rule in priority order
   for (const rule of rules as MappingRule[]) {
     if (matchesRule(rule, transaction)) {
-      return applySettlementAccount(buildResult(rule, transaction, entityType), bankAccount)
+      return applySettlementAccount(buildResult(rule, transaction, entityType), bankAccount, transaction.amount)
     }
   }
 
   // Try counterparty templates before static template fallback
   const counterpartyResult = await evaluateCounterpartyTemplates(supabase, companyId, transaction, entityType)
-  if (counterpartyResult) return applySettlementAccount(counterpartyResult, bankAccount)
+  if (counterpartyResult) return applySettlementAccount(counterpartyResult, bankAccount, transaction.amount)
 
   // Try template-based matching before default fallback
   const templateResult = evaluateTemplateRules(transaction, entityType)
-  if (templateResult) return applySettlementAccount(templateResult, bankAccount)
+  if (templateResult) return applySettlementAccount(templateResult, bankAccount, transaction.amount)
 
   return getDefaultResult(transaction, bankAccount)
 }
@@ -459,17 +459,23 @@ function buildOwnAccountTransferResult(
 }
 
 /**
- * Replace any default 1930 references in a mapping result with the actual settlement account.
- * This allows mapping rules and templates that don't explicitly set a bank account
- * to work correctly with secondary bank accounts (e.g. 1931).
+ * Bind a mapping's semantic settlement leg to the current transaction account.
+ *
+ * The bank leg is determined by cash-flow direction, not by an account-number
+ * heuristic: incoming transactions debit the settlement account and outgoing
+ * transactions credit it. This also rebinds learned rules/templates that store
+ * a concrete account from an earlier transaction, while preserving the other
+ * side of own-account transfers and every non-settlement VAT/business line.
  */
-export function applySettlementAccount(result: MappingResult, bankAccount: string): MappingResult {
-  if (bankAccount === '1930') return result
-  return {
-    ...result,
-    debit_account: result.debit_account === '1930' ? bankAccount : result.debit_account,
-    credit_account: result.credit_account === '1930' ? bankAccount : result.credit_account,
+export function applySettlementAccount(
+  result: MappingResult,
+  bankAccount: string,
+  transactionAmount: number,
+): MappingResult {
+  if (transactionAmount < 0) {
+    return { ...result, credit_account: bankAccount }
   }
+  return { ...result, debit_account: bankAccount }
 }
 
 /**

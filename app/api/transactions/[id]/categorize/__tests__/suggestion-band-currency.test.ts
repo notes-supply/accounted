@@ -35,7 +35,9 @@ function createRecordingSupabase(pages: Record<string, Array<{ data?: unknown; e
   }
 
   const from = (table: string) => {
-    const result = queues[table]?.shift() ?? { data: null, error: null }
+    const result = table === '__rpc'
+      ? { data: true, error: null }
+      : (queues[table]?.shift() ?? { data: null, error: null })
     const calls: Record<string, unknown[][]> = {}
     queries.push({ table, calls })
     const chain: unknown = new Proxy(

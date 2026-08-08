@@ -1,13 +1,7 @@
 /**
  * Tests for POST /api/v1/companies/{companyId}/transactions/{id}/categorize.
  *
- * Focus: the CAS-race compensation. When the transaction update matches no
- * row, the already-posted verifikation is orphaned. The route stornos it; if
- * the storno fails the voucher number stays stranded, and BFNAR 2013:2
- * requires that break in the verifikationsnummerserie to be documented in
- * voucher_gap_explanations. This asserts the insert payload column-for-column:
- * the table has user_id / gap_start / gap_end (all NOT NULL) and no
- * gap_number / created_by.
+ * Focus: settlement provenance and truthful post-attachment compensation.
  */
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -26,10 +20,18 @@ vi.mock('@supabase/supabase-js', async () => {
   return { ...actual, createClient: vi.fn().mockReturnValue({}) }
 })
 
-const { createTxJE, findMissingAccountsMock, reverseEntryMock } = vi.hoisted(() => ({
+const {
+  createTxJE,
+  findMissingAccountsMock,
+  reverseEntryMock,
+  saveUserMappingRuleMock,
+  upsertCounterpartyTemplateMock,
+} = vi.hoisted(() => ({
   createTxJE: vi.fn().mockResolvedValue({ id: 'je-fresh' }),
   findMissingAccountsMock: vi.fn().mockResolvedValue([]),
   reverseEntryMock: vi.fn().mockResolvedValue(undefined),
+  saveUserMappingRuleMock: vi.fn().mockResolvedValue(undefined),
+  upsertCounterpartyTemplateMock: vi.fn().mockResolvedValue(undefined),
 }))
 
 vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
@@ -49,16 +51,17 @@ vi.mock('@/lib/bookkeeping/counterparty-templates', async () => {
   const actual = await vi.importActual<
     typeof import('@/lib/bookkeeping/counterparty-templates')
   >('@/lib/bookkeeping/counterparty-templates')
-  return { ...actual, upsertCounterpartyTemplate: vi.fn().mockResolvedValue(undefined) }
+  return { ...actual, upsertCounterpartyTemplate: upsertCounterpartyTemplateMock }
 })
 vi.mock('@/lib/bookkeeping/mapping-engine', async () => {
   const actual = await vi.importActual<typeof import('@/lib/bookkeeping/mapping-engine')>(
     '@/lib/bookkeeping/mapping-engine',
   )
-  return { ...actual, saveUserMappingRule: vi.fn().mockResolvedValue(undefined) }
+  return { ...actual, saveUserMappingRule: saveUserMappingRuleMock }
 })
 
 import { validateApiKey, createServiceClientNoCookies } from '@/lib/auth/api-keys'
+import { PostCommitReadbackError } from '@/lib/bookkeeping/errors'
 import { POST } from '../route'
 
 const mockValidate = validateApiKey as ReturnType<typeof vi.fn>
@@ -91,11 +94,24 @@ function makeFlexibleSupabase(byTable: Record<string, MockResult | MockResult[]>
     }
     return new Proxy({}, handler)
   }
-  return { supabase: { from: vi.fn((table: string) => buildChain(table)) }, inserts }
+  const supabase = {
+    from: vi.fn((table: string) => buildChain(table)),
+    rpc: vi.fn((fn: string) => buildChain(`rpc:${fn}`)),
+  }
+  return { supabase, inserts }
 }
 
 const COMPANY_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 const TX_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+const compensationSuccess = {
+  data: {
+    status: 'reversed',
+    original_journal_entry_id: 'je-fresh',
+    reversal_journal_entry_ids: ['je-storno'],
+    original_pointer_cleared: true,
+  },
+  error: null,
+}
 
 function makeRequest(body: unknown): Request {
   return new Request(
@@ -115,34 +131,26 @@ function routeParams() {
   return { params: Promise.resolve({ companyId: COMPANY_ID, id: TX_ID }) }
 }
 
-function casRaceSupabase() {
+function casRaceSupabase(compensation: MockResult = compensationSuccess) {
   return makeFlexibleSupabase({
     company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
-    transactions: [
-      // 1: the fetch. 2: the CAS update, matching no row because a concurrent
-      // request stamped journal_entry_id first.
-      {
-        data: {
-          id: TX_ID,
-          company_id: COMPANY_ID,
-          date: '2026-05-12',
-          amount: -349.5,
-          currency: 'SEK',
-          merchant_name: 'ICA',
-          cash_account_id: null,
-          journal_entry_id: null,
-        },
-        error: null,
+    transactions: {
+      data: {
+        id: TX_ID,
+        company_id: COMPANY_ID,
+        date: '2026-05-12',
+        amount: -349.5,
+        currency: 'SEK',
+        merchant_name: 'ICA',
+        cash_account_id: null,
+        journal_entry_id: null,
       },
-      { data: [], error: null },
-    ],
-    company_settings: { data: { entity_type: 'enskild_firma' }, error: null },
-    fiscal_periods: { data: { id: 'period-1', is_closed: false, locked_at: null }, error: null },
-    journal_entries: {
-      data: { fiscal_period_id: 'period-1', voucher_series: 'B', voucher_number: 42 },
       error: null,
     },
-    voucher_gap_explanations: { data: null, error: null },
+    company_settings: { data: { entity_type: 'enskild_firma' }, error: null },
+    fiscal_periods: { data: { id: 'period-1', is_closed: false, locked_at: null }, error: null },
+    'rpc:attach_transaction_categorization': { data: false, error: null },
+    'rpc:compensate_transaction_categorization': compensation,
   })
 }
 
@@ -161,10 +169,225 @@ beforeEach(() => {
 })
 
 describe('POST /api/v1/.../transactions/{id}/categorize CAS race', () => {
-  it('documents the stranded voucher with the real voucher_gap_explanations columns when the storno fails', async () => {
-    const { supabase, inserts } = casRaceSupabase()
+  it('returns a typed database error and creates no voucher when company settings cannot be read', async () => {
+    const { supabase } = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      transactions: {
+        data: {
+          id: TX_ID,
+          company_id: COMPANY_ID,
+          date: '2026-05-12',
+          amount: -349.5,
+          currency: 'SEK',
+          cash_account_id: null,
+          journal_entry_id: null,
+        },
+        error: null,
+      },
+      company_settings: {
+        data: null,
+        error: { message: 'permission denied', code: '42501' },
+      },
+    })
     mockServiceClient.mockReturnValue(supabase)
-    reverseEntryMock.mockRejectedValueOnce(new Error('period locked'))
+
+    const res = await POST(
+      makeRequest({ is_business: false }),
+      routeParams(),
+    )
+    const body = await res.json()
+
+    expect(res.status).toBe(500)
+    expect(body.error).toMatchObject({
+      code: 'BOOKKEEPING_DATABASE_ERROR',
+      details: { operation: 'fetch_company_settings' },
+    })
+    expect(createTxJE).not.toHaveBeenCalled()
+  })
+
+  it('returns exact posted metadata as a no-write idempotent success', async () => {
+    const { supabase } = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      transactions: {
+        data: {
+          id: TX_ID,
+          company_id: COMPANY_ID,
+          date: '2026-05-12',
+          amount: -349.5,
+          currency: 'SEK',
+          journal_entry_id: 'je-posted',
+          category: 'expense_office',
+          is_business: true,
+        },
+        error: null,
+      },
+      journal_entries: {
+        data: {
+          id: 'je-posted',
+          company_id: COMPANY_ID,
+          status: 'posted',
+          source_type: 'bank_transaction',
+          source_id: TX_ID,
+          categorization_category: 'expense_office',
+          categorization_is_business: true,
+        },
+        error: null,
+      },
+    })
+    mockServiceClient.mockReturnValue(supabase)
+
+    const res = await POST(
+      makeRequest({ is_business: true, category: 'expense_office' }),
+      routeParams(),
+    )
+    const body = await res.json()
+
+    expect(res.status).toBe(200)
+    expect(body.data).toMatchObject({
+      journal_entry_id: 'je-posted',
+      category: 'expense_office',
+      already_had_journal_entry: true,
+    })
+    expect(
+      supabase.from.mock.calls.filter(([table]: [string]) => table === 'transactions'),
+    ).toHaveLength(1)
+  })
+
+  it.each([
+    {
+      name: 'category change',
+      request: { is_business: true, category: 'expense_software' },
+      journalCategory: 'expense_office',
+      journalBusiness: true,
+      reason: 'requested_change',
+    },
+    {
+      name: 'legacy null metadata',
+      request: { is_business: true, category: 'expense_office' },
+      journalCategory: null,
+      journalBusiness: null,
+      reason: 'metadata_unprovable',
+    },
+  ])('fails closed for $name on an existing journal', async (testCase) => {
+    const { supabase } = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      transactions: {
+        data: {
+          id: TX_ID,
+          company_id: COMPANY_ID,
+          date: '2026-05-12',
+          amount: -349.5,
+          currency: 'SEK',
+          journal_entry_id: 'je-posted',
+          category: 'expense_office',
+          is_business: true,
+        },
+        error: null,
+      },
+      journal_entries: {
+        data: {
+          id: 'je-posted',
+          company_id: COMPANY_ID,
+          status: 'posted',
+          source_type: 'bank_transaction',
+          source_id: TX_ID,
+          categorization_category: testCase.journalCategory,
+          categorization_is_business: testCase.journalBusiness,
+        },
+        error: null,
+      },
+    })
+    mockServiceClient.mockReturnValue(supabase)
+
+    const res = await POST(makeRequest(testCase.request), routeParams())
+    const body = await res.json()
+
+    expect(res.status).toBe(409)
+    expect(body.error).toMatchObject({
+      code: 'TX_CATEGORIZE_RACE',
+      details: { reason: testCase.reason },
+    })
+    expect(
+      supabase.from.mock.calls.filter(([table]: [string]) => table === 'transactions'),
+    ).toHaveLength(1)
+  })
+
+  it('fails closed when existing journal metadata query errors', async () => {
+    const { supabase } = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      transactions: {
+        data: {
+          id: TX_ID,
+          company_id: COMPANY_ID,
+          journal_entry_id: 'je-posted',
+          category: 'expense_office',
+          is_business: true,
+        },
+        error: null,
+      },
+      journal_entries: { data: null, error: { message: 'read timeout' } },
+    })
+    mockServiceClient.mockReturnValue(supabase)
+
+    const res = await POST(
+      makeRequest({ is_business: true, category: 'expense_office' }),
+      routeParams(),
+    )
+    const body = await res.json()
+
+    expect(res.status).toBe(500)
+    expect(body.error).toMatchObject({
+      code: 'BOOKKEEPING_DATABASE_ERROR',
+      details: { operation: 'verify_existing_transaction_categorization' },
+    })
+    expect(
+      supabase.from.mock.calls.filter(([table]: [string]) => table === 'transactions'),
+    ).toHaveLength(1)
+  })
+
+  it('rejects mapping-affecting input on an existing journal', async () => {
+    const { supabase } = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      transactions: {
+        data: {
+          id: TX_ID,
+          company_id: COMPANY_ID,
+          journal_entry_id: 'je-posted',
+          category: 'expense_office',
+          is_business: true,
+        },
+        error: null,
+      },
+    })
+    mockServiceClient.mockReturnValue(supabase)
+
+    const res = await POST(
+      makeRequest({
+        is_business: true,
+        category: 'expense_office',
+        account_override: '6250',
+      }),
+      routeParams(),
+    )
+    const body = await res.json()
+
+    expect(res.status).toBe(409)
+    expect(body.error).toMatchObject({
+      code: 'TX_CATEGORIZE_RACE',
+      details: {
+        reason: 'mapping_affecting_change',
+        fields: ['account_override'],
+      },
+    })
+    expect(supabase.from).not.toHaveBeenCalledWith('journal_entries')
+  })
+
+  it('surfaces the posted id and writes no voucher gap when storno fails', async () => {
+    const { supabase, inserts } = casRaceSupabase({
+      data: null,
+      error: { message: 'period locked' },
+    })
+    mockServiceClient.mockReturnValue(supabase)
 
     const res = await POST(
       makeRequest({ is_business: true, category: 'expense_office' }),
@@ -173,19 +396,60 @@ describe('POST /api/v1/.../transactions/{id}/categorize CAS race', () => {
 
     const body = await res.json()
     expect(body.error.code).toBe('TX_CATEGORIZE_RACE')
-
-    const gaps = inserts['voucher_gap_explanations'] as Record<string, unknown>[]
-    expect(gaps).toHaveLength(1)
-    // Exhaustive: no gap_number, no created_by, and every NOT NULL column set.
-    expect(gaps[0]).toEqual({
-      company_id: COMPANY_ID,
-      user_id: 'user-1',
-      fiscal_period_id: 'period-1',
-      voucher_series: 'B',
-      gap_start: 42,
-      gap_end: 42,
-      explanation: 'CAS-race orphan; automatisk storno misslyckades. Manuell reconciliation krävs.',
+    expect(body.error.details).toEqual({
+      partial_posted_ids: { journal_entry_id: 'je-fresh' },
     })
+    expect(inserts['voucher_gap_explanations']).toBeUndefined()
+  })
+
+  it('compensates a readback-unverified posting and discloses its durable id', async () => {
+    const { supabase } = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      transactions: {
+        data: {
+          id: TX_ID,
+          company_id: COMPANY_ID,
+          date: '2026-05-12',
+          amount: -349.5,
+          currency: 'SEK',
+          cash_account_id: null,
+          journal_entry_id: null,
+        },
+        error: null,
+      },
+      company_settings: { data: { entity_type: 'enskild_firma' }, error: null },
+      fiscal_periods: { data: { id: 'period-1', is_closed: false, locked_at: null }, error: null },
+      'rpc:compensate_transaction_categorization': {
+        data: null,
+        error: { message: 'compensation timeout' },
+      },
+    })
+    mockServiceClient.mockReturnValue(supabase)
+    createTxJE.mockRejectedValueOnce(
+      new PostCommitReadbackError('je-readback', 42, 'timeout'),
+    )
+
+    const res = await POST(makeRequest({ is_business: false }), routeParams())
+    const body = await res.json()
+
+    expect(res.status).toBe(500)
+    expect(body.error).toMatchObject({
+      code: 'BOOKKEEPING_DATABASE_ERROR',
+      details: {
+        operation: 'commit_entry.readback',
+        journal_entry_id: 'je-readback',
+        voucher_number: 42,
+        partial_posted_ids: { journal_entry_id: 'je-readback' },
+      },
+    })
+    expect(supabase.rpc).toHaveBeenCalledWith(
+      'compensate_transaction_categorization',
+      expect.objectContaining({ p_original_journal_entry_id: 'je-readback' }),
+    )
+    expect(supabase.rpc).not.toHaveBeenCalledWith(
+      'attach_transaction_categorization',
+      expect.anything(),
+    )
   })
 
   it('writes no gap explanation when the storno succeeds (the series stays unbroken)', async () => {
@@ -199,7 +463,129 @@ describe('POST /api/v1/.../transactions/{id}/categorize CAS race', () => {
 
     const body = await res.json()
     expect(body.error.code).toBe('TX_CATEGORIZE_RACE')
-    expect(reverseEntryMock).toHaveBeenCalledTimes(1)
+    expect(reverseEntryMock).not.toHaveBeenCalled()
+    expect(saveUserMappingRuleMock).not.toHaveBeenCalled()
+    expect(upsertCounterpartyTemplateMock).not.toHaveBeenCalled()
+    expect(inserts['voucher_gap_explanations']).toBeUndefined()
+  })
+
+  it('uses exact company-scoped cash-account and ledger provenance', async () => {
+    const { supabase } = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      transactions: {
+        data: {
+          id: TX_ID,
+          company_id: COMPANY_ID,
+          date: '2026-05-12',
+          amount: -349.5,
+          currency: 'SEK',
+          merchant_name: 'ICA',
+          cash_account_id: 'cash-revolut-sek',
+          journal_entry_id: null,
+        },
+        error: null,
+      },
+      company_settings: { data: { entity_type: 'enskild_firma' }, error: null },
+      cash_accounts: { data: { ledger_account: '1931' }, error: null },
+      fiscal_periods: { data: { id: 'period-1', is_closed: false, locked_at: null }, error: null },
+      'rpc:attach_transaction_categorization': { data: true, error: null },
+    })
+    mockServiceClient.mockReturnValue(supabase)
+
+    const res = await POST(
+      makeRequest({ is_business: true, category: 'expense_office' }),
+      routeParams(),
+    )
+
+    expect(res.status).toBe(200)
+    expect(createTxJE).toHaveBeenCalledWith(
+      supabase,
+      COMPANY_ID,
+      'user-1',
+      expect.objectContaining({ id: TX_ID }),
+      expect.objectContaining({ credit_account: '1931' }),
+      undefined,
+      { category: 'expense_office', isBusiness: true },
+    )
+    expect(supabase.rpc).toHaveBeenCalledWith(
+      'attach_transaction_categorization',
+      expect.objectContaining({
+        p_company_id: COMPANY_ID,
+        p_transaction_id: TX_ID,
+        p_expected_cash_account_id: 'cash-revolut-sek',
+        p_expected_settlement_account: '1931',
+        p_expected_journal_entry_id: null,
+        p_journal_entry_id: 'je-fresh',
+      }),
+    )
+    const attachmentOrder = supabase.rpc.mock.invocationCallOrder[0]
+    expect(attachmentOrder).toBeLessThan(saveUserMappingRuleMock.mock.invocationCallOrder[0])
+    expect(attachmentOrder).toBeLessThan(upsertCounterpartyTemplateMock.mock.invocationCallOrder[0])
+  })
+
+  it('returns an ordinary database error without a partial marker when storno succeeds', async () => {
+    const { supabase } = casRaceSupabase()
+    supabase.rpc.mockImplementationOnce(() => ({
+      then: (resolve: (value: unknown) => void) => resolve({
+        data: null,
+        error: { message: 'connection reset', code: '08006' },
+      }),
+    }) as never)
+    mockServiceClient.mockReturnValue(supabase)
+
+    const res = await POST(
+      makeRequest({ is_business: true, category: 'expense_office' }),
+      routeParams(),
+    )
+    const body = await res.json()
+
+    expect(body.error.code).toBe('BOOKKEEPING_DATABASE_ERROR')
+    expect(body.error.details).not.toHaveProperty('partial_posted_ids')
+    expect(reverseEntryMock).not.toHaveBeenCalled()
+    expect(saveUserMappingRuleMock).not.toHaveBeenCalled()
+    expect(upsertCounterpartyTemplateMock).not.toHaveBeenCalled()
+  })
+
+  it('exposes the posted id when database-error storno fails', async () => {
+    const { supabase, inserts } = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      transactions: {
+        data: {
+          id: TX_ID,
+          company_id: COMPANY_ID,
+          date: '2026-05-12',
+          amount: -349.5,
+          currency: 'SEK',
+          merchant_name: 'ICA',
+          cash_account_id: null,
+          journal_entry_id: null,
+        },
+        error: null,
+      },
+      company_settings: { data: { entity_type: 'enskild_firma' }, error: null },
+      fiscal_periods: { data: { id: 'period-1', is_closed: false, locked_at: null }, error: null },
+      'rpc:attach_transaction_categorization': {
+        data: null,
+        error: { message: 'connection reset', code: '08006' },
+      },
+      'rpc:compensate_transaction_categorization': {
+        data: null,
+        error: { message: 'period locked' },
+      },
+    })
+    mockServiceClient.mockReturnValue(supabase)
+
+    const res = await POST(
+      makeRequest({ is_business: true, category: 'expense_office' }),
+      routeParams(),
+    )
+    const body = await res.json()
+
+    expect(body.error.code).toBe('BOOKKEEPING_DATABASE_ERROR')
+    expect(body.error.details).toMatchObject({
+      operation: 'attach_transaction_categorization',
+      partial_posted_ids: { journal_entry_id: 'je-fresh' },
+    })
     expect(inserts['voucher_gap_explanations']).toBeUndefined()
   })
 })

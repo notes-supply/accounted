@@ -18,6 +18,7 @@ import { createLogger } from '@/lib/logger'
 import { roundOre, sumOre } from '@/lib/money'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { buildMappingResultFromCategory } from '@/lib/bookkeeping/category-mapping'
+import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
 import { buildTransactionEntryLines, createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
 import { upsertCounterpartyTemplate, findCounterpartyTemplatesBatch, formatCounterpartyName } from '@/lib/bookkeeping/counterparty-templates'
 import { formatVoucherLabel, hasLiveJournalEntryLink } from '@/lib/transactions/link-journal-entry'
@@ -84,6 +85,7 @@ import { normalizeVatRateToDecimal } from '@/lib/vat/supplier-invoice-line-check
 import { CreateSupplierParamsSchema } from '@/lib/pending-operations/schemas/create-supplier'
 import { accountClassTypeConflict } from '@/lib/pending-operations/schemas/account'
 import { getBASReference } from '@/lib/bookkeeping/bas-reference'
+import { loadCategorizationCompanySettings } from '@/lib/bookkeeping/company-settings'
 import { CreateDimensionValueParamsSchema } from '@/lib/pending-operations/schemas/dimension-value'
 import { RetagLineDimensionsParamsSchema, RETAG_MAX_LINES } from '@/lib/pending-operations/schemas/retag-line-dimensions'
 import { UpdateCompanySettingsParamsSchema } from '@/lib/pending-operations/schemas/company-settings'
@@ -187,7 +189,7 @@ import { appendProcessingHistory } from '@/lib/processing-history/append'
 import { getUserCompanies } from '@/lib/company/context'
 // ensureInitialized() is called by the extension router (ext/[...path]/route.ts)
 // which dispatches to this handler: no duplicate call needed here.
-import type { Transaction, TransactionCategory, EntityType, VatTreatment, Invoice, Currency, CompanySettings, Customer, InvoiceItem, PendingOperation, VatPeriodType, VatDeclarationRutor } from '@/types'
+import type { Transaction, TransactionCategory, VatTreatment, Invoice, Currency, CompanySettings, Customer, InvoiceItem, PendingOperation, VatPeriodType, VatDeclarationRutor } from '@/types'
 
 // ── Actor context ────────────────────────────────────────────
 
@@ -675,6 +677,8 @@ async function categorizeTransactionCore(
   journal_entry_id?: string | null
   journal_entry_error?: string | null
   category: string
+  cash_account_id?: string | null
+  settlement_account?: string
   debit_account: string
   credit_account: string
   amount: number
@@ -774,14 +778,17 @@ async function categorizeTransactionCore(
     }
   }
 
-  // Get entity type
-  const { data: settings } = await supabase
-    .from('company_settings')
-    .select('entity_type, fiscal_year_start_month')
-    .eq('company_id', companyId)
-    .single()
+  const { entityType, fiscalYearStartMonth } = await loadCategorizationCompanySettings(
+    supabase,
+    companyId,
+  )
 
-  const entityType: EntityType = (settings?.entity_type as EntityType) || 'enskild_firma'
+  // Preview the same transaction-specific settlement account the approval
+  // executor will commit. Never show 1930 for a transaction linked to another
+  // cash account (e.g. Revolut SEK 1931).
+  const settlementAccount = await resolveSettlementAccount(
+    supabase, companyId, transaction.cash_account_id ?? null, log,
+  )
 
   // Build mapping
   const mappingResult = buildMappingResultFromCategory(
@@ -790,7 +797,8 @@ async function categorizeTransactionCore(
     isBusiness,
     entityType,
     vatTreatment,
-    vatAmount
+    vatAmount,
+    settlementAccount,
   )
 
   if (!mappingResult.debit_account || !mappingResult.credit_account) {
@@ -811,6 +819,8 @@ async function categorizeTransactionCore(
     return {
       preview: true,
       category,
+      cash_account_id: transaction.cash_account_id ?? null,
+      settlement_account: settlementAccount,
       debit_account: mappingResult.debit_account,
       credit_account: mappingResult.credit_account,
       amount: Math.abs(transaction.amount),
@@ -833,7 +843,6 @@ async function categorizeTransactionCore(
   }
 
   // Ensure fiscal period exists
-  const fiscalYearStartMonth = settings?.fiscal_year_start_month ?? 1
   const txDate = new Date(transaction.date)
   const txMonth = txDate.getMonth() + 1
   const txYear = txDate.getFullYear()
@@ -876,7 +885,9 @@ async function categorizeTransactionCore(
       companyId,
       userId,
       transaction as Transaction,
-      mappingResult
+      mappingResult,
+      undefined,
+      { category, isBusiness },
     )
     if (journalEntry) {
       journalEntryId = journalEntry.id
@@ -4054,6 +4065,8 @@ export const tools: McpTool[] = [
         `Kategorisera: ${txDesc}`,
         {
           transaction_id: args.transaction_id,
+          cash_account_id: result.cash_account_id,
+          settlement_account: result.settlement_account,
           category: args.category,
           vat_treatment: args.vat_treatment || null,
           vat_amount: vatAmount ?? null,

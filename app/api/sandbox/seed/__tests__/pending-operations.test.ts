@@ -42,7 +42,11 @@ describe('sandbox pending-operation seed data', () => {
       invoice_date: '2026-07-25',
       due_date: '2026-08-06',
     })
-    expect(categorize.params).toMatchObject({ transaction_id: 'tx-1' })
+    expect(categorize.params).toMatchObject({
+      transaction_id: 'tx-1',
+      cash_account_id: null,
+      settlement_account: '1930',
+    })
   })
 
   it('gives categorize_transaction the preview shape CategorizePreview reads', () => {

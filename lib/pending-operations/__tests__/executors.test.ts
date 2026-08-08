@@ -74,6 +74,7 @@ vi.mock('@/lib/transactions/categorize-core', async () => {
   return {
     ...actual,
     categorizeMatchedTransaction: vi.fn(),
+    bulkBookMatchedInboxItems: vi.fn(),
   }
 })
 
@@ -107,7 +108,10 @@ import { parseSIEFile } from '@/lib/import/sie-parser'
 import { executeSIEImport } from '@/lib/import/sie-import'
 import { commitAnnualPostings } from '@/lib/bokslut/assets/depreciation-engine'
 import { createCreditNoteJournalEntry } from '@/lib/bookkeeping/invoice-entries'
-import { categorizeMatchedTransaction } from '@/lib/transactions/categorize-core'
+import {
+  bulkBookMatchedInboxItems,
+  categorizeMatchedTransaction,
+} from '@/lib/transactions/categorize-core'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
 
 function makePendingOp(overrides: Partial<PendingOperation>): PendingOperation {
@@ -1186,6 +1190,8 @@ describe('commitPendingOperation: categorize_transaction: dimensions propagation
       params: {
         transaction_id: 'tx-1',
         category: 'office_supplies',
+        cash_account_id: null,
+        settlement_account: '1930',
         dimensions: { '1': 'KS01', '6': 'P001' },
       },
     })
@@ -1215,6 +1221,8 @@ describe('commitPendingOperation: categorize_transaction: dimensions propagation
       params: {
         transaction_id: 'tx-1',
         category: 'office_supplies',
+        cash_account_id: null,
+        settlement_account: '1930',
         // '0' is not a valid SIE dimension number: the whole bag is rejected
         // and booking proceeds without dimensions.
         dimensions: { '0': 'X' },
@@ -1239,12 +1247,76 @@ describe('commitPendingOperation: categorize_transaction: dimensions propagation
 
     const op = makePendingOp({
       operation_type: 'categorize_transaction',
-      params: { transaction_id: 'tx-1', category: 'office_supplies' },
+      params: {
+        transaction_id: 'tx-1',
+        category: 'office_supplies',
+        cash_account_id: null,
+        settlement_account: '1930',
+      },
     })
 
     await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
 
     const opts = vi.mocked(categorizeMatchedTransaction).mock.calls[0][4]
     expect(opts.dimensions).toBeUndefined()
+  })
+})
+
+describe('commitPendingOperation: bulk_book_inbox_items partial settlement failure', () => {
+  it('persists failed_partial with every known original and reversal id', async () => {
+    const postedIds = {
+      journal_entry_id: 'je-original',
+      reversal_journal_entry_id: 'je-reversal',
+    }
+    vi.mocked(bulkBookMatchedInboxItems).mockResolvedValueOnce({
+      booked: [],
+      skipped: [
+        {
+          item_id: '11111111-1111-4111-8111-111111111111',
+          reason: 'error',
+          detail: 'Compensation could not be verified',
+          partial_posted_ids: postedIds,
+        },
+      ],
+      partial_posted_ids: postedIds,
+    })
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null })
+    enqueue({
+      data: {
+        id: 'op-1',
+        company_id: 'company-1',
+        status: 'failed_partial',
+        result_data: { posted_ids: postedIds },
+      },
+      error: null,
+    })
+    const op = makePendingOp({
+      operation_type: 'bulk_book_inbox_items',
+      params: {
+        item_ids: ['11111111-1111-4111-8111-111111111111'],
+        category: 'expense_software',
+      },
+    })
+
+    const result = await commitPendingOperation(
+      supabase as never,
+      'user-1',
+      'company-1',
+      op,
+    )
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      code: 'partial_commit',
+      data: {
+        posted_ids: postedIds,
+        partial_failure_state: {
+          persistence: 'confirmed',
+          operation_status: 'failed_partial',
+        },
+      },
+    })
+    expect(result.status).not.toBe('committed')
   })
 })

@@ -362,6 +362,31 @@ describe('recoverStuckCommittingOperations', () => {
     expect(line?.level).toBe('error')
   })
 
+  it('never recovers a committing row marked as capable of an unpersisted partial failure', async () => {
+    const { supabase, captures, enqueue } = createCapturingSupabase()
+    const { log, calls } = createLogSpy()
+
+    enqueue({
+      data: [
+        makeRow({
+          id: 'op-ambiguous',
+          operation_type: 'categorize_transaction',
+          params: { transaction_id: 'tx-1' },
+          result_data: { commit_in_progress: { partial_failure_possible: true } },
+        }),
+      ],
+    })
+
+    const summary = await recoverStuckCommittingOperations(supabase, { log })
+
+    expect(summary).toEqual({ scanned: 1, committed: 0, rejected: 0, skipped: 1 })
+    expect(captures).toHaveLength(1)
+    const line = calls.find((call) => call.args[0] === 'pending_op_recovery')
+    expect((line?.args[1] as Record<string, unknown>).outcome).toBe(
+      'skipped_partial_failure_ambiguous',
+    )
+  })
+
   it('counts a lost CAS as skipped when a concurrent finalize resolved the row first', async () => {
     const { supabase, enqueue } = createCapturingSupabase()
     const { log, calls } = createLogSpy()

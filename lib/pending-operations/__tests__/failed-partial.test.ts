@@ -136,7 +136,15 @@ describe('match_transaction_invoice: partial commit after the storno', () => {
     enqueue({ data: baseInvoice, error: null }) // invoice fetch
     enqueue({ data: { accounting_method: 'accrual', entity_type: 'aktiebolag' }, error: null }) // settings
     enqueue({ data: null, error: null }) // transactions unlink after storno
-    enqueue({ data: null, error: null }) // dispatcher pending_operations update
+    enqueue({
+      data: {
+        id: 'op-1',
+        company_id: 'company-1',
+        status: 'failed_partial',
+        result_data: { posted_ids: { reversal_journal_entry_id: 'je-storno' } },
+      },
+      error: null,
+    }) // dispatcher pending_operations update
 
     mockCreatePaymentEntry.mockRejectedValue(new JournalEntryNotBalancedError(500, 400))
 
@@ -147,11 +155,20 @@ describe('match_transaction_invoice: partial commit after the storno', () => {
     expect(result.status).toBe('failed')
     expect(result.http_status).toBe(500)
     expect(result.code).toBe('partial_commit')
-    expect(result.data).toEqual({ posted_ids: { reversal_journal_entry_id: 'je-storno' } })
+    expect(result.data).toEqual({
+      posted_ids: { reversal_journal_entry_id: 'je-storno' },
+      partial_failure_state: {
+        persistence: 'confirmed',
+        operation_status: 'failed_partial',
+      },
+    })
 
     const opUpdates = pendingOpUpdates(updates)
     // First write is the atomic claim, second is the terminal status.
-    expect(opUpdates[0]?.payload).toEqual({ status: 'committing' })
+    expect(opUpdates[0]?.payload).toEqual({
+      status: 'committing',
+      result_data: { commit_in_progress: { partial_failure_possible: true } },
+    })
     expect(opUpdates[1]?.payload).toMatchObject({
       status: 'failed_partial',
       result_data: {
@@ -162,6 +179,38 @@ describe('match_transaction_invoice: partial commit after the storno', () => {
     expect(opUpdates[1]?.payload.resolved_at).toBeTruthy()
   })
 
+  it('does not claim failed_partial persistence when the guarded terminal write errors', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null })
+    enqueue({ data: { ...baseTransaction, journal_entry_id: 'je-old' }, error: null })
+    enqueue({ data: baseInvoice, error: null })
+    enqueue({ data: { accounting_method: 'accrual', entity_type: 'aktiebolag' }, error: null })
+    enqueue({ data: null, error: null })
+    enqueue({ data: null, error: { code: '08006', message: 'connection failure' } })
+    enqueue({
+      data: {
+        id: 'op-1',
+        company_id: 'company-1',
+        status: 'committing',
+        result_data: { commit_in_progress: { partial_failure_possible: true } },
+      },
+      error: null,
+    })
+    mockCreatePaymentEntry.mockRejectedValue(new JournalEntryNotBalancedError(500, 400))
+
+    const op = makePendingOp({ params: { transaction_id: 'tx-1', invoice_id: 'inv-1' } })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.code).toBe('partial_commit_persistence_unverified')
+    expect(result.data).toEqual({
+      posted_ids: { reversal_journal_entry_id: 'je-storno' },
+      partial_failure_state: {
+        persistence: 'database_error',
+        operation_status: 'committing',
+      },
+    })
+  })
+
   it('lands failed_partial with the payment JE id when the invoice CAS update matches zero rows', async () => {
     const { supabase, enqueue } = createQueuedMockSupabase()
     const updates = recordUpdates(supabase)
@@ -170,7 +219,15 @@ describe('match_transaction_invoice: partial commit after the storno', () => {
     enqueue({ data: baseInvoice, error: null }) // invoice fetch
     enqueue({ data: { accounting_method: 'accrual', entity_type: 'aktiebolag' }, error: null }) // settings
     enqueue({ data: [], error: null }) // invoice CAS update: zero rows (raced fully-paid)
-    enqueue({ data: null, error: null }) // dispatcher pending_operations update
+    enqueue({
+      data: {
+        id: 'op-1',
+        company_id: 'company-1',
+        status: 'failed_partial',
+        result_data: { posted_ids: { payment_journal_entry_id: 'je-pay' } },
+      },
+      error: null,
+    }) // dispatcher pending_operations update
 
     const op = makePendingOp({ params: { transaction_id: 'tx-1', invoice_id: 'inv-1' } })
     const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
@@ -181,7 +238,13 @@ describe('match_transaction_invoice: partial commit after the storno', () => {
     expect(result.http_status).toBe(409)
     expect(result.auto_rejected).toBeUndefined()
     expect(result.code).toBe('partial_commit')
-    expect(result.data).toEqual({ posted_ids: { payment_journal_entry_id: 'je-pay' } })
+    expect(result.data).toEqual({
+      posted_ids: { payment_journal_entry_id: 'je-pay' },
+      partial_failure_state: {
+        persistence: 'confirmed',
+        operation_status: 'failed_partial',
+      },
+    })
 
     const opUpdates = pendingOpUpdates(updates)
     expect(opUpdates[1]?.payload).toMatchObject({
@@ -293,7 +356,15 @@ describe('credit_invoice: partial commit after the credit note persisted', () =>
       error: null,
     }) // complete credit note fetch
     enqueue({ data: { entity_type: 'aktiebolag', accounting_method: 'accrual' }, error: null }) // settings
-    enqueue({ data: null, error: null }) // dispatcher pending_operations update
+    enqueue({
+      data: {
+        id: 'op-1',
+        company_id: 'company-1',
+        status: 'failed_partial',
+        result_data: { posted_ids: { credit_note_id: 'cn-1', original_invoice_id: 'inv-1' } },
+      },
+      error: null,
+    }) // verified failed_partial update
 
     mockCreateCreditNoteEntry.mockRejectedValue(new JournalEntryNotBalancedError(500, 400))
 
@@ -307,6 +378,10 @@ describe('credit_invoice: partial commit after the credit note persisted', () =>
     expect(result.code).toBe('partial_commit')
     expect(result.data).toEqual({
       posted_ids: { credit_note_id: 'cn-1', original_invoice_id: 'inv-1' },
+      partial_failure_state: {
+        persistence: 'confirmed',
+        operation_status: 'failed_partial',
+      },
     })
 
     const opUpdates = pendingOpUpdates(updates)

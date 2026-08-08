@@ -5,14 +5,22 @@ import { ensureInitialized } from '@/lib/init'
 import { buildMappingResultFromCategory } from '@/lib/bookkeeping/category-mapping'
 import { getTemplateById, buildMappingResultFromTemplate, validateTemplateForEntity } from '@/lib/bookkeeping/booking-templates'
 import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
-import { cancelOrphanedPaymentEntry } from '@/lib/bookkeeping/cancel-orphaned-entry'
+import {
+  attachCategorizedTransaction,
+  compensatePostCommitReadbackFailure,
+} from '@/lib/transactions/settlement-attachment'
+import {
+  existingCategorizationMappingFields,
+  verifyExistingCategorization,
+} from '@/lib/transactions/existing-categorization'
 import { detectBookingDuplicate } from '@/lib/transactions/booking-duplicate-detection'
 import { appendProcessingHistory } from '@/lib/processing-history/append'
 import { saveUserMappingRule, applySettlementAccount } from '@/lib/bookkeeping/mapping-engine'
 import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
+import { loadCategorizationCompanySettings } from '@/lib/bookkeeping/company-settings'
 import { upsertCounterpartyTemplate, buildMappingResultFromCounterpartyTemplate } from '@/lib/bookkeeping/counterparty-templates'
 import { withRouteContext } from '@/lib/api/with-route-context'
-import { errorResponse, errorResponseFromCode } from '@/lib/errors/get-structured-error'
+import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import {
   DUPLICATE_AMOUNT_TOLERANCE_PCT,
   DUPLICATE_DATE_WINDOW_DAYS,
@@ -34,7 +42,7 @@ import type { Logger } from '@/lib/logger'
 import type { CategorizationTemplate } from '@/types'
 import { validateBody } from '@/lib/api/validate'
 import { CategorizeTransactionSchema } from '@/lib/api/schemas'
-import type { Transaction, TransactionCategory, EntityType } from '@/types'
+import type { Transaction, TransactionCategory } from '@/types'
 
 ensureInitialized()
 
@@ -132,18 +140,36 @@ export const POST = withRouteContext(
 
     const txLog = log.child({ transactionId: id })
 
-    // Already-categorized fast path: just update flags, leave the JE alone.
+    // A posted voucher's categorization provenance is immutable. The only
+    // valid fast path is an exact no-op proven against both rows.
     if (transaction.journal_entry_id) {
       const finalCat: TransactionCategory = is_business ? (category || 'uncategorized') : 'private'
-
-      const { error: updateErr } = await supabase
-        .from('transactions')
-        .update({ is_business, category: finalCat })
-        .eq('id', id)
-
-      if (updateErr) {
-        txLog.error('failed to update already-categorized transaction', updateErr)
-        return errorResponse(updateErr, txLog, { requestId })
+      const mappingFields = existingCategorizationMappingFields(body)
+      if (mappingFields.length > 0) {
+        return errorResponseFromCode('TX_CATEGORIZE_RACE', txLog, {
+          requestId,
+          details: { reason: 'mapping_affecting_change', fields: mappingFields },
+        })
+      }
+      const verification = await verifyExistingCategorization(supabase, {
+        companyId,
+        transaction: transaction as Transaction & { journal_entry_id: string },
+        requestedCategory: finalCat,
+        requestedIsBusiness: is_business,
+      })
+      if (!verification.ok) {
+        if (verification.kind === 'database_error') {
+          return errorResponseFromCode('BOOKKEEPING_DATABASE_ERROR', txLog, {
+            requestId,
+            details: {
+              operation: 'verify_existing_transaction_categorization',
+            },
+          })
+        }
+        return errorResponseFromCode('TX_CATEGORIZE_RACE', txLog, {
+          requestId,
+          details: { reason: verification.reason },
+        })
       }
 
       return NextResponse.json({
@@ -155,6 +181,8 @@ export const POST = withRouteContext(
         already_had_journal_entry: true,
       })
     }
+
+    let duplicateDismissalHistory: Parameters<typeof appendProcessingHistory>[0] | null = null
 
     // Booking-time duplicate guard: this transaction is about to become a NEW
     // verifikat. If another transaction on the same date+amount+account is
@@ -207,11 +235,10 @@ export const POST = withRouteContext(
           requestId,
           dismissedTransactionId: candidate.transaction_id,
         })
-        // Persist the dismissal to behandlingshistorik (BFNAR 2013:2 kap 8):         // booking over a DETECTED possible double-booking is a bookkeeping
-        // decision that needs a durable record. Best-effort; never blocks the
-        // booking.
-        try {
-          await appendProcessingHistory({
+        // Prepare the behandlingshistorik record now while the reviewed
+        // candidate is authoritative, but persist it only after the atomic
+        // transaction attachment succeeds.
+        duplicateDismissalHistory = {
             companyId,
             correlationId: id,
             aggregateType: 'BankTransaction',
@@ -237,9 +264,6 @@ export const POST = withRouteContext(
             },
             actor: { type: 'user', id: user.id },
             occurredAt: new Date(),
-          })
-        } catch (logErr) {
-          txLog.error('failed to append duplicate-dismissal behandlingshistorik', logErr as Error)
         }
       }
     } catch (err) {
@@ -252,14 +276,10 @@ export const POST = withRouteContext(
       txLog.warn('booking-time duplicate detection failed (continuing)', err as Error)
     }
 
-    const { data: settings } = await supabase
-      .from('company_settings')
-      .select('entity_type, fiscal_year_start_month')
-      .eq('company_id', companyId)
-      .single()
-
-    const entityType: EntityType = (settings?.entity_type as EntityType) || 'enskild_firma'
-    const fiscalYearStartMonth: number = settings?.fiscal_year_start_month ?? 1
+    const { entityType, fiscalYearStartMonth } = await loadCategorizationCompanySettings(
+      supabase,
+      companyId,
+    )
 
     let finalCategory: TransactionCategory
     if (body.template_id) {
@@ -334,19 +354,17 @@ export const POST = withRouteContext(
       )
     }
 
-    // Book the bank leg against the transaction's ACTUAL settlement account
-    // rather than the hardcoded 1930 in the templates. Without this, interest
-    // or fees that landed on a savings/EUR account mis-book to 1930 and the
-    // real bank line never reconciles. applySettlementAccount only rewrites a
-    // 1930 leg and is a no-op when the settlement account is 1930, so legacy
-    // rows with no cash_account_id behave exactly as before.
+    // Rebind the mapping's semantic bank leg to this transaction's current
+    // settlement account. This also corrects learned mappings that persisted
+    // a concrete account from an earlier transaction, while legacy unbound
+    // rows continue to resolve to 1930.
     const settlementAccount = await resolveSettlementAccount(
       supabase,
       companyId!,
       transaction.cash_account_id,
       txLog,
     )
-    mappingResult = applySettlementAccount(mappingResult, settlementAccount)
+    mappingResult = applySettlementAccount(mappingResult, settlementAccount, transaction.amount)
 
     txLog.info('mapping resolved', {
       debit: mappingResult.debit_account,
@@ -778,6 +796,8 @@ export const POST = withRouteContext(
         user.id,
         transaction as Transaction,
         mappingResult,
+        undefined,
+        { category: finalCategory, isBusiness: is_business },
       )
 
       if (journalEntry) {
@@ -786,6 +806,25 @@ export const POST = withRouteContext(
       }
     } catch (err) {
       txLog.error('failed to create transaction journal entry', err as Error)
+      const postCommitFailure = await compensatePostCommitReadbackFailure(
+        supabase,
+        { companyId, transactionId: id, error: err },
+        txLog,
+      )
+      if (postCommitFailure.handled) {
+        return errorResponseFromCode('BOOKKEEPING_DATABASE_ERROR', txLog, {
+          requestId,
+          details: {
+            operation: 'commit_entry.readback',
+            journal_entry_id: postCommitFailure.journalEntryId,
+            voucher_number: postCommitFailure.voucherNumber,
+            compensation_verified: postCommitFailure.compensationVerified,
+            ...(postCommitFailure.partialPostedIds
+              ? { partial_posted_ids: postCommitFailure.partialPostedIds }
+              : {}),
+          },
+        })
+      }
       // AccountsNotInChartError means an account was deactivated between our
       // pre-validation and the engine call (rare race). Don't fall through to
       // the partial-success path: that would mark the transaction bokförd
@@ -802,8 +841,64 @@ export const POST = withRouteContext(
       journalEntryError = getErrorMessage(err, { context: 'transaction' })
     }
 
-    // direction_mismatch = a mirrored refund/repayment booking; learning it
-    // as a rule would store backwards accounts for the merchant.
+    if (!journalEntryId) {
+      return errorResponseFromCode('BOOKKEEPING_DATABASE_ERROR', txLog, {
+        requestId,
+        details: {
+          operation: 'create_transaction_journal_entry',
+          reason: journalEntryError ?? 'Journal entry creation returned no durable id.',
+        },
+      })
+    }
+
+    const attachment = await attachCategorizedTransaction(
+      supabase,
+      {
+        companyId,
+        userId: user.id,
+        transactionId: id,
+        expectedJournalEntryId: transaction.journal_entry_id ?? null,
+        expectedCashAccountId: transaction.cash_account_id ?? null,
+        expectedSettlementAccount: settlementAccount,
+        isBusiness: is_business,
+        category: finalCategory,
+        journalEntryId,
+      },
+      txLog,
+    )
+
+    if (!attachment.ok && attachment.reason === 'database_error') {
+      txLog.error('failed to attach categorized transaction', attachment.error)
+      return errorResponseFromCode('BOOKKEEPING_DATABASE_ERROR', txLog, {
+        requestId,
+        details: {
+          operation: 'attach_transaction_categorization',
+          ...(attachment.partialPostedIds
+            ? { partial_posted_ids: attachment.partialPostedIds }
+            : {}),
+        },
+      })
+    }
+
+    if (!attachment.ok) {
+      return errorResponseFromCode('TX_CATEGORIZE_RACE', txLog, {
+        requestId,
+        ...(attachment.partialPostedIds
+          ? { details: { partial_posted_ids: attachment.partialPostedIds } }
+          : {}),
+      })
+    }
+
+    if (duplicateDismissalHistory) {
+      try {
+        await appendProcessingHistory(duplicateDismissalHistory)
+      } catch (logErr) {
+        txLog.error('failed to append duplicate-dismissal behandlingshistorik', logErr as Error)
+      }
+    }
+
+    // Learning is best-effort, but only a successfully attached
+    // categorization is evidence for future mappings.
     if (is_business && transaction.merchant_name && !mappingResult.direction_mismatch) {
       try {
         await saveUserMappingRule(
@@ -850,13 +945,9 @@ export const POST = withRouteContext(
         txLog.warn('failed to link receipt document (non-critical)', linkErr as Error)
       }
     } else if (journalEntryId && transaction.document_id) {
-      // Document was pinned to the transaction (via /attach-document or MCP) before
-      // categorization. Propagate the link to the journal entry so
-      // receipt-on-verifikation (BFL 5 kap 6 §) is satisfied. The journal entry has
-      // already been committed at this point, so we can't roll it back; instead
-      // surface a warning in the response so the UI can prompt the user to retry
-      // the link. Supabase JS returns { error } rather than throwing: destructure
-      // and surface it, never swallow silently.
+      // Document was pinned to the transaction before categorization. The
+      // posted journal is now attached successfully, so propagate the link as
+      // a best-effort follow-up and surface a warning if it needs manual repair.
       try {
         const { error: linkErr } = await supabase
           .from('document_attachments')
@@ -896,13 +987,9 @@ export const POST = withRouteContext(
             .eq('company_id', companyId)
         }
 
-        // Reflect the booking back onto the inbox row so it stops appearing as
-        // unmatched. Categorizing here puts the underlag on a verifikation,
-        // which is the inbox's "booked" state. Without this the inbox keeps
-        // offering "Matcha mot transaktion" for an underlag that's already on a
-        // posted entry, while the transactions view (which reads the
-        // doc↔verifikat link) already shows it as attached. Mirrors the
-        // backfill that /attach-document does for the manual paperclip path.
+        // Reflect the booking back onto the inbox row only after the journal
+        // attachment succeeded, so a conflict or compensated failure cannot
+        // leave the inbox pointing at the reversed original voucher.
         await supabase
           .from('invoice_inbox_items')
           .update({
@@ -914,38 +1001,6 @@ export const POST = withRouteContext(
       } catch (inboxErr) {
         txLog.warn('failed to sync inbox item after booking (non-critical)', inboxErr as Error)
       }
-    }
-
-    const { data: updateResult, error: updateError } = await supabase
-      .from('transactions')
-      .update({
-        is_business,
-        category: finalCategory,
-        journal_entry_id: journalEntryId,
-      })
-      .eq('id', id)
-      .is('journal_entry_id', null)
-      .select('id')
-
-    if (updateError) {
-      txLog.error('failed to update transaction', updateError)
-      return errorResponse(updateError, txLog, { requestId })
-    }
-
-    if ((!updateResult || updateResult.length === 0) && journalEntryId) {
-      // CAS guard: another request set journal_entry_id between our read and
-      // write. Cancel the orphaned entry and document the voucher gap through
-      // the shared helper (BFNAR 2013:2), which owns the correct
-      // voucher_gap_explanations column set and logs failures loudly.
-      await cancelOrphanedPaymentEntry(
-        supabase,
-        companyId,
-        user.id,
-        journalEntryId,
-        'Automatiskt makulerad: dubblettbokning förhindrad av samtidighetsskydd',
-      )
-
-      return errorResponseFromCode('TX_CATEGORIZE_RACE', txLog, { requestId })
     }
 
     // Flag any inbox underlag already matched to this transaction as booked.

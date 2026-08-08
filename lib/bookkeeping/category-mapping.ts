@@ -108,7 +108,8 @@ export function getCategoryAccountMapping(
   amount: number,
   isBusiness: boolean,
   entityType: EntityType = 'enskild_firma',
-  vatTreatment?: VatTreatment
+  vatTreatment?: VatTreatment,
+  settlementAccount: string = BANK_ACCOUNT,
 ): CategoryAccountMapping {
   // Private/owner transactions use entity-specific accounts
   // EF: 2013 for withdrawals (uttag), 2018 for deposits (insättningar)
@@ -121,8 +122,8 @@ export function getCategoryAccountMapping(
       privateAccount = PRIVATE_ACCOUNTS[entityType] || PRIVATE_ACCOUNTS.enskild_firma
     }
     return {
-      debitAccount: amount < 0 ? privateAccount : BANK_ACCOUNT,
-      creditAccount: amount < 0 ? BANK_ACCOUNT : privateAccount,
+      debitAccount: amount < 0 ? privateAccount : settlementAccount,
+      creditAccount: amount < 0 ? settlementAccount : privateAccount,
       vatTreatment: null,
       vatDebitAccount: null,
       vatCreditAccount: null,
@@ -145,7 +146,7 @@ export function getCategoryAccountMapping(
       // Incoming refund: bank receives money, expense account is reduced (credited).
       // Ingående moms is reversed: credit 2641 instead of debit.
       return {
-        debitAccount: BANK_ACCOUNT,
+        debitAccount: settlementAccount,
         creditAccount: expenseAccount,
         vatTreatment: resolvedVat,
         vatDebitAccount: null,
@@ -155,7 +156,7 @@ export function getCategoryAccountMapping(
 
     return {
       debitAccount: expenseAccount,
-      creditAccount: BANK_ACCOUNT,
+      creditAccount: settlementAccount,
       vatTreatment: resolvedVat,
       vatDebitAccount: resolvedVat ? '2641' : null, // Debiterad ingående moms
       vatCreditAccount: null,
@@ -187,7 +188,7 @@ export function getCategoryAccountMapping(
     }
 
     return {
-      debitAccount: BANK_ACCOUNT,
+      debitAccount: settlementAccount,
       creditAccount: incomeAccount,
       vatTreatment: resolvedVat,
       vatDebitAccount: null,
@@ -199,14 +200,14 @@ export function getCategoryAccountMapping(
   if (amount < 0) {
     return {
       debitAccount: '6991',
-      creditAccount: BANK_ACCOUNT,
+      creditAccount: settlementAccount,
       vatTreatment: null,
       vatDebitAccount: null,
       vatCreditAccount: null,
     }
   } else {
     return {
-      debitAccount: BANK_ACCOUNT,
+      debitAccount: settlementAccount,
       creditAccount: '3999',
       vatTreatment: null,
       vatDebitAccount: null,
@@ -234,9 +235,12 @@ export function buildMappingResultFromCategory(
   isBusiness: boolean,
   entityType: EntityType = 'enskild_firma',
   vatTreatment?: VatTreatment,
-  vatAmountOverride?: number | null
+  vatAmountOverride?: number | null,
+  settlementAccount: string = BANK_ACCOUNT,
 ): MappingResult {
-  const mapping = getCategoryAccountMapping(category, transaction.amount, isBusiness, entityType, vatTreatment)
+  const mapping = getCategoryAccountMapping(
+    category, transaction.amount, isBusiness, entityType, vatTreatment, settlementAccount,
+  )
 
   const vatLines: VatJournalLine[] = []
 
