@@ -94,6 +94,7 @@ function makeRecordingSupabase(opts: {
   const deleteOrFilters: string[] = []
   const deleteEqFilters: Array<[string, unknown]> = []
   const deleteIsFilters: Array<[string, unknown]> = []
+  const fiscalPeriodEqFilters: Array<[string, unknown]> = []
   let insertPayload: Array<Record<string, unknown>> | null = null
 
   const from = vi.fn((table: string) => {
@@ -121,6 +122,9 @@ function makeRecordingSupabase(opts: {
     })
     chain.eq = vi.fn((column: string, value: unknown) => {
       if (isDelete) deleteEqFilters.push([column, value])
+      if (!isDelete && table === 'fiscal_periods') {
+        fiscalPeriodEqFilters.push([column, value])
+      }
       return chain
     })
     chain.or = vi.fn((filter: string) => {
@@ -167,6 +171,7 @@ function makeRecordingSupabase(opts: {
     getDeleteOrFilters: () => deleteOrFilters,
     getDeleteEqFilters: () => deleteEqFilters,
     getDeleteIsFilters: () => deleteIsFilters,
+    getFiscalPeriodEqFilters: () => fiscalPeriodEqFilters,
     getInsertPayload: () => insertPayload,
   }
 }
@@ -281,6 +286,167 @@ describe('generateTaxDeadlinesForUser', () => {
       expect(annual).toHaveLength(1)
       expect(annual[0].linked_report_period).toEqual(expect.objectContaining({
         fiscalPeriodId: 'fp-pending',
+      }))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('maps a completed legacy calendar-year VAT row to its unique fiscal period', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-18T00:00:00Z'))
+    try {
+      const {
+        supabase,
+        getInsertPayload,
+        getDeleteEqFilters,
+        getDeleteIsFilters,
+        getFiscalPeriodEqFilters,
+      } = makeRecordingSupabase({
+        fiscalPeriods: [{
+          id: 'fp-calendar-2025',
+          name: 'Calendar 2025',
+          period_start: '2025-01-01',
+          period_end: '2025-12-31',
+        }],
+        completedRows: [{
+          tax_deadline_type: 'moms_yearly',
+          tax_period: '2025',
+          linked_report_period: { year: 2025 },
+        }],
+      })
+
+      await generateTaxDeadlinesForUser(supabase, 'company-1', {
+        ...SETTINGS,
+        moms_period: 'yearly',
+      }, [2026])
+
+      expect(getInsertPayload()!.filter(
+        (row) => row.tax_deadline_type === 'moms_yearly',
+      )).toHaveLength(0)
+      expect(getDeleteEqFilters()).toContainEqual(['is_completed', false])
+      expect(getDeleteIsFilters()).toContainEqual(['dismissed_at', null])
+      expect(getFiscalPeriodEqFilters()).toContainEqual(['company_id', 'company-1'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('maps a dismissed legacy broken-fiscal-year VAT row to its unique fiscal period', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-18T00:00:00Z'))
+    try {
+      const { supabase, getInsertPayload } = makeRecordingSupabase({
+        fiscalPeriods: [{
+          id: 'fp-broken-2026',
+          name: 'Broken 2025/2026',
+          period_start: '2025-07-01',
+          period_end: '2026-06-30',
+        }],
+        completedRows: [{
+          tax_deadline_type: 'moms_yearly',
+          tax_period: '2025/2026',
+          linked_report_period: { startYear: 2025, endYear: 2026 },
+        }],
+      })
+
+      await generateTaxDeadlinesForUser(supabase, 'company-1', {
+        ...SETTINGS,
+        moms_period: 'yearly',
+        fiscal_year_start_month: 7,
+      }, [2027])
+
+      expect(getInsertPayload()!.filter(
+        (row) => row.tax_deadline_type === 'moms_yearly',
+      )).toHaveLength(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not map a legacy annual row when same-end-year fiscal periods are ambiguous', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-18T00:00:00Z'))
+    try {
+      const { supabase, getInsertPayload } = makeRecordingSupabase({
+        fiscalPeriods: [
+          {
+            id: 'fp-first-2026',
+            name: 'First short 2026',
+            period_start: '2026-01-01',
+            period_end: '2026-03-31',
+          },
+          {
+            id: 'fp-second-2026',
+            name: 'Second short 2026',
+            period_start: '2026-04-01',
+            period_end: '2026-06-30',
+          },
+        ],
+        completedRows: [{
+          tax_deadline_type: 'moms_yearly',
+          tax_period: '2026',
+          linked_report_period: { year: 2026 },
+        }],
+      })
+
+      await generateTaxDeadlinesForUser(supabase, 'company-1', {
+        ...SETTINGS,
+        moms_period: 'yearly',
+      }, [2026, 2027])
+
+      const annual = getInsertPayload()!.filter(
+        (row) => row.tax_deadline_type === 'moms_yearly',
+      )
+      expect(annual).toHaveLength(2)
+      expect(annual.map((row) =>
+        (row.linked_report_period as { fiscalPeriodId: string }).fiscalPeriodId,
+      )).toEqual(['fp-first-2026', 'fp-second-2026'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not reinterpret monthly, quarterly, or non-VAT preserved rows as annual VAT', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-18T00:00:00Z'))
+    try {
+      const { supabase, getInsertPayload } = makeRecordingSupabase({
+        fiscalPeriods: [{
+          id: 'fp-calendar-2025',
+          name: 'Calendar 2025',
+          period_start: '2025-01-01',
+          period_end: '2025-12-31',
+        }],
+        completedRows: [
+          {
+            tax_deadline_type: 'moms_monthly',
+            tax_period: '2025-12',
+            linked_report_period: { year: 2025, month: 12 },
+          },
+          {
+            tax_deadline_type: 'moms_quarterly',
+            tax_period: '2025-Q4',
+            linked_report_period: { year: 2025, quarter: 4 },
+          },
+          {
+            tax_deadline_type: 'f_skatt',
+            tax_period: '2025-12',
+            linked_report_period: { year: 2025, month: 12 },
+          },
+        ],
+      })
+
+      await generateTaxDeadlinesForUser(supabase, 'company-1', {
+        ...SETTINGS,
+        moms_period: 'yearly',
+      }, [2026])
+
+      expect(getInsertPayload()).toContainEqual(expect.objectContaining({
+        tax_deadline_type: 'moms_yearly',
+        linked_report_period: expect.objectContaining({
+          fiscalPeriodId: 'fp-calendar-2025',
+        }),
       }))
     } finally {
       vi.useRealTimers()
@@ -1090,6 +1256,46 @@ describe('findSettingsMissingUpcomingDeadlines', () => {
       years,
       fromDate,
     )).toEqual(settings)
+  })
+
+  it('treats a uniquely mapped legacy annual VAT row as satisfied during recovery', () => {
+    const annualSettings = {
+      ...SETTINGS,
+      company_id: 'company-1',
+      moms_period: 'yearly' as const,
+      preliminary_tax_monthly: null,
+      pays_salaries: false,
+      employer_registered: false,
+      fiscal_periods: [{
+        id: 'fp-calendar-2029',
+        name: 'Calendar 2029',
+        period_start: '2029-01-01',
+        period_end: '2029-12-31',
+      }],
+    }
+    const legacyCompletedRow = {
+      id: 'legacy-annual-completed',
+      company_id: 'company-1',
+      tax_deadline_type: 'moms_yearly',
+      tax_period: '2029',
+      due_date: '2030-08-12',
+      is_completed: true,
+      dismissed_at: null,
+      linked_report_period: { year: 2029 },
+    }
+    const nonAnnualRows = rowsFor(
+      'company-1',
+      new Set(Array.from(
+        getExpectedUpcomingDeadlineKeys(annualSettings, years, fromDate),
+      ).filter((key) => !key.startsWith('moms_yearly:'))),
+    )
+
+    expect(findSettingsMissingUpcomingDeadlines(
+      [annualSettings],
+      [legacyCompletedRow, ...nonAnnualRows],
+      years,
+      fromDate,
+    )).toEqual([])
   })
 
   it('repairs a company whose rows carry dates from a superseded schedule', () => {

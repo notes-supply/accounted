@@ -179,7 +179,8 @@ export function parseVatSubmissionState(value: unknown): VatSubmissionState {
       period.period,
     )
     if (
-      exactState.resolvedPeriodStart !== expectedBounds.start ||
+      exactState.resolvedPeriodStart < expectedBounds.start ||
+      exactState.resolvedPeriodStart > expectedBounds.end ||
       exactState.resolvedPeriodEnd !== expectedBounds.end ||
       exactState.redovisningsperiod !== expectedRemotePeriod
     ) {
@@ -197,7 +198,9 @@ export function parseVatSubmissionState(value: unknown): VatSubmissionState {
     month: endMonth,
   })
   if (
-    exactState.fiscalPeriodStart !== exactState.resolvedPeriodStart ||
+    exactState.fiscalPeriodStart > exactState.fiscalPeriodEnd ||
+    exactState.resolvedPeriodStart < exactState.fiscalPeriodStart ||
+    exactState.resolvedPeriodStart > exactState.fiscalPeriodEnd ||
     exactState.fiscalPeriodEnd !== exactState.resolvedPeriodEnd ||
     period.year !== endYear ||
     exactState.redovisningsperiod !== expectedRemotePeriod

@@ -9,6 +9,7 @@ import type { TaxDeadlineType, DeadlineStatus } from '@/types'
 
 const log = createLogger('deadline-generator')
 import {
+  getActualFiscalPeriodLabel,
   getApplicableDeadlineConfigs,
   type CompanySettingsForDeadlines,
   type DeadlineInstance,
@@ -437,6 +438,111 @@ function deadlineObligationKey(
     : `${type}:${period}`
 }
 
+interface PreservedDeadlineIdentityRow {
+  tax_deadline_type: string | null
+  tax_period: string | null
+  linked_report_period: Record<string, unknown> | null
+}
+
+function hasOwnField(value: Record<string, unknown>, field: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, field)
+}
+
+function legacyAnnualVatYears(
+  row: PreservedDeadlineIdentityRow,
+): { startYear: number; endYear: number } | null {
+  if (
+    row.tax_deadline_type !== 'moms_yearly' ||
+    fiscalPeriodIdFromLinkedPeriod(row.linked_report_period)
+  ) {
+    return null
+  }
+
+  const linked = row.linked_report_period
+  if (linked && hasOwnField(linked, 'fiscalPeriodId')) return null
+
+  const startYears: number[] = []
+  const endYears: number[] = []
+  const calendarMatch = /^(\d{4})$/.exec(row.tax_period ?? '')
+  const brokenMatch = /^(\d{4})\/(\d{4})$/.exec(row.tax_period ?? '')
+  if (calendarMatch) {
+    const year = Number(calendarMatch[1])
+    startYears.push(year)
+    endYears.push(year)
+  } else if (brokenMatch) {
+    startYears.push(Number(brokenMatch[1]))
+    endYears.push(Number(brokenMatch[2]))
+  } else {
+    return null
+  }
+
+  if (linked) {
+    if (hasOwnField(linked, 'year')) {
+      if (!Number.isInteger(linked.year)) return null
+      startYears.push(linked.year as number)
+      endYears.push(linked.year as number)
+    }
+
+    const hasStartYear = hasOwnField(linked, 'startYear')
+    const hasEndYear = hasOwnField(linked, 'endYear')
+    if (hasStartYear !== hasEndYear) return null
+    if (hasStartYear) {
+      if (!Number.isInteger(linked.startYear) || !Number.isInteger(linked.endYear)) {
+        return null
+      }
+      startYears.push(linked.startYear as number)
+      endYears.push(linked.endYear as number)
+    }
+  }
+
+  const uniqueStartYears = new Set(startYears)
+  const uniqueEndYears = new Set(endYears)
+  if (uniqueStartYears.size !== 1 || uniqueEndYears.size !== 1) return null
+
+  return {
+    startYear: startYears[0],
+    endYear: endYears[0],
+  }
+}
+
+function resolveLegacyAnnualVatFiscalPeriod(
+  row: PreservedDeadlineIdentityRow,
+  fiscalPeriods: FiscalPeriodForDeadlines[],
+): FiscalPeriodForDeadlines | null {
+  const years = legacyAnnualVatYears(row)
+  if (!years) return null
+
+  const candidates = fiscalPeriods.filter((period) =>
+    /^\d{4}-\d{2}-\d{2}$/.test(period.period_start) &&
+    /^\d{4}-\d{2}-\d{2}$/.test(period.period_end) &&
+    period.period_start <= period.period_end &&
+    Number(period.period_start.slice(0, 4)) === years.startYear &&
+    Number(period.period_end.slice(0, 4)) === years.endYear,
+  )
+
+  const exactBoundsMatches = candidates.filter((period) =>
+    getActualFiscalPeriodLabel(period.period_start, period.period_end) === row.tax_period,
+  )
+  const matches = exactBoundsMatches.length > 0 ? exactBoundsMatches : candidates
+  return matches.length === 1 ? matches[0] : null
+}
+
+function preservedDeadlineObligationKeys(
+  row: PreservedDeadlineIdentityRow,
+  fiscalPeriods: FiscalPeriodForDeadlines[],
+): string[] {
+  const keys = [deadlineObligationKey(
+    row.tax_deadline_type,
+    row.tax_period,
+    row.linked_report_period,
+  )]
+  const fiscalPeriod = resolveLegacyAnnualVatFiscalPeriod(row, fiscalPeriods)
+  if (fiscalPeriod) {
+    keys.push(`moms_yearly:fiscal-period:${fiscalPeriod.id}`)
+  }
+  return keys
+}
+
 /**
  * Generate all tax deadlines for a user based on their company settings
  */
@@ -534,19 +640,12 @@ export async function generateTaxDeadlinesForUser(
     throw preservedRowsError
   }
 
-  const completedKeys = new Set(
-    (preservedRows ?? []).map(
-      (row: {
-        tax_deadline_type: string | null
-        tax_period: string | null
-        linked_report_period: Record<string, unknown> | null
-      }) => deadlineObligationKey(
-        row.tax_deadline_type,
-        row.tax_period,
-        row.linked_report_period,
-      ),
-    ),
-  )
+  const completedKeys = new Set<string>()
+  for (const row of (preservedRows ?? []) as PreservedDeadlineIdentityRow[]) {
+    for (const key of preservedDeadlineObligationKeys(row, settings.fiscal_periods ?? [])) {
+      completedKeys.add(key)
+    }
+  }
 
   // Everything the user (or the status flow) put on the rows about to be
   // replaced, keyed by the same tax_deadline_type:tax_period identity the
@@ -880,19 +979,6 @@ function deadlineIdentity(
   return `${deadlineObligationKey(type, period, linkedReportPeriod)}:${dueDate}`
 }
 
-// Completed and dismissed rows use the looser type:period identity (no due
-// date): a filed or opted-out obligation is satisfied even when its stored
-// date comes from a superseded schedule, and the generator never replaces
-// either kind, so flagging them by date would make the repair loop re-run
-// for the same company every day without ever converging.
-function completedIdentity(
-  type: string | null,
-  period: string | null,
-  linkedReportPeriod?: Record<string, unknown> | null,
-): string {
-  return deadlineObligationKey(type, period, linkedReportPeriod)
-}
-
 export function getExpectedUpcomingDeadlineKeys(
   settings: CompanySettingsForDeadlines,
   years: number[] = [],
@@ -950,6 +1036,9 @@ export function findSettingsMissingUpcomingDeadlines(
 ): DeadlineSettingsRow[] {
   const actualKeysByCompany = new Map<string, Set<string>>()
   const completedKeysByCompany = new Map<string, Set<string>>()
+  const settingsByCompany = new Map(
+    settingsRows.map((settings) => [settings.company_id, settings]),
+  )
   for (const row of upcomingDeadlineRows) {
     const keys = actualKeysByCompany.get(row.company_id) ?? new Set<string>()
     keys.add(deadlineIdentity(
@@ -962,11 +1051,13 @@ export function findSettingsMissingUpcomingDeadlines(
 
     if (row.is_completed || row.dismissed_at) {
       const completed = completedKeysByCompany.get(row.company_id) ?? new Set<string>()
-      completed.add(completedIdentity(
-        row.tax_deadline_type,
-        row.tax_period,
-        row.linked_report_period,
-      ))
+      const companySettings = settingsByCompany.get(row.company_id)
+      for (const key of preservedDeadlineObligationKeys(
+        row,
+        companySettings?.fiscal_periods ?? [],
+      )) {
+        completed.add(key)
+      }
       completedKeysByCompany.set(row.company_id, completed)
     }
   }
