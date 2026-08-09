@@ -977,6 +977,7 @@ export const ARCHIVE_EXCLUDED_TABLES: Record<string, string> = {
   stripe_connections: 'Stripe OAuth state (secrets)',
   stripe_payment_events: 'mirror of Stripe data, re-fetchable at source',
   stripe_payouts: 'mirror of Stripe data, re-fetchable at source',
+  transaction_categorization_event_outbox: 'internal durable event publication state; payload duplicates journal entries',
   webhook_deliveries: 'automation delivery log',
   webhooks: 'automation config with signing secrets',
 }

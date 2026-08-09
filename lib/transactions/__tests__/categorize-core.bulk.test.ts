@@ -371,6 +371,10 @@ describe('bulkBookMatchedInboxItems: booking', () => {
           original_journal_entry_id: 'je-original',
           reversal_journal_entry_ids: ['je-reversal'],
           original_pointer_cleared: true,
+          event_outbox_ids: [
+            'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+            'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+          ],
         },
         error: null,
       },
@@ -394,6 +398,20 @@ describe('bulkBookMatchedInboxItems: booking', () => {
           status: 'posted',
           reverses_id: 'je-original',
           lines: [],
+        },
+        error: null,
+      },
+      {
+        data: {
+          status: 'published',
+          original_journal_entry_id: 'je-original',
+          reversal_journal_entry_id: 'je-reversal',
+          event_outbox_ids: [
+            'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+            'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+          ],
+          event_log_count: 2,
+          webhook_delivery_count: 0,
         },
         error: null,
       },

@@ -304,6 +304,7 @@ export type BookkeepingOperation =
   | 'fetch_company_settings'
   | 'attach_transaction_categorization'
   | 'compensate_transaction_categorization'
+  | 'publish_transaction_compensation_events'
   | 'verify_transaction_compensation'
   | 'verify_existing_transaction_categorization'
 

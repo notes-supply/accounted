@@ -830,6 +830,16 @@ interface TransactionCategorizationCompensationData {
   original_journal_entry_id: string
   reversal_journal_entry_ids: string[]
   original_pointer_cleared: boolean
+  event_outbox_ids: string[]
+}
+
+interface TransactionCompensationPublicationData {
+  status: 'published' | 'already_published'
+  original_journal_entry_id: string
+  reversal_journal_entry_id: string
+  event_outbox_ids: string[]
+  event_log_count: number
+  webhook_delivery_count: number
 }
 
 export type TransactionCategorizationCompensationResult =
@@ -859,17 +869,44 @@ function reportedReversalIds(data: unknown): string[] {
     : []
 }
 
+function reportedOutboxIds(data: unknown): string[] {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return []
+  const ids = (data as Record<string, unknown>).event_outbox_ids
+  return Array.isArray(ids)
+    ? ids.filter((id): id is string => typeof id === 'string' && id.length > 0)
+    : []
+}
+
 function compensationPostedIds(
   originalJournalEntryId: string,
-  data: unknown,
+  ...reportedData: unknown[]
 ): Record<string, string> {
   const ids: Record<string, string> = { journal_entry_id: originalJournalEntryId }
-  const reportedOriginalId = reportedStringField(data, 'original_journal_entry_id')
-  if (reportedOriginalId && reportedOriginalId !== originalJournalEntryId) {
-    ids.reported_original_journal_entry_id = reportedOriginalId
-  }
-  reportedReversalIds(data).forEach((id, index) => {
+  const reportedOriginalIds = [...new Set(
+    reportedData
+      .map((data) => reportedStringField(data, 'original_journal_entry_id'))
+      .filter((id): id is string => id !== null && id !== originalJournalEntryId),
+  )]
+  reportedOriginalIds.forEach((id, index) => {
+    ids[index === 0
+      ? 'reported_original_journal_entry_id'
+      : `reported_original_journal_entry_${index + 1}_id`] = id
+  })
+  const reversalIds = [...new Set(reportedData.flatMap((data) => {
+    const ids = reportedReversalIds(data)
+    const singular = reportedStringField(data, 'reversal_journal_entry_id')
+    return singular ? [...ids, singular] : ids
+  }))]
+  reversalIds.forEach((id, index) => {
     ids[index === 0 ? 'reversal_journal_entry_id' : `reversal_journal_entry_${index + 1}_id`] = id
+  })
+  const outboxIds = [...new Set(reportedData.flatMap(reportedOutboxIds))]
+  outboxIds.forEach((id, index) => {
+    ids[index === 0
+      ? 'committed_event_outbox_id'
+      : index === 1
+        ? 'reversed_event_outbox_id'
+        : `event_outbox_${index + 1}_id`] = id
   })
   return ids
 }
@@ -886,11 +923,32 @@ function parseTransactionCategorizationCompensation(
     typeof row.original_journal_entry_id !== 'string' ||
     !Array.isArray(row.reversal_journal_entry_ids) ||
     !row.reversal_journal_entry_ids.every((id) => typeof id === 'string') ||
-    typeof row.original_pointer_cleared !== 'boolean'
+    typeof row.original_pointer_cleared !== 'boolean' ||
+    !Array.isArray(row.event_outbox_ids) ||
+    !row.event_outbox_ids.every((id) => typeof id === 'string')
   ) {
     return null
   }
   return row as unknown as TransactionCategorizationCompensationData
+}
+
+function parseTransactionCompensationPublication(
+  data: unknown,
+): TransactionCompensationPublicationData | null {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null
+  const row = data as Record<string, unknown>
+  if (
+    !['published', 'already_published'].includes(String(row.status)) ||
+    typeof row.original_journal_entry_id !== 'string' ||
+    typeof row.reversal_journal_entry_id !== 'string' ||
+    !Array.isArray(row.event_outbox_ids) ||
+    !row.event_outbox_ids.every((id) => typeof id === 'string') ||
+    typeof row.event_log_count !== 'number' ||
+    typeof row.webhook_delivery_count !== 'number'
+  ) {
+    return null
+  }
+  return row as unknown as TransactionCompensationPublicationData
 }
 
 function databaseCause(error: unknown): string {
@@ -904,12 +962,16 @@ function databaseCause(error: unknown): string {
 function unverifiedTransactionCompensation(
   originalJournalEntryId: string,
   data: unknown,
-  operation: 'compensate_transaction_categorization' | 'verify_transaction_compensation',
+  operation:
+    | 'compensate_transaction_categorization'
+    | 'publish_transaction_compensation_events'
+    | 'verify_transaction_compensation',
   cause: string,
+  additionalData?: unknown,
 ): TransactionCategorizationCompensationResult {
   return {
     compensationVerified: false,
-    partialPostedIds: compensationPostedIds(originalJournalEntryId, data),
+    partialPostedIds: compensationPostedIds(originalJournalEntryId, data, additionalData),
     error: new BookkeepingDatabaseError(operation, cause),
   }
 }
@@ -935,12 +997,11 @@ async function hydrateTransactionCompensationEntry(
  * Atomically compensates the exact journal written for transaction
  * categorization while retaining engine-owned journal event semantics.
  *
- * A newly completed compensation, including adoption of a sole existing
- * reversal, emits the same committed and reversed payloads as reverseEntry.
- * An already_reversed retry verifies and hydrates the durable pair but does
- * not replay events. This gives normal retries idempotent event behavior. If
- * event publication previously failed, the unverified result and posted IDs
- * remain explicit for manual recovery instead of reporting false success.
+ * Both reverseEntry-shaped events are created in an outbox by the atomic
+ * compensation RPC. Every successful call, including already_reversed,
+ * reconciles that outbox into event_log and webhook_deliveries through a
+ * second atomic, idempotent RPC. This closes both response-loss boundaries
+ * without replaying the best-effort in-process EventBus handlers.
  */
 export async function compensateTransactionCategorization(
   supabase: SupabaseClient,
@@ -981,6 +1042,8 @@ export async function compensateTransactionCategorization(
     !compensation ||
     compensation.original_journal_entry_id !== params.originalJournalEntryId ||
     compensation.reversal_journal_entry_ids.length !== 1 ||
+    compensation.event_outbox_ids.length !== 2 ||
+    new Set(compensation.event_outbox_ids).size !== 2 ||
     !compensation.original_pointer_cleared
   ) {
     return unverifiedTransactionCompensation(
@@ -1040,36 +1103,51 @@ export async function compensateTransactionCategorization(
     )
   }
 
-  if (compensation.status !== 'already_reversed') {
-    try {
-      await eventBus.emit({
-        type: 'journal_entry.committed',
-        payload: { entry: reversalEntry, userId: params.userId, companyId: params.companyId },
-      })
-      await eventBus.emit({
-        type: 'journal_entry.reversed',
-        payload: {
-          originalEntry,
-          reversalEntry,
-          userId: params.userId,
-          companyId: params.companyId,
-        },
-      })
-    } catch (error) {
-      log.error('transaction categorization compensation event publication failed', error as Error, {
-        operation: 'verify_transaction_compensation',
-        companyId: params.companyId,
-        entityType: 'journal_entry',
-        entityId: params.originalJournalEntryId,
-        reversalJournalEntryId,
-      })
+  let publicationData: unknown = null
+  try {
+    const { data, error } = await supabase.rpc('publish_transaction_compensation_events', {
+      p_company_id: params.companyId,
+      p_transaction_id: params.transactionId,
+      p_original_journal_entry_id: params.originalJournalEntryId,
+    })
+    publicationData = data
+    if (error) {
       return unverifiedTransactionCompensation(
         params.originalJournalEntryId,
         rpcData,
-        'verify_transaction_compensation',
+        'publish_transaction_compensation_events',
         databaseCause(error),
+        publicationData,
       )
     }
+  } catch (error) {
+    return unverifiedTransactionCompensation(
+      params.originalJournalEntryId,
+      rpcData,
+      'publish_transaction_compensation_events',
+      databaseCause(error),
+      publicationData,
+    )
+  }
+
+  const publication = parseTransactionCompensationPublication(publicationData)
+  const publicationMatches =
+    publication &&
+    publication.original_journal_entry_id === params.originalJournalEntryId &&
+    publication.reversal_journal_entry_id === reversalJournalEntryId &&
+    publication.event_log_count === 2 &&
+    publication.webhook_delivery_count >= 0 &&
+    publication.event_outbox_ids.length === 2 &&
+    publication.event_outbox_ids.every((id, index) => id === compensation.event_outbox_ids[index])
+
+  if (!publicationMatches) {
+    return unverifiedTransactionCompensation(
+      params.originalJournalEntryId,
+      rpcData,
+      'publish_transaction_compensation_events',
+      `Unverifiable compensation publication result: ${JSON.stringify(publicationData)}`,
+      publicationData,
+    )
   }
 
   return {

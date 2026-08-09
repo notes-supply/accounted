@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import {
   insertAuthUser,
@@ -13,11 +16,48 @@ const COMPENSATE_SQL = `
   SELECT public.compensate_transaction_categorization($1, $2, $3) AS result
 `
 
+const PUBLISH_SQL = `
+  SELECT public.publish_transaction_compensation_events($1, $2, $3) AS result
+`
+
+const MIGRATION_PATH = join(
+  process.cwd(),
+  'supabase/migrations/20260809100000_transaction_compensation_event_outbox.sql',
+)
+
 interface CompensationResult {
   status: string
   original_journal_entry_id: string
   reversal_journal_entry_ids: string[]
   original_pointer_cleared: boolean
+  event_outbox_ids: string[]
+}
+
+async function readOutbox(originalId: string) {
+  return getPool().query<{
+    id: string
+    event_type: string
+    payload: Record<string, unknown>
+    published_at: string | null
+  }>(
+    `SELECT id, event_type, payload, published_at
+       FROM public.transaction_categorization_event_outbox
+      WHERE original_journal_entry_id = $1
+      ORDER BY event_type`,
+    [originalId],
+  )
+}
+
+async function insertWebhook(companyId: string, eventType: string): Promise<string> {
+  const id = randomUUID()
+  await getPool().query(
+    `INSERT INTO public.webhooks
+       (id, company_id, name, event_type, webhook_url, secret, active)
+     VALUES ($1, $2, 'compensation-test', $3,
+             'https://example.com/compensation', $4, true)`,
+    [id, companyId, eventType, `whsec_${randomUUID().replaceAll('-', '')}`],
+  )
+  return id
 }
 
 async function seedCategorizedVoucher(options: {
@@ -158,6 +198,25 @@ describe('compensate_transaction_categorization', () => {
     ])
     expect(pointer.rows[0]?.journal_entry_id).toBeNull()
 
+    const outbox = await readOutbox(seeded.originalId)
+    expect(outbox.rows).toHaveLength(2)
+    expect(outbox.rows.map((row) => row.event_type)).toEqual([
+      'journal_entry.committed',
+      'journal_entry.reversed',
+    ])
+    expect(result.event_outbox_ids).toEqual(outbox.rows.map((row) => row.id))
+    expect(outbox.rows[0]?.payload).toMatchObject({
+      entry: { id: result.reversal_journal_entry_ids[0], company_id: seeded.companyId },
+      userId: seeded.userId,
+      companyId: seeded.companyId,
+    })
+    expect(outbox.rows[1]?.payload).toMatchObject({
+      originalEntry: { id: seeded.originalId, company_id: seeded.companyId },
+      reversalEntry: { id: result.reversal_journal_entry_ids[0], company_id: seeded.companyId },
+      userId: seeded.userId,
+      companyId: seeded.companyId,
+    })
+
     const reversedLines = await getPool().query<{
       account_number: string
       debit_amount: string
@@ -208,6 +267,7 @@ describe('compensate_transaction_categorization', () => {
         firstResult.rows[0]?.result.reversal_journal_entry_ids,
       )
       expect((await readCompensationRows(seeded.originalId)).reversals).toHaveLength(1)
+      expect((await readOutbox(seeded.originalId)).rows).toHaveLength(2)
     } finally {
       await first.query('ROLLBACK').catch(() => {})
       await second.query('ROLLBACK').catch(() => {})
@@ -342,6 +402,180 @@ describe('compensate_transaction_categorization', () => {
     const state = await readCompensationRows(seeded.originalId)
     expect(state.original).toEqual({ status: 'posted', reversed_by_id: null })
     expect(state.reversals).toEqual([])
+    expect((await readOutbox(seeded.originalId)).rows).toHaveLength(0)
+  })
+
+  it('recovers a lost compensation response and publishes each logical event and delivery once', async () => {
+    const seeded = await seedCategorizedVoucher()
+    const committedWebhookId = await insertWebhook(
+      seeded.companyId,
+      'journal_entry.committed',
+    )
+    const reversedWebhookId = await insertWebhook(
+      seeded.companyId,
+      'journal_entry.reversed',
+    )
+
+    await getPool().query(COMPENSATE_SQL, [
+      seeded.companyId,
+      seeded.transactionId,
+      seeded.originalId,
+    ])
+
+    const retry = await getPool().query<{ result: CompensationResult }>(COMPENSATE_SQL, [
+      seeded.companyId,
+      seeded.transactionId,
+      seeded.originalId,
+    ])
+    expect(retry.rows[0]?.result.status).toBe('already_reversed')
+
+    const firstPublish = await getPool().query(PUBLISH_SQL, [
+      seeded.companyId,
+      seeded.transactionId,
+      seeded.originalId,
+    ])
+    const secondPublish = await getPool().query(PUBLISH_SQL, [
+      seeded.companyId,
+      seeded.transactionId,
+      seeded.originalId,
+    ])
+    expect(firstPublish.rows[0]?.result.status).toBe('published')
+    expect(secondPublish.rows[0]?.result.status).toBe('already_published')
+
+    const eventRows = await getPool().query<{
+      event_type: string
+      entity_id: string
+      data: Record<string, unknown>
+    }>(
+      `SELECT event_type, entity_id, data
+         FROM public.event_log
+        WHERE company_id = $1
+          AND outbox_event_id = ANY($2::uuid[])
+        ORDER BY event_type`,
+      [seeded.companyId, retry.rows[0]!.result.event_outbox_ids],
+    )
+    expect(eventRows.rows).toHaveLength(2)
+    expect(eventRows.rows[0]).toMatchObject({
+      event_type: 'journal_entry.committed',
+      entity_id: retry.rows[0]!.result.reversal_journal_entry_ids[0],
+      data: { entry: { id: retry.rows[0]!.result.reversal_journal_entry_ids[0] } },
+    })
+    expect(eventRows.rows[0]?.data).not.toHaveProperty('userId')
+    expect(eventRows.rows[0]?.data).not.toHaveProperty('companyId')
+    expect(eventRows.rows[1]).toMatchObject({
+      event_type: 'journal_entry.reversed',
+      entity_id: retry.rows[0]!.result.reversal_journal_entry_ids[0],
+      data: {
+        originalEntry: { id: seeded.originalId },
+        reversalEntry: { id: retry.rows[0]!.result.reversal_journal_entry_ids[0] },
+      },
+    })
+
+    const deliveries = await getPool().query<{
+      webhook_id: string
+      event_type: string
+      payload: Record<string, unknown>
+    }>(
+      `SELECT webhook_id, event_type, payload
+         FROM public.webhook_deliveries
+        WHERE outbox_event_id = ANY($1::uuid[])
+        ORDER BY event_type`,
+      [retry.rows[0]!.result.event_outbox_ids],
+    )
+    expect(deliveries.rows).toHaveLength(2)
+    expect(deliveries.rows.map((row) => row.webhook_id)).toEqual([
+      committedWebhookId,
+      reversedWebhookId,
+    ])
+    expect(deliveries.rows[0]?.payload).toMatchObject({
+      entry: { id: retry.rows[0]!.result.reversal_journal_entry_ids[0] },
+      companyId: seeded.companyId,
+    })
+    expect(deliveries.rows[0]?.payload).not.toHaveProperty('userId')
+    expect(deliveries.rows[1]?.payload).toMatchObject({
+      originalEntry: { id: seeded.originalId },
+      reversalEntry: { id: retry.rows[0]!.result.reversal_journal_entry_ids[0] },
+      companyId: seeded.companyId,
+    })
+    expect((await readOutbox(seeded.originalId)).rows.every((row) => row.published_at)).toBe(true)
+  })
+
+  it('serializes concurrent publication without duplicate logical events or deliveries', async () => {
+    const seeded = await seedCategorizedVoucher()
+    await insertWebhook(seeded.companyId, 'journal_entry.committed')
+    await insertWebhook(seeded.companyId, 'journal_entry.reversed')
+    const compensation = await getPool().query<{ result: CompensationResult }>(COMPENSATE_SQL, [
+      seeded.companyId,
+      seeded.transactionId,
+      seeded.originalId,
+    ])
+
+    const [first, second] = await Promise.all([
+      getPool().query(PUBLISH_SQL, [seeded.companyId, seeded.transactionId, seeded.originalId]),
+      getPool().query(PUBLISH_SQL, [seeded.companyId, seeded.transactionId, seeded.originalId]),
+    ])
+    expect([first.rows[0]?.result.status, second.rows[0]?.result.status].sort()).toEqual([
+      'already_published',
+      'published',
+    ])
+
+    const counts = await getPool().query<{ event_count: string; delivery_count: string }>(
+      `SELECT
+         (SELECT count(*) FROM public.event_log
+           WHERE outbox_event_id = ANY($1::uuid[])) AS event_count,
+         (SELECT count(*) FROM public.webhook_deliveries
+           WHERE outbox_event_id = ANY($1::uuid[])) AS delivery_count`,
+      [compensation.rows[0]!.result.event_outbox_ids],
+    )
+    expect(counts.rows[0]).toEqual({ event_count: '2', delivery_count: '2' })
+  })
+
+  it('rejects cross-company outbox publication without adopting another company records', async () => {
+    const seeded = await seedCategorizedVoucher()
+    const other = await seedCompany()
+    await getPool().query(COMPENSATE_SQL, [
+      seeded.companyId,
+      seeded.transactionId,
+      seeded.originalId,
+    ])
+
+    await expect(
+      withUserContext(other.userId, (client) =>
+        client.query(PUBLISH_SQL, [
+          seeded.companyId,
+          seeded.transactionId,
+          seeded.originalId,
+        ]),
+      ),
+    ).rejects.toMatchObject({ code: '42501' })
+    expect((await readOutbox(seeded.originalId)).rows.every((row) => row.published_at === null)).toBe(true)
+  })
+
+  it('can reapply the outbox migration without changing durable identities', async () => {
+    const seeded = await seedCategorizedVoucher()
+    const compensation = await getPool().query<{ result: CompensationResult }>(COMPENSATE_SQL, [
+      seeded.companyId,
+      seeded.transactionId,
+      seeded.originalId,
+    ])
+    const before = compensation.rows[0]!.result.event_outbox_ids
+    const client = await getPool().connect()
+    try {
+      await client.query('BEGIN')
+      const migration = readFileSync(MIGRATION_PATH, 'utf8')
+      await client.query(migration)
+      await client.query(migration)
+      const reapplied = await client.query<{ result: CompensationResult }>(COMPENSATE_SQL, [
+        seeded.companyId,
+        seeded.transactionId,
+        seeded.originalId,
+      ])
+      expect(reapplied.rows[0]!.result.event_outbox_ids).toEqual(before)
+      await client.query('ROLLBACK')
+    } finally {
+      await client.query('ROLLBACK').catch(() => {})
+      client.release()
+    }
   })
 
   it('rejects a cross-company authenticated caller without changing the original', async () => {

@@ -37,9 +37,12 @@ function compensationEntryFixtures() {
 }
 
 function createSupabase(
-  rpcResult: { data: unknown; error: unknown },
+  rpcResults:
+    | { data: unknown; error: unknown }
+    | Array<{ data: unknown; error: unknown }>,
   entryResults: Array<{ data: unknown; error: unknown }> = [],
 ) {
+  const queuedRpcResults = Array.isArray(rpcResults) ? [...rpcResults] : [rpcResults]
   const filters: Array<Array<[string, unknown]>> = []
   const from = vi.fn(() => {
     const result = entryResults.shift() ?? { data: null, error: null }
@@ -56,7 +59,9 @@ function createSupabase(
   })
   return {
     supabase: {
-      rpc: vi.fn().mockResolvedValue(rpcResult),
+      rpc: vi.fn(() => Promise.resolve(
+        queuedRpcResults.shift() ?? { data: null, error: { message: 'unexpected RPC' } },
+      )),
       from,
     },
     filters,
@@ -75,18 +80,37 @@ beforeEach(() => {
 })
 
 describe('compensateTransactionCategorization', () => {
-  it('hydrates the exact storno pair and publishes reverseEntry-shaped events on new compensation', async () => {
+  const outboxIds = ['outbox-committed', 'outbox-reversed']
+
+  function compensationRpcResult(status: 'reversed' | 'already_reversed' | 'recovered_existing_reversal') {
+    return {
+      data: {
+        status,
+        original_journal_entry_id: 'je-original',
+        reversal_journal_entry_ids: ['je-reversal'],
+        original_pointer_cleared: true,
+        event_outbox_ids: outboxIds,
+      },
+      error: null,
+    }
+  }
+
+  const publicationRpcResult = {
+    data: {
+      status: 'published',
+      original_journal_entry_id: 'je-original',
+      reversal_journal_entry_id: 'je-reversal',
+      event_outbox_ids: outboxIds,
+      event_log_count: 2,
+      webhook_delivery_count: 0,
+    },
+    error: null,
+  }
+
+  it('hydrates the exact storno pair and durably publishes both standard events on new compensation', async () => {
     const { original, reversal } = compensationEntryFixtures()
     const { supabase, filters } = createSupabase(
-      {
-        data: {
-          status: 'reversed',
-          original_journal_entry_id: 'je-original',
-          reversal_journal_entry_ids: ['je-reversal'],
-          original_pointer_cleared: true,
-        },
-        error: null,
-      },
+      [compensationRpcResult('reversed'), publicationRpcResult],
       [
         { data: original, error: null },
         { data: reversal, error: null },
@@ -107,23 +131,16 @@ describe('compensateTransactionCategorization', () => {
       p_transaction_id: 'tx-1',
       p_original_journal_entry_id: 'je-original',
     })
+    expect(supabase.rpc).toHaveBeenNthCalledWith(2, 'publish_transaction_compensation_events', {
+      p_company_id: 'company-1',
+      p_transaction_id: 'tx-1',
+      p_original_journal_entry_id: 'je-original',
+    })
     expect(filters).toEqual([
       [['id', 'je-original'], ['company_id', 'company-1']],
       [['id', 'je-reversal'], ['company_id', 'company-1']],
     ])
-    expect(emit).toHaveBeenNthCalledWith(1, {
-      type: 'journal_entry.committed',
-      payload: { entry: reversal, userId: 'user-1', companyId: 'company-1' },
-    })
-    expect(emit).toHaveBeenNthCalledWith(2, {
-      type: 'journal_entry.reversed',
-      payload: {
-        originalEntry: original,
-        reversalEntry: reversal,
-        userId: 'user-1',
-        companyId: 'company-1',
-      },
-    })
+    expect(emit).not.toHaveBeenCalled()
   })
 
   it('does not report hydration failure as verified and preserves both posted ids', async () => {
@@ -154,24 +171,19 @@ describe('compensateTransactionCategorization', () => {
     expect(emit).not.toHaveBeenCalled()
   })
 
-  it('does not report event-publication failure as verified and preserves both posted ids', async () => {
+  it('does not report durable publication failure as verified and preserves journal and outbox ids', async () => {
     const { original, reversal } = compensationEntryFixtures()
     const { supabase } = createSupabase(
-      {
-        data: {
-          status: 'reversed',
-          original_journal_entry_id: 'je-original',
-          reversal_journal_entry_ids: ['je-reversal'],
-          original_pointer_cleared: true,
-        },
-        error: null,
-      },
+      [
+        compensationRpcResult('reversed'),
+        { data: null, error: { message: 'publication response lost after commit' } },
+      ],
       [
         { data: original, error: null },
         { data: reversal, error: null },
       ],
     )
-    vi.spyOn(eventBus, 'emit').mockRejectedValueOnce(new Error('event store unavailable'))
+    const emit = vi.spyOn(eventBus, 'emit')
 
     const result = await compensateTransactionCategorization(supabase as never, params)
 
@@ -180,9 +192,12 @@ describe('compensateTransactionCategorization', () => {
       partialPostedIds: {
         journal_entry_id: 'je-original',
         reversal_journal_entry_id: 'je-reversal',
+        committed_event_outbox_id: 'outbox-committed',
+        reversed_event_outbox_id: 'outbox-reversed',
       },
-      error: { operation: 'verify_transaction_compensation' },
+      error: { operation: 'publish_transaction_compensation_events' },
     })
+    expect(emit).not.toHaveBeenCalled()
   })
 
   it('preserves every RPC-reported id when the mutation outcome is erroneous', async () => {
@@ -209,18 +224,49 @@ describe('compensateTransactionCategorization', () => {
     })
   })
 
-  it('verifies already_reversed idempotently without replaying journal events', async () => {
+  it('fails closed and preserves every conflicting durable publication identity', async () => {
     const { original, reversal } = compensationEntryFixtures()
     const { supabase } = createSupabase(
-      {
-        data: {
-          status: 'already_reversed',
-          original_journal_entry_id: 'je-original',
-          reversal_journal_entry_ids: ['je-reversal'],
-          original_pointer_cleared: true,
+      [
+        compensationRpcResult('reversed'),
+        {
+          data: {
+            ...publicationRpcResult.data,
+            reversal_journal_entry_id: 'je-other-reversal',
+            event_outbox_ids: ['outbox-committed', 'outbox-foreign'],
+          },
+          error: null,
         },
-        error: null,
+      ],
+      [
+        { data: original, error: null },
+        { data: reversal, error: null },
+      ],
+    )
+
+    const result = await compensateTransactionCategorization(supabase as never, params)
+
+    expect(result).toMatchObject({
+      compensationVerified: false,
+      partialPostedIds: {
+        journal_entry_id: 'je-original',
+        reversal_journal_entry_id: 'je-reversal',
+        reversal_journal_entry_2_id: 'je-other-reversal',
+        committed_event_outbox_id: 'outbox-committed',
+        reversed_event_outbox_id: 'outbox-reversed',
+        event_outbox_3_id: 'outbox-foreign',
       },
+      error: { operation: 'publish_transaction_compensation_events' },
+    })
+  })
+
+  it('reconciles already_reversed through the durable publisher without replaying the event bus', async () => {
+    const { original, reversal } = compensationEntryFixtures()
+    const { supabase } = createSupabase(
+      [compensationRpcResult('already_reversed'), {
+        ...publicationRpcResult,
+        data: { ...publicationRpcResult.data, status: 'already_published' },
+      }],
       [
         { data: original, error: null },
         { data: reversal, error: null },
@@ -234,27 +280,24 @@ describe('compensateTransactionCategorization', () => {
       compensationVerified: true,
       status: 'already_reversed',
     })
+    expect(supabase.rpc).toHaveBeenNthCalledWith(2, 'publish_transaction_compensation_events', {
+      p_company_id: 'company-1',
+      p_transaction_id: 'tx-1',
+      p_original_journal_entry_id: 'je-original',
+    })
     expect(emit).not.toHaveBeenCalled()
   })
 
   it('publishes events when this call adopts a sole reversal and completes compensation', async () => {
     const { original, reversal } = compensationEntryFixtures()
     const { supabase } = createSupabase(
-      {
-        data: {
-          status: 'recovered_existing_reversal',
-          original_journal_entry_id: 'je-original',
-          reversal_journal_entry_ids: ['je-reversal'],
-          original_pointer_cleared: true,
-        },
-        error: null,
-      },
+      [compensationRpcResult('recovered_existing_reversal'), publicationRpcResult],
       [
         { data: original, error: null },
         { data: reversal, error: null },
       ],
     )
-    const emit = vi.spyOn(eventBus, 'emit').mockResolvedValue(undefined)
+    const emit = vi.spyOn(eventBus, 'emit')
 
     const result = await compensateTransactionCategorization(supabase as never, params)
 
@@ -262,6 +305,6 @@ describe('compensateTransactionCategorization', () => {
       compensationVerified: true,
       status: 'recovered_existing_reversal',
     })
-    expect(emit).toHaveBeenCalledTimes(2)
+    expect(emit).not.toHaveBeenCalled()
   })
 })
