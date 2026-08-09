@@ -131,6 +131,8 @@ export async function insertTransaction(params: {
   userId: string
   currency?: string
   amount?: number
+  amountSek?: number | null
+  exchangeRate?: number | null
   date?: string
   description?: string
   externalId?: string | null
@@ -141,15 +143,18 @@ export async function insertTransaction(params: {
   const id = randomUUID()
   await getPool().query(
     `INSERT INTO public.transactions
-       (id, company_id, user_id, currency, amount, date, description,
-        external_id, journal_entry_id, cash_account_id, is_ignored, category)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'uncategorized')`,
+       (id, company_id, user_id, currency, amount, amount_sek, exchange_rate,
+        date, description, external_id, journal_entry_id, cash_account_id,
+        is_ignored, category)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'uncategorized')`,
     [
       id,
       params.companyId,
       params.userId,
       params.currency ?? 'SEK',
       params.amount ?? -100,
+      params.amountSek ?? null,
+      params.exchangeRate ?? null,
       params.date ?? '2026-06-01',
       params.description ?? 'Test tx',
       params.externalId ?? null,
@@ -174,6 +179,8 @@ export async function insertDraftJournalEntry(params: {
   voucherNumber?: number
   sourceType?: string
   sourceId?: string | null
+  categorizationCategory?: string | null
+  categorizationIsBusiness?: boolean | null
   createdAt?: string
   // Inserting directly as 'posted' skips the set_committed_at() trigger (it
   // fires on draft->posted UPDATE), so committed_at stays null unless set here.
@@ -183,8 +190,10 @@ export async function insertDraftJournalEntry(params: {
   await getPool().query(
     `INSERT INTO public.journal_entries
        (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-        entry_date, description, source_type, source_id, status, created_at, committed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12::timestamptz, now()), $13::timestamptz)`,
+        entry_date, description, source_type, source_id, status, created_at, committed_at,
+        categorization_category, categorization_is_business)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+             COALESCE($12::timestamptz, now()), $13::timestamptz, $14, $15)`,
     [
       id,
       params.userId,
@@ -199,6 +208,8 @@ export async function insertDraftJournalEntry(params: {
       params.status ?? 'draft',
       params.createdAt ?? null,
       params.committedAt ?? null,
+      params.categorizationCategory ?? null,
+      params.categorizationIsBusiness ?? null,
     ],
   )
   return id

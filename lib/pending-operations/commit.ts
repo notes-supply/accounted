@@ -67,7 +67,7 @@ import { getErrorEntry } from '@/lib/errors/structured-errors'
 import { parseSIEFile } from '@/lib/import/sie-parser'
 import { executeSIEImport, undoSIEImport } from '@/lib/import/sie-import'
 import type { AccountMapping } from '@/lib/import/types'
-import { AccountsNotInChartError, isBookkeepingError, ACCOUNTS_NOT_IN_CHART } from '@/lib/bookkeeping/errors'
+import { AccountsNotInChartError, BookkeepingDatabaseError, isBookkeepingError, ACCOUNTS_NOT_IN_CHART } from '@/lib/bookkeeping/errors'
 import { extensionRegistry } from '@/lib/extensions/registry'
 import {
   SkatteverketRecoverableError,
@@ -176,6 +176,99 @@ export interface CommitResult {
   account_numbers?: string[]
 }
 
+export interface PartialFailureState {
+  persistence: 'confirmed' | 'database_error' | 'conflict'
+  operation_status: 'failed_partial' | 'committing' | 'other' | 'unknown'
+}
+
+interface PersistFailedPartialInput {
+  operationId: string
+  companyId: string
+  error: string
+  httpStatus?: number
+  postedIds: Record<string, string>
+  threw: boolean
+}
+
+function partialFailureOperationStatus(
+  status: unknown,
+): PartialFailureState['operation_status'] {
+  if (status === 'failed_partial' || status === 'committing') return status
+  return typeof status === 'string' ? 'other' : 'unknown'
+}
+
+function hasPostedIds(
+  resultData: unknown,
+  postedIds: Record<string, string>,
+): boolean {
+  if (!resultData || typeof resultData !== 'object' || Array.isArray(resultData)) return false
+  const stored = (resultData as { posted_ids?: unknown }).posted_ids
+  if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return false
+  return Object.entries(postedIds).every(
+    ([key, value]) => (stored as Record<string, unknown>)[key] === value,
+  )
+}
+
+/**
+ * Persist and verify the terminal partial-failure row through the same tenant
+ * and committing-status claim that authorized the executor.
+ */
+export async function persistFailedPartialState(
+  supabase: SupabaseClient,
+  input: PersistFailedPartialInput,
+): Promise<PartialFailureState> {
+  const resultData = {
+    error: input.error,
+    ...(input.httpStatus !== undefined ? { http_status: input.httpStatus } : {}),
+    ...(input.threw ? { threw: true } : {}),
+    posted_ids: input.postedIds,
+  }
+  const { data: updated, error: updateError } = await supabase
+    .from('pending_operations')
+    .update({
+      status: 'failed_partial',
+      resolved_at: new Date().toISOString(),
+      result_data: resultData,
+    })
+    .eq('id', input.operationId)
+    .eq('company_id', input.companyId)
+    .eq('status', 'committing')
+    .select('id, company_id, status, result_data')
+    .maybeSingle()
+
+  if (
+    !updateError &&
+    updated?.id === input.operationId &&
+    updated.company_id === input.companyId &&
+    updated.status === 'failed_partial' &&
+    hasPostedIds(updated.result_data, input.postedIds)
+  ) {
+    return { persistence: 'confirmed', operation_status: 'failed_partial' }
+  }
+
+  const { data: authoritative, error: readError } = await supabase
+    .from('pending_operations')
+    .select('id, company_id, status, result_data')
+    .eq('id', input.operationId)
+    .eq('company_id', input.companyId)
+    .maybeSingle()
+
+  if (
+    !readError &&
+    authoritative?.id === input.operationId &&
+    authoritative.company_id === input.companyId &&
+    authoritative.status === 'failed_partial' &&
+    hasPostedIds(authoritative.result_data, input.postedIds)
+  ) {
+    return { persistence: 'confirmed', operation_status: 'failed_partial' }
+  }
+
+  return {
+    persistence: updateError || readError ? 'database_error' : 'conflict',
+    operation_status: partialFailureOperationStatus(authoritative?.status),
+  }
+}
+
 export interface CommitOptions {
   /** Email address used as cc on send_invoice (typically the human user's email). */
   userEmail?: string
@@ -268,6 +361,19 @@ async function commitCategorizeTransaction(
   const txId = params.transaction_id as string
   const category = params.category as TransactionCategory
   const vatTreatment = params.vat_treatment as VatTreatment | undefined
+  const cashAccountId = params.cash_account_id
+  const settlementAccount = params.settlement_account
+  if (
+    !(cashAccountId === null || typeof cashAccountId === 'string') ||
+    typeof settlementAccount !== 'string' ||
+    settlementAccount.length === 0
+  ) {
+    return {
+      error: 'Förhandsgranskningen saknar avräkningskontots ursprung. Skapa en ny förhandsgranskning.',
+      errorCode: 'SETTLEMENT_PROVENANCE_MISSING',
+      status: 409,
+    }
+  }
   // Optional audit-trail text the agent passed alongside the categorization.
   // For representation bookings the agent captures deltagare + syfte and
   // funnels them in here so the verifikation's description carries the
@@ -296,6 +402,10 @@ async function commitCategorizeTransaction(
     allowDuplicate: params.allow_duplicate === true,
     // Dimensions PR7: resolved at staging; coerce is the drift/tamper gate.
     dimensions: coerceDimensionsBag(params.dimensions),
+    expectedSettlement: {
+      cashAccountId,
+      ledgerAccount: settlementAccount,
+    },
   })
 }
 
@@ -5198,7 +5308,17 @@ async function commitBulkBookInboxItems(
     return { error: `Invalid bulk_book_inbox_items params: ${parsed.error.message}`, status: 400 }
   }
 
-  const { booked, skipped } = await bulkBookMatchedInboxItems(supabase, userId, companyId, parsed.data)
+  const result = await bulkBookMatchedInboxItems(supabase, userId, companyId, parsed.data)
+  const { booked, skipped } = result
+
+  if (result.partial_posted_ids) {
+    return {
+      error: 'One or more inbox items have an unverified partial booking outcome.',
+      errorCode: 'BULK_BOOK_INBOX_PARTIAL_FAILURE',
+      status: 500,
+      partialPostedIds: result.partial_posted_ids,
+    }
+  }
 
   log.info('bulk_book_inbox_items committed', {
     companyId,
@@ -5304,7 +5424,7 @@ async function commitPendingOperationInner(
   supabase: SupabaseClient,
   userId: string,
   companyId: string,
-  pendingOp: PendingOperation,
+  pendingOpSnapshot: PendingOperation,
   opts: CommitOptions = {}
 ): Promise<CommitResult> {
   // ── Capability gate (commit-time twin of the MCP dispatch gate). The actual
@@ -5314,7 +5434,7 @@ async function commitPendingOperationInner(
   //    (MCP approve tool or the UI approval path). Checked BEFORE the atomic
   //    claim so a blocked op stays 'pending' and is re-approvable once the
   //    company subscribes. Self-hosted short-circuits to all-on in hasCapability.
-  const requiredCapability = PAID_OPERATION_CAPABILITY_MAP[pendingOp.operation_type]
+  const requiredCapability = PAID_OPERATION_CAPABILITY_MAP[pendingOpSnapshot.operation_type]
   if (requiredCapability && !(await hasCapability(supabase, companyId, requiredCapability))) {
     return {
       status: 'failed',
@@ -5330,12 +5450,25 @@ async function commitPendingOperationInner(
   //    must not run side-effects. Without this, both callers can pass the
   //    in-memory status check and double-book journal entries, send duplicate
   //    emails, etc.
+  const partialFailurePossible = new Set([
+    'categorize_transaction',
+    'match_transaction_invoice',
+    'credit_invoice',
+    'bulk_book_inbox_items',
+  ]).has(pendingOpSnapshot.operation_type)
+  const claimUpdate = partialFailurePossible
+    ? {
+        status: 'committing',
+        result_data: { commit_in_progress: { partial_failure_possible: true } },
+      }
+    : { status: 'committing' }
   const { data: claimed, error: claimError } = await supabase
     .from('pending_operations')
-    .update({ status: 'committing' })
-    .eq('id', pendingOp.id)
+    .update(claimUpdate)
+    .eq('id', pendingOpSnapshot.id)
+    .eq('company_id', companyId)
     .eq('status', 'pending')
-    .select('id')
+    .select('*')
     .maybeSingle()
 
   if (claimError) {
@@ -5349,6 +5482,11 @@ async function commitPendingOperationInner(
       http_status: 409,
     }
   }
+
+  // The atomic update returns the exact row version that won the claim. Merge
+  // it over the caller snapshot so an edit completed before this claim is
+  // authoritative, while an edit racing after it loses its own status CAS.
+  const pendingOp = { ...pendingOpSnapshot, ...claimed } as PendingOperation
 
   let result: ExecutorResult
   try {
@@ -5549,20 +5687,67 @@ async function commitPendingOperationInner(
     // FIRST: a wrapped recoverable cause must NOT release the claim back to
     // 'pending' (the side-effect already exists).
     if (err instanceof PartialCommitError) {
-      await supabase
-        .from('pending_operations')
-        .update({
-          status: 'failed_partial',
-          resolved_at: new Date().toISOString(),
-          result_data: { error: err.message, threw: true, posted_ids: err.postedIds },
-        })
-        .eq('id', pendingOp.id)
+      const partialFailureState = await persistFailedPartialState(supabase, {
+        operationId: pendingOp.id,
+        companyId,
+        error: err.message,
+        postedIds: err.postedIds,
+        threw: true,
+      })
+      const persistenceConfirmed = partialFailureState.persistence === 'confirmed'
       return {
         status: 'failed',
         error: err.message,
         http_status: 500,
-        code: 'partial_commit',
-        data: { posted_ids: err.postedIds },
+        code: persistenceConfirmed
+          ? 'partial_commit'
+          : 'partial_commit_persistence_unverified',
+        data: {
+          posted_ids: err.postedIds,
+          partial_failure_state: partialFailureState,
+        },
+      }
+    }
+    if (pendingOp.operation_type === 'categorize_transaction' && err instanceof BookkeepingDatabaseError) {
+      const message = err.message || 'Tillfälligt databasfel vid bokföring.'
+      const { data: released, error: releaseError } = await supabase
+        .from('pending_operations')
+        .update({ status: 'pending' })
+        .eq('id', pendingOp.id)
+        .eq('company_id', companyId)
+        .eq('status', 'committing')
+        .select('id, status')
+        .maybeSingle()
+      if (releaseError) {
+        log.error('Failed to release pending operation after database error', releaseError, {
+          operation_id: pendingOp.id,
+          company_id: companyId,
+        })
+        return {
+          status: 'failed',
+          error: `${message} Operationens status kunde inte återställas säkert.`,
+          http_status: 500,
+          code: 'BOOKKEEPING_DATABASE_ERROR_RELEASE_FAILED',
+        }
+      }
+      if (!released || released.status !== 'pending') {
+        log.warn('Pending operation retry release lost its committing claim', {
+          operation_id: pendingOp.id,
+          company_id: companyId,
+          authoritative_status: released?.status ?? null,
+        })
+        return {
+          status: 'failed',
+          error: `${message} Operationen ändrades samtidigt och kunde inte återställas till väntande.`,
+          http_status: 409,
+          code: 'BOOKKEEPING_DATABASE_ERROR_RELEASE_CONFLICT',
+        }
+      }
+      return {
+        status: 'failed',
+        error: message,
+        http_status: 500,
+        code: 'BOOKKEEPING_DATABASE_ERROR',
       }
     }
     // Accounts-not-in-chart is RECOVERABLE: the booking itself is valid; the
@@ -5630,24 +5815,26 @@ async function commitPendingOperationInner(
         ? result.partialPostedIds
         : null
     if (partialPostedIds) {
-      await supabase
-        .from('pending_operations')
-        .update({
-          status: 'failed_partial',
-          resolved_at: new Date().toISOString(),
-          result_data: {
-            error: result.error,
-            http_status: result.status,
-            posted_ids: partialPostedIds,
-          },
-        })
-        .eq('id', pendingOp.id)
+      const partialFailureState = await persistFailedPartialState(supabase, {
+        operationId: pendingOp.id,
+        companyId,
+        error: result.error,
+        httpStatus: result.status,
+        postedIds: partialPostedIds,
+        threw: false,
+      })
+      const persistenceConfirmed = partialFailureState.persistence === 'confirmed'
       return {
         status: 'failed',
         error: result.error,
-        http_status: result.status ?? 500,
-        code: 'partial_commit',
-        data: { posted_ids: partialPostedIds },
+        http_status: persistenceConfirmed ? (result.status ?? 500) : 500,
+        code: persistenceConfirmed
+          ? 'partial_commit'
+          : 'partial_commit_persistence_unverified',
+        data: {
+          posted_ids: partialPostedIds,
+          partial_failure_state: partialFailureState,
+        },
       }
     }
     const isAutoReject = result.status === 404 || result.status === 409

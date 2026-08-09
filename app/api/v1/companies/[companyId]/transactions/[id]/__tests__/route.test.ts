@@ -79,9 +79,8 @@ vi.mock('@/lib/invoices/clear-settled-invoice-suggestions', () => ({
   clearSettledInvoiceSuggestions: clearSuggestionsMock,
 }))
 vi.mock('@/lib/bookkeeping/mapping-engine', async () => {
-  // Keep the real applySettlementAccount: it's a pure rewrite (1930 -> the
-  // resolved bank leg) and the v1 categorize route's settlement-account fix
-  // depends on it actually running, not a stub.
+  // Keep the real applySettlementAccount: it semantically rebinds the bank leg
+  // and the v1 categorize route's settlement-account fix depends on it running.
   const actual = await vi.importActual<typeof import('@/lib/bookkeeping/mapping-engine')>(
     '@/lib/bookkeeping/mapping-engine',
   )
@@ -120,6 +119,7 @@ function makeFlexibleSupabase(byTable: Record<string, MockResult | MockResult[]>
   for (const [t, val] of Object.entries(byTable)) {
     queues.set(t, Array.isArray(val) ? [...val] : [val])
   }
+  queues.set('rpc:attach_transaction_categorization', [{ data: true, error: null }])
   // Every chained builder call, in order. The proxy otherwise swallows its
   // arguments, which makes update payloads invisible to assertions. Recording
   // is passive: it changes nothing about what a chain resolves to.
@@ -142,7 +142,11 @@ function makeFlexibleSupabase(byTable: Record<string, MockResult | MockResult[]>
     }
     return new Proxy({}, handler)
   }
-  return { from: vi.fn((table: string) => buildChain(table)), calls }
+  return {
+    from: vi.fn((table: string) => buildChain(table)),
+    rpc: vi.fn((fn: string) => buildChain(`rpc:${fn}`)),
+    calls,
+  }
 }
 
 /** Payloads of every `.update()` call made against `table`. */

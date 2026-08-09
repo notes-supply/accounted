@@ -4,6 +4,10 @@ import { withRouteContext } from '@/lib/api/with-route-context'
 import { commitPendingOperation } from '@/lib/pending-operations/commit'
 import { bookkeepingErrorResponse, AccountsNotInChartError, ACCOUNTS_NOT_IN_CHART } from '@/lib/bookkeeping/errors'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
+import {
+  extractPartialFailureState,
+  extractPartialPostedIds,
+} from '@/lib/pending-operations/partial-posted-ids'
 import type { PendingOperation } from '@/types'
 
 ensureInitialized()
@@ -54,13 +58,19 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
       // map it here. Swedish passes through untouched, English falls to the
       // status-appropriate Swedish fallback (issue #337). Raw stays in logs.
       const status = result.http_status ?? 500
+      const partialPostedIds = extractPartialPostedIds(result.data)
+      const partialFailureState = extractPartialFailureState(result.data)
       log.warn('pending operation commit failed', {
         operationId: id,
         rawError: result.error,
         status,
       })
       return NextResponse.json(
-        { error: getErrorMessage(result.error ?? null, { statusCode: status }) },
+        {
+          error: getErrorMessage(result.error ?? null, { statusCode: status }),
+          ...(partialPostedIds ? { partial_posted_ids: partialPostedIds } : {}),
+          ...(partialFailureState ? { partial_failure_state: partialFailureState } : {}),
+        },
         { status }
       )
     } catch (err) {

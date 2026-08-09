@@ -5,6 +5,11 @@ import { validateBody } from '@/lib/api/validate'
 import { PendingOperationsBulkSchema } from '@/lib/api/schemas'
 import { commitPendingOperation } from '@/lib/pending-operations/commit'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
+import {
+  extractPartialFailureState,
+  extractPartialPostedIds,
+  type PublicPartialFailureState,
+} from '@/lib/pending-operations/partial-posted-ids'
 import type { PendingOperation } from '@/types'
 
 ensureInitialized()
@@ -13,6 +18,8 @@ interface BulkCommitItemResult {
   id: string
   status: 'committed' | 'failed' | 'skipped' | 'rejected'
   error?: string
+  partial_posted_ids?: Record<string, string>
+  partial_failure_state?: PublicPartialFailureState
 }
 
 // Swedish display labels for already-handled operations; the raw enum values
@@ -90,10 +97,24 @@ export const POST = withRouteContext(
         const mapped = getErrorMessage(result.error ?? null, {
           statusCode: result.http_status ?? 500,
         })
+        const partialPostedIds = extractPartialPostedIds(result.data)
+        const partialFailureState = extractPartialFailureState(result.data)
         if (result.status === 'rejected' && result.auto_rejected) {
-          results.push({ id, status: 'rejected', error: mapped })
+          results.push({
+            id,
+            status: 'rejected',
+            error: mapped,
+            ...(partialPostedIds ? { partial_posted_ids: partialPostedIds } : {}),
+            ...(partialFailureState ? { partial_failure_state: partialFailureState } : {}),
+          })
         } else {
-          results.push({ id, status: 'failed', error: mapped })
+          results.push({
+            id,
+            status: 'failed',
+            error: mapped,
+            ...(partialPostedIds ? { partial_posted_ids: partialPostedIds } : {}),
+            ...(partialFailureState ? { partial_failure_state: partialFailureState } : {}),
+          })
         }
       }
     }

@@ -41,13 +41,16 @@ export async function resolveSettlementAccount(
 
   // A transaction with a cash_account_id that resolves to no row, or a row
   // with no ledger_account, is a data-integrity gap (not a normal "no cash
-  // account linked" case): the fallback fires silently otherwise, masking a
-  // bad cash_accounts row behind a plausible-looking 1930 verifikat.
+  // account linked" case). Refuse to manufacture a plausible-looking 1930
+  // posting: only a genuinely unbound transaction may use that legacy fallback.
   if (!data?.ledger_account) {
-    log.warn('settlement-account lookup returned no ledger_account; defaulting to 1930', {
+    log.warn('settlement-account lookup returned no ledger_account; refusing fallback', {
       cashAccountId,
     })
-    return FALLBACK_ACCOUNT
+    throw new BookkeepingDatabaseError(
+      'resolve_settlement_account',
+      `Cash account ${cashAccountId} is missing or has no ledger account`,
+    )
   }
 
   return data.ledger_account as string

@@ -808,6 +808,69 @@ describe('new and split templates', () => {
 // ============================================================
 
 describe('applySettlementAccount (bank-leg routing)', () => {
+  it('rebinds a learned 1931 expense bank leg to the current legacy 1930 settlement account', () => {
+    const learned = {
+      rule: null,
+      debit_account: '6570',
+      credit_account: '1931',
+      risk_level: 'NONE' as const,
+      confidence: 0.9,
+      requires_review: false,
+      default_private: false,
+      vat_lines: [],
+      description: 'Learned Revolut fee',
+    }
+
+    const routed = applySettlementAccount(learned, '1930', -29)
+
+    expect(routed.debit_account).toBe('6570')
+    expect(routed.credit_account).toBe('1930')
+  })
+
+  it('rebinds a learned 1931 expense bank leg to a current 1940 settlement account', () => {
+    const learned = {
+      rule: null,
+      debit_account: '6570',
+      credit_account: '1931',
+      risk_level: 'NONE' as const,
+      confidence: 0.9,
+      requires_review: false,
+      default_private: false,
+      vat_lines: [{
+        account_number: '2641',
+        debit_amount: 20,
+        credit_amount: 0,
+        description: 'VAT',
+      }],
+      description: 'Learned Revolut fee',
+    }
+
+    const routed = applySettlementAccount(learned, '1940', -125)
+
+    expect(routed.debit_account).toBe('6570')
+    expect(routed.credit_account).toBe('1940')
+    expect(routed.vat_lines).toEqual(learned.vat_lines)
+  })
+
+  it('rebinds only the incoming settlement side and preserves the mapped counter-account', () => {
+    const learnedTransfer = {
+      rule: null,
+      debit_account: '1931',
+      credit_account: '1932',
+      risk_level: 'LOW' as const,
+      confidence: 0.95,
+      requires_review: false,
+      default_private: false,
+      vat_lines: [],
+      description: 'Own-account transfer',
+    }
+
+    const routed = applySettlementAccount(learnedTransfer, '1940', 500)
+
+    expect(routed.debit_account).toBe('1940')
+    expect(routed.credit_account).toBe('1932')
+  })
+
   it('routes the bank_interest_income debit leg to the transaction settlement account', () => {
     const template = getTemplateById('bank_interest_income')
     expect(template).toBeDefined()
@@ -819,7 +882,7 @@ describe('applySettlementAccount (bank-leg routing)', () => {
 
     // Interest that landed on a savings account mapped to 1931 must debit 1931,
     // not 1930: otherwise the real bank transaction never reconciles.
-    const routed = applySettlementAccount(base, '1931')
+    const routed = applySettlementAccount(base, '1931', tx.amount)
     expect(routed.debit_account).toBe('1931')
     expect(routed.credit_account).toBe('8310')
   })
@@ -832,7 +895,7 @@ describe('applySettlementAccount (bank-leg routing)', () => {
     expect(base.debit_account).toBe('6570')
     expect(base.credit_account).toBe('1930')
 
-    const routed = applySettlementAccount(base, '1931')
+    const routed = applySettlementAccount(base, '1931', tx.amount)
     expect(routed.debit_account).toBe('6570')
     expect(routed.credit_account).toBe('1931')
   })
@@ -841,7 +904,7 @@ describe('applySettlementAccount (bank-leg routing)', () => {
     const template = getTemplateById('bank_interest_income')!
     const tx = makeTransaction({ amount: 50, currency: 'SEK' })
     const base = buildMappingResultFromTemplate(template, tx, 'enskild_firma')
-    const routed = applySettlementAccount(base, '1930')
+    const routed = applySettlementAccount(base, '1930', tx.amount)
     expect(routed.debit_account).toBe('1930')
     expect(routed.credit_account).toBe('8310')
   })

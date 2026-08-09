@@ -19,20 +19,35 @@ import { checkPeriodLock } from '@/lib/api/v1/check-period-lock'
 import { CategorizeTransactionSchema } from '@/lib/api/schemas'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { buildMappingResultFromCategory } from '@/lib/bookkeeping/category-mapping'
+import { applySettlementAccount } from '@/lib/bookkeeping/mapping-engine'
+import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
+import { loadCategorizationCompanySettings } from '@/lib/bookkeeping/company-settings'
 import {
   getTemplateById,
   buildMappingResultFromTemplate,
   validateTemplateForEntity,
 } from '@/lib/bookkeeping/booking-templates'
+import { buildMappingResultFromCounterpartyTemplate } from '@/lib/bookkeeping/counterparty-templates'
 import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
-import { recordVoucherGapExplanation } from '@/lib/bookkeeping/cancel-orphaned-entry'
-import { reverseEntry } from '@/lib/bookkeeping/engine'
+import {
+  attachCategorizedTransaction,
+  compensatePostCommitReadbackFailure,
+} from '@/lib/transactions/settlement-attachment'
+import {
+  existingCategorizationMappingFields,
+  verifyExistingCategorization,
+} from '@/lib/transactions/existing-categorization'
 import { AccountsNotInChartError, isBookkeepingError } from '@/lib/bookkeeping/errors'
 import { collectMappingResultAccounts, findUnresolvableAccounts } from '@/lib/bookkeeping/account-validation'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { eventBus } from '@/lib/events'
 import type { Logger } from '@/lib/logger'
-import type { EntityType, Transaction, TransactionCategory } from '@/types'
+import type {
+  CategorizationTemplate,
+  EntityType,
+  Transaction,
+  TransactionCategory,
+} from '@/types'
 
 const BatchItem = z.object({
   transaction_id: z.string().uuid(),
@@ -140,7 +155,103 @@ async function categorizeOne(
     }
   }
 
+  if (transaction.journal_entry_id) {
+    const mappingAffectingFields = existingCategorizationMappingFields(input)
+
+    if (mappingAffectingFields.length > 0) {
+      return {
+        ok: false,
+        request_index: index,
+        transaction_id: transactionId,
+        error: {
+          code: 'TX_CATEGORIZE_ALREADY_POSTED_MAPPING_CHANGE',
+          message: 'The posted journal entry cannot be changed by categorization.',
+          details: { fields: mappingAffectingFields },
+        },
+      }
+    }
+
+    const requestedCategory: TransactionCategory = input.is_business
+      ? input.category || 'uncategorized'
+      : 'private'
+    const verification = await verifyExistingCategorization(supabase, {
+      companyId,
+      transaction: transaction as Transaction & { journal_entry_id: string },
+      requestedCategory,
+      requestedIsBusiness: input.is_business,
+    })
+    if (!verification.ok) {
+      return {
+        ok: false,
+        request_index: index,
+        transaction_id: transactionId,
+        error: verification.kind === 'database_error'
+          ? {
+              code: 'BOOKKEEPING_DATABASE_ERROR',
+              message: getErrorMessage(verification.error),
+              details: {
+                operation: 'verify_existing_transaction_categorization',
+              },
+            }
+          : {
+              code: 'TX_CATEGORIZE_RACE',
+              message: 'Existing posted categorization could not be proven coherent.',
+              details: { reason: verification.reason },
+            },
+      }
+    }
+
+    return {
+      ok: true,
+      request_index: index,
+      transaction_id: transactionId,
+      data: {
+        journal_entry_created: false,
+        journal_entry_id: transaction.journal_entry_id,
+        category: requestedCategory,
+        already_had_journal_entry: true,
+      },
+    }
+  }
+
+  let settlementAccount: string
+  try {
+    settlementAccount = await resolveSettlementAccount(
+      supabase,
+      companyId,
+      transaction.cash_account_id ?? null,
+      log,
+    )
+  } catch (error) {
+    return {
+      ok: false,
+      request_index: index,
+      transaction_id: transactionId,
+      error: {
+        code: 'BOOKKEEPING_DATABASE_ERROR',
+        message: getErrorMessage(error),
+      },
+    }
+  }
+
   const { is_business, category } = input
+  if (
+    (input.counterparty_template_id && !is_business) ||
+    (input.account_override && !is_business) ||
+    (input.counterparty_template_id && input.template_id) ||
+    (input.account_override && (input.template_id || input.counterparty_template_id))
+  ) {
+    return {
+      ok: false,
+      request_index: index,
+      transaction_id: transactionId,
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'Unsupported categorization input combination.',
+      },
+    }
+  }
+
   let finalCategory: TransactionCategory
   if (input.template_id) {
     const template = getTemplateById(input.template_id)
@@ -175,7 +286,47 @@ async function categorizeOne(
   }
 
   let mappingResult
-  if (input.template_id) {
+  if (input.counterparty_template_id) {
+    const { data: counterpartyTemplate, error: counterpartyTemplateError } = await supabase
+      .from('categorization_templates')
+      .select('*')
+      .eq('id', input.counterparty_template_id)
+      .eq('company_id', companyId)
+      .eq('is_active', true)
+      .maybeSingle()
+    if (counterpartyTemplateError) {
+      return {
+        ok: false,
+        request_index: index,
+        transaction_id: transactionId,
+        error: {
+          code: 'BOOKKEEPING_DATABASE_ERROR',
+          message: getErrorMessage(counterpartyTemplateError),
+        },
+      }
+    }
+    if (!counterpartyTemplate) {
+      return {
+        ok: false,
+        request_index: index,
+        transaction_id: transactionId,
+        error: {
+          code: 'NOT_FOUND',
+          message: 'Counterparty template not found.',
+          details: { resource: 'counterparty_template' },
+        },
+      }
+    }
+    mappingResult = buildMappingResultFromCounterpartyTemplate(
+      {
+        template: counterpartyTemplate as CategorizationTemplate,
+        matchMethod: 'exact_alias',
+        confidence: Number(counterpartyTemplate.confidence),
+      },
+      transaction as Transaction,
+      entityType,
+    )
+  } else if (input.template_id) {
     const template = getTemplateById(input.template_id)!
     mappingResult = buildMappingResultFromTemplate(template, transaction as Transaction, entityType)
   } else {
@@ -186,6 +337,49 @@ async function categorizeOne(
       entityType,
       input.vat_treatment,
     )
+  }
+  mappingResult = applySettlementAccount(mappingResult, settlementAccount, transaction.amount)
+
+  if (input.account_override) {
+    const { data: accountExists, error: accountError } = await supabase
+      .from('chart_of_accounts')
+      .select('account_number, account_class')
+      .eq('company_id', companyId)
+      .eq('account_number', input.account_override)
+      .eq('is_active', true)
+      .single()
+    if (accountError && accountError.code !== 'PGRST116') {
+      return {
+        ok: false,
+        request_index: index,
+        transaction_id: transactionId,
+        error: {
+          code: 'BOOKKEEPING_DATABASE_ERROR',
+          message: getErrorMessage(accountError),
+        },
+      }
+    }
+    if (!accountExists) {
+      return {
+        ok: false,
+        request_index: index,
+        transaction_id: transactionId,
+        error: {
+          code: 'TX_CATEGORIZE_INVALID_ACCOUNT',
+          message: 'Account override is not active in the company chart.',
+          details: { accountNumber: input.account_override },
+        },
+      }
+    }
+
+    if (transaction.amount < 0) mappingResult.debit_account = input.account_override
+    else mappingResult.credit_account = input.account_override
+
+    const overrideNumber = parseInt(input.account_override, 10)
+    const isVatLineAccount = overrideNumber >= 2610 && overrideNumber <= 2649
+    if (accountExists.account_class === 2 && !isVatLineAccount) {
+      mappingResult.vat_lines = []
+    }
   }
   // Dimensions: an explicitly supplied bag tags the business lines of the
   // generated verifikat (bank/VAT legs stay untagged).
@@ -247,34 +441,6 @@ async function categorizeOne(
     }
   }
 
-  // Already-categorized: just flip flags.
-  if (transaction.journal_entry_id) {
-    const { error: updateErr } = await supabase
-      .from('transactions')
-      .update({ is_business, category: finalCategory })
-      .eq('id', transactionId)
-      .eq('company_id', companyId)
-    if (updateErr) {
-      return {
-        ok: false,
-        request_index: index,
-        transaction_id: transactionId,
-        error: { code: 'INTERNAL_ERROR', message: 'Failed to update flags.' },
-      }
-    }
-    return {
-      ok: true,
-      request_index: index,
-      transaction_id: transactionId,
-      data: {
-        journal_entry_created: false,
-        journal_entry_id: transaction.journal_entry_id,
-        category: finalCategory,
-        already_had_journal_entry: true,
-      },
-    }
-  }
-
   // Period-lock pre-check: same rationale as the single :categorize route.
   // A locked period surfaces as PERIOD_LOCKED on the per-item error rather
   // than a generic INTERNAL_ERROR from the trigger exception.
@@ -305,6 +471,8 @@ async function categorizeOne(
       userId,
       transaction as Transaction,
       mappingResult,
+      undefined,
+      { category: finalCategory, isBusiness: is_business },
     )
     if (je) journalEntryId = je.id
   } catch (err) {
@@ -312,6 +480,31 @@ async function categorizeOne(
       request_index: index,
       transactionId,
     })
+    const postCommitFailure = await compensatePostCommitReadbackFailure(
+      supabase,
+      { companyId, userId, transactionId, error: err },
+      log,
+    )
+    if (postCommitFailure.handled) {
+      return {
+        ok: false,
+        request_index: index,
+        transaction_id: transactionId,
+        error: {
+          code: 'BOOKKEEPING_DATABASE_ERROR',
+          message: 'Posted journal entry readback failed.',
+          details: {
+            operation: 'commit_entry.readback',
+            journal_entry_id: postCommitFailure.journalEntryId,
+            voucher_number: postCommitFailure.voucherNumber,
+            compensation_verified: postCommitFailure.compensationVerified,
+            ...(postCommitFailure.partialPostedIds
+              ? { partial_posted_ids: postCommitFailure.partialPostedIds }
+              : {}),
+          },
+        },
+      }
+    }
     // AccountsNotInChartError means an account was deactivated between our
     // pre-validation and the engine call (rare race). Return the per-item
     // failure WITHOUT the transaction update below so the row stays in
@@ -336,73 +529,60 @@ async function categorizeOne(
     }
   }
 
-  const { data: updated, error: updateErr } = await supabase
-    .from('transactions')
-    .update({
-      is_business,
-      category: finalCategory,
-      journal_entry_id: journalEntryId,
-    })
-    .eq('id', transactionId)
-    .eq('company_id', companyId)
-    .is('journal_entry_id', null)
-    .select('id')
-  if (updateErr) {
+  if (!journalEntryId) {
     return {
       ok: false,
       request_index: index,
       transaction_id: transactionId,
-      error: { code: 'INTERNAL_ERROR', message: getErrorMessage(updateErr) },
+      error: {
+        code: 'BOOKKEEPING_DATABASE_ERROR',
+        message: journalEntryError ?? 'Journal entry creation returned no durable id.',
+        details: { operation: 'create_transaction_journal_entry' },
+      },
     }
   }
-  if ((!updated || updated.length === 0) && journalEntryId) {
-    // CAS race: storno the orphan (BFL 5 kap 5 §). Direct statusflip
-    // would be blocked by enforce_journal_entry_immutability since the
-    // engine writes the JE as posted. Same fix as the single :categorize
-    // route. Storno keeps the verifikationsnummer series unbroken.
-    try {
-      await reverseEntry(supabase, companyId, userId, journalEntryId)
-    } catch (revErr) {
-      log.error('batch-categorize TX_CATEGORIZE_RACE: failed to storno orphaned JE', revErr as Error, {
-        request_index: index,
-        orphanJournalEntryId: journalEntryId,
-      })
-      // Document the gap so the orphan is traceable per BFL 5 kap 5 §.
-      try {
-        const { data: orphan } = await supabase
-          .from('journal_entries')
-          .select('fiscal_period_id, voucher_series, voucher_number')
-          .eq('id', journalEntryId)
-          .eq('company_id', companyId)
-          .single()
-        if (orphan && orphan.voucher_series) {
-          // Same rationale as the single :categorize route: skip the gap row
-          // when no series exists rather than filing under a fallback series
-          // that an audit query won't find. The insert itself lives in the
-          // shared helper, which owns the real voucher_gap_explanations
-          // column set (gap_start/gap_end/user_id) and logs failures loudly.
-          await recordVoucherGapExplanation(supabase, {
-            companyId,
-            userId,
-            fiscalPeriodId: orphan.fiscal_period_id,
-            voucherSeries: orphan.voucher_series,
-            voucherNumber: orphan.voucher_number,
-            explanation:
-              'CAS-race orphan; automatisk storno misslyckades. Manuell reconciliation krävs.',
-          })
-        }
-      } catch (gapErr) {
-        log.error('batch-categorize: failed to look up the orphan for its gap explanation', gapErr as Error, {
-          request_index: index,
-          orphanJournalEntryId: journalEntryId,
-        })
-      }
-    }
+
+  const attachment = await attachCategorizedTransaction(
+    supabase,
+    {
+      companyId,
+      userId,
+      transactionId,
+      expectedJournalEntryId: transaction.journal_entry_id ?? null,
+      expectedCashAccountId: transaction.cash_account_id ?? null,
+      expectedSettlementAccount: settlementAccount,
+      isBusiness: is_business,
+      category: finalCategory,
+      journalEntryId,
+    },
+    log,
+  )
+  if (!attachment.ok && attachment.reason === 'database_error') {
     return {
       ok: false,
       request_index: index,
       transaction_id: transactionId,
-      error: { code: 'TX_CATEGORIZE_RACE', message: 'Concurrent state change.' },
+      error: {
+        code: 'BOOKKEEPING_DATABASE_ERROR',
+        message: getErrorMessage(attachment.error),
+        ...(attachment.partialPostedIds
+          ? { details: { partial_posted_ids: attachment.partialPostedIds } }
+          : {}),
+      },
+    }
+  }
+  if (!attachment.ok) {
+    return {
+      ok: false,
+      request_index: index,
+      transaction_id: transactionId,
+      error: {
+        code: 'TX_CATEGORIZE_RACE',
+        message: 'Concurrent state change.',
+        ...(attachment.partialPostedIds
+          ? { details: { partial_posted_ids: attachment.partialPostedIds } }
+          : {}),
+      },
     }
   }
 
@@ -470,13 +650,10 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
       })
     }
 
-    const { data: settings } = await ctx.supabase
-      .from('company_settings')
-      .select('entity_type')
-      .eq('company_id', ctx.companyId!)
-      .single()
-    const entityType: EntityType =
-      (settings?.entity_type as EntityType) || 'enskild_firma'
+    const { entityType } = await loadCategorizationCompanySettings(
+      ctx.supabase,
+      ctx.companyId!,
+    )
 
     const results: Item[] = []
     for (let i = 0; i < body.items.length; i++) {

@@ -4,8 +4,11 @@ import { ensureInitialized } from '@/lib/init'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { buildMappingResultFromCategory, getCategoryAccountMapping } from '@/lib/bookkeeping/category-mapping'
 import { buildTransactionEntryLines } from '@/lib/bookkeeping/transaction-entries'
+import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
+import { loadCategorizationCompanySettings } from '@/lib/bookkeeping/company-settings'
 import { getVatRate } from '@/lib/bookkeeping/vat-entries'
-import type { EntityType, Transaction, TransactionCategory, VatTreatment } from '@/types'
+import { createLogger } from '@/lib/logger'
+import type { Transaction, TransactionCategory, VatTreatment } from '@/types'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
 // PATCH /api/pending-operations/[id]
@@ -20,6 +23,7 @@ import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-m
 // invoice line items before send) they extend this dispatcher.
 
 ensureInitialized()
+const log = createLogger('api/pending-operations/edit')
 
 const CATEGORIES = [
   'income_services', 'income_products', 'income_other',
@@ -115,12 +119,13 @@ export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
       return NextResponse.json({ error: 'Transaction not found' }, { status: 404 })
     }
 
-    const { data: settings } = await supabase
-      .from('company_settings')
-      .select('entity_type')
-      .eq('company_id', companyId)
-      .maybeSingle()
-    const entityType = ((settings?.entity_type as EntityType) || 'enskild_firma')
+    const { entityType } = await loadCategorizationCompanySettings(supabase, companyId)
+    const settlementAccount = await resolveSettlementAccount(
+      supabase,
+      companyId,
+      (tx as Transaction).cash_account_id ?? null,
+      log,
+    )
 
     const isBusiness = newCategory !== 'private'
 
@@ -130,6 +135,7 @@ export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
     // before the edit is simply stale and gets dropped.
     const probe = getCategoryAccountMapping(
       newCategory, (tx as Transaction).amount, isBusiness, entityType, newVatTreatment,
+      settlementAccount,
     )
     const carriesRateVat =
       isBusiness &&
@@ -160,6 +166,7 @@ export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
         entityType,
         newVatTreatment,
         newVatAmount,
+        settlementAccount,
       )
     } catch (err) {
       return NextResponse.json(
@@ -199,6 +206,8 @@ export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
 
     const newParams = {
       ...oldParams,
+      cash_account_id: (tx as Transaction).cash_account_id ?? null,
+      settlement_account: settlementAccount,
       category: newCategory,
       vat_treatment: newVatTreatment ?? null,
       vat_amount: newVatAmount,
@@ -209,9 +218,16 @@ export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
       .update({ params: newParams, preview_data: newPreview })
       .eq('id', id)
       .eq('company_id', companyId)
+      .eq('status', 'pending')
       .select('id, params, preview_data, title, status')
-      .single()
+      .maybeSingle()
     if (error) return NextResponse.json({ error: getUserErrorMessage(error) }, { status: 500 })
+    if (!updated) {
+      return NextResponse.json(
+        { error: 'Operationen hann behandlas av en annan begäran. Ladda om och försök igen.' },
+        { status: 409 },
+      )
+    }
 
     return NextResponse.json({ data: updated })
   },

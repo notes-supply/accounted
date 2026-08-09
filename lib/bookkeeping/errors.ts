@@ -42,6 +42,7 @@ export const ENTRY_ALREADY_REVERSED = 'ENTRY_ALREADY_REVERSED' as const
 export const CURRENCY_REVALUATION_ALREADY_EXISTS = 'CURRENCY_REVALUATION_ALREADY_EXISTS' as const
 export const INVALID_MAPPING_RESULT = 'INVALID_MAPPING_RESULT' as const
 export const BOOKKEEPING_DATABASE_ERROR = 'BOOKKEEPING_DATABASE_ERROR' as const
+export const POST_COMMIT_READBACK_FAILED = 'POST_COMMIT_READBACK_FAILED' as const
 export const MEANINGLESS_CORRECTION = 'MEANINGLESS_CORRECTION' as const
 export const NO_OPEN_PERIOD_FOR_DATE = 'NO_OPEN_PERIOD_FOR_DATE' as const
 export const TARGET_PERIOD_CLOSED = 'TARGET_PERIOD_CLOSED' as const
@@ -299,6 +300,13 @@ export type BookkeepingOperation =
   | 'fetch_currency_payables'
   | 'check_existing_revaluation'
   | 'resolve_settlement_account'
+  | 'fetch_transaction'
+  | 'fetch_company_settings'
+  | 'attach_transaction_categorization'
+  | 'compensate_transaction_categorization'
+  | 'publish_transaction_compensation_events'
+  | 'verify_transaction_compensation'
+  | 'verify_existing_transaction_categorization'
 
 export class BookkeepingDatabaseError extends Error {
   readonly code = BOOKKEEPING_DATABASE_ERROR
@@ -308,6 +316,30 @@ export class BookkeepingDatabaseError extends Error {
   ) {
     super(cause ? `Database operation "${operation}" failed: ${cause}` : `Database operation "${operation}" failed`)
     this.name = 'BookkeepingDatabaseError'
+  }
+}
+
+/**
+ * The commit outcome cannot safely be treated as an unposted draft. This
+ * covers both a successful RPC with failed complete-row readback and an RPC
+ * transport failure whose authoritative status readback did not prove draft.
+ * The durable identity and any known voucher number stay on the error so
+ * callers can compensate or disclose the possible accounting artifact.
+ */
+export class PostCommitReadbackError extends Error {
+  readonly code = POST_COMMIT_READBACK_FAILED
+
+  constructor(
+    public readonly journalEntryId: string,
+    public readonly voucherNumber: number | null,
+    public readonly cause: string,
+  ) {
+    super(
+      `Journal entry ${journalEntryId} may have been posted${
+        voucherNumber === null ? '' : ` as voucher ${voucherNumber}`
+      }, but its commit outcome could not be verified: ${cause}`,
+    )
+    this.name = 'PostCommitReadbackError'
   }
 }
 
@@ -335,6 +367,7 @@ export function isBookkeepingError(err: unknown): boolean {
     err instanceof CurrencyRevaluationAlreadyExistsError ||
     err instanceof InvalidMappingResultError ||
     err instanceof BookkeepingDatabaseError ||
+    err instanceof PostCommitReadbackError ||
     err instanceof MeaninglessCorrectionError ||
     err instanceof NoOpenPeriodForDateError ||
     err instanceof TargetPeriodClosedError ||
@@ -609,6 +642,22 @@ export function bookkeepingErrorResponse(err: unknown): NextResponse | null {
         },
       },
       { status: 500 }
+    )
+  }
+
+  if (err instanceof PostCommitReadbackError) {
+    return NextResponse.json(
+      {
+        error: {
+          code: err.code,
+          message: err.message,
+          details: {
+            journal_entry_id: err.journalEntryId,
+            voucher_number: err.voucherNumber,
+          },
+        },
+      },
+      { status: 500 },
     )
   }
 

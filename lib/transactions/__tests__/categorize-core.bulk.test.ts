@@ -40,6 +40,7 @@ vi.mock('@/lib/core/documents/document-service', () => ({
 
 import { bulkBookMatchedInboxItems } from '../categorize-core'
 import { BulkBookInboxSchema } from '@/lib/api/schemas'
+import { PostCommitReadbackError } from '@/lib/bookkeeping/errors'
 import { eventBus } from '@/lib/events/bus'
 
 /** Queue-based supabase mock: each `from()` consumes the next queued result. */
@@ -59,7 +60,7 @@ function queuedSupabase(results: Array<{ data?: unknown; error?: unknown }>) {
     )
     return chain
   })
-  return { from } as never
+  return { from, rpc: from } as never
 }
 
 beforeEach(() => {
@@ -221,8 +222,8 @@ describe('bulkBookMatchedInboxItems: booking', () => {
       { data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 } },
       // 4. ensureFiscalPeriod → existing period
       { data: [{ id: 'fp-1' }] },
-      // 5. transactions update (mark booked)
-      { error: null },
+      // 5. atomic settlement attachment
+      { data: true, error: null },
       // 6. propagation select (no matched inbox rows to stamp in this mock)
       { data: [] },
     ])
@@ -244,6 +245,7 @@ describe('bulkBookMatchedInboxItems: booking', () => {
       'aktiebolag',
       'reverse_charge',
       undefined,
+      '1930',
     )
   })
 
@@ -266,7 +268,7 @@ describe('bulkBookMatchedInboxItems: booking', () => {
       { data: { id: 'tx-1', date: '2026-06-01', amount: -700, currency: 'SEK', cash_account_id: null, journal_entry_id: null } },
       { data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 } },
       { data: [{ id: 'fp-1' }] },
-      { error: null },
+      { data: true, error: null },
       { data: [] },
     ])
 
@@ -285,6 +287,7 @@ describe('bulkBookMatchedInboxItems: booking', () => {
       expect.objectContaining({ id: 'tx-1' }),
       expect.objectContaining({ dimensions: { '6': 'P001' } }),
       undefined,
+      { category: 'expense_software', isBusiness: true },
     )
   })
 
@@ -297,7 +300,7 @@ describe('bulkBookMatchedInboxItems: booking', () => {
       { data: { id: 'tx-2', date: '2026-06-02', amount: -25, currency: 'SEK', cash_account_id: null, journal_entry_id: null } },
       { data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 } },
       { data: [{ id: 'fp-1' }] },
-      { error: null },
+      { data: true, error: null },
       { data: [] },
     ])
 
@@ -310,6 +313,124 @@ describe('bulkBookMatchedInboxItems: booking', () => {
     expect(booked).toEqual([{ item_id: 'i2', transaction_id: 'tx-2', journal_entry_id: 'je-1' }])
     expect(mockCreateJE).toHaveBeenCalledTimes(1)
   })
+
+  it('preserves every known posted id when categorization compensation is unverifiable', async () => {
+    mockCreateJE.mockRejectedValueOnce(
+      new PostCommitReadbackError('je-original', 42, 'transport outcome unknown'),
+    )
+    const supabase = queuedSupabase([
+      { data: { id: 'i1', matched_transaction_id: 'tx-1', created_journal_entry_id: null, created_supplier_invoice_id: null } },
+      { data: { id: 'tx-1', date: '2026-06-01', amount: -700, currency: 'SEK', cash_account_id: null, journal_entry_id: null } },
+      { data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 } },
+      { data: [{ id: 'fp-1' }] },
+      {
+        data: {
+          status: 'unverified_existing_reversal',
+          original_journal_entry_id: 'je-original',
+          reversal_journal_entry_ids: ['je-reversal-1', 'je-reversal-2'],
+          original_pointer_cleared: false,
+        },
+        error: null,
+      },
+    ])
+
+    const result = await bulkBookMatchedInboxItems(supabase, 'u1', 'c1', {
+      item_ids: ['i1'],
+      category: 'expense_software',
+    })
+
+    const postedIds = {
+      journal_entry_id: 'je-original',
+      reversal_journal_entry_id: 'je-reversal-1',
+      reversal_journal_entry_2_id: 'je-reversal-2',
+    }
+    expect(result.booked).toEqual([])
+    expect(result.skipped).toEqual([
+      {
+        item_id: 'i1',
+        reason: 'error',
+        detail: 'The journal entry was posted, but its complete readback could not be verified.',
+        partial_posted_ids: postedIds,
+      },
+    ])
+    expect(result.partial_posted_ids).toEqual(postedIds)
+  })
+
+  it('does not expose partial ids after categorization compensation is verified', async () => {
+    mockCreateJE.mockRejectedValueOnce(
+      new PostCommitReadbackError('je-original', 42, 'transport outcome unknown'),
+    )
+    const supabase = queuedSupabase([
+      { data: { id: 'i1', matched_transaction_id: 'tx-1', created_journal_entry_id: null, created_supplier_invoice_id: null } },
+      { data: { id: 'tx-1', date: '2026-06-01', amount: -700, currency: 'SEK', cash_account_id: null, journal_entry_id: null } },
+      { data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 } },
+      { data: [{ id: 'fp-1' }] },
+      {
+        data: {
+          status: 'reversed',
+          original_journal_entry_id: 'je-original',
+          reversal_journal_entry_ids: ['je-reversal'],
+          original_pointer_cleared: true,
+          event_outbox_ids: [
+            'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+            'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+          ],
+        },
+        error: null,
+      },
+      {
+        data: {
+          id: 'je-original',
+          company_id: 'c1',
+          source_type: 'bank_transaction',
+          source_id: 'tx-1',
+          status: 'reversed',
+          reversed_by_id: 'je-reversal',
+          lines: [],
+        },
+        error: null,
+      },
+      {
+        data: {
+          id: 'je-reversal',
+          company_id: 'c1',
+          source_type: 'storno',
+          status: 'posted',
+          reverses_id: 'je-original',
+          lines: [],
+        },
+        error: null,
+      },
+      {
+        data: {
+          status: 'published',
+          original_journal_entry_id: 'je-original',
+          reversal_journal_entry_id: 'je-reversal',
+          event_outbox_ids: [
+            'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+            'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+          ],
+          event_log_count: 2,
+          webhook_delivery_count: 0,
+        },
+        error: null,
+      },
+    ])
+
+    const result = await bulkBookMatchedInboxItems(supabase, 'u1', 'c1', {
+      item_ids: ['i1'],
+      category: 'expense_software',
+    })
+
+    expect(result.skipped).toEqual([
+      {
+        item_id: 'i1',
+        reason: 'error',
+        detail: 'The journal entry was posted, but its complete readback could not be verified.',
+      },
+    ])
+    expect(result).not.toHaveProperty('partial_posted_ids')
+  })
 })
 
 describe('bulkBookMatchedInboxItems: intra-batch duplicate handling', () => {
@@ -319,7 +440,7 @@ describe('bulkBookMatchedInboxItems: intra-batch duplicate handling', () => {
     { data: { id: txId, date: '2026-06-01', amount, currency: 'SEK', cash_account_id: null, journal_entry_id: null } },
     { data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 } },
     { data: [{ id: 'fp-1' }] },
-    { error: null },
+    { data: true, error: null },
     { data: [] },
   ]
 

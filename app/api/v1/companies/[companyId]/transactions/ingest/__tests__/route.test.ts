@@ -67,6 +67,7 @@ function makeFlexibleSupabase(byTable: Record<string, MockResult | MockResult[]>
   for (const [t, val] of Object.entries(byTable)) {
     queues.set(t, Array.isArray(val) ? [...val] : [val])
   }
+  queues.set('rpc:attach_transaction_categorization', [{ data: true, error: null }])
   const buildChain = (table: string): unknown => {
     const handler: ProxyHandler<object> = {
       get(_target, prop) {
@@ -82,7 +83,10 @@ function makeFlexibleSupabase(byTable: Record<string, MockResult | MockResult[]>
     }
     return new Proxy({}, handler)
   }
-  return { from: vi.fn((table: string) => buildChain(table)) }
+  return {
+    from: vi.fn((table: string) => buildChain(table)),
+    rpc: vi.fn((fn: string) => buildChain(`rpc:${fn}`)),
+  }
 }
 
 const COMPANY_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
@@ -138,6 +142,49 @@ describe('POST /transactions/ingest', () => {
     expect(body.data.imported).toBe(2)
     expect(body.data.duplicates).toBe(1)
     expect(ingestMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('preserves per-item auto-categorization failure and posted-artifact details', async () => {
+    ingestMock.mockResolvedValueOnce({
+      imported: 1,
+      duplicates: 0,
+      reconciled: 0,
+      auto_categorized: 0,
+      auto_matched_invoices: 0,
+      errors: 0,
+      transaction_ids: ['11111111-1111-4111-8111-111111111111'],
+      auto_categorization_failures: [{
+        transaction_id: '11111111-1111-4111-8111-111111111111',
+        code: 'ATTACHMENT_DATABASE_ERROR',
+        partial_posted_ids: {
+          journal_entry_id: 'je-original',
+          reversal_journal_entry_id: 'je-reversal',
+        },
+      }],
+    })
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      }),
+    )
+
+    const res = await ingestPOST(
+      makeRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/transactions/ingest`, {
+        transactions: [SAMPLE_TX],
+      }),
+      { params: Promise.resolve({ companyId: COMPANY_ID }) },
+    )
+    const body = await res.json()
+
+    expect(res.status).toBe(200)
+    expect(body.data.auto_categorization_failures).toEqual([{
+      transaction_id: '11111111-1111-4111-8111-111111111111',
+      code: 'ATTACHMENT_DATABASE_ERROR',
+      partial_posted_ids: {
+        journal_entry_id: 'je-original',
+        reversal_journal_entry_id: 'je-reversal',
+      },
+    }])
   })
 
   it('dry-run returns dedup decisions without inserting', async () => {
@@ -214,7 +261,6 @@ describe('POST /transactions/batch-categorize', () => {
             },
             error: null,
           },
-          { data: [{ id: TX_ID }], error: null }, // CAS update select for item 0
           { data: null, error: { code: 'PGRST116' } }, // item 1 not found
         ],
       }),

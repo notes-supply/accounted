@@ -25,9 +25,15 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 import { eventBus } from '@/lib/events'
 import { buildMappingResultFromCategory } from '@/lib/bookkeeping/category-mapping'
 import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
+import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
+import { loadCategorizationCompanySettings } from '@/lib/bookkeeping/company-settings'
 import { upsertCounterpartyTemplate } from '@/lib/bookkeeping/counterparty-templates'
-import { isBookkeepingError } from '@/lib/bookkeeping/errors'
+import { BookkeepingDatabaseError, isBookkeepingError } from '@/lib/bookkeeping/errors'
 import { linkToJournalEntry } from '@/lib/core/documents/document-service'
+import {
+  attachCategorizedTransaction,
+  compensatePostCommitReadbackFailure,
+} from '@/lib/transactions/settlement-attachment'
 import {
   detectBookingDuplicate,
   type BookedDuplicateCandidate,
@@ -36,7 +42,7 @@ import {
 import { hasLiveJournalEntryLink } from '@/lib/transactions/link-journal-entry'
 import { appendProcessingHistory } from '@/lib/processing-history/append'
 import { createLogger } from '@/lib/logger'
-import type { Transaction, TransactionCategory, EntityType, VatTreatment } from '@/types'
+import type { Transaction, TransactionCategory, VatTreatment } from '@/types'
 
 const log = createLogger('transactions/categorize-core')
 
@@ -44,7 +50,9 @@ const log = createLogger('transactions/categorize-core')
 export interface CategorizeCoreResult {
   data?: Record<string, unknown>
   error?: string
+  errorCode?: string
   status?: number
+  partialPostedIds?: Record<string, string>
 }
 
 export interface CategorizeMatchedTransactionOpts {
@@ -69,6 +77,11 @@ export interface CategorizeMatchedTransactionOpts {
    * registry at staging time (MCP) or picked in the UI.
    */
   dimensions?: Record<string, string>
+  /** Immutable settlement provenance captured in the approved preview. */
+  expectedSettlement?: {
+    cashAccountId: string | null
+    ledgerAccount: string
+  }
 }
 
 // ── Helper: duplicate-guard claim text ───────────────────────────────
@@ -211,9 +224,12 @@ export async function categorizeMatchedTransaction(
   const { category, vatTreatment, vatAmount, notes, allowDuplicate, dimensions } = opts
 
   const { data: transaction, error: fetchError } = await supabase
-    .from('transactions').select('*').eq('id', txId).eq('company_id', companyId).single()
+    .from('transactions').select('*').eq('id', txId).eq('company_id', companyId).maybeSingle()
 
-  if (fetchError || !transaction) {
+  if (fetchError) {
+    throw new BookkeepingDatabaseError('fetch_transaction', fetchError.message)
+  }
+  if (!transaction) {
     return { error: 'Transaction not found: it may have been deleted.', status: 404 }
   }
   // A stale pointer at a 'reversed' entry (storno/correction left it behind)
@@ -229,6 +245,8 @@ export async function categorizeMatchedTransaction(
   ) {
     return { error: 'Transaction already has a journal entry: it was categorized in the meantime.', status: 409 }
   }
+
+  let duplicateDismissalHistory: Parameters<typeof appendProcessingHistory>[0] | null = null
 
   // Booking-time duplicate guard: parity with the web /categorize route.
   // Refuse to mint a second verifikat for an affärshändelse already in the
@@ -287,7 +305,7 @@ export async function categorizeMatchedTransaction(
         cash_account_id: transaction.cash_account_id ?? null,
       }, exclude)
       if (dismissed) {
-        await appendProcessingHistory({
+        duplicateDismissalHistory = {
           companyId,
           correlationId: txId,
           aggregateType: 'BankTransaction',
@@ -314,7 +332,7 @@ export async function categorizeMatchedTransaction(
           },
           actor: { type: 'user', id: userId },
           occurredAt: new Date(),
-        })
+        }
       }
     } catch (logErr) {
       log.warn('failed to record duplicate-dismissal behandlingshistorik', logErr)
@@ -323,14 +341,34 @@ export async function categorizeMatchedTransaction(
 
   const isBusiness = category !== 'private'
 
-  const { data: settings } = await supabase
-    .from('company_settings').select('entity_type, fiscal_year_start_month').eq('company_id', companyId).single()
+  const { entityType, fiscalYearStartMonth } = await loadCategorizationCompanySettings(
+    supabase,
+    companyId,
+  )
 
-  const entityType: EntityType = (settings?.entity_type as EntityType) || 'enskild_firma'
-  const fiscalYearStartMonth = settings?.fiscal_year_start_month ?? 1
+  // Book the bank leg on the cash account this transaction actually belongs
+  // to. cash_account_id -> cash_accounts.ledger_account is authoritative;
+  // resolveSettlementAccount retains 1930 only for legacy unbound rows.
+  const settlementAccount = await resolveSettlementAccount(
+    supabase, companyId, transaction.cash_account_id ?? null, log,
+  )
+  if (
+    opts.expectedSettlement &&
+    (
+      (transaction.cash_account_id ?? null) !== opts.expectedSettlement.cashAccountId ||
+      settlementAccount !== opts.expectedSettlement.ledgerAccount
+    )
+  ) {
+    return {
+      error: 'Transactionens avräkningskonto har ändrats sedan förhandsgranskningen. Skapa en ny förhandsgranskning.',
+      errorCode: 'SETTLEMENT_ACCOUNT_DRIFT',
+      status: 409,
+    }
+  }
 
   const mappingResult = buildMappingResultFromCategory(
-    category, transaction as Transaction, isBusiness, entityType, vatTreatment, vatAmount
+    category, transaction as Transaction, isBusiness, entityType, vatTreatment, vatAmount,
+    settlementAccount,
   )
   // Dimensions PR7: tag the business lines of the generated verifikat.
   if (dimensions && Object.keys(dimensions).length > 0) {
@@ -347,22 +385,83 @@ export async function categorizeMatchedTransaction(
   try {
     const journalEntry = await createTransactionJournalEntry(
       supabase, companyId, userId, transaction as Transaction, mappingResult, notes,
+      { category, isBusiness },
     )
     if (journalEntry) journalEntryId = journalEntry.id
   } catch (err) {
+    const postCommitFailure = await compensatePostCommitReadbackFailure(
+      supabase,
+      { companyId, userId, transactionId: txId, error: err },
+      log,
+    )
+    if (postCommitFailure.handled) {
+      return {
+        error: 'The journal entry was posted, but its complete readback could not be verified.',
+        errorCode: 'POST_COMMIT_READBACK_FAILED',
+        status: 500,
+        ...(postCommitFailure.partialPostedIds
+          ? { partialPostedIds: postCommitFailure.partialPostedIds }
+          : {}),
+      }
+    }
     if (isBookkeepingError(err)) throw err
     log.error('Failed to create journal entry:', err)
     return { error: err instanceof Error ? err.message : 'Failed to create journal entry', status: 500 }
   }
 
-  const { error: updateError } = await supabase
-    .from('transactions')
-    .update({ is_business: isBusiness, category, journal_entry_id: journalEntryId })
-    .eq('id', txId)
+  if (!journalEntryId) {
+    return {
+      error: 'Journal entry creation returned no durable journal entry id.',
+      errorCode: 'BOOKKEEPING_DATABASE_ERROR',
+      status: 500,
+    }
+  }
 
-  if (updateError) {
-    log.error('Failed to update transaction:', updateError)
-    return { error: 'Failed to update transaction', status: 500 }
+  const attachment = await attachCategorizedTransaction(
+    supabase,
+    {
+      companyId,
+      userId,
+      transactionId: txId,
+      expectedJournalEntryId: transaction.journal_entry_id ?? null,
+      expectedCashAccountId: transaction.cash_account_id ?? null,
+      expectedSettlementAccount: settlementAccount,
+      isBusiness,
+      category,
+      journalEntryId,
+    },
+    log,
+  )
+
+  if (!attachment.ok && attachment.reason === 'database_error') {
+    if (!attachment.partialPostedIds && attachment.error) throw attachment.error
+    return {
+      error: 'Failed to attach the posted journal entry to the transaction',
+      errorCode: 'BOOKKEEPING_DATABASE_ERROR',
+      status: 500,
+      ...(attachment.partialPostedIds
+        ? { partialPostedIds: attachment.partialPostedIds }
+        : {}),
+    }
+  }
+
+  if (!attachment.ok) {
+    return {
+      error: 'Transactionen ändrades samtidigt som bokföringen skapades. Skapa en ny förhandsgranskning.',
+      errorCode: 'SETTLEMENT_ACCOUNT_DRIFT',
+      status: 409,
+      ...(attachment.partialPostedIds
+        ? { partialPostedIds: attachment.partialPostedIds }
+        : {}),
+    }
+  }
+
+  if (duplicateDismissalHistory) {
+    try {
+      await appendProcessingHistory(duplicateDismissalHistory)
+    } catch (logErr) {
+      log.warn('failed to record duplicate-dismissal behandlingshistorik', logErr)
+    }
   }
 
   // Propagate the underlag from a matched invoice-inbox item onto the new
@@ -456,7 +555,30 @@ export interface BulkBookInboxInput {
 
 export interface BulkBookInboxResult {
   booked: Array<{ item_id: string; transaction_id: string; journal_entry_id: string | null }>
-  skipped: Array<{ item_id: string; reason: string; detail?: string }>
+  skipped: Array<{
+    item_id: string
+    reason: string
+    detail?: string
+    partial_posted_ids?: Record<string, string>
+  }>
+  partial_posted_ids?: Record<string, string>
+}
+
+function appendPartialPostedIds(
+  aggregate: Record<string, string>,
+  postedIds: Record<string, string>,
+): void {
+  for (const [key, id] of Object.entries(postedIds)) {
+    if (!aggregate[key]) {
+      aggregate[key] = id
+      continue
+    }
+
+    const base = key.endsWith('_id') ? key.slice(0, -3) : key
+    let suffix = 2
+    while (aggregate[`${base}_${suffix}_id`]) suffix++
+    aggregate[`${base}_${suffix}_id`] = id
+  }
 }
 
 /**
@@ -480,6 +602,7 @@ export async function bulkBookMatchedInboxItems(
 
   const booked: BulkBookInboxResult['booked'] = []
   const skipped: BulkBookInboxResult['skipped'] = []
+  const partialPostedIds: Record<string, string> = {}
 
   // Ids booked so far in THIS batch. Passed as exclusions to each subsequent
   // booking so two DISTINCT bank movements the user selected that share a
@@ -543,7 +666,17 @@ export async function bulkBookMatchedInboxItems(
         : result.status === 409 ? 'already_booked_or_duplicate'
         : result.status === 400 ? 'no_account_mapping'
         : 'error'
-      skipped.push({ item_id: itemId, reason, detail: result.error })
+      if (result.partialPostedIds) {
+        appendPartialPostedIds(partialPostedIds, result.partialPostedIds)
+      }
+      skipped.push({
+        item_id: itemId,
+        reason,
+        detail: result.error,
+        ...(result.partialPostedIds
+          ? { partial_posted_ids: result.partialPostedIds }
+          : {}),
+      })
       continue
     }
 
@@ -559,5 +692,11 @@ export async function bulkBookMatchedInboxItems(
     })
   }
 
-  return { booked, skipped }
+  return {
+    booked,
+    skipped,
+    ...(Object.keys(partialPostedIds).length > 0
+      ? { partial_posted_ids: partialPostedIds }
+      : {}),
+  }
 }

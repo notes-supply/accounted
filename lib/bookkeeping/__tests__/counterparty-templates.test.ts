@@ -17,6 +17,7 @@ import {
   populateTemplatesFromSieVouchers,
 } from '../counterparty-templates'
 import { buildTransactionEntryLines } from '../transaction-entries'
+import { applySettlementAccount } from '../mapping-engine'
 import { roundOre } from '@/lib/money'
 import type { TemplateUpsertParams } from '../counterparty-templates'
 import type { LinePatternEntry } from '@/types'
@@ -365,6 +366,46 @@ describe('counterparty-templates', () => {
   // ── Build MappingResult ────────────────────────────────────
 
   describe('buildMappingResultFromCounterpartyTemplate', () => {
+    it('rebinds a learned 1931 expense template to the current transaction settlement account', () => {
+      const template = makeCategorizationTemplate({
+        debit_account: '6570',
+        credit_account: '1931',
+        vat_treatment: null,
+      })
+      const match = { template, matchMethod: 'exact_alias' as const, confidence: 0.9 }
+      const tx = makeTransaction({ amount: -50 })
+      const learned = buildMappingResultFromCounterpartyTemplate(match, tx, 'aktiebolag')
+
+      expect(applySettlementAccount(learned, '1930', tx.amount)).toMatchObject({
+        debit_account: '6570',
+        credit_account: '1930',
+      })
+      expect(applySettlementAccount(learned, '1940', tx.amount)).toMatchObject({
+        debit_account: '6570',
+        credit_account: '1940',
+      })
+    })
+
+    it('preserves a learned multi-line VAT pattern while rebinding its settlement leg', () => {
+      const template = makeCategorizationTemplate({
+        debit_account: '5420',
+        credit_account: '1931',
+        line_pattern: [
+          { account: '5420', type: 'business', side: 'debit', ratio: 1 },
+          { account: '2641', type: 'vat', side: 'debit', vat_rate: 0.25 },
+        ],
+      })
+      const match = { template, matchMethod: 'exact_alias' as const, confidence: 0.9 }
+      const tx = makeTransaction({ amount: -125 })
+      const learned = buildMappingResultFromCounterpartyTemplate(match, tx, 'aktiebolag')
+
+      const rebound = applySettlementAccount(learned, '1940', tx.amount)
+
+      expect(rebound.credit_account).toBe('1940')
+      expect(rebound.all_lines_complete).toBe(true)
+      expect(rebound.vat_lines.map((line) => line.account_number)).toEqual(['2641', '5420'])
+    })
+
     it('builds correct MappingResult for expense with VAT', () => {
       const template = makeCategorizationTemplate({
         debit_account: '6200',

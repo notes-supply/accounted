@@ -18,6 +18,42 @@ vi.mock('@/lib/logger', () => ({
 import { commitEntry, getNextVoucherNumber, createJournalEntry } from '../engine'
 import { runWithActor } from '../actor-context-node'
 import { BookkeepingDatabaseError } from '../errors'
+import { eventBus } from '@/lib/events'
+
+type AmbiguousRpcOutcome =
+  | { kind: 'returned'; message: string }
+  | { kind: 'thrown'; message: string }
+
+function makeAmbiguousCommitSupabase(
+  rpcOutcome: AmbiguousRpcOutcome,
+  readback: { data: unknown; error: unknown },
+) {
+  const readbackMaybeSingle = vi.fn().mockResolvedValue(readback)
+  const companyEq = vi.fn().mockReturnValue({ maybeSingle: readbackMaybeSingle })
+  const entryEq = vi.fn().mockReturnValue({ eq: companyEq })
+  const readbackSelect = vi.fn().mockReturnValue({ eq: entryEq })
+  const rulesQuery = Promise.resolve({ data: [], error: null })
+  const rulesSecondEq = vi.fn().mockReturnValue(rulesQuery)
+  const rulesFirstEq = vi.fn().mockReturnValue({ eq: rulesSecondEq })
+  const rulesSelect = vi.fn().mockReturnValue({ eq: rulesFirstEq })
+  const rpc = rpcOutcome.kind === 'returned'
+    ? vi.fn().mockResolvedValue({ data: null, error: { message: rpcOutcome.message } })
+    : vi.fn().mockRejectedValue(new TypeError(rpcOutcome.message))
+
+  return {
+    supabase: {
+      from: vi.fn().mockImplementation((table: string) => {
+        if (table === 'account_dimension_rules') return { select: rulesSelect }
+        if (table === 'journal_entries') return { select: readbackSelect }
+        throw new Error(`Unexpected table: ${table}`)
+      }),
+      rpc,
+    },
+    entryEq,
+    companyEq,
+    readbackMaybeSingle,
+  }
+}
 
 describe('voucher number atomicity', () => {
   beforeEach(() => {
@@ -59,14 +95,11 @@ describe('voucher number atomicity', () => {
    * If the RPC fails (e.g., balance trigger rejection), the sequence increment
    * rolls back: no burned number, no gap.
    */
-  it('commitEntry RPC failure does not burn a sequence number', async () => {
-    const supabase = {
-      from: vi.fn(),
-      rpc: vi.fn().mockResolvedValue({
-        data: null,
-        error: { message: 'Journal entry is not balanced: debit=1000 credit=500' },
-      }),
-    }
+  it('commitEntry RPC failure stays ordinary only after company-scoped draft readback', async () => {
+    const { supabase, entryEq, companyEq } = makeAmbiguousCommitSupabase(
+      { kind: 'returned', message: 'Journal entry is not balanced: debit=1000 credit=500' },
+      { data: { status: 'draft', voucher_number: 0 }, error: null },
+    )
 
     await expect(
       commitEntry(supabase as never, 'co-1', 'user-1', 'entry-1')
@@ -83,12 +116,60 @@ describe('voucher number atomicity', () => {
       p_actor_label: null,
     })
 
-    // No line/entry fetch happened: the RPC handles everything atomically.
-    // (PR10: commitEntry now also probes account_dimension_rules first; the
-    // bare mock makes that probe fail open, which is exactly the posture.)
-    expect(supabase.from).not.toHaveBeenCalledWith('journal_entries')
+    expect(supabase.from).toHaveBeenCalledWith('journal_entries')
     expect(supabase.from).not.toHaveBeenCalledWith('journal_entry_lines')
+    expect(entryEq).toHaveBeenCalledWith('id', 'entry-1')
+    expect(companyEq).toHaveBeenCalledWith('company_id', 'co-1')
   })
+
+  it.each([
+    { rpcKind: 'returned' as const, readbackKind: 'posted' as const },
+    { rpcKind: 'returned' as const, readbackKind: 'error' as const },
+    { rpcKind: 'returned' as const, readbackKind: 'missing' as const },
+    { rpcKind: 'thrown' as const, readbackKind: 'posted' as const },
+    { rpcKind: 'thrown' as const, readbackKind: 'error' as const },
+    { rpcKind: 'thrown' as const, readbackKind: 'missing' as const },
+  ])(
+    'commitEntry classifies $rpcKind RPC failure with $readbackKind readback as unknown-post',
+    async ({ rpcKind, readbackKind }) => {
+      const readback = readbackKind === 'posted'
+        ? { data: { status: 'posted', voucher_number: 73 }, error: null }
+        : readbackKind === 'error'
+          ? { data: null, error: { message: 'readback transport failed', code: '08006' } }
+          : { data: null, error: null }
+      const { supabase, entryEq, companyEq } = makeAmbiguousCommitSupabase(
+        { kind: rpcKind, message: 'commit transport failed' },
+        readback,
+      )
+
+      await expect(
+        commitEntry(supabase as never, 'co-1', 'user-1', 'entry-ambiguous'),
+      ).rejects.toMatchObject({
+        name: 'PostCommitReadbackError',
+        journalEntryId: 'entry-ambiguous',
+        voucherNumber: readbackKind === 'posted' ? 73 : null,
+      })
+      expect(entryEq).toHaveBeenCalledWith('id', 'entry-ambiguous')
+      expect(companyEq).toHaveBeenCalledWith('company_id', 'co-1')
+    },
+  )
+
+  it.each([
+    { kind: 'returned' as const, message: 'constraint rejected commit' },
+    { kind: 'thrown' as const, message: 'fetch failed' },
+  ])(
+    'commitEntry keeps a $kind RPC failure ordinary when readback proves draft',
+    async (rpcOutcome) => {
+      const { supabase } = makeAmbiguousCommitSupabase(
+        rpcOutcome,
+        { data: { status: 'draft', voucher_number: 0 }, error: null },
+      )
+
+      await expect(
+        commitEntry(supabase as never, 'co-1', 'user-1', 'entry-draft'),
+      ).rejects.toBeInstanceOf(BookkeepingDatabaseError)
+    },
+  )
 
   it('commitEntry succeeds via atomic RPC and returns posted entry', async () => {
     const postedEntry = {
@@ -127,6 +208,42 @@ describe('voucher number atomicity', () => {
     })
     // from() called once to fetch the complete entry with lines
     expect(supabase.from).toHaveBeenCalledWith('journal_entries')
+  })
+
+  it.each([
+    {
+      name: 'database error',
+      readback: { data: null, error: { message: 'connection reset', code: '08006' } },
+    },
+    {
+      name: 'null row',
+      readback: { data: null, error: null },
+    },
+  ])('commitEntry preserves durable identity when posted readback returns $name', async ({ readback }) => {
+    const supabase = {
+      from: vi.fn().mockImplementation(() => ({
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            single: vi.fn().mockResolvedValue(readback),
+          }),
+        }),
+      })),
+      rpc: vi.fn().mockResolvedValue({
+        data: [{ voucher_number: 37 }],
+        error: null,
+      }),
+    }
+
+    await expect(
+      commitEntry(supabase as never, 'co-1', 'user-1', 'entry-posted'),
+    ).rejects.toMatchObject({
+      name: 'PostCommitReadbackError',
+      journalEntryId: 'entry-posted',
+      voucherNumber: 37,
+    })
+    expect(eventBus.emit).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'journal_entry.committed' }),
+    )
   })
 
   /**
@@ -201,11 +318,14 @@ describe('createJournalEntry orphan draft cleanup', () => {
    * ambiguity, balance trigger, period lock), the draft created by createDraftEntry
    * must be cancelled so it doesn't linger as an undeletable stuck draft.
    */
-  it('cancels the draft when commit RPC fails', async () => {
+  it.each(['returned', 'thrown'] as const)(
+  'cancels the company-scoped draft when a %s commit RPC failure is proven unposted', async (failureKind) => {
     const draftId = 'entry-1'
     const cancelUpdate = vi.fn().mockReturnValue({
       eq: vi.fn().mockReturnValue({
-        eq: vi.fn().mockResolvedValue({ error: null }),
+        eq: vi.fn().mockReturnValue({
+          eq: vi.fn().mockResolvedValue({ error: null }),
+        }),
       }),
     })
 
@@ -258,6 +378,12 @@ describe('createJournalEntry orphan draft cleanup', () => {
                   data: { id: draftId, status: 'draft', lines: [] },
                   error: null,
                 }),
+                eq: vi.fn().mockReturnValue({
+                  maybeSingle: vi.fn().mockResolvedValue({
+                    data: { status: 'draft', voucher_number: 0 },
+                    error: null,
+                  }),
+                }),
               }),
             }),
             update: cancelUpdate,
@@ -271,10 +397,12 @@ describe('createJournalEntry orphan draft cleanup', () => {
         return {}
       }),
       // commit_journal_entry RPC fails: simulates overload ambiguity or balance error
-      rpc: vi.fn().mockResolvedValue({
-        data: null,
-        error: { message: 'Could not choose the best candidate function' },
-      }),
+      rpc: failureKind === 'returned'
+        ? vi.fn().mockResolvedValue({
+            data: null,
+            error: { message: 'Could not choose the best candidate function' },
+          })
+        : vi.fn().mockRejectedValue(new TypeError('commit transport failed')),
     }
 
     await expect(
@@ -295,7 +423,110 @@ describe('createJournalEntry orphan draft cleanup', () => {
     const firstEq = cancelUpdate.mock.results[0].value.eq
     expect(firstEq).toHaveBeenCalledWith('id', draftId)
     const secondEq = firstEq.mock.results[0].value.eq
-    expect(secondEq).toHaveBeenCalledWith('status', 'draft')
+    expect(secondEq).toHaveBeenCalledWith('company_id', 'co-1')
+    const thirdEq = secondEq.mock.results[0].value.eq
+    expect(thirdEq).toHaveBeenCalledWith('status', 'draft')
+  })
+
+  it('never attempts draft cancellation after a durable commit with failed readback', async () => {
+    const draftId = 'entry-posted'
+    const cancelUpdate = vi.fn()
+    let completeReadCount = 0
+    const draft = {
+      id: draftId,
+      company_id: 'co-1',
+      fiscal_period_id: 'fp-1',
+      voucher_series: 'A',
+      voucher_number: 0,
+      status: 'draft' as JournalEntryStatus,
+      lines: [],
+    }
+
+    const supabase = {
+      from: vi.fn().mockImplementation((table: string) => {
+        if (table === 'fiscal_periods') {
+          return {
+            select: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                eq: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({
+                    data: {
+                      name: 'FY 2025',
+                      period_start: '2025-01-01',
+                      period_end: '2025-12-31',
+                    },
+                    error: null,
+                  }),
+                }),
+              }),
+            }),
+          }
+        }
+        if (table === 'chart_of_accounts') {
+          return {
+            select: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                in: vi.fn().mockReturnValue({
+                  eq: vi.fn().mockResolvedValue({
+                    data: [
+                      { account_number: '1930', id: 'acc-1930' },
+                      { account_number: '1510', id: 'acc-1510' },
+                    ],
+                    error: null,
+                  }),
+                }),
+              }),
+            }),
+          }
+        }
+        if (table === 'journal_entries') {
+          return {
+            insert: vi.fn().mockReturnValue({
+              select: vi.fn().mockReturnValue({
+                single: vi.fn().mockResolvedValue({ data: draft, error: null }),
+              }),
+            }),
+            select: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                single: vi.fn().mockImplementation(async () => {
+                  completeReadCount++
+                  return completeReadCount === 1
+                    ? { data: draft, error: null }
+                    : { data: null, error: { message: 'read timed out', code: '57014' } }
+                }),
+              }),
+            }),
+            update: cancelUpdate,
+          }
+        }
+        if (table === 'journal_entry_lines') {
+          return { insert: vi.fn().mockResolvedValue({ error: null }) }
+        }
+        return {}
+      }),
+      rpc: vi.fn().mockResolvedValue({
+        data: [{ voucher_number: 12 }],
+        error: null,
+      }),
+    }
+
+    await expect(
+      createJournalEntry(supabase as never, 'co-1', 'user-1', {
+        fiscal_period_id: 'fp-1',
+        entry_date: '2025-06-15',
+        description: 'Payment',
+        source_type: 'invoice_paid',
+        lines: [
+          { account_number: '1930', debit_amount: 1000, credit_amount: 0 },
+          { account_number: '1510', debit_amount: 0, credit_amount: 1000 },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      name: 'PostCommitReadbackError',
+      journalEntryId: draftId,
+      voucherNumber: 12,
+    })
+    expect(cancelUpdate).not.toHaveBeenCalled()
   })
 
   it('surfaces original commit error even if cleanup update fails', async () => {
@@ -349,6 +580,12 @@ describe('createJournalEntry orphan draft cleanup', () => {
                 single: vi.fn().mockResolvedValue({
                   data: { id: draftId, status: 'draft', lines: [] },
                   error: null,
+                }),
+                eq: vi.fn().mockReturnValue({
+                  maybeSingle: vi.fn().mockResolvedValue({
+                    data: { status: 'draft', voucher_number: 0 },
+                    error: null,
+                  }),
                 }),
               }),
             }),

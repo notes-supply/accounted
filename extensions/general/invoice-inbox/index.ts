@@ -2419,12 +2419,13 @@ export const invoiceInboxExtension: Extension = {
           )
         }
 
-        const { booked, skipped } = await bulkBookMatchedInboxItems(
+        const result = await bulkBookMatchedInboxItems(
           ctx.supabase,
           ctx.userId,
           ctx.companyId,
           body,
         )
+        const { booked, skipped } = result
 
         return NextResponse.json({
           data: {
@@ -2432,6 +2433,9 @@ export const invoiceInboxExtension: Extension = {
             skipped_count: skipped.length,
             booked,
             skipped,
+            ...(result.partial_posted_ids
+              ? { partial_posted_ids: result.partial_posted_ids }
+              : {}),
           },
         })
       },

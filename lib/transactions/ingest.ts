@@ -2,6 +2,10 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 import { evaluateMappingRules } from '@/lib/bookkeeping/mapping-engine'
 import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
 import { upsertCounterpartyTemplate } from '@/lib/bookkeeping/counterparty-templates'
+import {
+  attachCategorizedTransaction,
+  compensatePostCommitReadbackFailure,
+} from '@/lib/transactions/settlement-attachment'
 import { getBestInvoiceMatch } from '@/lib/invoices/invoice-matching'
 import { findSupplierInvoiceMatch } from '@/lib/invoices/supplier-invoice-matching'
 import { fetchExchangeRate } from '@/lib/currency/riksbanken'
@@ -414,14 +418,16 @@ export async function ingestTransactions(
   // We never auto-create a cash account here; that would race upsertFromPsd2's
   // seed-promotion logic in lib/cash-accounts/service.ts.
   let cashAccountId: string | null = null
+  let settlementProvenanceVerified = true
   if (options?.settlementAccount) {
-    const { data: ca } = await supabase
+    const { data: ca, error: cashAccountError } = await supabase
       .from('cash_accounts')
       .select('id')
       .eq('company_id', companyId)
       .eq('ledger_account', options.settlementAccount)
       .maybeSingle()
     cashAccountId = (ca?.id as string | undefined) ?? null
+    settlementProvenanceVerified = !cashAccountError && cashAccountId !== null
   }
 
   // ── Shadow-mode same-feed scope-drift precompute (measure only) ──────────
@@ -998,6 +1004,7 @@ export async function ingestTransactions(
     // Reconciliation (step 2.5) still links transactions to existing GL lines.
     const autoBookEnabled = process.env.NODE_ENV === 'development' || process.env.NODE_ENV === 'test'
     if (autoBookEnabled && !options?.skipAutoCategorization) {
+      let postedJournalEntryId: string | null = null
       try {
         const mappingResult = await evaluateMappingRules(
           supabase,
@@ -1008,22 +1015,56 @@ export async function ingestTransactions(
         )
 
         if (mappingResult.confidence >= 0.8 && !mappingResult.requires_review) {
+          if (!settlementProvenanceVerified) {
+            ;(result.auto_categorization_failures ??= []).push({
+              transaction_id: newTransaction.id,
+              code: 'SETTLEMENT_PROVENANCE_UNAVAILABLE',
+            })
+            continue
+          }
+
+          const autoCategory = mappingResult.default_private ? 'private' : 'uncategorized'
+          const autoIsBusiness = !mappingResult.default_private
           const journalEntry = await createTransactionJournalEntry(
             supabase,
             companyId,
             userId,
             newTransaction as Transaction,
-            mappingResult
+            mappingResult,
+            undefined,
+            { category: autoCategory, isBusiness: autoIsBusiness },
           )
 
           if (journalEntry) {
-            await supabase
-              .from('transactions')
-              .update({
-                journal_entry_id: journalEntry.id,
-                is_business: !mappingResult.default_private,
+            postedJournalEntryId = journalEntry.id
+            const attachment = await attachCategorizedTransaction(
+              supabase,
+              {
+                companyId,
+                userId,
+                transactionId: newTransaction.id,
+                expectedJournalEntryId: newTransaction.journal_entry_id ?? null,
+                expectedCashAccountId: cashAccountId,
+                expectedSettlementAccount: options?.settlementAccount ?? '1930',
+                isBusiness: autoIsBusiness,
+                category: autoCategory,
+                journalEntryId: journalEntry.id,
+              },
+              log,
+            )
+
+            if (!attachment.ok) {
+              ;(result.auto_categorization_failures ??= []).push({
+                transaction_id: newTransaction.id,
+                code: attachment.reason === 'conflict'
+                  ? 'ATTACHMENT_CONFLICT'
+                  : 'ATTACHMENT_DATABASE_ERROR',
+                ...(attachment.partialPostedIds
+                  ? { partial_posted_ids: attachment.partialPostedIds }
+                  : {}),
               })
-              .eq('id', newTransaction.id)
+              continue
+            }
 
             // Upsert counterparty template (auto-learned, lower confidence)
             try {
@@ -1038,8 +1079,38 @@ export async function ingestTransactions(
             result.auto_categorized++
           }
         }
-      } catch {
-        // Non-critical: continue processing
+      } catch (error) {
+        const postCommitFailure = await compensatePostCommitReadbackFailure(
+          supabase,
+          {
+            companyId,
+            userId,
+            transactionId: newTransaction.id,
+            error,
+          },
+          log,
+        )
+        if (postCommitFailure.handled) {
+          ;(result.auto_categorization_failures ??= []).push({
+            transaction_id: newTransaction.id,
+            code: 'POST_COMMIT_READBACK_FAILED',
+            ...(postCommitFailure.partialPostedIds
+              ? { partial_posted_ids: postCommitFailure.partialPostedIds }
+              : {}),
+          })
+          log.warn('auto-categorization posting readback failed', error)
+          continue
+        }
+        ;(result.auto_categorization_failures ??= []).push({
+          transaction_id: newTransaction.id,
+          code: postedJournalEntryId
+            ? 'ATTACHMENT_UNVERIFIABLE'
+            : 'AUTO_CATEGORIZATION_ERROR',
+          ...(postedJournalEntryId
+            ? { partial_posted_ids: { journal_entry_id: postedJournalEntryId } }
+            : {}),
+        })
+        log.warn('auto-categorization failed after transaction ingestion', error)
       }
     }
   }

@@ -12,6 +12,7 @@ import {
   FiscalPeriodNotFoundError,
   JournalEntryNotBalancedError,
   JournalEntryNotFoundError,
+  PostCommitReadbackError,
 } from '@/lib/bookkeeping/errors'
 import { resolveDefaultSeriesForSource } from '@/lib/bookkeeping/voucher-series-resolver'
 import {
@@ -317,6 +318,8 @@ export async function createDraftEntry(
       description: input.description,
       source_type: input.source_type,
       source_id: input.source_id || null,
+      categorization_category: input.categorization_category || null,
+      categorization_is_business: input.categorization_is_business ?? null,
       notes: input.notes || null,
       status: 'draft',
     })
@@ -619,16 +622,29 @@ export async function commitEntry(
 
   // Atomic: increment voucher sequence + update status in one transaction.
   // Rolls back the sequence if the balance trigger or any constraint fails.
-  const { data: rpcResult, error: commitError } = await supabase.rpc('commit_journal_entry', {
-    p_company_id: companyId,
-    p_entry_id: entryId,
-    p_commit_method: commitMethod ?? null,
-    p_rubric_version: rubricVersion ?? null,
-    p_actor_type: actor?.type ?? null,
-    p_actor_label: actor?.label ?? null,
-  })
+  let rpcResult: unknown = null
+  let commitError: unknown = null
+  try {
+    const response = await supabase.rpc('commit_journal_entry', {
+      p_company_id: companyId,
+      p_entry_id: entryId,
+      p_commit_method: commitMethod ?? null,
+      p_rubric_version: rubricVersion ?? null,
+      p_actor_type: actor?.type ?? null,
+      p_actor_label: actor?.label ?? null,
+    })
+    rpcResult = response.data
+    commitError = response.error
+  } catch (error) {
+    commitError = error
+  }
 
   if (commitError) {
+    const commitCause =
+      typeof commitError === 'object' && commitError !== null && 'message' in commitError &&
+      typeof (commitError as { message?: unknown }).message === 'string'
+        ? (commitError as { message: string }).message
+        : String(commitError)
     log.error('commit_journal_entry RPC failed', commitError, {
       operation: 'commit_entry',
       companyId,
@@ -640,15 +656,93 @@ export async function commitEntry(
       pgDetails: (commitError as { details?: string }).details,
       pgHint: (commitError as { hint?: string }).hint,
     })
-    throw new BookkeepingDatabaseError('commit_entry', commitError.message)
+
+    let outcome: { status?: unknown; voucher_number?: unknown } | null = null
+    let outcomeError: unknown = null
+    try {
+      const readback = await supabase
+        .from('journal_entries')
+        .select('status, voucher_number')
+        .eq('id', entryId)
+        .eq('company_id', companyId)
+        .maybeSingle()
+      outcome = readback.data
+      outcomeError = readback.error
+    } catch (error) {
+      outcomeError = error
+    }
+
+    if (
+      !outcomeError &&
+      outcome?.status === 'draft' &&
+      outcome.voucher_number === 0
+    ) {
+      throw new BookkeepingDatabaseError('commit_entry', commitCause)
+    }
+
+    const rpcRow = Array.isArray(rpcResult) ? rpcResult[0] : rpcResult
+    const rpcVoucherNumber =
+      rpcRow && typeof rpcRow === 'object' && 'voucher_number' in rpcRow
+        ? (rpcRow as { voucher_number?: unknown }).voucher_number
+        : null
+    const rawVoucherNumber = outcome?.voucher_number ?? rpcVoucherNumber
+    const voucherNumber =
+      typeof rawVoucherNumber === 'number' && Number.isFinite(rawVoucherNumber) &&
+      rawVoucherNumber > 0
+        ? rawVoucherNumber
+        : null
+    const outcomeCause = outcomeError
+      ? `commit failed (${commitCause}); outcome readback failed (${String(
+          (outcomeError as { message?: unknown })?.message ?? outcomeError,
+        )})`
+      : !outcome
+        ? `commit failed (${commitCause}); outcome readback returned no row`
+        : `commit failed (${commitCause}); outcome status was ${String(outcome.status)}`
+    log.error(
+      'commit_journal_entry outcome could not be classified as draft',
+      outcomeError ?? new Error(outcomeCause),
+      {
+        operation: 'commit_entry.outcome_readback',
+        companyId,
+        userId,
+        entityType: 'journal_entry',
+        entityId: entryId,
+        outcomeStatus: outcome?.status ?? null,
+        voucherNumber,
+      },
+    )
+    throw new PostCommitReadbackError(entryId, voucherNumber, outcomeCause)
   }
 
   // Fetch complete posted entry with lines
-  const { data: completeEntry } = await supabase
+  const { data: completeEntry, error: readbackError } = await supabase
     .from('journal_entries')
     .select('*, lines:journal_entry_lines(*)')
     .eq('id', entryId)
     .single()
+
+  if (readbackError || !completeEntry) {
+    const rpcRow = Array.isArray(rpcResult) ? rpcResult[0] : rpcResult
+    const rawVoucherNumber =
+      rpcRow && typeof rpcRow === 'object' && 'voucher_number' in rpcRow
+        ? (rpcRow as { voucher_number?: unknown }).voucher_number
+        : null
+    const voucherNumber =
+      typeof rawVoucherNumber === 'number' && Number.isFinite(rawVoucherNumber)
+        ? rawVoucherNumber
+        : null
+    const cause = readbackError?.message ?? 'posted journal entry row was not returned'
+    log.error('posted journal entry readback failed', readbackError ?? new Error(cause), {
+      operation: 'commit_entry.readback',
+      companyId,
+      userId,
+      entityType: 'journal_entry',
+      entityId: entryId,
+      voucherNumber,
+      pgCode: (readbackError as { code?: string } | null)?.code,
+    })
+    throw new PostCommitReadbackError(entryId, voucherNumber, cause)
+  }
 
   const result = completeEntry as JournalEntry
 
@@ -682,6 +776,10 @@ export async function createJournalEntry(
   try {
     return await commitEntry(supabase, companyId, userId, draft.id, commitMethod, rubricVersion)
   } catch (commitError) {
+    // The RPC already posted this entry. It is immutable and must be handled
+    // through the caller's compensation path, never draft cancellation.
+    if (commitError instanceof PostCommitReadbackError) throw commitError
+
     // CAS guard: only cancel if still in draft. If the RPC actually posted
     // before failing downstream, immutability trigger blocks draft→cancelled
     // on a posted row anyway: the filter just avoids firing the trigger.
@@ -690,6 +788,7 @@ export async function createJournalEntry(
         .from('journal_entries')
         .update({ status: 'cancelled' })
         .eq('id', draft.id)
+        .eq('company_id', companyId)
         .eq('status', 'draft')
       if (cancelError) {
         log.error('orphan draft cleanup failed (phantom draft remains)', cancelError, {
@@ -719,6 +818,344 @@ export async function createJournalEntry(
  */
 export function getSwedishLocalDate(): string {
   return new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Stockholm' }).format(new Date())
+}
+
+type TransactionCategorizationCompensationStatus =
+  | 'reversed'
+  | 'already_reversed'
+  | 'recovered_existing_reversal'
+
+interface TransactionCategorizationCompensationData {
+  status: TransactionCategorizationCompensationStatus
+  original_journal_entry_id: string
+  reversal_journal_entry_ids: string[]
+  original_pointer_cleared: boolean
+  event_outbox_ids: string[]
+}
+
+interface TransactionCompensationPublicationData {
+  status: 'published' | 'already_published'
+  original_journal_entry_id: string
+  reversal_journal_entry_id: string
+  event_outbox_ids: string[]
+  event_log_count: number
+  webhook_delivery_count: number
+}
+
+export type TransactionCategorizationCompensationResult =
+  | {
+      compensationVerified: true
+      status: TransactionCategorizationCompensationStatus
+      originalEntry: JournalEntry
+      reversalEntry: JournalEntry
+    }
+  | {
+      compensationVerified: false
+      partialPostedIds: Record<string, string>
+      error: BookkeepingDatabaseError
+    }
+
+function reportedStringField(data: unknown, field: string): string | null {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null
+  const value = (data as Record<string, unknown>)[field]
+  return typeof value === 'string' && value.length > 0 ? value : null
+}
+
+function reportedReversalIds(data: unknown): string[] {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return []
+  const ids = (data as Record<string, unknown>).reversal_journal_entry_ids
+  return Array.isArray(ids)
+    ? ids.filter((id): id is string => typeof id === 'string' && id.length > 0)
+    : []
+}
+
+function reportedOutboxIds(data: unknown): string[] {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return []
+  const ids = (data as Record<string, unknown>).event_outbox_ids
+  return Array.isArray(ids)
+    ? ids.filter((id): id is string => typeof id === 'string' && id.length > 0)
+    : []
+}
+
+function compensationPostedIds(
+  originalJournalEntryId: string,
+  ...reportedData: unknown[]
+): Record<string, string> {
+  const ids: Record<string, string> = { journal_entry_id: originalJournalEntryId }
+  const reportedOriginalIds = [...new Set(
+    reportedData
+      .map((data) => reportedStringField(data, 'original_journal_entry_id'))
+      .filter((id): id is string => id !== null && id !== originalJournalEntryId),
+  )]
+  reportedOriginalIds.forEach((id, index) => {
+    ids[index === 0
+      ? 'reported_original_journal_entry_id'
+      : `reported_original_journal_entry_${index + 1}_id`] = id
+  })
+  const reversalIds = [...new Set(reportedData.flatMap((data) => {
+    const ids = reportedReversalIds(data)
+    const singular = reportedStringField(data, 'reversal_journal_entry_id')
+    return singular ? [...ids, singular] : ids
+  }))]
+  reversalIds.forEach((id, index) => {
+    ids[index === 0 ? 'reversal_journal_entry_id' : `reversal_journal_entry_${index + 1}_id`] = id
+  })
+  const outboxIds = [...new Set(reportedData.flatMap(reportedOutboxIds))]
+  outboxIds.forEach((id, index) => {
+    ids[index === 0
+      ? 'committed_event_outbox_id'
+      : index === 1
+        ? 'reversed_event_outbox_id'
+        : `event_outbox_${index + 1}_id`] = id
+  })
+  return ids
+}
+
+function parseTransactionCategorizationCompensation(
+  data: unknown,
+): TransactionCategorizationCompensationData | null {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null
+  const row = data as Record<string, unknown>
+  if (
+    !['reversed', 'already_reversed', 'recovered_existing_reversal'].includes(
+      String(row.status),
+    ) ||
+    typeof row.original_journal_entry_id !== 'string' ||
+    !Array.isArray(row.reversal_journal_entry_ids) ||
+    !row.reversal_journal_entry_ids.every((id) => typeof id === 'string') ||
+    typeof row.original_pointer_cleared !== 'boolean' ||
+    !Array.isArray(row.event_outbox_ids) ||
+    !row.event_outbox_ids.every((id) => typeof id === 'string')
+  ) {
+    return null
+  }
+  return row as unknown as TransactionCategorizationCompensationData
+}
+
+function parseTransactionCompensationPublication(
+  data: unknown,
+): TransactionCompensationPublicationData | null {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null
+  const row = data as Record<string, unknown>
+  if (
+    !['published', 'already_published'].includes(String(row.status)) ||
+    typeof row.original_journal_entry_id !== 'string' ||
+    typeof row.reversal_journal_entry_id !== 'string' ||
+    !Array.isArray(row.event_outbox_ids) ||
+    !row.event_outbox_ids.every((id) => typeof id === 'string') ||
+    typeof row.event_log_count !== 'number' ||
+    typeof row.webhook_delivery_count !== 'number'
+  ) {
+    return null
+  }
+  return row as unknown as TransactionCompensationPublicationData
+}
+
+function databaseCause(error: unknown): string {
+  if (error && typeof error === 'object' && 'message' in error) {
+    const message = (error as { message?: unknown }).message
+    if (typeof message === 'string') return message
+  }
+  return String(error)
+}
+
+function unverifiedTransactionCompensation(
+  originalJournalEntryId: string,
+  data: unknown,
+  operation:
+    | 'compensate_transaction_categorization'
+    | 'publish_transaction_compensation_events'
+    | 'verify_transaction_compensation',
+  cause: string,
+  additionalData?: unknown,
+): TransactionCategorizationCompensationResult {
+  return {
+    compensationVerified: false,
+    partialPostedIds: compensationPostedIds(originalJournalEntryId, data, additionalData),
+    error: new BookkeepingDatabaseError(operation, cause),
+  }
+}
+
+async function hydrateTransactionCompensationEntry(
+  supabase: SupabaseClient,
+  companyId: string,
+  entryId: string,
+): Promise<JournalEntry> {
+  const { data, error } = await supabase
+    .from('journal_entries')
+    .select('*, lines:journal_entry_lines(*)')
+    .eq('id', entryId)
+    .eq('company_id', companyId)
+    .single()
+  if (error || !data) {
+    throw new Error(error?.message ?? `Journal entry ${entryId} was not returned`)
+  }
+  return data as JournalEntry
+}
+
+/**
+ * Atomically compensates the exact journal written for transaction
+ * categorization while retaining engine-owned journal event semantics.
+ *
+ * Both reverseEntry-shaped events are created in an outbox by the atomic
+ * compensation RPC. Every successful call, including already_reversed,
+ * reconciles that outbox into event_log and webhook_deliveries through a
+ * second atomic, idempotent RPC. This closes both response-loss boundaries
+ * without replaying the best-effort in-process EventBus handlers.
+ */
+export async function compensateTransactionCategorization(
+  supabase: SupabaseClient,
+  params: {
+    companyId: string
+    userId: string
+    transactionId: string
+    originalJournalEntryId: string
+  },
+): Promise<TransactionCategorizationCompensationResult> {
+  let rpcData: unknown = null
+  try {
+    const { data, error } = await supabase.rpc('compensate_transaction_categorization', {
+      p_company_id: params.companyId,
+      p_transaction_id: params.transactionId,
+      p_original_journal_entry_id: params.originalJournalEntryId,
+    })
+    rpcData = data
+    if (error) {
+      return unverifiedTransactionCompensation(
+        params.originalJournalEntryId,
+        rpcData,
+        'compensate_transaction_categorization',
+        databaseCause(error),
+      )
+    }
+  } catch (error) {
+    return unverifiedTransactionCompensation(
+      params.originalJournalEntryId,
+      rpcData,
+      'compensate_transaction_categorization',
+      databaseCause(error),
+    )
+  }
+
+  const compensation = parseTransactionCategorizationCompensation(rpcData)
+  if (
+    !compensation ||
+    compensation.original_journal_entry_id !== params.originalJournalEntryId ||
+    compensation.reversal_journal_entry_ids.length !== 1 ||
+    compensation.event_outbox_ids.length !== 2 ||
+    new Set(compensation.event_outbox_ids).size !== 2 ||
+    !compensation.original_pointer_cleared
+  ) {
+    return unverifiedTransactionCompensation(
+      params.originalJournalEntryId,
+      rpcData,
+      'verify_transaction_compensation',
+      `Unverifiable compensation result: ${JSON.stringify(rpcData)}`,
+    )
+  }
+
+  const reversalJournalEntryId = compensation.reversal_journal_entry_ids[0]
+  let originalEntry: JournalEntry
+  let reversalEntry: JournalEntry
+  try {
+    originalEntry = await hydrateTransactionCompensationEntry(
+      supabase,
+      params.companyId,
+      params.originalJournalEntryId,
+    )
+    reversalEntry = await hydrateTransactionCompensationEntry(
+      supabase,
+      params.companyId,
+      reversalJournalEntryId,
+    )
+  } catch (error) {
+    return unverifiedTransactionCompensation(
+      params.originalJournalEntryId,
+      rpcData,
+      'verify_transaction_compensation',
+      databaseCause(error),
+    )
+  }
+
+  const originalLines = (originalEntry as JournalEntry & { lines?: unknown }).lines
+  const reversalLines = (reversalEntry as JournalEntry & { lines?: unknown }).lines
+  const exactPairVerified =
+    originalEntry.id === params.originalJournalEntryId &&
+    originalEntry.company_id === params.companyId &&
+    originalEntry.source_type === 'bank_transaction' &&
+    originalEntry.source_id === params.transactionId &&
+    originalEntry.status === 'reversed' &&
+    originalEntry.reversed_by_id === reversalJournalEntryId &&
+    Array.isArray(originalLines) &&
+    reversalEntry.id === reversalJournalEntryId &&
+    reversalEntry.company_id === params.companyId &&
+    reversalEntry.source_type === 'storno' &&
+    reversalEntry.status === 'posted' &&
+    reversalEntry.reverses_id === params.originalJournalEntryId &&
+    Array.isArray(reversalLines)
+
+  if (!exactPairVerified) {
+    return unverifiedTransactionCompensation(
+      params.originalJournalEntryId,
+      rpcData,
+      'verify_transaction_compensation',
+      'Hydrated journal entries did not prove the exact company-scoped original and sole reversal',
+    )
+  }
+
+  let publicationData: unknown = null
+  try {
+    const { data, error } = await supabase.rpc('publish_transaction_compensation_events', {
+      p_company_id: params.companyId,
+      p_transaction_id: params.transactionId,
+      p_original_journal_entry_id: params.originalJournalEntryId,
+    })
+    publicationData = data
+    if (error) {
+      return unverifiedTransactionCompensation(
+        params.originalJournalEntryId,
+        rpcData,
+        'publish_transaction_compensation_events',
+        databaseCause(error),
+        publicationData,
+      )
+    }
+  } catch (error) {
+    return unverifiedTransactionCompensation(
+      params.originalJournalEntryId,
+      rpcData,
+      'publish_transaction_compensation_events',
+      databaseCause(error),
+      publicationData,
+    )
+  }
+
+  const publication = parseTransactionCompensationPublication(publicationData)
+  const publicationMatches =
+    publication &&
+    publication.original_journal_entry_id === params.originalJournalEntryId &&
+    publication.reversal_journal_entry_id === reversalJournalEntryId &&
+    publication.event_log_count === 2 &&
+    publication.webhook_delivery_count >= 0 &&
+    publication.event_outbox_ids.length === 2 &&
+    publication.event_outbox_ids.every((id, index) => id === compensation.event_outbox_ids[index])
+
+  if (!publicationMatches) {
+    return unverifiedTransactionCompensation(
+      params.originalJournalEntryId,
+      rpcData,
+      'publish_transaction_compensation_events',
+      `Unverifiable compensation publication result: ${JSON.stringify(publicationData)}`,
+      publicationData,
+    )
+  }
+
+  return {
+    compensationVerified: true,
+    status: compensation.status,
+    originalEntry,
+    reversalEntry,
+  }
 }
 
 /**

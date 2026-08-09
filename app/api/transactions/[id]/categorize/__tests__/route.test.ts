@@ -7,9 +7,12 @@ import {
   makeTransaction,
 } from '@/tests/helpers'
 import { eventBus } from '@/lib/events'
-import { JournalEntryNotBalancedError } from '@/lib/bookkeeping/errors'
+import {
+  JournalEntryNotBalancedError,
+  PostCommitReadbackError,
+} from '@/lib/bookkeeping/errors'
 
-const { supabase: mockSupabase, enqueue, reset } = createQueuedMockSupabase()
+const { supabase: mockSupabase, enqueue, reset, calls } = createQueuedMockSupabase()
 vi.mock('@/lib/supabase/server', () => ({
   createClient: () => Promise.resolve(mockSupabase),
 }))
@@ -61,32 +64,71 @@ vi.mock('@/lib/processing-history/append', () => ({
 const mockSaveUserMappingRule = vi.fn()
 vi.mock('@/lib/bookkeeping/mapping-engine', () => ({
   saveUserMappingRule: (...args: unknown[]) => mockSaveUserMappingRule(...args),
-  // Mirror the real implementation: rewrite a 1930 bank leg to the settlement
-  // account, no-op when the settlement account is 1930.
+  // Mirror the real implementation: the transaction direction identifies the
+  // semantic settlement side, independent of the account previously stored.
   applySettlementAccount: (
     result: { debit_account?: string; credit_account?: string },
     bankAccount: string,
+    transactionAmount: number,
   ) =>
-    bankAccount === '1930'
-      ? result
-      : {
-          ...result,
-          debit_account: result.debit_account === '1930' ? bankAccount : result.debit_account,
-          credit_account: result.credit_account === '1930' ? bankAccount : result.credit_account,
-        },
+    transactionAmount < 0
+      ? { ...result, credit_account: bankAccount }
+      : { ...result, debit_account: bankAccount },
 }))
 
+const mockUpsertCounterpartyTemplate = vi.fn()
 vi.mock('@/lib/bookkeeping/counterparty-templates', () => ({
-  upsertCounterpartyTemplate: vi.fn().mockResolvedValue(undefined),
+  upsertCounterpartyTemplate: (...args: unknown[]) => mockUpsertCounterpartyTemplate(...args),
 }))
 
-// CAS-race compensation is centralized in lib/bookkeeping/cancel-orphaned-entry.
-// The route must delegate to it rather than hand-rolling the cancel + the
-// voucher_gap_explanations insert (BFNAR 2013:2). The exact insert payload is
-// asserted in that helper's own test.
-const mockCancelOrphanedPaymentEntry = vi.fn()
-vi.mock('@/lib/bookkeeping/cancel-orphaned-entry', () => ({
-  cancelOrphanedPaymentEntry: (...args: unknown[]) => mockCancelOrphanedPaymentEntry(...args),
+const mockReverseEntry = vi.fn()
+const mockCompensateTransactionCategorization = vi.fn(
+  async (supabase: typeof mockSupabase, params: { companyId: string; transactionId: string; originalJournalEntryId: string }) => {
+    const { data, error } = await supabase.rpc('compensate_transaction_categorization', {
+      p_company_id: params.companyId,
+      p_transaction_id: params.transactionId,
+      p_original_journal_entry_id: params.originalJournalEntryId,
+    })
+    const row = data as {
+      status?: string
+      original_journal_entry_id?: string
+      reversal_journal_entry_ids?: string[]
+      original_pointer_cleared?: boolean
+    } | null
+    const reversalIds = row?.reversal_journal_entry_ids ?? []
+    const partialPostedIds: Record<string, string> = {
+      journal_entry_id: params.originalJournalEntryId,
+    }
+    reversalIds.forEach((id, index) => {
+      partialPostedIds[
+        index === 0 ? 'reversal_journal_entry_id' : `reversal_journal_entry_${index + 1}_id`
+      ] = id
+    })
+    const compensationVerified =
+      !error &&
+      row?.original_journal_entry_id === params.originalJournalEntryId &&
+      row.original_pointer_cleared === true &&
+      reversalIds.length === 1 &&
+      ['reversed', 'already_reversed', 'recovered_existing_reversal'].includes(row.status ?? '')
+    return compensationVerified
+      ? {
+          compensationVerified: true as const,
+          status: row!.status,
+          originalEntry: { id: params.originalJournalEntryId },
+          reversalEntry: { id: reversalIds[0] },
+        }
+      : { compensationVerified: false as const, partialPostedIds, error: new Error('unverified') }
+  },
+)
+vi.mock('@/lib/bookkeeping/engine', () => ({
+  reverseEntry: (...args: unknown[]) => mockReverseEntry(...args),
+  compensateTransactionCategorization: (...args: Parameters<typeof mockCompensateTransactionCategorization>) =>
+    mockCompensateTransactionCategorization(...args),
+}))
+
+const mockResolveSettlementAccount = vi.fn()
+vi.mock('@/lib/bookkeeping/settlement-account', () => ({
+  resolveSettlementAccount: (...args: unknown[]) => mockResolveSettlementAccount(...args),
 }))
 
 const mockFindMissingActiveAccounts = vi.fn()
@@ -116,6 +158,13 @@ describe('POST /api/transactions/[id]/categorize', () => {
     description: 'Test expense',
   }
 
+  const compensationSuccess = {
+    status: 'reversed',
+    original_journal_entry_id: 'je-1',
+    reversal_journal_entry_ids: ['je-storno'],
+    original_pointer_cleared: true,
+  }
+
   beforeEach(() => {
     vi.clearAllMocks()
     reset()
@@ -128,10 +177,37 @@ describe('POST /api/transactions/[id]/categorize', () => {
     // Default: no booking-time duplicate. The dedicated guard test overrides this.
     mockDetectDup.mockResolvedValue(null)
     mockAppendProcessingHistory.mockResolvedValue('evt-1')
-    mockCancelOrphanedPaymentEntry.mockResolvedValue(undefined)
+    mockReverseEntry.mockResolvedValue({ id: 'je-storno' })
+    mockResolveSettlementAccount.mockResolvedValue('1930')
   })
 
-  it('delegates the CAS-race orphan to cancelOrphanedPaymentEntry (documented voucher gap)', async () => {
+  it('returns a typed database error and creates no voucher when company settings cannot be read', async () => {
+    enqueue({
+      data: makeTransaction({ id: 'tx-1', amount: -500, journal_entry_id: null }),
+      error: null,
+    })
+    enqueue({ data: null, error: { message: 'permission denied', code: '42501' } })
+
+    const response = await POST(
+      createMockRequest('/api/transactions/tx-1/categorize', {
+        method: 'POST',
+        body: { is_business: false },
+      }),
+      createMockRouteParams({ id: 'tx-1' }),
+    )
+    const { status, body } = await parseJsonResponse<{
+      error: { code: string; details?: { operation?: string } }
+    }>(response)
+
+    expect(status).toBe(500)
+    expect(body.error).toMatchObject({
+      code: 'BOOKKEEPING_DATABASE_ERROR',
+      details: { operation: 'fetch_company_settings' },
+    })
+    expect(mockCreateTransactionJournalEntry).not.toHaveBeenCalled()
+  })
+
+  it('stornoes a CAS-race orphan and returns no partial marker when compensation succeeds', async () => {
     const tx = makeTransaction({
       id: 'tx-1',
       amount: -500,
@@ -147,7 +223,8 @@ describe('POST /api/transactions/[id]/categorize', () => {
     mockSaveUserMappingRule.mockResolvedValue(undefined)
 
     // Lost the CAS: another request stamped journal_entry_id first.
-    enqueue({ data: [], error: null })
+    enqueue({ data: false, error: null })
+    enqueue({ data: compensationSuccess, error: null })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
@@ -159,15 +236,224 @@ describe('POST /api/transactions/[id]/categorize', () => {
     expect(status).toBe(409)
     expect((body.error as { code: string }).code).toBe('TX_CATEGORIZE_RACE')
 
-    // No hand-rolled insert: the helper owns the real column set.
-    expect(mockCancelOrphanedPaymentEntry).toHaveBeenCalledTimes(1)
-    expect(mockCancelOrphanedPaymentEntry).toHaveBeenCalledWith(
+    expect((body.error as { details?: unknown }).details).toBeUndefined()
+    expect(mockReverseEntry).not.toHaveBeenCalled()
+    expect(mockSupabase.rpc).toHaveBeenCalledWith(
+      'compensate_transaction_categorization',
+      expect.objectContaining({ p_original_journal_entry_id: 'je-1' }),
+    )
+  })
+
+  it('compensates a readback-unverified posting and discloses its durable id', async () => {
+    const tx = makeTransaction({
+      id: 'tx-1',
+      amount: -500,
+      journal_entry_id: null,
+    })
+    enqueue({ data: tx, error: null })
+    enqueue({
+      data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 },
+      error: null,
+    })
+    enqueue({ data: [{ id: 'period-1' }], error: null })
+    const readbackError = new PostCommitReadbackError('je-readback', 42, 'timeout')
+    mockCreateTransactionJournalEntry.mockRejectedValueOnce(readbackError)
+    enqueue({ data: null, error: { message: 'compensation timeout' } })
+
+    const response = await POST(
+      createMockRequest('/api/transactions/tx-1/categorize', {
+        method: 'POST',
+        body: { is_business: false },
+      }),
+      createMockRouteParams({ id: 'tx-1' }),
+    )
+    const { status, body } = await parseJsonResponse<{
+      error: {
+        code: string
+        details: {
+          operation: string
+          journal_entry_id: string
+          voucher_number: number
+          partial_posted_ids: Record<string, string>
+        }
+      }
+    }>(response)
+
+    expect(status).toBe(500)
+    expect(body.error).toMatchObject({
+      code: 'BOOKKEEPING_DATABASE_ERROR',
+      details: {
+        operation: 'commit_entry.readback',
+        journal_entry_id: 'je-readback',
+        voucher_number: 42,
+        partial_posted_ids: { journal_entry_id: 'je-readback' },
+      },
+    })
+    expect(mockSupabase.rpc).toHaveBeenCalledWith(
+      'compensate_transaction_categorization',
+      expect.objectContaining({ p_original_journal_entry_id: 'je-readback' }),
+    )
+    expect(mockSupabase.rpc).not.toHaveBeenCalledWith(
+      'attach_transaction_categorization',
       expect.anything(),
+    )
+  })
+
+  it('does not mutate documents or inbox state when atomic attachment conflicts', async () => {
+    const tx = makeTransaction({
+      id: 'tx-1',
+      amount: -500,
+      merchant_name: 'GitHub',
+      journal_entry_id: null,
+      document_id: 'doc-transaction',
+      receipt_id: null,
+    })
+
+    enqueue({ data: tx, error: null })
+    enqueue({ data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 }, error: null })
+    enqueue({ data: [{ id: 'period-1' }], error: null })
+    mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
+    enqueue({ data: false, error: null }) // atomic attachment conflict
+    enqueue({ data: compensationSuccess, error: null }) // atomic compensation
+
+    const response = await POST(
+      createMockRequest('/api/transactions/tx-1/categorize', {
+        method: 'POST',
+        body: {
+          is_business: true,
+          category: 'expense_software',
+          inbox_item_id: '11111111-1111-4111-8111-111111111111',
+        },
+      }),
+      createMockRouteParams({ id: 'tx-1' }),
+    )
+    const { status } = await parseJsonResponse(response)
+
+    expect(status).toBe(409)
+    expect(mockSupabase.from).not.toHaveBeenCalledWith('document_attachments')
+    expect(mockSupabase.from).not.toHaveBeenCalledWith('invoice_inbox_items')
+  })
+
+  it('persists no dismissal or learning side effects when forced categorization fails attachment', async () => {
+    const siblingId = '660e8400-e29b-41d4-a716-446655440111'
+    const tx = makeTransaction({
+      id: 'tx-1',
+      amount: -500,
+      merchant_name: 'GitHub',
+      journal_entry_id: null,
+    })
+    mockDetectDup.mockResolvedValue({
+      transaction_id: siblingId,
+      journal_entry_id: 'je-existing',
+      voucher_label: 'A142',
+      entry_date: '2025-01-15',
+      description: null,
+      amount: -500,
+      currency: 'SEK',
+      amount_in_currency: -500,
+      amount_verified: true,
+      unverified_reason: null,
+    })
+    enqueue({ data: tx, error: null })
+    enqueue({ data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null })
+    enqueue({ data: [{ id: 'period-1' }], error: null })
+    mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
+    enqueue({ data: false, error: null })
+    enqueue({ data: compensationSuccess, error: null })
+
+    const response = await POST(
+      createMockRequest('/api/transactions/tx-1/categorize', {
+        method: 'POST',
+        body: {
+          is_business: true,
+          category: 'expense_software',
+          force: true,
+          expected_duplicate_transaction_id: siblingId,
+        },
+      }),
+      createMockRouteParams({ id: 'tx-1' }),
+    )
+
+    expect(response.status).toBe(409)
+    expect(mockAppendProcessingHistory).not.toHaveBeenCalled()
+    expect(mockSaveUserMappingRule).not.toHaveBeenCalled()
+    expect(mockUpsertCounterpartyTemplate).not.toHaveBeenCalled()
+  })
+
+  it('uses exact company-scoped cash-account and ledger provenance', async () => {
+    const tx = makeTransaction({
+      id: 'tx-1',
+      amount: -500,
+      merchant_name: 'GitHub',
+      journal_entry_id: null,
+      cash_account_id: 'cash-revolut-sek',
+    })
+    mockResolveSettlementAccount.mockResolvedValueOnce('1931')
+    enqueue({ data: tx, error: null })
+    enqueue({ data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null })
+    enqueue({ data: [{ id: 'period-1' }], error: null })
+    mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
+    enqueue({ data: true, error: null })
+
+    const request = createMockRequest('/api/transactions/tx-1/categorize', {
+      method: 'POST',
+      body: { is_business: true, category: 'expense_software' },
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
+
+    expect(response.status).toBe(200)
+    expect(mockResolveSettlementAccount).toHaveBeenCalledWith(
+      mockSupabase,
+      'company-1',
+      'cash-revolut-sek',
+      expect.anything(),
+    )
+    expect(mockCreateTransactionJournalEntry).toHaveBeenCalledWith(
+      mockSupabase,
       'company-1',
       'user-1',
-      'je-1',
-      'Automatiskt makulerad: dubblettbokning förhindrad av samtidighetsskydd',
+      expect.objectContaining({ id: 'tx-1' }),
+      expect.objectContaining({ credit_account: '1931' }),
+      undefined,
+      { category: 'expense_software', isBusiness: true },
     )
+    expect(mockSupabase.rpc).toHaveBeenCalledWith(
+      'attach_transaction_categorization',
+      expect.objectContaining({
+        p_company_id: 'company-1',
+        p_transaction_id: 'tx-1',
+        p_expected_cash_account_id: 'cash-revolut-sek',
+        p_expected_settlement_account: '1931',
+        p_expected_journal_entry_id: null,
+        p_journal_entry_id: 'je-1',
+      }),
+    )
+  })
+
+  it('surfaces the posted id when CAS-race storno fails', async () => {
+    const tx = makeTransaction({ id: 'tx-1', journal_entry_id: null })
+    enqueue({ data: tx, error: null })
+    enqueue({ data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null })
+    enqueue({ data: [{ id: 'period-1' }], error: null })
+    mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
+    enqueue({ data: false, error: null })
+    enqueue({ data: null, error: { message: 'period locked' } })
+
+    const request = createMockRequest('/api/transactions/tx-1/categorize', {
+      method: 'POST',
+      body: { is_business: true, category: 'expense_software' },
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
+    const { status, body } = await parseJsonResponse<{
+      error: { code: string; details?: unknown }
+    }>(response)
+
+    expect(status).toBe(409)
+    expect(body.error.code).toBe('TX_CATEGORIZE_RACE')
+    expect(body.error.details).toEqual({
+      partial_posted_ids: { journal_entry_id: 'je-1' },
+    })
+    expect(mockSupabase.from).not.toHaveBeenCalledWith('voucher_gap_explanations')
   })
 
   it('returns 401 when not authenticated', async () => {
@@ -198,16 +484,26 @@ describe('POST /api/transactions/[id]/categorize', () => {
     expect((body.error as unknown as { code: string }).code).toBe('TX_CATEGORIZE_TX_NOT_FOUND')
   })
 
-  it('updates category only when transaction already has journal entry', async () => {
+  it('returns an exact already-posted categorization as a no-write idempotent success', async () => {
     const tx = makeTransaction({
       id: 'tx-1',
       journal_entry_id: 'je-existing',
-      category: 'uncategorized',
+      category: 'expense_software',
+      is_business: true,
     })
-    // Fetch transaction
     enqueue({ data: tx, error: null })
-    // Update transaction
-    enqueue({ data: null, error: null })
+    enqueue({
+      data: {
+        id: 'je-existing',
+        company_id: 'company-1',
+        status: 'posted',
+        source_type: 'bank_transaction',
+        source_id: 'tx-1',
+        categorization_category: 'expense_software',
+        categorization_is_business: true,
+      },
+      error: null,
+    })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
@@ -224,7 +520,243 @@ describe('POST /api/transactions/[id]/categorize', () => {
     expect(body.success).toBe(true)
     expect(body.already_had_journal_entry).toBe(true)
     expect(body.journal_entry_id).toBe('je-existing')
+    expect(calls).not.toContainEqual(
+      expect.objectContaining({ table: 'transactions', method: 'update' }),
+    )
     expect(mockCreateTransactionJournalEntry).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      name: 'requested category change',
+      txCategory: 'expense_office',
+      txBusiness: true,
+      request: { is_business: true, category: 'expense_software' },
+      journalCategory: 'expense_office',
+      journalBusiness: true,
+      expectedReason: 'requested_change',
+    },
+    {
+      name: 'requested business/private change',
+      txCategory: 'expense_office',
+      txBusiness: true,
+      request: { is_business: false },
+      journalCategory: 'expense_office',
+      journalBusiness: true,
+      expectedReason: 'requested_change',
+    },
+    {
+      name: 'preexisting transaction-voucher drift',
+      txCategory: 'expense_software',
+      txBusiness: true,
+      request: { is_business: true, category: 'expense_software' },
+      journalCategory: 'expense_office',
+      journalBusiness: true,
+      expectedReason: 'transaction_metadata_drift',
+    },
+    {
+      name: 'legacy null journal metadata',
+      txCategory: 'expense_office',
+      txBusiness: true,
+      request: { is_business: true, category: 'expense_office' },
+      journalCategory: null,
+      journalBusiness: null,
+      expectedReason: 'metadata_unprovable',
+    },
+  ])('fails closed for $name without updating the transaction', async (testCase) => {
+    enqueue({
+      data: makeTransaction({
+        id: 'tx-1',
+        company_id: 'company-1',
+        journal_entry_id: 'je-existing',
+        category: testCase.txCategory as never,
+        is_business: testCase.txBusiness,
+      }),
+      error: null,
+    })
+    enqueue({
+      data: {
+        id: 'je-existing',
+        company_id: 'company-1',
+        status: 'posted',
+        source_type: 'bank_transaction',
+        source_id: 'tx-1',
+        categorization_category: testCase.journalCategory,
+        categorization_is_business: testCase.journalBusiness,
+      },
+      error: null,
+    })
+
+    const response = await POST(
+      createMockRequest('/api/transactions/tx-1/categorize', {
+        method: 'POST',
+        body: testCase.request,
+      }),
+      createMockRouteParams({ id: 'tx-1' }),
+    )
+    const { status, body } = await parseJsonResponse<{
+      error: { code: string; details?: { reason?: string } }
+    }>(response)
+
+    expect(status).toBe(409)
+    expect(body.error).toMatchObject({
+      code: 'TX_CATEGORIZE_RACE',
+      details: { reason: testCase.expectedReason },
+    })
+    expect(calls).not.toContainEqual(
+      expect.objectContaining({ table: 'transactions', method: 'update' }),
+    )
+  })
+
+  it('fails closed when posted journal metadata cannot be queried', async () => {
+    enqueue({
+      data: makeTransaction({
+        id: 'tx-1',
+        company_id: 'company-1',
+        journal_entry_id: 'je-existing',
+        category: 'expense_office',
+        is_business: true,
+      }),
+      error: null,
+    })
+    enqueue({ data: null, error: { message: 'read timeout' } })
+
+    const response = await POST(
+      createMockRequest('/api/transactions/tx-1/categorize', {
+        method: 'POST',
+        body: { is_business: true, category: 'expense_office' },
+      }),
+      createMockRouteParams({ id: 'tx-1' }),
+    )
+    const { status, body } = await parseJsonResponse<{
+      error: { code: string; details?: { operation?: string } }
+    }>(response)
+
+    expect(status).toBe(500)
+    expect(body.error).toMatchObject({
+      code: 'BOOKKEEPING_DATABASE_ERROR',
+      details: { operation: 'verify_existing_transaction_categorization' },
+    })
+    expect(calls).not.toContainEqual(
+      expect.objectContaining({ table: 'transactions', method: 'update' }),
+    )
+  })
+
+  it('fails closed when the transaction pointer has no company-scoped journal row', async () => {
+    enqueue({
+      data: makeTransaction({
+        id: 'tx-1',
+        company_id: 'company-1',
+        journal_entry_id: 'je-missing',
+        category: 'expense_office',
+        is_business: true,
+      }),
+      error: null,
+    })
+    enqueue({ data: null, error: null })
+
+    const response = await POST(
+      createMockRequest('/api/transactions/tx-1/categorize', {
+        method: 'POST',
+        body: { is_business: true, category: 'expense_office' },
+      }),
+      createMockRouteParams({ id: 'tx-1' }),
+    )
+    const { status, body } = await parseJsonResponse<{
+      error: { code: string; details?: { reason?: string } }
+    }>(response)
+
+    expect(status).toBe(409)
+    expect(body.error).toMatchObject({
+      code: 'TX_CATEGORIZE_RACE',
+      details: { reason: 'journal_missing' },
+    })
+  })
+
+  it('rejects mapping-affecting input on an existing journal before any metadata write', async () => {
+    enqueue({
+      data: makeTransaction({
+        id: 'tx-1',
+        company_id: 'company-1',
+        journal_entry_id: 'je-existing',
+        category: 'expense_office',
+        is_business: true,
+      }),
+      error: null,
+    })
+
+    const response = await POST(
+      createMockRequest('/api/transactions/tx-1/categorize', {
+        method: 'POST',
+        body: {
+          is_business: true,
+          category: 'expense_office',
+          account_override: '6250',
+        },
+      }),
+      createMockRouteParams({ id: 'tx-1' }),
+    )
+    const { status, body } = await parseJsonResponse<{
+      error: { code: string; details?: { reason?: string; fields?: string[] } }
+    }>(response)
+
+    expect(status).toBe(409)
+    expect(body.error).toMatchObject({
+      code: 'TX_CATEGORIZE_RACE',
+      details: {
+        reason: 'mapping_affecting_change',
+        fields: ['account_override'],
+      },
+    })
+    expect(mockSupabase.from).not.toHaveBeenCalledWith('journal_entries')
+  })
+
+  it.each([
+    { company_id: 'company-other', source_type: 'bank_transaction', source_id: 'tx-1' },
+    { company_id: 'company-1', source_type: 'manual', source_id: 'tx-1' },
+    { company_id: 'company-1', source_type: 'bank_transaction', source_id: 'tx-other' },
+    { company_id: 'company-1', source_type: 'bank_transaction', source_id: 'tx-1', status: 'reversed' },
+  ])('rejects wrong-company/source/status posted metadata %#', async (journalOverride) => {
+    enqueue({
+      data: makeTransaction({
+        id: 'tx-1',
+        company_id: 'company-1',
+        journal_entry_id: 'je-existing',
+        category: 'expense_office',
+        is_business: true,
+      }),
+      error: null,
+    })
+    enqueue({
+      data: {
+        id: 'je-existing',
+        company_id: 'company-1',
+        status: 'posted',
+        source_type: 'bank_transaction',
+        source_id: 'tx-1',
+        categorization_category: 'expense_office',
+        categorization_is_business: true,
+        ...journalOverride,
+      },
+      error: null,
+    })
+
+    const response = await POST(
+      createMockRequest('/api/transactions/tx-1/categorize', {
+        method: 'POST',
+        body: { is_business: true, category: 'expense_office' },
+      }),
+      createMockRouteParams({ id: 'tx-1' }),
+    )
+    const { status, body } = await parseJsonResponse<{
+      error: { code: string; details?: { reason?: string } }
+    }>(response)
+
+    expect(status).toBe(409)
+    expect(body.error).toMatchObject({
+      code: 'TX_CATEGORIZE_RACE',
+      details: { reason: 'journal_identity_mismatch' },
+    })
   })
 
   it('creates journal entry for business expense', async () => {
@@ -246,7 +778,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     mockSaveUserMappingRule.mockResolvedValue(undefined)
 
     // Update transaction (CAS guard: returns matched row)
-    enqueue({ data: [{ id: 'tx-1' }], error: null })
+    enqueue({ data: true, error: null })
 
     const emitSpy = vi.spyOn(eventBus, 'emit')
 
@@ -297,7 +829,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null }) // settings
     enqueue({ data: [{ id: 'period-1' }], error: null }) // fiscal period check
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
-    enqueue({ data: [{ id: 'tx-1' }], error: null }) // tx update (CAS matched)
+    enqueue({ data: true, error: null }) // atomic attachment matched
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
@@ -317,6 +849,8 @@ describe('POST /api/transactions/[id]/categorize', () => {
       'user-1',
       expect.objectContaining({ id: 'tx-1' }),
       expect.objectContaining({ dimensions: { '1': 'KS1', '6': 'P001' } }),
+      undefined,
+      { category: 'expense_software', isBusiness: true },
     )
   })
 
@@ -354,7 +888,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null }) // settings
     enqueue({ data: [{ id: 'period-1' }], error: null }) // fiscal period check
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
-    enqueue({ data: [{ id: 'tx-1' }], error: null }) // tx update (CAS matched)
+    enqueue({ data: true, error: null }) // atomic attachment matched
     // Inbox propagation: one matched item with a document
     enqueue({ data: [{ id: 'inbox-1', document_id: 'doc-1' }], error: null })
     enqueue({ data: null, error: null }) // document_attachments update
@@ -388,7 +922,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null })
     enqueue({ data: [{ id: 'period-1' }], error: null })
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
-    enqueue({ data: [{ id: 'tx-1' }], error: null }) // tx update
+    enqueue({ data: true, error: null }) // atomic attachment
     enqueue({ data: [], error: null }) // inbox propagation: no matched items
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
@@ -403,7 +937,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     expect(mockSupabase.from).not.toHaveBeenCalledWith('document_attachments')
   })
 
-  it('returns success with error when journal entry creation fails (non-blocking)', async () => {
+  it('fails without attaching categorization when journal entry creation fails', async () => {
     const tx = makeTransaction({
       id: 'tx-1',
       amount: -500,
@@ -417,29 +951,33 @@ describe('POST /api/transactions/[id]/categorize', () => {
 
     mockCreateTransactionJournalEntry.mockRejectedValue(new Error('Period locked'))
 
-    // Update transaction
-    enqueue({ data: null, error: null })
-
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
       body: { is_business: true, category: 'expense_software' },
     })
     const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
     const { status, body } = await parseJsonResponse<{
-      success: boolean
-      journal_entry_created: boolean
-      journal_entry_error: string
+      error: {
+        code: string
+        details: { operation: string; reason: string }
+      }
     }>(response)
 
-    expect(status).toBe(200)
-    expect(body.success).toBe(true)
-    expect(body.journal_entry_created).toBe(false)
-    // Untyped errors no longer leak their raw English message (issue #337):
-    // they map to the Swedish transaction-context fallback.
-    expect(body.journal_entry_error).toBe('Kunde inte hantera transaktionen. Försök igen.')
+    expect(status).toBe(500)
+    expect(body.error).toMatchObject({
+      code: 'BOOKKEEPING_DATABASE_ERROR',
+      details: {
+        operation: 'create_transaction_journal_entry',
+        reason: 'Kunde inte hantera transaktionen. Försök igen.',
+      },
+    })
+    expect(mockSupabase.rpc).not.toHaveBeenCalledWith(
+      'attach_transaction_categorization',
+      expect.anything(),
+    )
   })
 
-  it('translates typed engine errors to Swedish in journal_entry_error (issue #337)', async () => {
+  it('translates typed engine errors without attaching a null journal id', async () => {
     const tx = makeTransaction({
       id: 'tx-1',
       amount: -500,
@@ -453,28 +991,30 @@ describe('POST /api/transactions/[id]/categorize', () => {
 
     mockCreateTransactionJournalEntry.mockRejectedValue(new JournalEntryNotBalancedError(100, 80))
 
-    // Update transaction
-    enqueue({ data: null, error: null })
-
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
       body: { is_business: true, category: 'expense_software' },
     })
     const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
     const { status, body } = await parseJsonResponse<{
-      success: boolean
-      journal_entry_created: boolean
-      journal_entry_error: string
+      error: {
+        code: string
+        details: { operation: string; reason: string }
+      }
     }>(response)
 
-    expect(status).toBe(200)
-    expect(body.success).toBe(true)
-    expect(body.journal_entry_created).toBe(false)
-    expect(body.journal_entry_error).toContain('balanserar inte')
-    expect(body.journal_entry_error).toMatch(/100/)
-    expect(body.journal_entry_error).toMatch(/80/)
-    expect(body.journal_entry_error).not.toContain('not balanced')
-    expect(body.journal_entry_error).not.toContain('check constraint')
+    expect(status).toBe(500)
+    expect(body.error.code).toBe('BOOKKEEPING_DATABASE_ERROR')
+    expect(body.error.details.operation).toBe('create_transaction_journal_entry')
+    expect(body.error.details.reason).toContain('balanserar inte')
+    expect(body.error.details.reason).toMatch(/100/)
+    expect(body.error.details.reason).toMatch(/80/)
+    expect(body.error.details.reason).not.toContain('not balanced')
+    expect(body.error.details.reason).not.toContain('check constraint')
+    expect(mockSupabase.rpc).not.toHaveBeenCalledWith(
+      'attach_transaction_categorization',
+      expect.anything(),
+    )
   })
 
   it('returns 500 when transaction update fails', async () => {
@@ -492,16 +1032,51 @@ describe('POST /api/transactions/[id]/categorize', () => {
 
     // Transaction update fails
     enqueue({ data: null, error: { message: 'Update failed' } })
+    enqueue({ data: compensationSuccess, error: null })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
       body: { is_business: true, category: 'expense_software' },
     })
     const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
-    const { status, body } = await parseJsonResponse<{ error: string }>(response)
+    const { status, body } = await parseJsonResponse<{
+      error: { code: string; details?: Record<string, unknown> }
+    }>(response)
 
     expect(status).toBe(500)
-    expect((body.error as unknown as { code: string }).code).toBe('INTERNAL_ERROR')
+    expect(body.error.code).toBe('BOOKKEEPING_DATABASE_ERROR')
+    expect(body.error.details).not.toHaveProperty('partial_posted_ids')
+    expect(mockReverseEntry).not.toHaveBeenCalled()
+  })
+
+  it('surfaces the posted id when attachment-update error storno fails', async () => {
+    const tx = makeTransaction({
+      id: 'tx-1',
+      journal_entry_id: null,
+      merchant_name: null,
+    })
+    enqueue({ data: tx, error: null })
+    enqueue({ data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null })
+    enqueue({ data: [{ id: 'period-1' }], error: null })
+    mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
+    enqueue({ data: null, error: { message: 'Update failed' } })
+    enqueue({ data: null, error: { message: 'period locked' } })
+
+    const request = createMockRequest('/api/transactions/tx-1/categorize', {
+      method: 'POST',
+      body: { is_business: true, category: 'expense_software' },
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
+    const { status, body } = await parseJsonResponse<{
+      error: { code: string; details?: unknown }
+    }>(response)
+
+    expect(status).toBe(500)
+    expect(body.error.code).toBe('BOOKKEEPING_DATABASE_ERROR')
+    expect(body.error.details).toMatchObject({
+      partial_posted_ids: { journal_entry_id: 'je-1' },
+    })
+    expect(mockSupabase.from).not.toHaveBeenCalledWith('voucher_gap_explanations')
   })
 
   it('returns 400 when mapping result has empty debit_account', async () => {
@@ -598,7 +1173,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: [{ id: 'period-1' }], error: null })
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
     // Transaction update
-    enqueue({ data: [{ id: 'tx-1' }], error: null })
+    enqueue({ data: true, error: null })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
@@ -641,7 +1216,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: [{ id: 'period-1' }], error: null })
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
     // Transaction update
-    enqueue({ data: [{ id: 'tx-1' }], error: null })
+    enqueue({ data: true, error: null })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
@@ -700,7 +1275,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     // ensureFiscalPeriod + transaction update
     enqueue({ data: [{ id: 'period-1' }], error: null })
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
-    enqueue({ data: [{ id: 'tx-1' }], error: null })
+    enqueue({ data: true, error: null })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
@@ -762,7 +1337,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: [sekSupplierInvoice(1000)], error: null })
     enqueue({ data: [{ id: 'period-1' }], error: null })
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
-    enqueue({ data: [{ id: 'tx-1' }], error: null })
+    enqueue({ data: true, error: null })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
@@ -855,7 +1430,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     // ensureFiscalPeriod + transaction update
     enqueue({ data: [{ id: 'period-1' }], error: null })
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
-    enqueue({ data: [{ id: 'tx-1' }], error: null })
+    enqueue({ data: true, error: null })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
@@ -1006,7 +1581,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: [{ id: 'period-1' }], error: null })
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
     // Transaction update
-    enqueue({ data: [{ id: 'tx-1' }], error: null })
+    enqueue({ data: true, error: null })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
@@ -1063,7 +1638,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: [{ id: 'period-1' }], error: null }) // ensureFiscalPeriod existing check
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
     mockSaveUserMappingRule.mockResolvedValue(undefined)
-    enqueue({ data: [{ id: 'tx-1' }], error: null }) // tx update (CAS matched)
+    enqueue({ data: true, error: null }) // atomic attachment matched
 
     mockDetectDup.mockResolvedValue({
       transaction_id: SIBLING_UUID,
@@ -1099,6 +1674,10 @@ describe('POST /api/transactions/[id]/categorize', () => {
         payload: expect.objectContaining({ dismissed_transaction_id: SIBLING_UUID }),
       }),
     )
+    const attachmentOrder = mockSupabase.rpc.mock.invocationCallOrder[0]
+    expect(attachmentOrder).toBeLessThan(mockAppendProcessingHistory.mock.invocationCallOrder[0])
+    expect(attachmentOrder).toBeLessThan(mockSaveUserMappingRule.mock.invocationCallOrder[0])
+    expect(attachmentOrder).toBeLessThan(mockUpsertCounterpartyTemplate.mock.invocationCallOrder[0])
   })
 
   it('categorizes as private when is_business is false', async () => {
@@ -1115,7 +1694,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
 
     // Update transaction (CAS guard: returns matched row)
-    enqueue({ data: [{ id: 'tx-1' }], error: null })
+    enqueue({ data: true, error: null })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',

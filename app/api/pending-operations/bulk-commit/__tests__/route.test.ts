@@ -361,4 +361,47 @@ describe('POST /api/pending-operations/bulk-commit', () => {
     })
     expect(mockCommit).toHaveBeenCalledTimes(3)
   })
+
+  it('preserves failed-partial posted ids per item without leaking other executor data', async () => {
+    enqueue({ data: [makeOp({ id: VALID_ID_1 }), makeOp({ id: VALID_ID_2 })] })
+    mockCommit
+      .mockResolvedValueOnce({
+        status: 'failed',
+        error: 'compensation unverifiable',
+        http_status: 500,
+        data: {
+          posted_ids: { journal_entry_id: 'je-original' },
+          partial_failure_state: {
+            persistence: 'conflict',
+            operation_status: 'other',
+          },
+          internal_debug: 'must not leak',
+        },
+      })
+      .mockResolvedValueOnce({
+        status: 'failed',
+        error: 'ordinary failure',
+        http_status: 500,
+      })
+
+    const response = await POST(
+      createMockRequest('/api/pending-operations/bulk-commit', {
+        method: 'POST',
+        body: { ids: [VALID_ID_1, VALID_ID_2] },
+      }),
+    )
+    const body = await response.json()
+
+    expect(body.data.results[0]).toMatchObject({
+      id: VALID_ID_1,
+      status: 'failed',
+      partial_posted_ids: { journal_entry_id: 'je-original' },
+      partial_failure_state: {
+        persistence: 'conflict',
+        operation_status: 'other',
+      },
+    })
+    expect(body.data.results[0]).not.toHaveProperty('internal_debug')
+    expect(body.data.results[1]).not.toHaveProperty('partial_posted_ids')
+  })
 })

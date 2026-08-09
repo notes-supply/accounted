@@ -55,6 +55,11 @@ const IngestResponse = z.object({
   auto_matched_invoices: z.number().int(),
   errors: z.number().int(),
   transaction_ids: z.array(z.string().uuid()),
+  auto_categorization_failures: z.array(z.object({
+    transaction_id: z.string().uuid(),
+    code: z.string(),
+    partial_posted_ids: z.record(z.string(), z.string()).optional(),
+  })).optional(),
 })
 
 registerEndpoint({
@@ -254,6 +259,9 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(
         auto_matched_invoices: result.auto_matched_invoices,
         errors: result.errors,
         transaction_ids: result.transaction_ids,
+        ...(result.auto_categorization_failures
+          ? { auto_categorization_failures: result.auto_categorization_failures }
+          : {}),
       },
       { requestId: ctx.requestId },
     )

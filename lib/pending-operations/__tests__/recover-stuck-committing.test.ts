@@ -362,6 +362,32 @@ describe('recoverStuckCommittingOperations', () => {
     expect(line?.level).toBe('error')
   })
 
+  it('preserves a bulk inbox row after an ambiguous partial failure instead of rejecting it', async () => {
+    const { supabase, captures, enqueue } = createCapturingSupabase()
+    const { log, calls } = createLogSpy()
+
+    enqueue({
+      data: [
+        makeRow({
+          id: 'op-ambiguous',
+          operation_type: 'bulk_book_inbox_items',
+          params: { item_ids: ['inbox-1'] },
+          result_data: { commit_in_progress: { partial_failure_possible: true } },
+        }),
+      ],
+    })
+
+    const summary = await recoverStuckCommittingOperations(supabase, { log })
+
+    expect(summary).toEqual({ scanned: 1, committed: 0, rejected: 0, skipped: 1 })
+    expect(captures).toHaveLength(1)
+    expect(captures.filter((capture) => capture.payload !== undefined)).toHaveLength(0)
+    const line = calls.find((call) => call.args[0] === 'pending_op_recovery')
+    expect((line?.args[1] as Record<string, unknown>).outcome).toBe(
+      'skipped_partial_failure_ambiguous',
+    )
+  })
+
   it('counts a lost CAS as skipped when a concurrent finalize resolved the row first', async () => {
     const { supabase, enqueue } = createCapturingSupabase()
     const { log, calls } = createLogSpy()

@@ -1618,6 +1618,8 @@ export interface JournalEntry {
   description: string
   source_type: JournalEntrySourceType
   source_id: string | null
+  categorization_category?: TransactionCategory | null
+  categorization_is_business?: boolean | null
   status: JournalEntryStatus
   committed_at: string | null
   reversed_by_id: string | null
@@ -2083,6 +2085,8 @@ export interface CreateJournalEntryInput {
   description: string
   source_type: JournalEntrySourceType
   source_id?: string
+  categorization_category?: TransactionCategory
+  categorization_is_business?: boolean
   voucher_series?: string
   notes?: string
   lines: CreateJournalEntryLineInput[]
@@ -3565,6 +3569,22 @@ export interface IngestResult {
   auto_matched_invoices: number
   errors: number
   transaction_ids: string[]
+  /**
+   * Auto-booking failures do not roll back successful transaction ingestion.
+   * Any posted artifacts that could not be verified as compensated are exposed
+   * by stable identifier keys for repair.
+   */
+  auto_categorization_failures?: Array<{
+    transaction_id: string
+    code:
+      | 'SETTLEMENT_PROVENANCE_UNAVAILABLE'
+      | 'AUTO_CATEGORIZATION_ERROR'
+      | 'ATTACHMENT_CONFLICT'
+      | 'ATTACHMENT_DATABASE_ERROR'
+      | 'ATTACHMENT_UNVERIFIABLE'
+      | 'POST_COMMIT_READBACK_FAILED'
+    partial_posted_ids?: Record<string, string>
+  }>
   /** First insert error encountered, surfaced for debugging. Optional. */
   first_error?: { message: string; code?: string | null; details?: string | null; hint?: string | null }
   /**

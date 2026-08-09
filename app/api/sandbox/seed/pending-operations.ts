@@ -118,6 +118,8 @@ export function buildSandboxPendingOperations({
         transaction_id: transactionId,
         category: 'income_services',
         vat_treatment: 'standard_25',
+        cash_account_id: null,
+        settlement_account: '1930',
       },
       // CategorizePreview reads `lines`, NOT the generic `preview_lines` the
       // operation above uses. Seeding the generic shape here dropped the card

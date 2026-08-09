@@ -6,7 +6,7 @@ import {
   createQueuedMockSupabase,
 } from '@/tests/helpers'
 
-const { supabase: mockSupabase, enqueue, reset } = createQueuedMockSupabase()
+const { supabase: mockSupabase, enqueue, reset, findCall, findCalls } = createQueuedMockSupabase()
 
 // The route runs through the real withRouteContext wrapper: mock its auth,
 // company-resolution and write-permission dependencies (getActiveCompanyId,
@@ -41,6 +41,11 @@ vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
   buildTransactionEntryLines: (...args: unknown[]) => buildLinesMock(...args),
 }))
 
+const resolveSettlementAccountMock = vi.fn()
+vi.mock('@/lib/bookkeeping/settlement-account', () => ({
+  resolveSettlementAccount: (...args: unknown[]) => resolveSettlementAccountMock(...args),
+}))
+
 import { PATCH } from '../route'
 
 const mockUser = { id: 'user-1' }
@@ -50,6 +55,7 @@ beforeEach(() => {
   reset()
   requireAuthMock.mockResolvedValue({ user: mockUser, supabase: mockSupabase, error: null })
   requireWritePermissionMock.mockResolvedValue({ ok: true })
+  resolveSettlementAccountMock.mockResolvedValue('1931')
   mappingMock.mockReturnValue({
     debit_account: '5410',
     credit_account: '1930',
@@ -191,16 +197,23 @@ describe('PATCH /api/pending-operations/[id]', () => {
         amount: -500,
         currency: 'SEK',
         date: '2026-05-10',
+        cash_account_id: 'cash-revolut-sek',
       },
     })
     enqueue({ data: { entity_type: 'aktiebolag' } })
     enqueue({
       data: {
         id: 'op-1',
-        params: { transaction_id: 'tx-1', category: 'expense_software', vat_treatment: null },
+        params: {
+          transaction_id: 'tx-1',
+          category: 'expense_software',
+          vat_treatment: null,
+          cash_account_id: 'cash-revolut-sek',
+          settlement_account: '1931',
+        },
         preview_data: {
           debit_account: '5410',
-          credit_account: '1930',
+          credit_account: '1931',
           amount: 500,
           currency: 'SEK',
           vat_lines: [],
@@ -211,6 +224,12 @@ describe('PATCH /api/pending-operations/[id]', () => {
       },
     })
 
+    mappingMock.mockReturnValueOnce({
+      debit_account: '5410',
+      credit_account: '1931',
+      vat_lines: [],
+    })
+
     const res = await PATCH(
       createMockRequest('/api/pending-operations/op-1', {
         method: 'PATCH',
@@ -219,12 +238,141 @@ describe('PATCH /api/pending-operations/[id]', () => {
       createMockRouteParams({ id: 'op-1' }),
     )
     const { status, body } = await parseJsonResponse<{
-      data: { preview_data: { category: string; debit_account: string } }
+      data: { preview_data: { category: string; debit_account: string; credit_account: string } }
     }>(res)
     expect(status).toBe(200)
     expect(body.data.preview_data.category).toBe('expense_software')
     expect(body.data.preview_data.debit_account).toBe('5410')
+    expect(body.data.preview_data.credit_account).toBe('1931')
+    expect(resolveSettlementAccountMock).toHaveBeenCalledWith(
+      mockSupabase,
+      'company-1',
+      'cash-revolut-sek',
+      expect.anything(),
+    )
+    expect(accountMappingMock).toHaveBeenCalledWith(
+      'expense_software', -500, true, 'aktiebolag', null, '1931',
+    )
+    expect(mappingMock).toHaveBeenCalledWith(
+      'expense_software', expect.objectContaining({ id: 'tx-1' }), true,
+      'aktiebolag', null, null, '1931',
+    )
+    const updatePayload = findCall('pending_operations', 'update')?.[0] as {
+      params: Record<string, unknown>
+      preview_data: Record<string, unknown>
+    }
+    expect(updatePayload.params).toMatchObject({
+      cash_account_id: 'cash-revolut-sek',
+      settlement_account: '1931',
+    })
+    expect(updatePayload.preview_data.credit_account).toBe('1931')
+    expect(findCalls('pending_operations', 'eq')).toContainEqual(['status', 'pending'])
     expect(mappingMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('returns 409 when approval claims the operation before the edit update', async () => {
+    enqueue({
+      data: {
+        id: 'op-1',
+        company_id: 'company-1',
+        operation_type: 'categorize_transaction',
+        status: 'pending',
+        params: { transaction_id: 'tx-1', category: 'expense_other', vat_treatment: null },
+        preview_data: {},
+        title: 'Kategorisera: X',
+      },
+    })
+    enqueue({
+      data: {
+        id: 'tx-1',
+        company_id: 'company-1',
+        amount: -500,
+        currency: 'SEK',
+        date: '2026-05-10',
+        cash_account_id: 'cash-revolut-sek',
+      },
+    })
+    enqueue({ data: { entity_type: 'aktiebolag' } })
+    enqueue({ data: null, error: null }) // status-CAS update lost to approval claim
+
+    const res = await PATCH(
+      createMockRequest('/api/pending-operations/op-1', {
+        method: 'PATCH',
+        body: { category: 'expense_software' },
+      }),
+      createMockRouteParams({ id: 'op-1' }),
+    )
+    const { status, body } = await parseJsonResponse<{ error: string }>(res)
+
+    expect(status).toBe(409)
+    expect(body.error).toContain('hann behandlas')
+    expect(findCalls('pending_operations', 'eq')).toContainEqual(['status', 'pending'])
+  })
+
+  it('uses legacy defaults when the company-settings row is genuinely absent', async () => {
+    enqueue({
+      data: {
+        id: 'op-1',
+        company_id: 'company-1',
+        operation_type: 'categorize_transaction',
+        status: 'pending',
+        params: { transaction_id: 'tx-1', category: 'expense_other' },
+        preview_data: {},
+        title: 'Kategorisera',
+      },
+    })
+    enqueue({ data: { id: 'tx-1', amount: -100, currency: 'SEK', cash_account_id: null } })
+    enqueue({ data: null, error: null })
+    enqueue({
+      data: { id: 'op-1', params: {}, preview_data: {}, title: 'Kategorisera', status: 'pending' },
+    })
+
+    const res = await PATCH(
+      createMockRequest('/api/pending-operations/op-1', {
+        method: 'PATCH',
+        body: { category: 'expense_software' },
+      }),
+      createMockRouteParams({ id: 'op-1' }),
+    )
+
+    expect(res.status).toBe(200)
+    expect(mappingMock).toHaveBeenCalledWith(
+      'expense_software',
+      expect.anything(),
+      true,
+      'enskild_firma',
+      undefined,
+      null,
+      '1931',
+    )
+  })
+
+  it('stops before preview mutation when the company-settings query errors', async () => {
+    enqueue({
+      data: {
+        id: 'op-1',
+        company_id: 'company-1',
+        operation_type: 'categorize_transaction',
+        status: 'pending',
+        params: { transaction_id: 'tx-1', category: 'expense_other' },
+        preview_data: {},
+        title: 'Kategorisera',
+      },
+    })
+    enqueue({ data: { id: 'tx-1', amount: -100, currency: 'SEK', cash_account_id: null } })
+    enqueue({ data: null, error: { code: '42501', message: 'permission denied' } })
+
+    const res = await PATCH(
+      createMockRequest('/api/pending-operations/op-1', {
+        method: 'PATCH',
+        body: { category: 'expense_software' },
+      }),
+      createMockRouteParams({ id: 'op-1' }),
+    )
+
+    expect(res.status).toBe(500)
+    expect(mappingMock).not.toHaveBeenCalled()
+    expect(findCall('pending_operations', 'update')).toBeUndefined()
   })
 
   it('re-derives the full journal lines from the new mapping (stale-preview guard)', async () => {
@@ -311,7 +459,7 @@ describe('PATCH /api/pending-operations/[id]', () => {
     // 6th arg = vat_amount override, carried over from the staged params
     // (vat_treatment persists too, only the category changed)
     expect(mappingMock).toHaveBeenCalledWith(
-      'expense_office', expect.anything(), true, 'enskild_firma', 'reduced_12', 42.43,
+      'expense_office', expect.anything(), true, 'enskild_firma', 'reduced_12', 42.43, '1931',
     )
   })
 
@@ -352,7 +500,7 @@ describe('PATCH /api/pending-operations/[id]', () => {
     )
     expect(res.status).toBe(200)
     expect(mappingMock).toHaveBeenCalledWith(
-      'expense_bank_fees', expect.anything(), true, 'enskild_firma', undefined, null,
+      'expense_bank_fees', expect.anything(), true, 'enskild_firma', undefined, null, '1931',
     )
   })
 
