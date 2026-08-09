@@ -326,9 +326,6 @@ export function shouldRegenerateTaxDeadlines(
  * conservative choice for a compliance surface: a stale filing date is a
  * missed filing, a lost title edit is cosmetic.
  */
-const SUPERSEDED_ROW_SELECT =
-  'id, tax_deadline_type, tax_period, status, status_changed_at, notes, due_time, priority, customer_id, linked_report_period' as const
-
 interface SupersededDeadlineRow {
   id: string
   tax_deadline_type: string | null
@@ -654,10 +651,10 @@ export async function generateTaxDeadlinesForUser(
 
   // Everything the user (or the status flow) put on the rows about to be
   // replaced, keyed by the same tax_deadline_type:tax_period identity the
-  // completed/dismissed check uses. See SUPERSEDED_ROW_SELECT for the rule.
+  // completed/dismissed check uses. See the superseded-row field selection above for the rule.
   const { data: supersededRows, error: supersededError } = await supabase
     .from('deadlines')
-    .select(SUPERSEDED_ROW_SELECT)
+    .select('id, tax_deadline_type, tax_period, status, status_changed_at, notes, due_time, priority, customer_id, linked_report_period')
     .eq('company_id', companyId)
     .eq('source', 'system')
     .eq('is_completed', false)
@@ -798,7 +795,7 @@ export async function generateTaxDeadlinesForUser(
         }
 
         // The row this one replaces, if any: its user-owned columns and its
-        // manually reported progress carry across (see SUPERSEDED_ROW_SELECT).
+        // manually reported progress carry across (see the superseded-row field selection above).
         const superseded = supersededByKey.get(deadlineKey)
 
         // Determine initial status based on days until deadline, keeping a
