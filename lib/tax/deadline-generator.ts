@@ -543,6 +543,11 @@ function preservedDeadlineObligationKeys(
   return keys
 }
 
+function isLegacyAnnualVatRow(row: PreservedDeadlineIdentityRow): boolean {
+  return row.tax_deadline_type === 'moms_yearly' &&
+    fiscalPeriodIdFromLinkedPeriod(row.linked_report_period) === null
+}
+
 /**
  * Generate all tax deadlines for a user based on their company settings
  */
@@ -663,16 +668,50 @@ export async function generateTaxDeadlinesForUser(
     throw supersededError
   }
 
+  const pendingRows = (supersededRows ?? []) as SupersededDeadlineRow[]
   const supersededByKey = new Map<string, SupersededDeadlineRow>()
-  for (const row of (supersededRows ?? []) as SupersededDeadlineRow[]) {
+  const authoritativeAnnualCounts = new Map<string, number>()
+  for (const row of pendingRows) {
+    const key = deadlineObligationKey(
+      row.tax_deadline_type,
+      row.tax_period,
+      row.linked_report_period,
+    )
     supersededByKey.set(deadlineObligationKey(
       row.tax_deadline_type,
       row.tax_period,
       row.linked_report_period,
     ), row)
+    if (row.tax_deadline_type === 'moms_yearly' && !isLegacyAnnualVatRow(row)) {
+      authoritativeAnnualCounts.set(key, (authoritativeAnnualCounts.get(key) ?? 0) + 1)
+    }
   }
 
-  const stalePreLiabilityVatDeadlineIds = ((supersededRows ?? []) as SupersededDeadlineRow[])
+  // Legacy annual rows have no authoritative fiscal-period UUID. Reuse the
+  // completed/dismissed resolver, but only carry a row forward when exactly
+  // one legacy candidate maps to a key that has no canonical pending row.
+  const legacyRows = pendingRows.filter(isLegacyAnnualVatRow)
+  const legacyKeyById = new Map<string, string>()
+  const legacyRowsByKey = new Map<string, SupersededDeadlineRow[]>()
+  for (const row of legacyRows) {
+    const fiscalPeriod = resolveLegacyAnnualVatFiscalPeriod(
+      row,
+      settings.fiscal_periods ?? [],
+    )
+    if (!fiscalPeriod) continue
+    const key = `moms_yearly:fiscal-period:${fiscalPeriod.id}`
+    legacyKeyById.set(row.id, key)
+    const candidates = legacyRowsByKey.get(key) ?? []
+    candidates.push(row)
+    legacyRowsByKey.set(key, candidates)
+  }
+  for (const [key, candidates] of legacyRowsByKey) {
+    if (candidates.length === 1 && (authoritativeAnnualCounts.get(key) ?? 0) === 0) {
+      supersededByKey.set(key, candidates[0])
+    }
+  }
+
+  const stalePreLiabilityVatDeadlineIds = pendingRows
     .filter((row) =>
       row.id &&
       row.tax_deadline_type &&
@@ -813,6 +852,24 @@ export async function generateTaxDeadlinesForUser(
       ]),
     ).values(),
   )
+  const replacementKeys = new Set(uniqueDeadlines.map((deadline) => deadlineObligationKey(
+    deadline.tax_deadline_type,
+    deadline.tax_period,
+    deadline.linked_report_period,
+  )))
+  const replaceableLegacyAnnualIds = legacyRows
+    .filter((row) => {
+      const key = legacyKeyById.get(row.id)
+      return key != null &&
+        (legacyRowsByKey.get(key)?.length ?? 0) === 1 &&
+        (authoritativeAnnualCounts.get(key) ?? 0) === 0 &&
+        replacementKeys.has(key)
+    })
+    .map((row) => row.id)
+  const replaceableLegacyAnnualIdSet = new Set(replaceableLegacyAnnualIds)
+  const protectedLegacyAnnualIds = legacyRows
+    .filter((row) => !replaceableLegacyAnnualIdSet.has(row.id))
+    .map((row) => row.id)
 
   // Insert the replacement rows BEFORE deleting the old set. A failed insert
   // then leaves the previous deadlines intact: the old delete-first order
@@ -859,13 +916,18 @@ export async function generateTaxDeadlinesForUser(
     .eq('is_completed', false)
     .is('dismissed_at', null)
 
-  // The ordinary replacement window starts today. A pre-liability VAT row can
-  // have an already-passed filing date, so include only those known row IDs in
-  // the cleanup filter. This removes stale VAT obligations without widening
-  // deletion to old non-VAT or user-created deadlines.
-  if (stalePreLiabilityVatDeadlineIds.length > 0) {
+  // The ordinary replacement window starts today. A pre-liability VAT row or
+  // a proven legacy annual row replaced above can have an already-passed
+  // filing date, so include only those known row IDs in the cleanup filter.
+  // This removes stale VAT obligations without widening deletion to old
+  // non-VAT or user-created deadlines.
+  const explicitDeletionIds = Array.from(new Set([
+    ...stalePreLiabilityVatDeadlineIds,
+    ...replaceableLegacyAnnualIds,
+  ]))
+  if (explicitDeletionIds.length > 0) {
     deleteQuery = deleteQuery.or(
-      `and(due_date.gte.${todayIso},due_date.lte.${endDate}),id.in.(${stalePreLiabilityVatDeadlineIds.join(',')})`,
+      `and(due_date.gte.${todayIso},due_date.lte.${endDate}),id.in.(${explicitDeletionIds.join(',')})`,
     )
   } else {
     deleteQuery = deleteQuery
@@ -875,6 +937,13 @@ export async function generateTaxDeadlinesForUser(
 
   if (newIds.length > 0) {
     deleteQuery = deleteQuery.not('id', 'in', `(${newIds.join(',')})`)
+  }
+  if (protectedLegacyAnnualIds.length > 0) {
+    deleteQuery = deleteQuery.not(
+      'id',
+      'in',
+      `(${protectedLegacyAnnualIds.join(',')})`,
+    )
   }
 
   const { data: deletedData, error: deleteError } = await deleteQuery.select('id')

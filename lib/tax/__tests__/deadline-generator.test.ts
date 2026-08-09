@@ -94,6 +94,8 @@ function makeRecordingSupabase(opts: {
   const deleteOrFilters: string[] = []
   const deleteEqFilters: Array<[string, unknown]> = []
   const deleteIsFilters: Array<[string, unknown]> = []
+  const deleteNotFilters: Array<[string, string, unknown]> = []
+  const deadlineReadEqFilters: Array<[string, unknown]> = []
   const fiscalPeriodEqFilters: Array<[string, unknown]> = []
   let insertPayload: Array<Record<string, unknown>> | null = null
 
@@ -122,6 +124,9 @@ function makeRecordingSupabase(opts: {
     })
     chain.eq = vi.fn((column: string, value: unknown) => {
       if (isDelete) deleteEqFilters.push([column, value])
+      if (!isDelete && table === 'deadlines') {
+        deadlineReadEqFilters.push([column, value])
+      }
       if (!isDelete && table === 'fiscal_periods') {
         fiscalPeriodEqFilters.push([column, value])
       }
@@ -150,6 +155,9 @@ function makeRecordingSupabase(opts: {
     })
     chain.not = vi.fn((...args: unknown[]) => {
       calls.push(`not(${String(args[2]).slice(0, 20)}…)`)
+      if (isDelete) {
+        deleteNotFilters.push(args as [string, string, unknown])
+      }
       return chain
     })
     chain.select = vi.fn(() => {
@@ -171,6 +179,8 @@ function makeRecordingSupabase(opts: {
     getDeleteOrFilters: () => deleteOrFilters,
     getDeleteEqFilters: () => deleteEqFilters,
     getDeleteIsFilters: () => deleteIsFilters,
+    getDeleteNotFilters: () => deleteNotFilters,
+    getDeadlineReadEqFilters: () => deadlineReadEqFilters,
     getFiscalPeriodEqFilters: () => fiscalPeriodEqFilters,
     getInsertPayload: () => insertPayload,
   }
@@ -448,6 +458,296 @@ describe('generateTaxDeadlinesForUser', () => {
           fiscalPeriodId: 'fp-calendar-2025',
         }),
       }))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it.each([
+    {
+      label: 'pending calendar year',
+      fiscalPeriod: {
+        id: 'fp-calendar-2025',
+        name: 'Calendar 2025',
+        period_start: '2025-01-01',
+        period_end: '2025-12-31',
+      },
+      legacyPeriod: '2025',
+      linkedReportPeriod: { year: 2025 },
+      status: 'upcoming',
+    },
+    {
+      label: 'in-progress broken year',
+      fiscalPeriod: {
+        id: 'fp-broken-2026',
+        name: 'Broken 2025/2026',
+        period_start: '2025-07-01',
+        period_end: '2026-06-30',
+      },
+      legacyPeriod: '2025/2026',
+      linkedReportPeriod: { startYear: 2025, endYear: 2026 },
+      status: 'in_progress',
+    },
+    {
+      label: 'submitted broken year',
+      fiscalPeriod: {
+        id: 'fp-submitted-2026',
+        name: 'Submitted 2025/2026',
+        period_start: '2025-07-01',
+        period_end: '2026-06-30',
+      },
+      legacyPeriod: '2025/2026',
+      linkedReportPeriod: { startYear: 2025, endYear: 2026 },
+      status: 'submitted',
+    },
+  ] as const)('preserves a unique future legacy $label row on its canonical replacement', async ({
+    fiscalPeriod,
+    legacyPeriod,
+    linkedReportPeriod,
+    status,
+  }) => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-18T00:00:00Z'))
+    try {
+      const {
+        supabase,
+        calls,
+        getInsertPayload,
+        getDeleteOrFilters,
+        getDeleteNotFilters,
+        getDeadlineReadEqFilters,
+      } = makeRecordingSupabase({
+        fiscalPeriods: [fiscalPeriod],
+        supersededRows: [{
+          id: `legacy-${status}`,
+          tax_deadline_type: 'moms_yearly',
+          tax_period: legacyPeriod,
+          linked_report_period: linkedReportPeriod,
+          due_date: '2026-02-12',
+          status,
+          status_changed_at: '2025-01-02T03:04:05.000Z',
+          notes: 'Behåll anteckningen',
+          due_time: '09:15:00',
+          priority: 'critical',
+          customer_id: '11111111-1111-1111-1111-111111111111',
+        }],
+      })
+
+      await generateTaxDeadlinesForUser(supabase, 'company-1', {
+        ...SETTINGS,
+        moms_period: 'yearly',
+      }, [2026, 2027])
+
+      const replacement = getInsertPayload()!.find((row) =>
+        row.tax_deadline_type === 'moms_yearly' &&
+        (row.linked_report_period as { fiscalPeriodId?: string }).fiscalPeriodId === fiscalPeriod.id,
+      )
+      expect(replacement).toMatchObject({
+        notes: 'Behåll anteckningen',
+        due_time: '09:15:00',
+        priority: 'critical',
+        customer_id: '11111111-1111-1111-1111-111111111111',
+      })
+      if (status === 'in_progress' || status === 'submitted') {
+        expect(replacement).toMatchObject({
+          status,
+          status_changed_at: '2025-01-02T03:04:05.000Z',
+        })
+      } else {
+        expect(replacement?.status).toBe('upcoming')
+        expect(replacement?.status_changed_at).not.toBe('2025-01-02T03:04:05.000Z')
+      }
+      expect(calls.indexOf('insert')).toBeLessThan(calls.indexOf('delete'))
+      expect(getDeleteOrFilters()).toHaveLength(1)
+      expect(getDeleteOrFilters()[0]).toContain(`id.in.(legacy-${status})`)
+      expect(getDeleteNotFilters().flatMap((filter) => String(filter[2]))).not.toContain(
+        `legacy-${status}`,
+      )
+      expect(getDeadlineReadEqFilters()).toContainEqual(['company_id', 'company-1'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('deletes a past-due uniquely mapped legacy row after inserting its canonical replacement', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-18T00:00:00Z'))
+    try {
+      const { supabase, calls, getInsertPayload, getDeleteOrFilters } = makeRecordingSupabase({
+        fiscalPeriods: [{
+          id: 'fp-calendar-2025',
+          name: 'Calendar 2025',
+          period_start: '2025-01-01',
+          period_end: '2025-12-31',
+        }],
+        supersededRows: [{
+          id: 'legacy-past-due',
+          tax_deadline_type: 'moms_yearly',
+          tax_period: '2025',
+          linked_report_period: { year: 2025 },
+          due_date: '2025-12-12',
+          notes: 'Carry into replacement',
+        }],
+      })
+
+      await generateTaxDeadlinesForUser(supabase, 'company-1', {
+        ...SETTINGS,
+        moms_period: 'yearly',
+      }, [2026])
+
+      expect(getInsertPayload()).toContainEqual(expect.objectContaining({
+        tax_deadline_type: 'moms_yearly',
+        notes: 'Carry into replacement',
+        linked_report_period: expect.objectContaining({
+          fiscalPeriodId: 'fp-calendar-2025',
+        }),
+      }))
+      expect(calls.indexOf('insert')).toBeLessThan(calls.indexOf('delete'))
+      expect(getDeleteOrFilters()).toHaveLength(1)
+      expect(getDeleteOrFilters()[0]).toContain(
+        'and(due_date.gte.2026-01-18,due_date.lte.2027-12-31)',
+      )
+      expect(getDeleteOrFilters()[0]).toContain('id.in.(legacy-past-due)')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps a past-due mapped legacy row when canonical replacement insertion fails', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-18T00:00:00Z'))
+    try {
+      const { supabase, calls } = makeRecordingSupabase({
+        insertError: { code: '23502', message: 'replacement insert failed' },
+        fiscalPeriods: [{
+          id: 'fp-calendar-2025',
+          name: 'Calendar 2025',
+          period_start: '2025-01-01',
+          period_end: '2025-12-31',
+        }],
+        supersededRows: [{
+          id: 'legacy-past-due',
+          tax_deadline_type: 'moms_yearly',
+          tax_period: '2025',
+          linked_report_period: { year: 2025 },
+          due_date: '2025-12-12',
+        }],
+      })
+
+      await expect(generateTaxDeadlinesForUser(supabase, 'company-1', {
+        ...SETTINGS,
+        moms_period: 'yearly',
+      }, [2026])).rejects.toMatchObject({ code: '23502' })
+
+      expect(calls).toContain('insert')
+      expect(calls).not.toContain('delete')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not adopt or delete an ambiguous past-due legacy pending annual VAT row', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-18T00:00:00Z'))
+    try {
+      const {
+        supabase,
+        getInsertPayload,
+        getDeleteOrFilters,
+        getDeleteNotFilters,
+      } = makeRecordingSupabase({
+        fiscalPeriods: [
+          {
+            id: 'fp-first-2026',
+            name: 'First short 2026',
+            period_start: '2026-01-01',
+            period_end: '2026-03-31',
+          },
+          {
+            id: 'fp-second-2026',
+            name: 'Second short 2026',
+            period_start: '2026-04-01',
+            period_end: '2026-06-30',
+          },
+        ],
+        supersededRows: [{
+          id: 'legacy-ambiguous',
+          tax_deadline_type: 'moms_yearly',
+          tax_period: '2026',
+          linked_report_period: { year: 2026 },
+          due_date: '2025-12-12',
+          notes: 'Får inte flyttas',
+          status: 'submitted',
+        }],
+      })
+
+      await generateTaxDeadlinesForUser(supabase, 'company-1', {
+        ...SETTINGS,
+        moms_period: 'yearly',
+      }, [2026, 2027])
+
+      const annual = getInsertPayload()!.filter((row) => row.tax_deadline_type === 'moms_yearly')
+      expect(annual).toHaveLength(2)
+      expect(annual).not.toContainEqual(expect.objectContaining({ notes: 'Får inte flyttas' }))
+      expect(getDeleteOrFilters().join(',')).not.toContain('legacy-ambiguous')
+      expect(getDeleteNotFilters()).toContainEqual(['id', 'in', '(legacy-ambiguous)'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not adopt or delete duplicate past-due legacy pending candidates', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-18T00:00:00Z'))
+    try {
+      const {
+        supabase,
+        getInsertPayload,
+        getDeleteOrFilters,
+        getDeleteNotFilters,
+      } = makeRecordingSupabase({
+        fiscalPeriods: [{
+          id: 'fp-calendar-2025',
+          name: 'Calendar 2025',
+          period_start: '2025-01-01',
+          period_end: '2025-12-31',
+        }],
+        supersededRows: [
+          {
+            id: 'legacy-duplicate-a',
+            tax_deadline_type: 'moms_yearly',
+            tax_period: '2025',
+            linked_report_period: { year: 2025 },
+            due_date: '2025-12-12',
+            notes: 'Candidate A',
+          },
+          {
+            id: 'legacy-duplicate-b',
+            tax_deadline_type: 'moms_yearly',
+            tax_period: '2025',
+            linked_report_period: { year: 2025 },
+            due_date: '2025-12-13',
+            notes: 'Candidate B',
+          },
+        ],
+      })
+
+      await generateTaxDeadlinesForUser(supabase, 'company-1', {
+        ...SETTINGS,
+        moms_period: 'yearly',
+      }, [2026])
+
+      const replacement = getInsertPayload()!.find((row) =>
+        row.tax_deadline_type === 'moms_yearly',
+      )
+      expect(replacement?.notes).toBeNull()
+      expect(getDeleteOrFilters().join(',')).not.toContain('legacy-duplicate-a')
+      expect(getDeleteOrFilters().join(',')).not.toContain('legacy-duplicate-b')
+      expect(getDeleteNotFilters()).toContainEqual([
+        'id',
+        'in',
+        '(legacy-duplicate-a,legacy-duplicate-b)',
+      ])
     } finally {
       vi.useRealTimers()
     }

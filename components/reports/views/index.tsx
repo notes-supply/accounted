@@ -40,6 +40,11 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import { useCanWrite } from '@/lib/hooks/use-can-write'
 import type { FormLine } from '@/components/bookkeeping/JournalEntryForm'
 import type { VatSettlementProposal } from '@/lib/reports/vat-settlement'
+import {
+  buildVatReportRequest,
+  selectVatFiscalPeriod,
+  vatReportRequestQuery,
+} from '@/lib/reports/vat-report-request'
 
 // Recharts is ~180KB: defer the chart components so report tables (the
 // regulated content) render without waiting for the charting bundle.
@@ -1500,8 +1505,12 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
   // periods and need no fiscal year. The period's end date rides along so
   // the Skatteverket panel can target the FY-end month (broken fiscal years
   // do not end in December).
-  const [fiscalPeriodId, setFiscalPeriodId] = useState('')
-  const [fiscalPeriodEnd, setFiscalPeriodEnd] = useState<string | null>(null)
+  const [fiscalPeriodSelection, setFiscalPeriodSelection] = useState<{
+    id: string
+    periodEnd: string
+  } | null>(null)
+  const fiscalPeriodId = fiscalPeriodSelection?.id ?? ''
+  const fiscalPeriodEnd = fiscalPeriodSelection?.periodEnd ?? null
   // Latest fetch outcome, tagged with the fetch key it was requested under.
   // loading / error / data are all derived by comparing that tag with the
   // current key, so the fetch effect never sets state synchronously.
@@ -1536,6 +1545,7 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
   const companyKey = settingsLoading ? null : (settings?.company_id ?? 'none')
   if (companyKey !== null && appliedCompany !== companyKey) {
     setAppliedCompany(companyKey)
+    setFiscalPeriodSelection(null)
     const configured = settings?.moms_period ?? 'quarterly'
     setPeriodType(configured)
     setPeriod(
@@ -1562,16 +1572,13 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
   // For yearly we pass the selected fiscal period so the API uses its actual
   // bounds (handles extended/shortened years); monthly/quarterly stay calendar.
   const isYearly = periodType === 'yearly'
-  const awaitingFiscalPeriod = isYearly && !fiscalPeriodId
-  const vatQueryString = () => {
-    const params = new URLSearchParams({
-      periodType: periodType ?? 'quarterly',
-      year: String(year),
-      period: String(period),
-    })
-    if (isYearly && fiscalPeriodId) params.set('fiscal_period_id', fiscalPeriodId)
-    return params.toString()
-  }
+  const vatRequest = periodType === null
+    ? null
+    : buildVatReportRequest(periodType, year, period, fiscalPeriodSelection)
+  const vatQueryString = vatRequest ? vatReportRequestQuery(vatRequest) : null
+  const awaitingFiscalPeriod = isYearly && vatRequest === null
+  const requestYear = vatRequest?.year ?? year
+  const requestPeriod = vatRequest?.period ?? period
 
   // The declaration loads as soon as the period is known — no manual "Hämta"
   // step. fetchKey is null while a prerequisite is missing (settings pending,
@@ -1580,7 +1587,7 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
   const fetchKey =
     periodType === null || notVatRegistered || momsPeriodMissing || awaitingFiscalPeriod
       ? null
-      : `${periodType}:${year}:${period}:${isYearly ? fiscalPeriodId : ''}:${retryKey}`
+      : `${vatQueryString}:${retryKey}`
 
   // Period identity WITHOUT the retry counter, used to decide whether the gap
   // scan below still speaks for what is on screen. The scan re-runs on every
@@ -1597,7 +1604,7 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
   const gapScanPeriodKey =
     periodType === null
       ? null
-      : `${periodType}:${year}:${period}:${isYearly ? fiscalPeriodId : ''}`
+      : vatQueryString
 
   useEffect(() => {
     setChosenStep(null)
@@ -1606,14 +1613,8 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
 
   useEffect(() => {
     if (!fetchKey || periodType === null) return
-    const params = new URLSearchParams({
-      periodType,
-      year: String(year),
-      period: String(period),
-    })
-    if (periodType === 'yearly') params.set('fiscal_period_id', fiscalPeriodId)
     let cancelled = false
-    fetch(`/api/reports/vat-declaration?${params.toString()}`)
+    fetch(`/api/reports/vat-declaration?${vatQueryString}`)
       .then(async (res) => {
         const json = await res.json().catch(() => null)
         if (cancelled) return
@@ -1633,21 +1634,15 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
     return () => {
       cancelled = true
     }
-  }, [fetchKey, periodType, year, period, fiscalPeriodId])
+  }, [fetchKey, periodType, vatQueryString])
 
   // The per-verifikat gap scan runs on the same key as the declaration, so a
   // korrigering (which bumps retryKey via onCorrected) re-verifies the gate
   // instead of leaving it stuck on the pre-correction count.
   useEffect(() => {
     if (!fetchKey || periodType === null || !gapScanPeriodKey) return
-    const params = new URLSearchParams({
-      periodType,
-      year: String(year),
-      period: String(period),
-    })
-    if (periodType === 'yearly') params.set('fiscal_period_id', fiscalPeriodId)
     let cancelled = false
-    fetch(`/api/reports/vat-declaration/rc-basis-gaps?${params.toString()}`)
+    fetch(`/api/reports/vat-declaration/rc-basis-gaps?${vatQueryString}`)
       .then(async (res) => {
         const json = await res.json().catch(() => null)
         if (cancelled) return
@@ -1664,7 +1659,7 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
     return () => {
       cancelled = true
     }
-  }, [fetchKey, gapScanPeriodKey, periodType, year, period, fiscalPeriodId])
+  }, [fetchKey, gapScanPeriodKey, periodType, vatQueryString])
 
   // Derived fetch state: the previous declaration stays visible (dimmed)
   // while the next period loads.
@@ -1810,14 +1805,14 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
       {pageTitle && (
         <PageHeader
           title={pageTitle}
-          action={
+          action={vatQueryString ? (
             <ReportExportMenu
               variant="default"
               items={[
-                { format: 'xlsx', href: `/api/reports/vat-declaration/xlsx?${vatQueryString()}` },
+                { format: 'xlsx', href: `/api/reports/vat-declaration/xlsx?${vatQueryString}` },
               ]}
             />
-          }
+          ) : undefined}
         />
       )}
       <div className="flex flex-wrap items-center justify-end gap-2">
@@ -1841,8 +1836,11 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
               <FyPicker
                 value={fiscalPeriodId || null}
                 onChange={(id, fp) => {
-                  setFiscalPeriodId(id || '')
-                  setFiscalPeriodEnd(fp?.period_end ?? null)
+                  setFiscalPeriodSelection(selectVatFiscalPeriod(
+                    settings?.company_id ?? null,
+                    id,
+                    fp,
+                  ))
                 }}
                 includeAllOption={false}
                 hideFuturePeriods
@@ -1860,11 +1858,11 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
                 ariaLabel="Redovisningsperiod"
               />
             )}
-            {!pageTitle && (
+            {!pageTitle && vatQueryString && (
               <ReportExportMenu
                 variant="default"
                 items={[
-                  { format: 'xlsx', href: `/api/reports/vat-declaration/xlsx?${vatQueryString()}` },
+                  { format: 'xlsx', href: `/api/reports/vat-declaration/xlsx?${vatQueryString}` },
                 ]}
               />
             )}
@@ -1912,8 +1910,8 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
               <VatChecksCard
               checks={checks}
               periodType={periodType}
-              year={year}
-              period={period}
+              year={requestYear}
+              period={requestPeriod}
               fiscalPeriodId={isYearly ? fiscalPeriodId : undefined}
               onCorrected={() => setRetryKey((k) => k + 1)}
             />
@@ -1952,8 +1950,8 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
                           amount={data.rutor.ruta05}
                           baseAmount={0}
                           periodType={periodType}
-                          year={year}
-                          period={period}
+                          year={requestYear}
+                          period={requestPeriod}
                         />
                       )}
                       <VatRutaRow
@@ -1962,8 +1960,8 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
                         amount={data.rutor.ruta10}
                         baseAmount={data.breakdown.invoices.base25}
                         periodType={periodType}
-                        year={year}
-                        period={period}
+                        year={requestYear}
+                        period={requestPeriod}
                       />
                       <VatRutaRow
                         ruta="11"
@@ -1971,8 +1969,8 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
                         amount={data.rutor.ruta11}
                         baseAmount={data.breakdown.invoices.base12}
                         periodType={periodType}
-                        year={year}
-                        period={period}
+                        year={requestYear}
+                        period={requestPeriod}
                       />
                       <VatRutaRow
                         ruta="12"
@@ -1980,8 +1978,8 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
                         amount={data.rutor.ruta12}
                         baseAmount={data.breakdown.invoices.base6}
                         periodType={periodType}
-                        year={year}
-                        period={period}
+                        year={requestYear}
+                        period={requestPeriod}
                       />
                       <VatRutaRow
                         ruta="39"
@@ -1990,8 +1988,8 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
                         baseAmount={data.rutor.ruta39}
                         noVat
                         periodType={periodType}
-                        year={year}
-                        period={period}
+                        year={requestYear}
+                        period={requestPeriod}
                       />
                       <VatRutaRow
                         ruta="40"
@@ -2000,8 +1998,8 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
                         baseAmount={data.rutor.ruta40}
                         noVat
                         periodType={periodType}
-                        year={year}
-                        period={period}
+                        year={requestYear}
+                        period={requestPeriod}
                       />
                     </TableBody>
                     <tfoot>
@@ -2027,14 +2025,14 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
                       </h3>
                       <Table>
                         <TableBody>
-                          <VatRutaRow ruta="20" label="Inköp av varor från annat EU-land" amount={0} baseAmount={data.rutor.ruta20} noVat periodType={periodType} year={year} period={period} />
-                          <VatRutaRow ruta="21" label="Inköp av tjänster från annat EU-land" amount={0} baseAmount={data.rutor.ruta21} noVat periodType={periodType} year={year} period={period} />
-                          <VatRutaRow ruta="22" label="Inköp av tjänster utanför EU" amount={0} baseAmount={data.rutor.ruta22} noVat periodType={periodType} year={year} period={period} />
-                          <VatRutaRow ruta="23" label="Inköp av varor i Sverige" amount={0} baseAmount={data.rutor.ruta23} noVat periodType={periodType} year={year} period={period} />
-                          <VatRutaRow ruta="24" label="Övriga inköp av tjänster i Sverige" amount={0} baseAmount={data.rutor.ruta24} noVat periodType={periodType} year={year} period={period} />
-                          <VatRutaRow ruta="30" label="Utgående moms 25% (omvänd)" amount={data.rutor.ruta30} baseAmount={0} periodType={periodType} year={year} period={period} />
-                          <VatRutaRow ruta="31" label="Utgående moms 12% (omvänd)" amount={data.rutor.ruta31} baseAmount={0} periodType={periodType} year={year} period={period} />
-                          <VatRutaRow ruta="32" label="Utgående moms 6% (omvänd)" amount={data.rutor.ruta32} baseAmount={0} periodType={periodType} year={year} period={period} />
+                          <VatRutaRow ruta="20" label="Inköp av varor från annat EU-land" amount={0} baseAmount={data.rutor.ruta20} noVat periodType={periodType} year={requestYear} period={requestPeriod} />
+                          <VatRutaRow ruta="21" label="Inköp av tjänster från annat EU-land" amount={0} baseAmount={data.rutor.ruta21} noVat periodType={periodType} year={requestYear} period={requestPeriod} />
+                          <VatRutaRow ruta="22" label="Inköp av tjänster utanför EU" amount={0} baseAmount={data.rutor.ruta22} noVat periodType={periodType} year={requestYear} period={requestPeriod} />
+                          <VatRutaRow ruta="23" label="Inköp av varor i Sverige" amount={0} baseAmount={data.rutor.ruta23} noVat periodType={periodType} year={requestYear} period={requestPeriod} />
+                          <VatRutaRow ruta="24" label="Övriga inköp av tjänster i Sverige" amount={0} baseAmount={data.rutor.ruta24} noVat periodType={periodType} year={requestYear} period={requestPeriod} />
+                          <VatRutaRow ruta="30" label="Utgående moms 25% (omvänd)" amount={data.rutor.ruta30} baseAmount={0} periodType={periodType} year={requestYear} period={requestPeriod} />
+                          <VatRutaRow ruta="31" label="Utgående moms 12% (omvänd)" amount={data.rutor.ruta31} baseAmount={0} periodType={periodType} year={requestYear} period={requestPeriod} />
+                          <VatRutaRow ruta="32" label="Utgående moms 6% (omvänd)" amount={data.rutor.ruta32} baseAmount={0} periodType={periodType} year={requestYear} period={requestPeriod} />
                         </TableBody>
                       </Table>
                     </>
@@ -2048,10 +2046,10 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
                       </h3>
                       <Table>
                         <TableBody>
-                          <VatRutaRow ruta="50" label="Beskattningsunderlag vid import" amount={0} baseAmount={data.rutor.ruta50} noVat periodType={periodType} year={year} period={period} />
-                          <VatRutaRow ruta="60" label="Utgående moms 25% import" amount={data.rutor.ruta60} baseAmount={0} periodType={periodType} year={year} period={period} />
-                          <VatRutaRow ruta="61" label="Utgående moms 12% import" amount={data.rutor.ruta61} baseAmount={0} periodType={periodType} year={year} period={period} />
-                          <VatRutaRow ruta="62" label="Utgående moms 6% import" amount={data.rutor.ruta62} baseAmount={0} periodType={periodType} year={year} period={period} />
+                          <VatRutaRow ruta="50" label="Beskattningsunderlag vid import" amount={0} baseAmount={data.rutor.ruta50} noVat periodType={periodType} year={requestYear} period={requestPeriod} />
+                          <VatRutaRow ruta="60" label="Utgående moms 25% import" amount={data.rutor.ruta60} baseAmount={0} periodType={periodType} year={requestYear} period={requestPeriod} />
+                          <VatRutaRow ruta="61" label="Utgående moms 12% import" amount={data.rutor.ruta61} baseAmount={0} periodType={periodType} year={requestYear} period={requestPeriod} />
+                          <VatRutaRow ruta="62" label="Utgående moms 6% import" amount={data.rutor.ruta62} baseAmount={0} periodType={periodType} year={requestYear} period={requestPeriod} />
                         </TableBody>
                       </Table>
                     </>
@@ -2072,8 +2070,8 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
                         amount={data.rutor.ruta48}
                         baseAmount={0}
                         periodType={periodType}
-                        year={year}
-                        period={period}
+                        year={requestYear}
+                        period={requestPeriod}
                       />
                       {data.breakdown.transactions.ruta48 > 0 && (
                         <tr className="text-muted-foreground">
@@ -2126,8 +2124,8 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
             <section className="mx-auto max-w-3xl space-y-3">
               <VatBookingCard
               periodType={periodType}
-              year={year}
-              period={period}
+              year={requestYear}
+              period={requestPeriod}
               fiscalPeriodId={isYearly ? fiscalPeriodId : undefined}
               checksBlocked={checksBlocked}
               onStatus={setBookingStatus}
@@ -2144,8 +2142,8 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
             <section className="mx-auto max-w-3xl space-y-8">
               <SkatteverketPanel
                 periodType={periodType}
-                year={year}
-                period={period}
+                year={requestYear}
+                period={requestPeriod}
                 fiscalPeriodId={isYearly ? fiscalPeriodId : undefined}
                 fiscalYearEnd={
                   isYearly && fiscalPeriodEnd
@@ -2159,8 +2157,8 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
                 localBlocked={checksBlocked}
               />
               <VatManualFilingCard
-              xmlHref={`/api/reports/vat-declaration/eskd?${vatQueryString()}`}
-              pdfHref={`/api/reports/vat-declaration/pdf?${vatQueryString()}`}
+              xmlHref={`/api/reports/vat-declaration/eskd?${vatQueryString}`}
+              pdfHref={`/api/reports/vat-declaration/pdf?${vatQueryString}`}
             />
             </section>
           )}
@@ -2174,8 +2172,8 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
       {!awaitingFiscalPeriod && !data && (
         <SkatteverketPanel
           periodType={periodType}
-          year={year}
-          period={period}
+          year={requestYear}
+          period={requestPeriod}
           fiscalPeriodId={isYearly ? fiscalPeriodId : undefined}
           fiscalYearEnd={
             isYearly && fiscalPeriodEnd
