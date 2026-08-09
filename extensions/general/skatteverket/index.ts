@@ -31,6 +31,10 @@ import { currentSkvEnvironment, resolveReadAuth } from './lib/resolve-auth'
 import { probeCompanyGrants } from './lib/grant-probe'
 import { formatRedovisare } from '@/lib/skatteverket/format'
 import { parseVatPeriodInput, VatPeriodInputError } from '@/lib/vat/period-input'
+import {
+  isVatPeriodBoundsError,
+  requireVatResolvedPeriodBounds,
+} from '@/lib/vat/resolved-period-bounds'
 import { createExtensionContext } from '@/lib/extensions/context-factory'
 import type { SkvSubmitResult } from '@/lib/pending-operations/skatteverket-commit'
 import {
@@ -2609,8 +2613,21 @@ async function commitSubmitVatDeclaration(
   const year = params.year as number
   const period = params.period as number
   const fiscalPeriodId = params.fiscal_period_id as string | undefined
-  const resolvedPeriodStart = params.resolved_period_start as string | undefined
-  const resolvedPeriodEnd = params.resolved_period_end as string | undefined
+  let resolvedBounds: ReturnType<typeof requireVatResolvedPeriodBounds>
+  try {
+    resolvedBounds = requireVatResolvedPeriodBounds(
+      params.resolved_period_start,
+      params.resolved_period_end,
+    )
+  } catch (err) {
+    return {
+      ok: false,
+      code: 'SKATTEVERKET_SUBMIT_REJECTED',
+      http_status: 409,
+      recoverable: false,
+      error: err instanceof Error ? err.message : 'Ogiltiga resolved period bounds',
+    }
+  }
   const ctx = createExtensionContext(supabase, userId, companyId, 'skatteverket')
 
   try {
@@ -2621,8 +2638,8 @@ async function commitSubmitVatDeclaration(
       year,
       period,
       fiscalPeriodId,
-      resolvedPeriodStart,
-      resolvedPeriodEnd,
+      resolvedPeriodStart: resolvedBounds.start,
+      resolvedPeriodEnd: resolvedBounds.end,
     })
     if (!result.ok) {
       return {
@@ -2638,6 +2655,15 @@ async function commitSubmitVatDeclaration(
       kontrollresultat: result.kontrollresultat,
     }
   } catch (err) {
+    if (isVatPeriodBoundsError(err)) {
+      return {
+        ok: false,
+        code: 'SKATTEVERKET_SUBMIT_REJECTED',
+        http_status: 409,
+        recoverable: false,
+        error: err.message,
+      }
+    }
     return mapServiceError(ctx, 'declaration/submit', err)
   }
 }

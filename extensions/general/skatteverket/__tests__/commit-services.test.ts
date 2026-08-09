@@ -21,14 +21,19 @@ vi.mock('../lib/declaration-prep', async (importOriginal) => {
   return { ...actual, buildMomsuppgift: (...a: unknown[]) => mockBuildMomsuppgift(...a) }
 })
 
-vi.mock('../lib/audit', () => ({ writeSkatteverketAudit: vi.fn() }))
+const mockWriteSkatteverketAudit = vi.fn()
+vi.mock('../lib/audit', () => ({
+  writeSkatteverketAudit: (...args: unknown[]) => mockWriteSkatteverketAudit(...args),
+}))
+
+const mockSettingsSet = vi.fn().mockResolvedValue(undefined)
 
 vi.mock('@/lib/extensions/context-factory', () => ({
   createExtensionContext: () => ({
     supabase: {},
     companyId: 'company-1',
     userId: 'user-1',
-    settings: { set: vi.fn().mockResolvedValue(undefined) },
+    settings: { set: (...args: unknown[]) => mockSettingsSet(...args) },
     log: { error: vi.fn(), warn: vi.fn(), info: vi.fn() },
   }),
 }))
@@ -41,7 +46,13 @@ type SkvSubmitFn = (
 ) => Promise<{ ok: boolean; code?: string; recoverable?: boolean; signing_url?: string }>
 
 const commitSubmitVatDeclaration = skatteverketExtension.services!.commitSubmitVatDeclaration as unknown as SkvSubmitFn
-const VAT_PARAMS = { period_type: 'monthly', year: 2025, period: 3 }
+const VAT_PARAMS = {
+  period_type: 'monthly',
+  year: 2025,
+  period: 3,
+  resolved_period_start: '2025-03-01',
+  resolved_period_end: '2025-03-31',
+}
 
 let prevEnv: string | undefined
 beforeEach(() => {
@@ -93,6 +104,53 @@ describe('commitSubmitVatDeclaration', () => {
     expect(mockSkvRequest.mock.calls[0][3]).toMatch(/^\/utkast\/165560000000\/202503$/)
     expect(mockSkvRequest.mock.calls[1][2]).toBe('PUT')
     expect(mockSkvRequest.mock.calls[1][3]).toMatch(/^\/las\/165560000000\/202503$/)
+    expect(mockBuildMomsuppgift).toHaveBeenCalledWith(expect.anything(), 'company-1', {
+      periodType: 'monthly',
+      year: 2025,
+      period: 3,
+      fiscalPeriodId: undefined,
+      resolvedPeriodStart: '2025-03-01',
+      resolvedPeriodEnd: '2025-03-31',
+    })
+  })
+
+  it('stable quarterly bounds reach prep unchanged and submit successfully', async () => {
+    mockBuildMomsuppgift.mockResolvedValueOnce({
+      redovisare: '165560000000',
+      redovisningsperiod: '202506',
+      momsuppgift: { summaMoms: 150 },
+      declaration: {
+        period: {
+          type: 'quarterly', year: 2025, period: 2,
+          start: '2025-05-10', end: '2025-06-30',
+        },
+        rutor: {},
+      },
+      resolvedPeriodStart: '2025-05-10',
+      resolvedPeriodEnd: '2025-06-30',
+    })
+    mockSkvRequest
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ kontrollResultat: { status: 'OK' } }) })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ signeringsLank: 'https://skv.test/sign/q2' }) })
+
+    const result = await commitSubmitVatDeclaration({}, 'user-1', 'company-1', {
+      period_type: 'quarterly',
+      year: 2025,
+      period: 2,
+      resolved_period_start: '2025-05-10',
+      resolved_period_end: '2025-06-30',
+    })
+
+    expect(result).toMatchObject({ ok: true, signing_url: 'https://skv.test/sign/q2' })
+    expect(mockBuildMomsuppgift).toHaveBeenCalledWith(expect.anything(), 'company-1', {
+      periodType: 'quarterly',
+      year: 2025,
+      period: 2,
+      fiscalPeriodId: undefined,
+      resolvedPeriodStart: '2025-05-10',
+      resolvedPeriodEnd: '2025-06-30',
+    })
+    expect(mockSkvRequest).toHaveBeenCalledTimes(2)
   })
 
   it('utkast rejected by SKV → non-recoverable, no /las call', async () => {
@@ -109,7 +167,10 @@ describe('commitSubmitVatDeclaration', () => {
   })
 
   it('passes immutable staged bounds to prep and makes no SKV call on drift', async () => {
-    mockBuildMomsuppgift.mockRejectedValueOnce(new Error('Annual VAT period changed since staging'))
+    mockBuildMomsuppgift.mockRejectedValueOnce(Object.assign(
+      new Error('VAT period changed since staging'),
+      { code: 'VAT_PERIOD_BOUNDS_DRIFT' },
+    ))
     const params = {
       period_type: 'yearly',
       year: 2026,
@@ -131,5 +192,64 @@ describe('commitSubmitVatDeclaration', () => {
       resolvedPeriodEnd: '2026-03-31',
     })
     expect(mockSkvRequest).not.toHaveBeenCalled()
+    expect(mockWriteSkatteverketAudit).not.toHaveBeenCalled()
+    expect(mockSettingsSet).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      period_type: 'monthly', year: 2025, period: 3,
+      resolved_period_start: '2025-03-14', resolved_period_end: '2025-03-31',
+    },
+    {
+      period_type: 'quarterly', year: 2025, period: 2,
+      resolved_period_start: '2025-05-10', resolved_period_end: '2025-06-30',
+    },
+  ])('rejects $period_type liability setting drift before SKV, audit, or settings effects', async (params) => {
+    mockBuildMomsuppgift.mockRejectedValueOnce(Object.assign(
+      new Error(
+        `VAT period changed since staging: staged ${params.resolved_period_start}..${params.resolved_period_end}, ` +
+        'declaration resolved different bounds',
+      ),
+      { code: 'VAT_PERIOD_BOUNDS_DRIFT' },
+    ))
+
+    const result = await commitSubmitVatDeclaration({}, 'user-1', 'company-1', params)
+
+    expect(result).toMatchObject({ ok: false, recoverable: false })
+    expect(mockBuildMomsuppgift).toHaveBeenCalledWith(expect.anything(), 'company-1', {
+      periodType: params.period_type,
+      year: params.year,
+      period: params.period,
+      fiscalPeriodId: undefined,
+      resolvedPeriodStart: params.resolved_period_start,
+      resolvedPeriodEnd: params.resolved_period_end,
+    })
+    expect(mockSkvRequest).not.toHaveBeenCalled()
+    expect(mockWriteSkatteverketAudit).not.toHaveBeenCalled()
+    expect(mockSettingsSet).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { label: 'absent', bounds: {} },
+    { label: 'one-sided', bounds: { resolved_period_start: '2025-03-01' } },
+    {
+      label: 'malformed',
+      bounds: { resolved_period_start: '2025-02-30', resolved_period_end: '2025-03-31' },
+    },
+    {
+      label: 'reversed',
+      bounds: { resolved_period_start: '2025-04-01', resolved_period_end: '2025-03-31' },
+    },
+  ])('rejects $label staged bounds before declaration prep or effects', async ({ bounds }) => {
+    const result = await commitSubmitVatDeclaration({}, 'user-1', 'company-1', {
+      period_type: 'monthly', year: 2025, period: 3, ...bounds,
+    })
+
+    expect(result).toMatchObject({ ok: false, recoverable: false })
+    expect(mockBuildMomsuppgift).not.toHaveBeenCalled()
+    expect(mockSkvRequest).not.toHaveBeenCalled()
+    expect(mockWriteSkatteverketAudit).not.toHaveBeenCalled()
+    expect(mockSettingsSet).not.toHaveBeenCalled()
   })
 })

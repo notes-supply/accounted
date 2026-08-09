@@ -31,6 +31,8 @@ const mockBuildMomsuppgift = vi.fn(async () => ({
   redovisningsperiod: '202601',
   momsuppgift: { summaMoms: 0 },
   declaration: await mockCalculateVatDeclaration(),
+  resolvedPeriodStart: '2026-01-01',
+  resolvedPeriodEnd: '2026-01-31',
 }))
 vi.mock('@/extensions/general/skatteverket/lib/declaration-prep', () => ({
   buildMomsuppgift: (...args: unknown[]) => mockBuildMomsuppgift(...args),

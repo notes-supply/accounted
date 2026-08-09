@@ -4,6 +4,11 @@ import { calculateVatDeclaration } from '@/lib/reports/vat-declaration'
 import { rutorToMomsuppgift, formatRedovisare, formatRedovisningsperiod } from './mappers'
 import type { SkatteverketMomsuppgift } from '../types'
 import { parseVatPeriodInput } from '@/lib/vat/period-input'
+import {
+  parseOptionalVatResolvedPeriodBounds,
+  requireVatResolvedPeriodBounds,
+  vatPeriodBoundsDriftError,
+} from '@/lib/vat/resolved-period-bounds'
 
 /**
  * Request-free Skatteverket declaration prep.
@@ -96,6 +101,10 @@ export async function buildMomsuppgift(
     resolvedPeriodEnd,
   } = input
   const { periodType, year, period } = validated
+  const stagedBounds = parseOptionalVatResolvedPeriodBounds(
+    resolvedPeriodStart,
+    resolvedPeriodEnd,
+  )
 
   const redovisare = await resolveRedovisare(supabase, companyId)
 
@@ -107,6 +116,16 @@ export async function buildMomsuppgift(
     period,
     { fiscalPeriodId },
   )
+  const declarationBounds = requireVatResolvedPeriodBounds(
+    declaration.period.start,
+    declaration.period.end,
+  )
+  if (
+    stagedBounds &&
+    (stagedBounds.start !== declarationBounds.start || stagedBounds.end !== declarationBounds.end)
+  ) {
+    throw vatPeriodBoundsDriftError(stagedBounds, declarationBounds)
+  }
 
   // Helårsmoms is filed per räkenskapsår (SFL 26 kap 10-11 §§): the SKV
   // redovisningsperiod is the FY-end month, which for a broken fiscal year is
@@ -115,18 +134,12 @@ export async function buildMomsuppgift(
   let fiscalYearEnd: { year: number; month: number } | undefined
   let resolvedFiscalPeriodId: string | undefined
   if (periodType === 'yearly') {
-    const { start, end, fiscalPeriodId: declarationFiscalPeriodId } = declaration.period
+    const { end, fiscalPeriodId: declarationFiscalPeriodId } = declaration.period
     if (!declarationFiscalPeriodId) {
       throw new Error('Annual VAT preparation did not resolve a fiscal period id')
     }
     if (fiscalPeriodId && declarationFiscalPeriodId !== fiscalPeriodId) {
       throw new Error('Annual VAT fiscal period identity changed during preparation')
-    }
-    if (
-      (resolvedPeriodStart && resolvedPeriodStart !== start) ||
-      (resolvedPeriodEnd && resolvedPeriodEnd !== end)
-    ) {
-      throw new Error('Annual VAT period changed since staging')
     }
     resolvedFiscalPeriodId = declarationFiscalPeriodId
     fiscalYearEnd = { year: Number(end.slice(0, 4)), month: Number(end.slice(5, 7)) }
@@ -140,8 +153,8 @@ export async function buildMomsuppgift(
     redovisningsperiod,
     momsuppgift,
     declaration,
-    resolvedPeriodStart: declaration.period.start,
-    resolvedPeriodEnd: declaration.period.end,
+    resolvedPeriodStart: declarationBounds.start,
+    resolvedPeriodEnd: declarationBounds.end,
     ...(resolvedFiscalPeriodId
       ? {
           fiscalPeriodId: resolvedFiscalPeriodId,

@@ -54,6 +54,7 @@ import {
   VAT_PERIOD_MAX_YEAR,
   VAT_PERIOD_MIN_YEAR,
 } from '@/lib/vat/period-input'
+import { requireVatResolvedPeriodBounds } from '@/lib/vat/resolved-period-bounds'
 // The momsdeklaration completeness checks live in core (lib/reports) and are
 // shared with the web UI's "Kontroll av underlaget" gate. The MCP surface
 // imports them instead of mirroring them: a hand-rolled copy here is exactly
@@ -10633,6 +10634,10 @@ export const tools: McpTool[] = [
             period,
             fiscalPeriodId,
           })
+          const prepBounds = requireVatResolvedPeriodBounds(
+            prep.resolvedPeriodStart,
+            prep.resolvedPeriodEnd,
+          )
           const completenessChecks = await runVatCompletenessChecks(
             supabase,
             companyId,
@@ -10661,7 +10666,12 @@ export const tools: McpTool[] = [
             const text = await res.text().catch(() => '')
             throw new Error(`Skatteverket svarade med ${res.status}: ${text}`)
           }
-          return { ...prep, kontrollresultat: await res.json() }
+          return {
+            ...prep,
+            resolvedPeriodStart: prepBounds.start,
+            resolvedPeriodEnd: prepBounds.end,
+            kontrollresultat: await res.json(),
+          }
         } catch (err) {
           throw mapSkatteverketError(err)
         }
@@ -10677,10 +10687,10 @@ export const tools: McpTool[] = [
           period_type: periodType,
           year,
           period,
+          resolved_period_start: prepared.resolvedPeriodStart,
+          resolved_period_end: prepared.resolvedPeriodEnd,
           ...(resolvedFiscalPeriodId ? {
             fiscal_period_id: resolvedFiscalPeriodId,
-            resolved_period_start: prepared.resolvedPeriodStart,
-            resolved_period_end: prepared.resolvedPeriodEnd,
           } : {}),
         },
         {

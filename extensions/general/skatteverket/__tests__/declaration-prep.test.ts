@@ -174,6 +174,118 @@ describe('buildMomsuppgift', () => {
       resolvedPeriodEnd: '2026-03-31',
     })).rejects.toThrow(/changed since staging/)
   })
+
+  it.each([
+    {
+      periodType: 'monthly' as const,
+      year: 2025,
+      period: 3,
+      start: '2025-03-14',
+      end: '2025-03-31',
+    },
+    {
+      periodType: 'quarterly' as const,
+      year: 2025,
+      period: 2,
+      start: '2025-05-10',
+      end: '2025-06-30',
+    },
+  ])('accepts unchanged staged bounds for $periodType VAT', async ({ periodType, year, period, start, end }) => {
+    mockCalculateVatDeclaration.mockResolvedValue({
+      rutor: zeroRutor(),
+      period: { type: periodType, year, period, start, end },
+    })
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { org_number: '5560000000', entity_type: 'aktiebolag' } })
+
+    const result = await buildMomsuppgift(supabase as never, 'company-1', {
+      periodType,
+      year,
+      period,
+      resolvedPeriodStart: start,
+      resolvedPeriodEnd: end,
+    })
+
+    expect(result).toMatchObject({ resolvedPeriodStart: start, resolvedPeriodEnd: end })
+  })
+
+  it.each([
+    {
+      periodType: 'monthly' as const,
+      year: 2025,
+      period: 3,
+      stagedStart: '2025-03-14',
+      stagedEnd: '2025-03-31',
+      currentStart: '2025-03-20',
+      currentEnd: '2025-03-31',
+    },
+    {
+      periodType: 'quarterly' as const,
+      year: 2025,
+      period: 2,
+      stagedStart: '2025-05-10',
+      stagedEnd: '2025-06-30',
+      currentStart: '2025-05-20',
+      currentEnd: '2025-06-30',
+    },
+  ])('rejects $periodType liability-bound drift from staged bounds', async ({
+    periodType,
+    year,
+    period,
+    stagedStart,
+    stagedEnd,
+    currentStart,
+    currentEnd,
+  }) => {
+    mockCalculateVatDeclaration.mockResolvedValue({
+      rutor: zeroRutor(),
+      period: { type: periodType, year, period, start: currentStart, end: currentEnd },
+    })
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { org_number: '5560000000', entity_type: 'aktiebolag' } })
+
+    await expect(buildMomsuppgift(supabase as never, 'company-1', {
+      periodType,
+      year,
+      period,
+      resolvedPeriodStart: stagedStart,
+      resolvedPeriodEnd: stagedEnd,
+    })).rejects.toThrow(/VAT period changed since staging.*staged.*declaration/i)
+  })
+
+  it.each([
+    {
+      label: 'one-sided',
+      resolvedPeriodStart: '2025-03-01',
+      resolvedPeriodEnd: undefined,
+    },
+    {
+      label: 'malformed',
+      resolvedPeriodStart: '2025-02-30',
+      resolvedPeriodEnd: '2025-03-31',
+    },
+    {
+      label: 'reversed',
+      resolvedPeriodStart: '2025-04-01',
+      resolvedPeriodEnd: '2025-03-31',
+    },
+  ])('rejects $label supplied resolved bounds before reads', async ({
+    resolvedPeriodStart,
+    resolvedPeriodEnd,
+  }) => {
+    const { supabase } = createQueuedMockSupabase()
+
+    await expect(buildMomsuppgift(supabase as never, 'company-1', {
+      periodType: 'monthly',
+      year: 2025,
+      period: 3,
+      resolvedPeriodStart,
+      resolvedPeriodEnd,
+    })).rejects.toThrow(/period bounds/i)
+
+    expect(supabase.from).not.toHaveBeenCalled()
+    expect(mockCalculateVatDeclaration).not.toHaveBeenCalled()
+  })
 })
 
 describe('buildAgiUnderlag', () => {

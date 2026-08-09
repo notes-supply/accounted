@@ -26,6 +26,7 @@ import { roundOre } from '@/lib/money'
 import { validateVatNumber } from '@/lib/vat/vies-client'
 import { normalizeVatRateToDecimal } from '@/lib/vat/supplier-invoice-line-checks'
 import { parseVatPeriodInput } from '@/lib/vat/period-input'
+import { requireVatResolvedPeriodBounds } from '@/lib/vat/resolved-period-bounds'
 import {
   createInvoicePaymentJournalEntry,
   createInvoiceCashEntry,
@@ -5024,12 +5025,21 @@ async function commitSubmitVatDeclaration(
       status: 400,
     }
   }
-  if (
-    validatedPeriod.periodType === 'yearly' &&
-    (!params.fiscal_period_id || !params.resolved_period_start || !params.resolved_period_end)
-  ) {
+  if (validatedPeriod.periodType === 'yearly' && !params.fiscal_period_id) {
     return {
-      error: 'fiscal_period_id och resolved period bounds krävs för en staged årlig momsdeklaration',
+      error: 'fiscal_period_id krävs för en staged årlig momsdeklaration',
+      status: 409,
+    }
+  }
+  let resolvedBounds: ReturnType<typeof requireVatResolvedPeriodBounds>
+  try {
+    resolvedBounds = requireVatResolvedPeriodBounds(
+      params.resolved_period_start,
+      params.resolved_period_end,
+    )
+  } catch (error) {
+    return {
+      error: error instanceof Error ? error.message : 'Ogiltiga resolved period bounds',
       status: 409,
     }
   }
@@ -5038,6 +5048,8 @@ async function commitSubmitVatDeclaration(
     period_type: validatedPeriod.periodType,
     year: validatedPeriod.year,
     period: validatedPeriod.period,
+    resolved_period_start: resolvedBounds.start,
+    resolved_period_end: resolvedBounds.end,
   }
   const services = getSkatteverketServices()
   const result = await services.commitSubmitVatDeclaration(
