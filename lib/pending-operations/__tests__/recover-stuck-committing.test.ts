@@ -362,7 +362,7 @@ describe('recoverStuckCommittingOperations', () => {
     expect(line?.level).toBe('error')
   })
 
-  it('never recovers a committing row marked as capable of an unpersisted partial failure', async () => {
+  it('preserves a bulk inbox row after an ambiguous partial failure instead of rejecting it', async () => {
     const { supabase, captures, enqueue } = createCapturingSupabase()
     const { log, calls } = createLogSpy()
 
@@ -370,8 +370,8 @@ describe('recoverStuckCommittingOperations', () => {
       data: [
         makeRow({
           id: 'op-ambiguous',
-          operation_type: 'categorize_transaction',
-          params: { transaction_id: 'tx-1' },
+          operation_type: 'bulk_book_inbox_items',
+          params: { item_ids: ['inbox-1'] },
           result_data: { commit_in_progress: { partial_failure_possible: true } },
         }),
       ],
@@ -381,6 +381,7 @@ describe('recoverStuckCommittingOperations', () => {
 
     expect(summary).toEqual({ scanned: 1, committed: 0, rejected: 0, skipped: 1 })
     expect(captures).toHaveLength(1)
+    expect(captures.filter((capture) => capture.payload !== undefined)).toHaveLength(0)
     const line = calls.find((call) => call.args[0] === 'pending_op_recovery')
     expect((line?.args[1] as Record<string, unknown>).outcome).toBe(
       'skipped_partial_failure_ambiguous',

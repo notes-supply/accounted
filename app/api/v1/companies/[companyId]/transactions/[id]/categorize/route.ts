@@ -410,7 +410,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       txLog.error('transactions.categorize: journal entry creation failed', err as Error)
       const postCommitFailure = await compensatePostCommitReadbackFailure(
         ctx.supabase,
-        { companyId: ctx.companyId!, transactionId: txId, error: err },
+        { companyId: ctx.companyId!, userId: ctx.userId, transactionId: txId, error: err },
         txLog,
       )
       if (postCommitFailure.handled) {

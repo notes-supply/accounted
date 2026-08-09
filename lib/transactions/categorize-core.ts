@@ -391,7 +391,7 @@ export async function categorizeMatchedTransaction(
   } catch (err) {
     const postCommitFailure = await compensatePostCommitReadbackFailure(
       supabase,
-      { companyId, transactionId: txId, error: err },
+      { companyId, userId, transactionId: txId, error: err },
       log,
     )
     if (postCommitFailure.handled) {

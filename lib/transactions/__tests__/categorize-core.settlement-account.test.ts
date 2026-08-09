@@ -202,6 +202,7 @@ describe('categorizeMatchedTransaction settlement account', () => {
       supabase,
       {
         companyId: 'company-1',
+        userId: 'user-1',
         transactionId: revolutFee.id,
         error: readbackError,
       },

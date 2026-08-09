@@ -820,6 +820,266 @@ export function getSwedishLocalDate(): string {
   return new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Stockholm' }).format(new Date())
 }
 
+type TransactionCategorizationCompensationStatus =
+  | 'reversed'
+  | 'already_reversed'
+  | 'recovered_existing_reversal'
+
+interface TransactionCategorizationCompensationData {
+  status: TransactionCategorizationCompensationStatus
+  original_journal_entry_id: string
+  reversal_journal_entry_ids: string[]
+  original_pointer_cleared: boolean
+}
+
+export type TransactionCategorizationCompensationResult =
+  | {
+      compensationVerified: true
+      status: TransactionCategorizationCompensationStatus
+      originalEntry: JournalEntry
+      reversalEntry: JournalEntry
+    }
+  | {
+      compensationVerified: false
+      partialPostedIds: Record<string, string>
+      error: BookkeepingDatabaseError
+    }
+
+function reportedStringField(data: unknown, field: string): string | null {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null
+  const value = (data as Record<string, unknown>)[field]
+  return typeof value === 'string' && value.length > 0 ? value : null
+}
+
+function reportedReversalIds(data: unknown): string[] {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return []
+  const ids = (data as Record<string, unknown>).reversal_journal_entry_ids
+  return Array.isArray(ids)
+    ? ids.filter((id): id is string => typeof id === 'string' && id.length > 0)
+    : []
+}
+
+function compensationPostedIds(
+  originalJournalEntryId: string,
+  data: unknown,
+): Record<string, string> {
+  const ids: Record<string, string> = { journal_entry_id: originalJournalEntryId }
+  const reportedOriginalId = reportedStringField(data, 'original_journal_entry_id')
+  if (reportedOriginalId && reportedOriginalId !== originalJournalEntryId) {
+    ids.reported_original_journal_entry_id = reportedOriginalId
+  }
+  reportedReversalIds(data).forEach((id, index) => {
+    ids[index === 0 ? 'reversal_journal_entry_id' : `reversal_journal_entry_${index + 1}_id`] = id
+  })
+  return ids
+}
+
+function parseTransactionCategorizationCompensation(
+  data: unknown,
+): TransactionCategorizationCompensationData | null {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null
+  const row = data as Record<string, unknown>
+  if (
+    !['reversed', 'already_reversed', 'recovered_existing_reversal'].includes(
+      String(row.status),
+    ) ||
+    typeof row.original_journal_entry_id !== 'string' ||
+    !Array.isArray(row.reversal_journal_entry_ids) ||
+    !row.reversal_journal_entry_ids.every((id) => typeof id === 'string') ||
+    typeof row.original_pointer_cleared !== 'boolean'
+  ) {
+    return null
+  }
+  return row as unknown as TransactionCategorizationCompensationData
+}
+
+function databaseCause(error: unknown): string {
+  if (error && typeof error === 'object' && 'message' in error) {
+    const message = (error as { message?: unknown }).message
+    if (typeof message === 'string') return message
+  }
+  return String(error)
+}
+
+function unverifiedTransactionCompensation(
+  originalJournalEntryId: string,
+  data: unknown,
+  operation: 'compensate_transaction_categorization' | 'verify_transaction_compensation',
+  cause: string,
+): TransactionCategorizationCompensationResult {
+  return {
+    compensationVerified: false,
+    partialPostedIds: compensationPostedIds(originalJournalEntryId, data),
+    error: new BookkeepingDatabaseError(operation, cause),
+  }
+}
+
+async function hydrateTransactionCompensationEntry(
+  supabase: SupabaseClient,
+  companyId: string,
+  entryId: string,
+): Promise<JournalEntry> {
+  const { data, error } = await supabase
+    .from('journal_entries')
+    .select('*, lines:journal_entry_lines(*)')
+    .eq('id', entryId)
+    .eq('company_id', companyId)
+    .single()
+  if (error || !data) {
+    throw new Error(error?.message ?? `Journal entry ${entryId} was not returned`)
+  }
+  return data as JournalEntry
+}
+
+/**
+ * Atomically compensates the exact journal written for transaction
+ * categorization while retaining engine-owned journal event semantics.
+ *
+ * A newly completed compensation, including adoption of a sole existing
+ * reversal, emits the same committed and reversed payloads as reverseEntry.
+ * An already_reversed retry verifies and hydrates the durable pair but does
+ * not replay events. This gives normal retries idempotent event behavior. If
+ * event publication previously failed, the unverified result and posted IDs
+ * remain explicit for manual recovery instead of reporting false success.
+ */
+export async function compensateTransactionCategorization(
+  supabase: SupabaseClient,
+  params: {
+    companyId: string
+    userId: string
+    transactionId: string
+    originalJournalEntryId: string
+  },
+): Promise<TransactionCategorizationCompensationResult> {
+  let rpcData: unknown = null
+  try {
+    const { data, error } = await supabase.rpc('compensate_transaction_categorization', {
+      p_company_id: params.companyId,
+      p_transaction_id: params.transactionId,
+      p_original_journal_entry_id: params.originalJournalEntryId,
+    })
+    rpcData = data
+    if (error) {
+      return unverifiedTransactionCompensation(
+        params.originalJournalEntryId,
+        rpcData,
+        'compensate_transaction_categorization',
+        databaseCause(error),
+      )
+    }
+  } catch (error) {
+    return unverifiedTransactionCompensation(
+      params.originalJournalEntryId,
+      rpcData,
+      'compensate_transaction_categorization',
+      databaseCause(error),
+    )
+  }
+
+  const compensation = parseTransactionCategorizationCompensation(rpcData)
+  if (
+    !compensation ||
+    compensation.original_journal_entry_id !== params.originalJournalEntryId ||
+    compensation.reversal_journal_entry_ids.length !== 1 ||
+    !compensation.original_pointer_cleared
+  ) {
+    return unverifiedTransactionCompensation(
+      params.originalJournalEntryId,
+      rpcData,
+      'verify_transaction_compensation',
+      `Unverifiable compensation result: ${JSON.stringify(rpcData)}`,
+    )
+  }
+
+  const reversalJournalEntryId = compensation.reversal_journal_entry_ids[0]
+  let originalEntry: JournalEntry
+  let reversalEntry: JournalEntry
+  try {
+    originalEntry = await hydrateTransactionCompensationEntry(
+      supabase,
+      params.companyId,
+      params.originalJournalEntryId,
+    )
+    reversalEntry = await hydrateTransactionCompensationEntry(
+      supabase,
+      params.companyId,
+      reversalJournalEntryId,
+    )
+  } catch (error) {
+    return unverifiedTransactionCompensation(
+      params.originalJournalEntryId,
+      rpcData,
+      'verify_transaction_compensation',
+      databaseCause(error),
+    )
+  }
+
+  const originalLines = (originalEntry as JournalEntry & { lines?: unknown }).lines
+  const reversalLines = (reversalEntry as JournalEntry & { lines?: unknown }).lines
+  const exactPairVerified =
+    originalEntry.id === params.originalJournalEntryId &&
+    originalEntry.company_id === params.companyId &&
+    originalEntry.source_type === 'bank_transaction' &&
+    originalEntry.source_id === params.transactionId &&
+    originalEntry.status === 'reversed' &&
+    originalEntry.reversed_by_id === reversalJournalEntryId &&
+    Array.isArray(originalLines) &&
+    reversalEntry.id === reversalJournalEntryId &&
+    reversalEntry.company_id === params.companyId &&
+    reversalEntry.source_type === 'storno' &&
+    reversalEntry.status === 'posted' &&
+    reversalEntry.reverses_id === params.originalJournalEntryId &&
+    Array.isArray(reversalLines)
+
+  if (!exactPairVerified) {
+    return unverifiedTransactionCompensation(
+      params.originalJournalEntryId,
+      rpcData,
+      'verify_transaction_compensation',
+      'Hydrated journal entries did not prove the exact company-scoped original and sole reversal',
+    )
+  }
+
+  if (compensation.status !== 'already_reversed') {
+    try {
+      await eventBus.emit({
+        type: 'journal_entry.committed',
+        payload: { entry: reversalEntry, userId: params.userId, companyId: params.companyId },
+      })
+      await eventBus.emit({
+        type: 'journal_entry.reversed',
+        payload: {
+          originalEntry,
+          reversalEntry,
+          userId: params.userId,
+          companyId: params.companyId,
+        },
+      })
+    } catch (error) {
+      log.error('transaction categorization compensation event publication failed', error as Error, {
+        operation: 'verify_transaction_compensation',
+        companyId: params.companyId,
+        entityType: 'journal_entry',
+        entityId: params.originalJournalEntryId,
+        reversalJournalEntryId,
+      })
+      return unverifiedTransactionCompensation(
+        params.originalJournalEntryId,
+        rpcData,
+        'verify_transaction_compensation',
+        databaseCause(error),
+      )
+    }
+  }
+
+  return {
+    compensationVerified: true,
+    status: compensation.status,
+    originalEntry,
+    reversalEntry,
+  }
+}
+
 /**
  * Create a reversal entry for an existing journal entry
  * Sets reversed_by_id/reverses_id links for compliance tracking

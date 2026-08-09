@@ -1,9 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const reverseEntryMock = vi.fn()
+const compensateTransactionCategorizationMock = vi.fn()
 
 vi.mock('@/lib/bookkeeping/engine', () => ({
   reverseEntry: (...args: unknown[]) => reverseEntryMock(...args),
+  compensateTransactionCategorization: (...args: unknown[]) =>
+    compensateTransactionCategorizationMock(...args),
 }))
 
 import {
@@ -11,7 +14,7 @@ import {
   compensatePostCommitReadbackFailure,
 } from '../settlement-attachment'
 import type { CategorizationAttachmentParams } from '../settlement-attachment'
-import { PostCommitReadbackError } from '@/lib/bookkeeping/errors'
+import { BookkeepingDatabaseError, PostCommitReadbackError } from '@/lib/bookkeeping/errors'
 
 const log = {
   error: vi.fn(),
@@ -33,10 +36,46 @@ function rpcSupabase(
     error: null,
   },
 ) {
+  const data = compensation.data as {
+    status?: string
+    original_journal_entry_id?: string
+    reversal_journal_entry_ids?: string[]
+    original_pointer_cleared?: boolean
+  } | null
+  const reversalIds = data?.reversal_journal_entry_ids ?? []
+  const partialPostedIds: Record<string, string> = { journal_entry_id: 'je-1' }
+  reversalIds.forEach((id, index) => {
+    partialPostedIds[
+      index === 0 ? 'reversal_journal_entry_id' : `reversal_journal_entry_${index + 1}_id`
+    ] = id
+  })
+  const verified =
+    !compensation.error &&
+    data?.original_journal_entry_id === 'je-1' &&
+    data.original_pointer_cleared === true &&
+    reversalIds.length === 1 &&
+    ['reversed', 'already_reversed', 'recovered_existing_reversal'].includes(
+      data.status ?? '',
+    )
+  compensateTransactionCategorizationMock.mockResolvedValueOnce(
+    verified
+      ? {
+          compensationVerified: true,
+          status: data!.status,
+          originalEntry: { id: 'je-1' },
+          reversalEntry: { id: reversalIds[0] },
+        }
+      : {
+          compensationVerified: false,
+          partialPostedIds,
+          error: new BookkeepingDatabaseError(
+            compensation.error ? 'compensate_transaction_categorization' : 'verify_transaction_compensation',
+            (compensation.error as { message?: string } | null)?.message ?? 'unverifiable result',
+          ),
+        },
+  )
   return {
-    rpc: vi.fn()
-      .mockResolvedValueOnce(result)
-      .mockResolvedValueOnce(compensation),
+    rpc: vi.fn().mockResolvedValueOnce(result),
   }
 }
 
@@ -55,9 +94,41 @@ const baseParams: CategorizationAttachmentParams = {
 beforeEach(() => {
   vi.clearAllMocks()
   reverseEntryMock.mockResolvedValue({ id: 'je-storno' })
+  compensateTransactionCategorizationMock.mockResolvedValue({
+    compensationVerified: true,
+    status: 'reversed',
+    originalEntry: { id: 'je-1' },
+    reversalEntry: { id: 'je-storno' },
+  })
 })
 
 describe('attachCategorizedTransaction', () => {
+  it('delegates compensation to the bookkeeping engine without invoking the writer RPC here', async () => {
+    const supabase = { rpc: vi.fn().mockResolvedValue({ data: false, error: null }) }
+
+    const result = await attachCategorizedTransaction(
+      supabase as never,
+      baseParams,
+      log as never,
+    )
+
+    expect(result).toEqual({ ok: false, reason: 'conflict' })
+    expect(compensateTransactionCategorizationMock).toHaveBeenCalledWith(
+      supabase,
+      {
+        companyId: 'company-1',
+        userId: 'user-1',
+        transactionId: 'tx-1',
+        originalJournalEntryId: 'je-1',
+      },
+    )
+    expect(supabase.rpc).toHaveBeenCalledTimes(1)
+    expect(supabase.rpc).not.toHaveBeenCalledWith(
+      'compensate_transaction_categorization',
+      expect.anything(),
+    )
+  })
+
   it('passes the complete settlement provenance to the atomic RPC', async () => {
     const supabase = rpcSupabase({ data: true, error: null })
 
@@ -94,13 +165,13 @@ describe('attachCategorizedTransaction', () => {
     )
 
     expect(result).toEqual({ ok: false, reason: 'conflict' })
-    expect(supabase.rpc).toHaveBeenNthCalledWith(
-      2,
-      'compensate_transaction_categorization',
+    expect(compensateTransactionCategorizationMock).toHaveBeenCalledWith(
+      supabase,
       {
-        p_company_id: 'company-1',
-        p_transaction_id: 'tx-1',
-        p_original_journal_entry_id: 'je-1',
+        companyId: 'company-1',
+        userId: 'user-1',
+        transactionId: 'tx-1',
+        originalJournalEntryId: 'je-1',
       },
     )
     expect(reverseEntryMock).not.toHaveBeenCalled()
@@ -120,7 +191,8 @@ describe('attachCategorizedTransaction', () => {
 
     expect(result).toMatchObject({ ok: false, reason: 'database_error' })
     expect(result).not.toHaveProperty('partialPostedIds')
-    expect(supabase.rpc).toHaveBeenCalledTimes(2)
+    expect(supabase.rpc).toHaveBeenCalledTimes(1)
+    expect(compensateTransactionCategorizationMock).toHaveBeenCalledTimes(1)
     expect(reverseEntryMock).not.toHaveBeenCalled()
   })
 
@@ -155,22 +227,23 @@ describe('attachCategorizedTransaction', () => {
       },
     })
     expect(result).not.toHaveProperty('partialPostedIds')
-    expect(supabase.rpc).toHaveBeenNthCalledWith(
-      2,
-      'compensate_transaction_categorization',
+    expect(compensateTransactionCategorizationMock).toHaveBeenCalledWith(
+      supabase,
       {
-        p_company_id: 'company-1',
-        p_transaction_id: 'tx-1',
-        p_original_journal_entry_id: 'je-1',
+        companyId: 'company-1',
+        userId: 'user-1',
+        transactionId: 'tx-1',
+        originalJournalEntryId: 'je-1',
       },
     )
   })
 
   it('exposes the original posted id when thrown attachment and compensation transports are unverifiable', async () => {
+    compensateTransactionCategorizationMock.mockRejectedValueOnce(
+      new TypeError('compensation network failure'),
+    )
     const supabase = {
-      rpc: vi.fn()
-        .mockRejectedValueOnce(new TypeError('attach network failure'))
-        .mockRejectedValueOnce(new TypeError('compensation network failure')),
+      rpc: vi.fn().mockRejectedValueOnce(new TypeError('attach network failure')),
     }
 
     const result = await attachCategorizedTransaction(
@@ -200,18 +273,20 @@ describe('attachCategorizedTransaction', () => {
   })
 
   it('exposes every known posted id after thrown attachment and unverified compensation', async () => {
+    compensateTransactionCategorizationMock.mockResolvedValueOnce({
+      compensationVerified: false,
+      partialPostedIds: {
+        journal_entry_id: 'je-1',
+        reversal_journal_entry_id: 'je-storno-1',
+        reversal_journal_entry_2_id: 'je-storno-2',
+      },
+      error: new BookkeepingDatabaseError(
+        'verify_transaction_compensation',
+        'unverified existing reversals',
+      ),
+    })
     const supabase = {
-      rpc: vi.fn()
-        .mockRejectedValueOnce(new TypeError('attach network failure'))
-        .mockResolvedValueOnce({
-          data: {
-            status: 'unverified_existing_reversal',
-            original_journal_entry_id: 'je-1',
-            reversal_journal_entry_ids: ['je-storno-1', 'je-storno-2'],
-            original_pointer_cleared: false,
-          },
-          error: null,
-        }),
+      rpc: vi.fn().mockRejectedValueOnce(new TypeError('attach network failure')),
     }
 
     const result = await attachCategorizedTransaction(
@@ -319,7 +394,8 @@ describe('attachCategorizedTransaction', () => {
     )
 
     expect(result).toMatchObject({ ok: false, reason: 'database_error' })
-    expect(supabase.rpc).toHaveBeenCalledTimes(2)
+    expect(supabase.rpc).toHaveBeenCalledTimes(1)
+    expect(compensateTransactionCategorizationMock).toHaveBeenCalledTimes(1)
     expect(reverseEntryMock).not.toHaveBeenCalled()
   })
 
@@ -428,6 +504,7 @@ describe('compensatePostCommitReadbackFailure', () => {
       supabase as never,
       {
         companyId: 'company-1',
+        userId: 'user-1',
         transactionId: 'tx-1',
         error: new PostCommitReadbackError('je-readback', 41, 'timeout'),
       },
@@ -440,29 +517,36 @@ describe('compensatePostCommitReadbackFailure', () => {
       voucherNumber: 41,
       compensationVerified: true,
     })
-    expect(supabase.rpc).toHaveBeenCalledTimes(1)
-    expect(supabase.rpc).toHaveBeenCalledWith(
-      'compensate_transaction_categorization',
+    expect(supabase.rpc).not.toHaveBeenCalled()
+    expect(compensateTransactionCategorizationMock).toHaveBeenCalledWith(
+      supabase,
       {
-        p_company_id: 'company-1',
-        p_transaction_id: 'tx-1',
-        p_original_journal_entry_id: 'je-readback',
+        companyId: 'company-1',
+        userId: 'user-1',
+        transactionId: 'tx-1',
+        originalJournalEntryId: 'je-readback',
       },
     )
   })
 
   it('exposes the durable posted id when compensation is unverifiable', async () => {
+    compensateTransactionCategorizationMock.mockResolvedValueOnce({
+      compensationVerified: false,
+      partialPostedIds: { journal_entry_id: 'je-readback' },
+      error: new BookkeepingDatabaseError(
+        'compensate_transaction_categorization',
+        'connection reset',
+      ),
+    })
     const supabase = {
-      rpc: vi.fn().mockResolvedValue({
-        data: null,
-        error: { message: 'connection reset' },
-      }),
+      rpc: vi.fn(),
     }
 
     const result = await compensatePostCommitReadbackFailure(
       supabase as never,
       {
         companyId: 'company-1',
+        userId: 'user-1',
         transactionId: 'tx-1',
         error: new PostCommitReadbackError('je-readback', 41, 'timeout'),
       },
@@ -485,6 +569,7 @@ describe('compensatePostCommitReadbackFailure', () => {
       supabase as never,
       {
         companyId: 'company-1',
+        userId: 'user-1',
         transactionId: 'tx-1',
         error: new Error('validation failed'),
       },

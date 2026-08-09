@@ -1084,6 +1084,7 @@ export async function ingestTransactions(
           supabase,
           {
             companyId,
+            userId,
             transactionId: newTransaction.id,
             error,
           },

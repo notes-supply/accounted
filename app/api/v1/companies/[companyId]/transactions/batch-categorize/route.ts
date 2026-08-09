@@ -482,7 +482,7 @@ async function categorizeOne(
     })
     const postCommitFailure = await compensatePostCommitReadbackFailure(
       supabase,
-      { companyId, transactionId, error: err },
+      { companyId, userId, transactionId, error: err },
       log,
     )
     if (postCommitFailure.handled) {

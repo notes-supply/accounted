@@ -374,6 +374,29 @@ describe('bulkBookMatchedInboxItems: booking', () => {
         },
         error: null,
       },
+      {
+        data: {
+          id: 'je-original',
+          company_id: 'c1',
+          source_type: 'bank_transaction',
+          source_id: 'tx-1',
+          status: 'reversed',
+          reversed_by_id: 'je-reversal',
+          lines: [],
+        },
+        error: null,
+      },
+      {
+        data: {
+          id: 'je-reversal',
+          company_id: 'c1',
+          source_type: 'storno',
+          status: 'posted',
+          reverses_id: 'je-original',
+          lines: [],
+        },
+        error: null,
+      },
     ])
 
     const result = await bulkBookMatchedInboxItems(supabase, 'u1', 'c1', {

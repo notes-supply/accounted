@@ -1280,7 +1280,7 @@ describe('commitPendingOperation: bulk_book_inbox_items partial settlement failu
       ],
       partial_posted_ids: postedIds,
     })
-    const { supabase, enqueue } = createQueuedMockSupabase()
+    const { supabase, enqueue, findCalls } = createQueuedMockSupabase()
     enqueue({ data: { id: 'op-1' }, error: null })
     enqueue({
       data: {
@@ -1318,5 +1318,48 @@ describe('commitPendingOperation: bulk_book_inbox_items partial settlement failu
       },
     })
     expect(result.status).not.toBe('committed')
+    expect(findCalls('pending_operations', 'update')[0]?.[0]).toEqual({
+      status: 'committing',
+      result_data: { commit_in_progress: { partial_failure_possible: true } },
+    })
+  })
+
+  it('keeps the durable partial-failure claim contract on ordinary success', async () => {
+    vi.mocked(bulkBookMatchedInboxItems).mockResolvedValueOnce({
+      booked: [
+        {
+          item_id: '11111111-1111-4111-8111-111111111111',
+          transaction_id: 'tx-1',
+          journal_entry_id: 'je-1',
+        },
+      ],
+      skipped: [],
+    })
+    const { supabase, enqueue, findCalls } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null })
+    enqueue({ data: null, error: null })
+    const op = makePendingOp({
+      operation_type: 'bulk_book_inbox_items',
+      params: {
+        item_ids: ['11111111-1111-4111-8111-111111111111'],
+        category: 'expense_software',
+      },
+    })
+
+    const result = await commitPendingOperation(
+      supabase as never,
+      'user-1',
+      'company-1',
+      op,
+    )
+
+    expect(result).toMatchObject({
+      status: 'committed',
+      data: { booked_count: 1, skipped_count: 0 },
+    })
+    expect(findCalls('pending_operations', 'update')[0]?.[0]).toEqual({
+      status: 'committing',
+      result_data: { commit_in_progress: { partial_failure_possible: true } },
+    })
   })
 })

@@ -1834,6 +1834,7 @@ describe('ingestTransactions', () => {
       supabase,
       {
         companyId: COMPANY_ID,
+        userId: USER_ID,
         transactionId: inserted.id,
         error: readbackError,
       },

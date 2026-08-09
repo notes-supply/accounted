@@ -3,6 +3,7 @@ import {
   BookkeepingDatabaseError,
   PostCommitReadbackError,
 } from '@/lib/bookkeeping/errors'
+import { compensateTransactionCategorization } from '@/lib/bookkeeping/engine'
 import type { Logger } from '@/lib/logger'
 import type { TransactionCategory } from '@/types'
 
@@ -35,28 +36,6 @@ function databaseErrorCause(error: unknown, data: unknown): string {
   return `Atomic attachment returned an unverifiable result: ${JSON.stringify(data)}`
 }
 
-interface CategorizationCompensationData {
-  status: string
-  original_journal_entry_id: string
-  reversal_journal_entry_ids: string[]
-  original_pointer_cleared: boolean
-}
-
-function parseCompensationData(data: unknown): CategorizationCompensationData | null {
-  if (!data || typeof data !== 'object' || Array.isArray(data)) return null
-  const row = data as Record<string, unknown>
-  if (
-    typeof row.status !== 'string' ||
-    typeof row.original_journal_entry_id !== 'string' ||
-    !Array.isArray(row.reversal_journal_entry_ids) ||
-    !row.reversal_journal_entry_ids.every((id) => typeof id === 'string') ||
-    typeof row.original_pointer_cleared !== 'boolean'
-  ) {
-    return null
-  }
-  return row as unknown as CategorizationCompensationData
-}
-
 function postedArtifactIds(
   originalJournalEntryId: string,
   reversalJournalEntryIds: string[] = [],
@@ -70,6 +49,7 @@ function postedArtifactIds(
 
 interface AtomicCompensationParams {
   companyId: string
+  userId: string
   transactionId: string
   journalEntryId: string
 }
@@ -85,55 +65,48 @@ async function compensateCategorizationPosting(
   log: Logger,
   failureContext: string,
 ): Promise<AtomicCompensationResult> {
-  let compensationRaw: unknown = null
-  let compensationError: unknown = null
   try {
-    const result = await supabase.rpc(
-      'compensate_transaction_categorization',
+    const result = await compensateTransactionCategorization(supabase, {
+      companyId: params.companyId,
+      userId: params.userId,
+      transactionId: params.transactionId,
+      originalJournalEntryId: params.journalEntryId,
+    })
+    if (result.compensationVerified) return { compensationVerified: true }
+
+    log.error(
+      'Atomic categorization compensation failed or was unverifiable',
+      result.error,
       {
-        p_company_id: params.companyId,
-        p_transaction_id: params.transactionId,
-        p_original_journal_entry_id: params.journalEntryId,
+        companyId: params.companyId,
+        transactionId: params.transactionId,
+        journalEntryId: params.journalEntryId,
+        attachmentFailure: failureContext,
       },
     )
-    compensationRaw = result.data
-    compensationError = result.error
+    return {
+      compensationVerified: false,
+      partialPostedIds: result.partialPostedIds,
+    }
   } catch (error) {
-    compensationError = error
-  }
-
-  const compensation = parseCompensationData(compensationRaw)
-  const reversalIds = compensation?.reversal_journal_entry_ids ?? []
-  const compensationVerified =
-    !compensationError &&
-    compensation !== null &&
-    compensation.original_journal_entry_id === params.journalEntryId &&
-    compensation.original_pointer_cleared &&
-    compensation.reversal_journal_entry_ids.length === 1 &&
-    ['reversed', 'already_reversed', 'recovered_existing_reversal'].includes(
-      compensation.status,
+    const compensationError = new BookkeepingDatabaseError(
+      'compensate_transaction_categorization',
+      databaseErrorCause(error, null),
     )
-
-  if (compensationVerified) return { compensationVerified: true }
-
-  log.error(
-    'Atomic categorization compensation failed or was unverifiable',
-    compensationError
-      ? new BookkeepingDatabaseError(
-          'compensate_transaction_categorization',
-          databaseErrorCause(compensationError, compensationRaw),
-        )
-      : new Error(`Unverifiable compensation result: ${JSON.stringify(compensationRaw)}`),
-    {
-      companyId: params.companyId,
-      transactionId: params.transactionId,
-      journalEntryId: params.journalEntryId,
-      attachmentFailure: failureContext,
-    },
-  )
-  return {
-    compensationVerified: false,
-    partialPostedIds: postedArtifactIds(params.journalEntryId, reversalIds),
+    log.error(
+      'Atomic categorization compensation failed or was unverifiable',
+      compensationError,
+      {
+        companyId: params.companyId,
+        transactionId: params.transactionId,
+        journalEntryId: params.journalEntryId,
+        attachmentFailure: failureContext,
+      },
+    )
+    return {
+      compensationVerified: false,
+      partialPostedIds: postedArtifactIds(params.journalEntryId),
+    }
   }
 }
 
@@ -157,6 +130,7 @@ export async function compensatePostCommitReadbackFailure(
   supabase: SupabaseClient,
   params: {
     companyId: string
+    userId: string
     transactionId: string
     error: unknown
   },
@@ -170,6 +144,7 @@ export async function compensatePostCommitReadbackFailure(
     supabase,
     {
       companyId: params.companyId,
+      userId: params.userId,
       transactionId: params.transactionId,
       journalEntryId: params.error.journalEntryId,
     },
@@ -231,6 +206,7 @@ export async function attachCategorizedTransaction(
     supabase,
     {
       companyId: params.companyId,
+      userId: params.userId,
       transactionId: params.transactionId,
       journalEntryId: params.journalEntryId,
     },

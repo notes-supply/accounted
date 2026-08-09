@@ -22,12 +22,54 @@ vi.mock('@supabase/supabase-js', async () => {
 
 const {
   createTxJE,
+  compensateTransactionCategorizationMock,
   findMissingAccountsMock,
   reverseEntryMock,
   saveUserMappingRuleMock,
   upsertCounterpartyTemplateMock,
 } = vi.hoisted(() => ({
   createTxJE: vi.fn().mockResolvedValue({ id: 'je-fresh' }),
+  compensateTransactionCategorizationMock: vi.fn(
+    async (
+      supabase: { rpc: (name: string, args: Record<string, string>) => Promise<{ data: unknown; error: unknown }> },
+      params: { companyId: string; transactionId: string; originalJournalEntryId: string },
+    ) => {
+      const { data, error } = await supabase.rpc('compensate_transaction_categorization', {
+        p_company_id: params.companyId,
+        p_transaction_id: params.transactionId,
+        p_original_journal_entry_id: params.originalJournalEntryId,
+      })
+      const row = data as {
+        status?: string
+        original_journal_entry_id?: string
+        reversal_journal_entry_ids?: string[]
+        original_pointer_cleared?: boolean
+      } | null
+      const reversalIds = row?.reversal_journal_entry_ids ?? []
+      const partialPostedIds: Record<string, string> = {
+        journal_entry_id: params.originalJournalEntryId,
+      }
+      reversalIds.forEach((id, index) => {
+        partialPostedIds[
+          index === 0 ? 'reversal_journal_entry_id' : `reversal_journal_entry_${index + 1}_id`
+        ] = id
+      })
+      const compensationVerified =
+        !error &&
+        row?.original_journal_entry_id === params.originalJournalEntryId &&
+        row.original_pointer_cleared === true &&
+        reversalIds.length === 1 &&
+        ['reversed', 'already_reversed', 'recovered_existing_reversal'].includes(row.status ?? '')
+      return compensationVerified
+        ? {
+            compensationVerified: true as const,
+            status: row!.status,
+            originalEntry: { id: params.originalJournalEntryId },
+            reversalEntry: { id: reversalIds[0] },
+          }
+        : { compensationVerified: false as const, partialPostedIds, error: new Error('unverified') }
+    },
+  ),
   findMissingAccountsMock: vi.fn().mockResolvedValue([]),
   reverseEntryMock: vi.fn().mockResolvedValue(undefined),
   saveUserMappingRuleMock: vi.fn().mockResolvedValue(undefined),
@@ -39,6 +81,7 @@ vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
 }))
 vi.mock('@/lib/bookkeeping/engine', () => ({
   reverseEntry: reverseEntryMock,
+  compensateTransactionCategorization: compensateTransactionCategorizationMock,
 }))
 vi.mock('@/lib/bookkeeping/account-validation', async () => {
   const actual = await vi.importActual<typeof import('@/lib/bookkeeping/account-validation')>(

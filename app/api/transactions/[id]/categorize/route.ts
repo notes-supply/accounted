@@ -808,7 +808,7 @@ export const POST = withRouteContext(
       txLog.error('failed to create transaction journal entry', err as Error)
       const postCommitFailure = await compensatePostCommitReadbackFailure(
         supabase,
-        { companyId, transactionId: id, error: err },
+        { companyId, userId: user.id, transactionId: id, error: err },
         txLog,
       )
       if (postCommitFailure.handled) {

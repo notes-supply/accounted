@@ -5454,6 +5454,7 @@ async function commitPendingOperationInner(
     'categorize_transaction',
     'match_transaction_invoice',
     'credit_invoice',
+    'bulk_book_inbox_items',
   ]).has(pendingOpSnapshot.operation_type)
   const claimUpdate = partialFailurePossible
     ? {
