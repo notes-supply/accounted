@@ -67,13 +67,13 @@ describe('withRcBasisGapFindings', () => {
 })
 
 describe('withRcBasisGapFindings, failed scan', () => {
-  it('adds a non-blocking finding so the banner cannot claim all-clear', () => {
+  it('adds a blocking finding because required filing evidence is unavailable', () => {
     // An empty check list renders as "Inga fel hittades i underlaget för
     // perioden". A scan that never answered has not earned that sentence.
     const result = withRcBasisGapFindings([], { status: 'unavailable' })
     expect(result).toHaveLength(1)
-    expect(result[0].status).toBe('WARNING')
-    expect(isFilingBlocked(result)).toBe(false)
+    expect(result[0].status).toBe('ERROR')
+    expect(isFilingBlocked(result)).toBe(true)
   })
 
   it('does not stack on top of a finding that already blocks', () => {
@@ -119,9 +119,10 @@ describe('rcBasisGapFinding', () => {
 })
 
 describe('rcBasisScanUnavailableFinding', () => {
-  it('is a warning that admits it does not know, and points at the worklist', () => {
+  it('is a stable error that admits it does not know, and points at the worklist', () => {
     const finding = rcBasisScanUnavailableFinding()
-    expect(finding.status).toBe('WARNING')
+    expect(finding.code).toBe('RC_BASIS_SCAN_UNAVAILABLE')
+    expect(finding.status).toBe('ERROR')
     expect(finding.message).toContain('kunde inte köras')
     expect(finding.message).toContain('listan nedan')
   })

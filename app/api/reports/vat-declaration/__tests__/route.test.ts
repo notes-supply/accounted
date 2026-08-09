@@ -61,6 +61,16 @@ function chartBuilder(accounts: Array<{ account_number: string; default_vat_rate
   return b
 }
 
+function settingsBuilder(vatLiabilityStartDate: string | null = null) {
+  const b: Record<string, unknown> = {}
+  for (const m of ['select', 'eq']) b[m] = vi.fn().mockReturnValue(b)
+  b.maybeSingle = vi.fn().mockResolvedValue({
+    data: { vat_liability_start_date: vatLiabilityStartDate },
+    error: null,
+  })
+  return b
+}
+
 describe('GET /api/reports/vat-declaration', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -70,7 +80,9 @@ describe('GET /api/reports/vat-declaration', () => {
       error: null,
     })
     mockSupabase.rpc.mockResolvedValue({ data: rpcPayload(), error: null })
-    mockSupabase.from.mockImplementation(() => chartBuilder())
+    mockSupabase.from.mockImplementation((table: string) => (
+      table === 'company_settings' ? settingsBuilder() : chartBuilder()
+    ))
   })
 
   it('returns 401 when not authenticated', async () => {
@@ -128,6 +140,19 @@ describe('GET /api/reports/vat-declaration', () => {
     expect(mockSupabase.rpc).not.toHaveBeenCalled()
   })
 
+  it('rejects fractional, scientific, partial, and overflowing period input', async () => {
+    for (const query of [
+      '?periodType=monthly&year=2026&period=1.5',
+      '?periodType=monthly&year=2e3&period=1',
+      '?periodType=monthly&year=2026junk&period=1',
+      '?periodType=monthly&year=999999999999999999999&period=1',
+    ]) {
+      const res = await GET(makeRequest(query), { params: Promise.resolve({}) })
+      expect(res.status).toBe(400)
+    }
+    expect(mockSupabase.rpc).not.toHaveBeenCalled()
+  })
+
   it('happy path quarterly: öre-exact rutor from a single RPC round trip', async () => {
     const res = await GET(
       makeRequest('?periodType=quarterly&year=2026&period=3'),
@@ -145,11 +170,12 @@ describe('GET /api/reports/vat-declaration', () => {
     expect(body.data.transactionCount).toBe(3)
     expect(body.data.periodLabel).toBe('Kvartal 3 2026')
 
-    // Regression guard: the dead company_settings round trip is gone and
-    // resolvePeriodDates makes no DB call for calendar quarters. The only
-    // table read left is chart_of_accounts, for the company's own ruta 05
-    // accounts (#1261).
-    expect(mockSupabase.from.mock.calls.map(([t]) => t)).toEqual(['chart_of_accounts'])
+    // Period resolution reads the VAT liability start once, then the report
+    // reads chart_of_accounts for the company's own ruta 05 accounts (#1261).
+    expect(mockSupabase.from.mock.calls.map(([t]) => t)).toEqual([
+      'company_settings',
+      'chart_of_accounts',
+    ])
     expect(mockSupabase.rpc).toHaveBeenCalledTimes(1)
     expect(mockSupabase.rpc).toHaveBeenCalledWith(
       'get_vat_declaration_totals',
@@ -161,7 +187,7 @@ describe('GET /api/reports/vat-declaration', () => {
     )
   })
 
-  it('happy path monthly: no period lookup, one RPC', async () => {
+  it('happy path monthly: VAT settings lookup, no fiscal-period lookup, one RPC', async () => {
     const res = await GET(
       makeRequest('?periodType=monthly&year=2026&period=7'),
       { params: Promise.resolve({}) },
@@ -172,6 +198,7 @@ describe('GET /api/reports/vat-declaration', () => {
     expect(body.data.periodLabel).toBe('Juli 2026')
 
     expect(mockSupabase.from).not.toHaveBeenCalledWith('fiscal_periods')
+    expect(mockSupabase.from).toHaveBeenCalledWith('company_settings')
     expect(mockSupabase.rpc).toHaveBeenCalledTimes(1)
     expect(mockSupabase.rpc).toHaveBeenCalledWith(
       'get_vat_declaration_totals',

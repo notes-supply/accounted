@@ -42,6 +42,7 @@ export interface VatDeclarationCheck {
   /** Stable identifier so the UI can render specific guidance per rule. */
   code:
     | 'RC_BASIS_MISSING'
+    | 'RC_BASIS_SCAN_UNAVAILABLE'
     | 'RC_OUTPUT_MISSING'
     | 'RC_INPUT_VAT_MISMATCH'
     | 'SUMMA_MOMS_DRIFT'

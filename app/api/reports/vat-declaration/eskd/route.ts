@@ -3,6 +3,7 @@ import { withRouteContext } from '@/lib/api/with-route-context'
 import { calculateVatDeclaration } from '@/lib/reports/vat-declaration'
 import { buildESkdFile } from '@/lib/reports/vat-eskd-file'
 import type { VatPeriodType } from '@/types'
+import { parseVatPeriodInput } from '@/lib/vat/period-input'
 
 /**
  * Momsdeklaration eSKDUpload (v6.0) XML file for filing at skatteverket.se via
@@ -31,11 +32,13 @@ export const GET = withRouteContext(
     if (!['monthly', 'quarterly', 'yearly'].includes(periodType)) {
       return NextResponse.json({ error: 'Invalid periodType' }, { status: 400 })
     }
-    const year = parseInt(yearStr, 10)
-    const period = parseInt(periodStr, 10)
-    if (isNaN(year) || isNaN(period)) {
+    let parsedPeriod: ReturnType<typeof parseVatPeriodInput>
+    try {
+      parsedPeriod = parseVatPeriodInput({ periodType, year: yearStr, period: periodStr })
+    } catch {
       return NextResponse.json({ error: 'Invalid year or period' }, { status: 400 })
     }
+    const { year, period } = parsedPeriod
 
     const { data: companyRow } = await supabase
       .from('company_settings')

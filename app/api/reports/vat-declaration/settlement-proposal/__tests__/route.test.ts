@@ -102,6 +102,22 @@ describe('GET /api/reports/vat-declaration/settlement-proposal', () => {
     expect(buildVatSettlementProposal).not.toHaveBeenCalled()
   })
 
+  it.each([
+    'periodType=monthly&year=2026&period=1.5',
+    'periodType=monthly&year=2e3&period=1',
+    'periodType=monthly&year=2026tail&period=1',
+    'periodType=yearly&year=2026&period=2',
+  ])('rejects non-canonical VAT period input before settlement calculation: %s', async (query) => {
+    const req = new Request(
+      `http://localhost/api/reports/vat-declaration/settlement-proposal?${query}`,
+    )
+
+    const res = await GET(req, { params: Promise.resolve({}) })
+
+    expect(res.status).toBe(400)
+    expect(buildVatSettlementProposal).not.toHaveBeenCalled()
+  })
+
   it('happy path: returns the proposal', async () => {
     const req = new Request(
       'http://localhost/api/reports/vat-declaration/settlement-proposal?periodType=quarterly&year=2026&period=1',

@@ -66,6 +66,7 @@ import { GET as trialBalance } from '../trial-balance/route'
 import { GET as incomeStatement } from '../income-statement/route'
 import { GET as sieExport } from '../sie-export/route'
 import { GET as vatDeclaration } from '../vat-declaration/route'
+import { generateOpenApiSpec } from '@/lib/api/v1/registry'
 
 const mockValidate = validateApiKey as ReturnType<typeof vi.fn>
 const mockServiceClient = createServiceClientNoCookies as ReturnType<typeof vi.fn>
@@ -407,6 +408,29 @@ describe('GET /reports/vat-declaration', () => {
     expect(res.status).toBe(400)
   })
 
+  it.each([
+    'period_type=monthly&year=2026&period=1.5',
+    'period_type=monthly&year=2e3&period=1',
+    'period_type=quarterly&year=2026&period=5',
+    'period_type=yearly&year=2026&period=2',
+  ])('rejects non-canonical VAT period input: %s', async (query) => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      }),
+    )
+
+    const res = await vatDeclaration(
+      makeReq(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/reports/vat-declaration?${query}`,
+      ),
+      companyParams(COMPANY_ID),
+    )
+
+    expect(res.status).toBe(400)
+    expect(mocks.calculateVatDeclaration).not.toHaveBeenCalled()
+  })
+
   it('passes through to calculateVatDeclaration on the happy path', async () => {
     mockServiceClient.mockReturnValue(
       makeFlexibleSupabase({
@@ -431,6 +455,64 @@ describe('GET /reports/vat-declaration', () => {
       'monthly',
       2026,
       4,
+      { fiscalPeriodId: undefined },
     )
+  })
+
+  it('passes a qualified annual fiscal_period_id to period resolution', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      }),
+    )
+    mocks.calculateVatDeclaration.mockResolvedValue({ rutor: { ruta49: 0 } })
+
+    const res = await vatDeclaration(
+      makeReq(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/reports/vat-declaration?period_type=yearly&year=2026&period=1&fiscal_period_id=${PERIOD_ID}`,
+      ),
+      companyParams(COMPANY_ID),
+    )
+
+    expect(res.status).toBe(200)
+    expect(mocks.calculateVatDeclaration).toHaveBeenCalledWith(
+      expect.anything(),
+      COMPANY_ID,
+      'yearly',
+      2026,
+      1,
+      { fiscalPeriodId: PERIOD_ID },
+    )
+  })
+
+  it('rejects an invalid fiscal_period_id instead of ignoring it', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      }),
+    )
+
+    const res = await vatDeclaration(
+      makeReq(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/reports/vat-declaration?period_type=yearly&year=2026&period=1&fiscal_period_id=not-a-uuid`,
+      ),
+      companyParams(COMPANY_ID),
+    )
+
+    expect(res.status).toBe(400)
+    expect(mocks.calculateVatDeclaration).not.toHaveBeenCalled()
+  })
+
+  it('documents fiscal_period_id as an optional OpenAPI query parameter', () => {
+    const spec = generateOpenApiSpec('https://api.test')
+    const operation = spec.paths[
+      '/api/v1/companies/{companyId}/reports/vat-declaration'
+    ].get as { parameters?: Array<{ name: string; in: string; required: boolean }> }
+
+    expect(operation.parameters).toContainEqual(expect.objectContaining({
+      name: 'fiscal_period_id',
+      in: 'query',
+      required: false,
+    }))
   })
 })

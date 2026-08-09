@@ -63,6 +63,14 @@ function registerFakeSkatteverket(
   } as unknown as Extension)
 }
 
+const MONTHLY_VAT_PARAMS = {
+  period_type: 'monthly',
+  year: 2025,
+  period: 3,
+  resolved_period_start: '2025-03-14',
+  resolved_period_end: '2025-03-31',
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   eventBus.clear()
@@ -81,13 +89,13 @@ describe('commitPendingOperation: submit_vat_declaration / submit_agi', () => {
     enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
     enqueue({ data: null, error: null })           // dispatcher commit update
 
-    const op = makePendingOp({ params: { period_type: 'monthly', year: 2025, period: 3 } })
+    const op = makePendingOp({ params: MONTHLY_VAT_PARAMS })
     const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
 
     expect(result.status).toBe('committed')
     expect(result.data).toMatchObject({ signing_url: 'https://skv.test/sign/abc', status: 'awaiting_signature' })
     expect(vat).toHaveBeenCalledWith(expect.anything(), 'user-1', 'company-1', {
-      period_type: 'monthly', year: 2025, period: 3,
+      ...MONTHLY_VAT_PARAMS,
     })
   })
 
@@ -112,7 +120,7 @@ describe('commitPendingOperation: submit_vat_declaration / submit_agi', () => {
     enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
     enqueue({ data: null, error: null })           // release-to-pending update
 
-    const op = makePendingOp({ params: { period_type: 'monthly', year: 2025, period: 3 } })
+    const op = makePendingOp({ params: MONTHLY_VAT_PARAMS })
     const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
 
     expect(result.status).toBe('failed')
@@ -129,7 +137,7 @@ describe('commitPendingOperation: submit_vat_declaration / submit_agi', () => {
     enqueue({ data: { id: 'op-1' }, error: null })
     enqueue({ data: null, error: null }) // release-to-pending update
 
-    const op = makePendingOp({ params: { period_type: 'monthly', year: 2025, period: 3 } })
+    const op = makePendingOp({ params: MONTHLY_VAT_PARAMS })
     const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
 
     expect(result.status).toBe('failed')
@@ -146,7 +154,7 @@ describe('commitPendingOperation: submit_vat_declaration / submit_agi', () => {
     enqueue({ data: { id: 'op-1' }, error: null })
     enqueue({ data: null, error: null }) // reject update
 
-    const op = makePendingOp({ params: { period_type: 'monthly', year: 2025, period: 3 } })
+    const op = makePendingOp({ params: MONTHLY_VAT_PARAMS })
     const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
 
     expect(result.status).toBe('failed')
@@ -166,6 +174,102 @@ describe('commitPendingOperation: submit_vat_declaration / submit_agi', () => {
 
     expect(result.status).toBe('failed')
     expect(result.http_status).toBe(400)
+    expect(vat).not.toHaveBeenCalled()
+  })
+
+  it('rejects a tampered staged VAT period before resolving the extension service', async () => {
+    const vat = vi.fn().mockResolvedValue({
+      ok: true,
+      signing_url: 'https://skv.test/should-not-be-used',
+      redovisningsperiod: '202501',
+    })
+    registerFakeSkatteverket({ commitSubmitVatDeclaration: vat, commitSubmitAgi: vi.fn() })
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null })
+    enqueue({ data: null, error: null })
+
+    const op = makePendingOp({
+      params: { period_type: 'monthly', year: 2025, period: 1.5 },
+    })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).toBe('failed')
+    expect(result.http_status).toBe(400)
+    expect(vat).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { label: 'absent', bounds: {} },
+    { label: 'start only', bounds: { resolved_period_start: '2025-03-14' } },
+    { label: 'end only', bounds: { resolved_period_end: '2025-03-31' } },
+    {
+      label: 'malformed start',
+      bounds: { resolved_period_start: '2025-02-30', resolved_period_end: '2025-03-31' },
+    },
+    {
+      label: 'malformed end',
+      bounds: { resolved_period_start: '2025-03-14', resolved_period_end: '2025-13-31' },
+    },
+    {
+      label: 'reversed',
+      bounds: { resolved_period_start: '2025-04-01', resolved_period_end: '2025-03-31' },
+    },
+  ])('rejects $label staged VAT bounds before resolving the extension service', async ({ bounds }) => {
+    const vat = vi.fn()
+    registerFakeSkatteverket({ commitSubmitVatDeclaration: vat, commitSubmitAgi: vi.fn() })
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null })
+    enqueue({ data: null, error: null })
+    const op = makePendingOp({
+      params: { period_type: 'monthly', year: 2025, period: 3, ...bounds },
+    })
+
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).toBe('rejected')
+    expect(result.http_status).toBe(409)
+    expect(result.error).toMatch(/resolved period bounds/i)
+    expect(vat).not.toHaveBeenCalled()
+  })
+
+  it('rejects a legacy yearly operation without an immutable fiscal period id', async () => {
+    const vat = vi.fn()
+    registerFakeSkatteverket({ commitSubmitVatDeclaration: vat, commitSubmitAgi: vi.fn() })
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null })
+    enqueue({ data: null, error: null })
+
+    const op = makePendingOp({
+      params: { period_type: 'yearly', year: 2026, period: 1 },
+    })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).toBe('rejected')
+    expect(result.http_status).toBe(409)
+    expect(result.error).toMatch(/fiscal_period_id/)
+    expect(vat).not.toHaveBeenCalled()
+  })
+
+  it('rejects a yearly operation that has an id but lacks staged bounds', async () => {
+    const vat = vi.fn()
+    registerFakeSkatteverket({ commitSubmitVatDeclaration: vat, commitSubmitAgi: vi.fn() })
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null })
+    enqueue({ data: null, error: null })
+
+    const op = makePendingOp({
+      params: {
+        period_type: 'yearly',
+        year: 2026,
+        period: 1,
+        fiscal_period_id: 'fp-1',
+      },
+    })
+    const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
+
+    expect(result.status).toBe('rejected')
+    expect(result.http_status).toBe(409)
+    expect(result.error).toMatch(/resolved period bounds/)
     expect(vat).not.toHaveBeenCalled()
   })
 })

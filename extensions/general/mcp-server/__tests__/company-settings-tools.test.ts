@@ -29,7 +29,7 @@ describe('company settings MCP tools: registration', () => {
     expect(updateTool().inputSchema.additionalProperties).toBe(false)
   })
 
-  it('exposes the same field set on the read and write tools', () => {
+  it('exposes tax settings read-only without widening the write tool', () => {
     const readFields = (
       (getTool().outputSchema as { required: string[] }).required
     )
@@ -41,21 +41,43 @@ describe('company settings MCP tools: registration', () => {
       .filter((field) => field !== 'dry_run' && field !== 'idempotency_key')
       .sort()
 
-    expect(writeFields).toEqual(readFields)
+    expect(writeFields).toEqual([
+      'account_number',
+      'bank_name',
+      'bankgiro',
+      'bic',
+      'clearing_number',
+      'contact_person',
+      'email',
+      'iban',
+      'invoice_email_texts',
+      'phone',
+      'plusgiro',
+      'swish',
+      'website',
+    ])
+    expect(readFields).toEqual(expect.arrayContaining(writeFields))
     expect(readFields).toEqual(
       [
         'account_number',
+        'accounting_method',
         'bank_name',
         'bankgiro',
         'bic',
         'clearing_number',
         'contact_person',
         'email',
+        'employer_registered',
+        'f_skatt',
         'iban',
         'invoice_email_texts',
+        'moms_period',
         'phone',
         'plusgiro',
         'swish',
+        'vat_liability_start_date',
+        'vat_number',
+        'vat_registered',
         'website',
       ],
     )
@@ -124,6 +146,42 @@ describe('gnubok_get_company_settings', () => {
       contact_person: 'Test Contact',
     })
     expect(supabase.from).toHaveBeenCalledWith('company_settings')
+  })
+
+  it('returns the tax registration settings', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({
+      data: {
+        f_skatt: true,
+        vat_registered: true,
+        vat_number: 'SE559581504301',
+        vat_liability_start_date: '2026-05-01',
+        moms_period: 'yearly',
+        accounting_method: 'accrual',
+        employer_registered: false,
+      },
+    })
+
+    const result = await getTool().execute({}, 'company-1', 'user-1', supabase as never)
+
+    expect(result).toMatchObject({
+      f_skatt: true,
+      vat_registered: true,
+      vat_number: 'SE559581504301',
+      vat_liability_start_date: '2026-05-01',
+      moms_period: 'yearly',
+      accounting_method: 'accrual',
+      employer_registered: false,
+    })
+  })
+
+  it('reports the legacy null f_skatt value as the effective default true', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { f_skatt: null } })
+
+    const result = await getTool().execute({}, 'company-1', 'user-1', supabase as never)
+
+    expect(result).toMatchObject({ f_skatt: true })
   })
 
   it('fails when the company has no settings row', async () => {

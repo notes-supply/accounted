@@ -1,8 +1,14 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
-import type { VatPeriodType } from '@/types'
-import { calculateVatDeclaration, resolvePeriodDates } from '@/lib/reports/vat-declaration'
+import type { VatDeclaration, VatPeriodType } from '@/types'
+import { calculateVatDeclaration } from '@/lib/reports/vat-declaration'
 import { rutorToMomsuppgift, formatRedovisare, formatRedovisningsperiod } from './mappers'
 import type { SkatteverketMomsuppgift } from '../types'
+import { parseVatPeriodInput } from '@/lib/vat/period-input'
+import {
+  parseOptionalVatResolvedPeriodBounds,
+  requireVatResolvedPeriodBounds,
+  vatPeriodBoundsDriftError,
+} from '@/lib/vat/resolved-period-bounds'
 
 /**
  * Request-free Skatteverket declaration prep.
@@ -22,6 +28,21 @@ export interface VatDeclarationPrep {
   redovisare: string
   redovisningsperiod: string
   momsuppgift: SkatteverketMomsuppgift
+  declaration: VatDeclaration
+  fiscalPeriodId?: string
+  resolvedPeriodStart?: string
+  resolvedPeriodEnd?: string
+  fiscalPeriodStart?: string
+  fiscalPeriodEnd?: string
+}
+
+export interface VatDeclarationPrepInput {
+  periodType: VatPeriodType
+  year: number
+  period: number
+  fiscalPeriodId?: string
+  resolvedPeriodStart?: string
+  resolvedPeriodEnd?: string
 }
 
 export interface AgiUnderlagPrep {
@@ -42,11 +63,15 @@ export async function resolveRedovisare(
   supabase: SupabaseClient,
   companyId: string,
 ): Promise<string> {
-  const { data: settings } = await supabase
+  const { data: settings, error } = await supabase
     .from('company_settings')
     .select('org_number, entity_type')
     .eq('company_id', companyId)
     .single()
+
+  if (error) {
+    throw new Error(`Företagets organisationsnummer kunde inte läsas: ${error.message}`)
+  }
 
   if (!settings?.org_number) {
     throw new Error('Organisationsnummer saknas i företagsinställningar')
@@ -63,26 +88,26 @@ export async function resolveRedovisare(
 export async function buildMomsuppgift(
   supabase: SupabaseClient,
   companyId: string,
-  input: { periodType: VatPeriodType; year: number; period: number; fiscalPeriodId?: string },
+  input: VatDeclarationPrepInput,
 ): Promise<VatDeclarationPrep> {
-  const { periodType, year, period, fiscalPeriodId } = input
+  const validated = parseVatPeriodInput({
+    periodType: input.periodType,
+    year: input.year,
+    period: input.period,
+  })
+  const {
+    fiscalPeriodId,
+    resolvedPeriodStart,
+    resolvedPeriodEnd,
+  } = input
+  const { periodType, year, period } = validated
+  const stagedBounds = parseOptionalVatResolvedPeriodBounds(
+    resolvedPeriodStart,
+    resolvedPeriodEnd,
+  )
 
   const redovisare = await resolveRedovisare(supabase, companyId)
 
-  // Helårsmoms is filed per räkenskapsår (SFL 26 kap 10-11 §§): the SKV
-  // redovisningsperiod is the FY-end month, which for a broken fiscal year is
-  // not December. Resolve the fiscal period's actual bounds so the period
-  // identifier and the figures below always describe the same räkenskapsår.
-  let fiscalYearEnd: { year: number; month: number } | undefined
-  if (periodType === 'yearly') {
-    const { end } = await resolvePeriodDates(
-      supabase, companyId, periodType, year, period, fiscalPeriodId,
-    )
-    fiscalYearEnd = { year: Number(end.slice(0, 4)), month: Number(end.slice(5, 7)) }
-  }
-  const redovisningsperiod = formatRedovisningsperiod(periodType, year, period, fiscalYearEnd)
-
-  // Calculate VAT declaration from the general ledger
   const declaration = await calculateVatDeclaration(
     supabase,
     companyId,
@@ -91,10 +116,53 @@ export async function buildMomsuppgift(
     period,
     { fiscalPeriodId },
   )
+  const declarationBounds = requireVatResolvedPeriodBounds(
+    declaration.period.start,
+    declaration.period.end,
+  )
+  if (
+    stagedBounds &&
+    (stagedBounds.start !== declarationBounds.start || stagedBounds.end !== declarationBounds.end)
+  ) {
+    throw vatPeriodBoundsDriftError(stagedBounds, declarationBounds)
+  }
+
+  // Helårsmoms is filed per räkenskapsår (SFL 26 kap 10-11 §§): the SKV
+  // redovisningsperiod is the FY-end month, which for a broken fiscal year is
+  // not December. Resolve the fiscal period's actual bounds so the period
+  // identifier and the figures below always describe the same räkenskapsår.
+  let fiscalYearEnd: { year: number; month: number } | undefined
+  let resolvedFiscalPeriodId: string | undefined
+  if (periodType === 'yearly') {
+    const { end, fiscalPeriodId: declarationFiscalPeriodId } = declaration.period
+    if (!declarationFiscalPeriodId) {
+      throw new Error('Annual VAT preparation did not resolve a fiscal period id')
+    }
+    if (fiscalPeriodId && declarationFiscalPeriodId !== fiscalPeriodId) {
+      throw new Error('Annual VAT fiscal period identity changed during preparation')
+    }
+    resolvedFiscalPeriodId = declarationFiscalPeriodId
+    fiscalYearEnd = { year: Number(end.slice(0, 4)), month: Number(end.slice(5, 7)) }
+  }
+  const redovisningsperiod = formatRedovisningsperiod(periodType, year, period, fiscalYearEnd)
 
   const momsuppgift = rutorToMomsuppgift(declaration.rutor)
 
-  return { redovisare, redovisningsperiod, momsuppgift }
+  return {
+    redovisare,
+    redovisningsperiod,
+    momsuppgift,
+    declaration,
+    resolvedPeriodStart: declarationBounds.start,
+    resolvedPeriodEnd: declarationBounds.end,
+    ...(resolvedFiscalPeriodId
+      ? {
+          fiscalPeriodId: resolvedFiscalPeriodId,
+          fiscalPeriodStart: declaration.period.fiscalPeriodStart ?? declaration.period.start,
+          fiscalPeriodEnd: declaration.period.fiscalPeriodEnd ?? declaration.period.end,
+        }
+      : {}),
+  }
 }
 
 /**

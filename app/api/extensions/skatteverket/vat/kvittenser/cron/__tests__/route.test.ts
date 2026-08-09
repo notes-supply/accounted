@@ -88,7 +88,13 @@ const LOCKED_STATE = {
   periodType: 'monthly',
   year: 2026,
   period: 6,
+  resolvedPeriodStart: '2026-06-01',
+  resolvedPeriodEnd: '2026-06-30',
+  fiscalPeriodId: null,
+  fiscalPeriodStart: null,
+  fiscalPeriodEnd: null,
   signeringsLank: 'https://skv.test/sign/abc',
+  updatedAt: '2026-07-01T00:00:00.000Z',
 }
 
 function makeSupabaseStub(
@@ -121,8 +127,20 @@ function stubHappyTables(state: Record<string, unknown> = LOCKED_STATE) {
     extension_data: {
       data: [{ company_id: 'comp-1', key: 'submission_202606', value: JSON.stringify(state) }],
     },
+    company_settings: {
+      data: { org_number: '5560000000', entity_type: 'aktiebolag' },
+    },
     skatteverket_tokens: { data: { user_id: 'user-1', status: 'active' } },
   })
+}
+
+function expectNoVatEffects(supabase: ReturnType<typeof makeSupabaseStub>) {
+  expect(mockSkvRequest).not.toHaveBeenCalled()
+  expect(mockCompleteTaxDeadline).not.toHaveBeenCalled()
+  expect(mockSendKvittensNotification).not.toHaveBeenCalled()
+  for (const call of supabase.from.mock.results) {
+    expect(call.value.update).not.toHaveBeenCalled()
+  }
 }
 
 describe('VAT kvittenser cron', () => {
@@ -184,9 +202,10 @@ describe('VAT kvittenser cron', () => {
     expect(mockCompleteTaxDeadline).toHaveBeenCalledWith(
       expect.anything(),
       'comp-1',
-      ['moms_monthly', 'moms_quarterly'],
+      'moms_monthly',
       '2026-06',
       'confirmed',
+      undefined,
     )
     expect(mockSendKvittensNotification).toHaveBeenCalledWith(
       expect.anything(),
@@ -202,7 +221,12 @@ describe('VAT kvittenser cron', () => {
 
   it('quarterly picker params produce a YYYY-QN tax period', async () => {
     mockCreateClient.mockReturnValueOnce(
-      stubHappyTables({ ...LOCKED_STATE, periodType: 'quarterly', period: 2 }),
+      stubHappyTables({
+        ...LOCKED_STATE,
+        periodType: 'quarterly',
+        period: 2,
+        resolvedPeriodStart: '2026-04-01',
+      }),
     )
     mockSkvRequest.mockResolvedValueOnce({
       ok: true,
@@ -213,13 +237,42 @@ describe('VAT kvittenser cron', () => {
     await GET(makeRequest())
 
     expect(mockCompleteTaxDeadline).toHaveBeenCalledWith(
-      expect.anything(), 'comp-1', ['moms_monthly', 'moms_quarterly'], '2026-Q2', 'confirmed',
+      expect.anything(), 'comp-1', 'moms_quarterly', '2026-Q2', 'confirmed', undefined,
     )
   })
 
-  it('yearly picker params complete the moms_yearly deadline with the fiscal-year label', async () => {
+  it('yearly picker params complete only the exact fiscal-period deadline', async () => {
     mockCreateClient.mockReturnValueOnce(
-      stubHappyTables({ ...LOCKED_STATE, periodType: 'yearly', period: 12 }),
+      makeSupabaseStub({
+        extension_data: {
+          data: [{
+            company_id: 'comp-1',
+            key: 'submission_202603',
+            value: JSON.stringify({
+              ...LOCKED_STATE,
+              redovisningsperiod: '202603',
+              periodType: 'yearly',
+              period: 1,
+              fiscalPeriodId: 'fp-short',
+              fiscalPeriodStart: '2026-01-01',
+              fiscalPeriodEnd: '2026-03-31',
+              resolvedPeriodStart: '2026-01-01',
+              resolvedPeriodEnd: '2026-03-31',
+            }),
+          }],
+        },
+        fiscal_periods: {
+          data: {
+            id: 'fp-short',
+            period_start: '2026-01-01',
+            period_end: '2026-03-31',
+          },
+        },
+        company_settings: {
+          data: { org_number: '5560000000', entity_type: 'aktiebolag' },
+        },
+        skatteverket_tokens: { data: { user_id: 'user-1', status: 'active' } },
+      }),
     )
     mockSkvRequest.mockResolvedValueOnce({
       ok: true,
@@ -229,28 +282,80 @@ describe('VAT kvittenser cron', () => {
 
     await GET(makeRequest())
 
-    // Calendar FY (company_settings unstubbed → default start month 1):
-    // the moms_yearly tax_period is the plain year label.
     expect(mockCompleteTaxDeadline).toHaveBeenCalledWith(
-      expect.anything(), 'comp-1', ['moms_yearly'], '2026', 'confirmed',
+      expect.anything(),
+      'comp-1',
+      'moms_yearly',
+      '2026-01-01/2026-03-31',
+      'confirmed',
+      {
+        fiscalPeriodId: 'fp-short',
+        fiscalPeriodStart: '2026-01-01',
+        fiscalPeriodEnd: '2026-03-31',
+      },
     )
   })
 
-  it('legacy state without picker params still flips status but skips the deadline', async () => {
+  it('fails closed when yearly state lacks exact fiscal-period identity', async () => {
+    const supabase = stubHappyTables({ ...LOCKED_STATE, periodType: 'yearly', period: 1 })
+    mockCreateClient.mockReturnValueOnce(supabase)
+
+    const response = await GET(makeRequest())
+    expect((await response.json()).processed).toBe(0)
+
+    expectNoVatEffects(supabase)
+  })
+
+  it('fails closed on malformed legacy state with zero remote or local effect', async () => {
     const { periodType: _pt, year: _y, period: _p, ...legacyState } = LOCKED_STATE
-    mockCreateClient.mockReturnValueOnce(stubHappyTables(legacyState))
-    mockSkvRequest.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({ kvittensnummer: 'KV-789' }),
-    } as any)
+    const supabase = stubHappyTables(legacyState)
+    mockCreateClient.mockReturnValueOnce(supabase)
 
     const res = await GET(makeRequest())
     const body = await res.json()
 
-    expect(body.signed).toBe(1)
-    expect(mockCompleteTaxDeadline).not.toHaveBeenCalled()
-    expect(mockSendKvittensNotification).toHaveBeenCalled()
+    expect(body.processed).toBe(0)
+    expectNoVatEffects(supabase)
+  })
+
+  it('fails closed on a forged other represented organisation with zero remote or local effect', async () => {
+    const supabase = stubHappyTables({ ...LOCKED_STATE, redovisare: '165599999999' })
+    mockCreateClient.mockReturnValueOnce(supabase)
+
+    const res = await GET(makeRequest())
+    expect((await res.json()).errors).toBe(1)
+    expectNoVatEffects(supabase)
+  })
+
+  it('fails closed on company identity lookup error with zero remote or local effect', async () => {
+    const supabase = makeSupabaseStub({
+      extension_data: {
+        data: [{ company_id: 'comp-1', key: 'submission_202606', value: JSON.stringify(LOCKED_STATE) }],
+      },
+      company_settings: {
+        data: null,
+        error: { message: 'company lookup unavailable', code: '08006' },
+      },
+    })
+    mockCreateClient.mockReturnValueOnce(supabase)
+
+    const res = await GET(makeRequest())
+    expect((await res.json()).errors).toBe(1)
+    expectNoVatEffects(supabase)
+  })
+
+  it('fails closed on the submission-state query error with zero remote or local effect', async () => {
+    const supabase = makeSupabaseStub({
+      extension_data: {
+        data: null,
+        error: { message: 'submission state unavailable', code: '08006' },
+      },
+    })
+    mockCreateClient.mockReturnValueOnce(supabase)
+
+    const res = await GET(makeRequest())
+    expect(res.status).toBe(500)
+    expectNoVatEffects(supabase)
   })
 
   it('records still_pending on 404 without touching state', async () => {
@@ -312,6 +417,9 @@ describe('VAT kvittenser cron', () => {
           data: [{ company_id: 'comp-1', key: 'submission_202606', value: JSON.stringify(LOCKED_STATE) }],
           updateError: { message: 'connection reset', code: '08006' },
         },
+        company_settings: {
+          data: { org_number: '5560000000', entity_type: 'aktiebolag' },
+        },
         skatteverket_tokens: { data: { user_id: 'user-1', status: 'active' } },
       }),
     )
@@ -344,6 +452,9 @@ describe('VAT kvittenser cron', () => {
           { company_id: 'comp-1', key: 'submission_202606', value: JSON.stringify(LOCKED_STATE) },
           { company_id: 'comp-2', key: 'submission_202606', value: JSON.stringify(LOCKED_STATE) },
         ],
+      },
+      company_settings: {
+        data: { org_number: '5560000000', entity_type: 'aktiebolag' },
       },
       skatteverket_tokens: { data: { user_id: 'user-1', status: 'active' } },
     })

@@ -9,9 +9,11 @@ import type { TaxDeadlineType, DeadlineStatus } from '@/types'
 
 const log = createLogger('deadline-generator')
 import {
+  getActualFiscalPeriodLabel,
   getApplicableDeadlineConfigs,
   type CompanySettingsForDeadlines,
   type DeadlineInstance,
+  type FiscalPeriodForDeadlines,
   type TaxAssessmentNoticeForDeadline,
 } from './deadline-config'
 import { adjustDeadlineToNextBankingDay } from './swedish-holidays'
@@ -64,6 +66,7 @@ export const TAX_RELEVANT_FIELDS = [
   'f_skatt',
   'preliminary_tax_monthly',
   'vat_registered',
+  'vat_liability_start_date',
   'pays_salaries',
   'employer_registered',
   'employer_seasonal',
@@ -84,7 +87,7 @@ export const TAX_RELEVANT_FIELDS = [
 ] as const
 
 export const DEADLINE_SETTINGS_SELECT =
-  'company_id, entity_type, moms_period, f_skatt, preliminary_tax_monthly, vat_registered, pays_salaries, employer_registered, employer_seasonal, fiscal_year_start_month, vat_taxable_base_over_40m, vat_has_eu_trade, vat_filing_method, periodisk_sammanstallning_enabled, periodisk_sammanstallning_period, periodisk_sammanstallning_filing_method, kontrolluppgifter_enabled, rot_rut_enabled, oss_enabled, ioss_enabled, intrastat_enabled, punktskatt_enabled, fyllnadsinbetalning_enabled' as const
+  'company_id, entity_type, moms_period, f_skatt, preliminary_tax_monthly, vat_registered, vat_liability_start_date, pays_salaries, employer_registered, employer_seasonal, fiscal_year_start_month, vat_taxable_base_over_40m, vat_has_eu_trade, vat_filing_method, periodisk_sammanstallning_enabled, periodisk_sammanstallning_period, periodisk_sammanstallning_filing_method, kontrolluppgifter_enabled, rot_rut_enabled, oss_enabled, ioss_enabled, intrastat_enabled, punktskatt_enabled, fyllnadsinbetalning_enabled' as const
 
 /**
  * Check if any tax-relevant fields changed
@@ -118,6 +121,7 @@ export function toDeadlineSettings(
     f_skatt: settings.f_skatt ?? true,
     preliminary_tax_monthly: settings.preliminary_tax_monthly ?? null,
     vat_registered: settings.vat_registered ?? false,
+    vat_liability_start_date: settings.vat_liability_start_date ?? null,
     pays_salaries: settings.pays_salaries ?? false,
     employer_registered: settings.employer_registered ?? null,
     employer_seasonal: settings.employer_seasonal ?? false,
@@ -138,6 +142,74 @@ export function toDeadlineSettings(
     punktskatt_enabled: settings.punktskatt_enabled ?? false,
     fyllnadsinbetalning_enabled: settings.fyllnadsinbetalning_enabled ?? false,
     tax_assessment_notices: settings.tax_assessment_notices,
+    fiscal_periods: settings.fiscal_periods,
+  }
+}
+
+interface FiscalPeriodDeadlineRow extends FiscalPeriodForDeadlines {
+  company_id: string
+}
+
+async function fetchFiscalPeriodsForDeadlines(
+  supabase: SupabaseClient,
+  companyId?: string,
+): Promise<FiscalPeriodDeadlineRow[]> {
+  const rows: FiscalPeriodDeadlineRow[] = []
+  let from = 0
+  while (true) {
+    let query = supabase
+      .from('fiscal_periods')
+      .select('id, company_id, name, period_start, period_end')
+      .order('id', { ascending: true })
+    if (companyId) query = query.eq('company_id', companyId)
+    const { data, error } = await query.range(from, from + 999)
+    if (error) throw error
+    const page = (data ?? []) as FiscalPeriodDeadlineRow[]
+    rows.push(...page)
+    if (page.length < 1000) break
+    from += 1000
+  }
+  return rows
+}
+
+async function hydrateFiscalPeriods(
+  supabase: SupabaseClient,
+  settingsRows: DeadlineSettingsRow[],
+): Promise<DeadlineSettingsRow[]> {
+  if (!settingsRows.some((settings) =>
+    settings.vat_registered === true && settings.moms_period === 'yearly',
+  )) {
+    return settingsRows
+  }
+  const periods = await fetchFiscalPeriodsForDeadlines(supabase)
+  const byCompany = new Map<string, FiscalPeriodForDeadlines[]>()
+  for (const period of periods) {
+    const current = byCompany.get(period.company_id) ?? []
+    current.push(period)
+    byCompany.set(period.company_id, current)
+  }
+  return settingsRows.map((settings) => {
+    if (settings.vat_registered !== true || settings.moms_period !== 'yearly') {
+      return settings
+    }
+    return {
+      ...settings,
+      // Keep a missing company unresolved so detection selects it for repair
+      // and the generator retries with a company-scoped query.
+      fiscal_periods: byCompany.get(settings.company_id),
+    }
+  })
+}
+
+function assertAnnualVatFiscalPeriodsAvailable(
+  settings: CompanySettingsForDeadlines,
+): void {
+  if (!settings.vat_registered || settings.moms_period !== 'yearly') return
+  if (settings.fiscal_periods === undefined) {
+    throw new Error('Actual fiscal periods are required for yearly VAT deadlines')
+  }
+  if (settings.fiscal_periods.length === 0) {
+    throw new Error('No fiscal periods found for yearly VAT deadline generation')
   }
 }
 
@@ -254,10 +326,8 @@ export function shouldRegenerateTaxDeadlines(
  * conservative choice for a compliance surface: a stale filing date is a
  * missed filing, a lost title edit is cosmetic.
  */
-const SUPERSEDED_ROW_SELECT =
-  'tax_deadline_type, tax_period, status, status_changed_at, notes, due_time, priority, customer_id' as const
-
 interface SupersededDeadlineRow {
+  id: string
   tax_deadline_type: string | null
   tax_period: string | null
   status: DeadlineStatus | null
@@ -266,6 +336,7 @@ interface SupersededDeadlineRow {
   due_time: string | null
   priority: 'critical' | 'important' | 'normal' | null
   customer_id: string | null
+  linked_report_period: Record<string, unknown> | null
 }
 
 /**
@@ -287,6 +358,193 @@ function formatDateISO(date: Date): string {
   return `${year}-${month}-${day}`
 }
 
+const VAT_DEADLINE_TYPES = new Set<TaxDeadlineType>([
+  'moms_monthly',
+  'moms_quarterly',
+  'moms_yearly',
+])
+
+function lastDayOfMonth(year: number, month: number): number {
+  return new Date(year, month, 0).getDate()
+}
+
+/** Resolve the report-period end represented by a generated VAT deadline. */
+function vatDeadlinePeriodEnd(
+  type: TaxDeadlineType,
+  period: string,
+  settings: CompanySettingsForDeadlines,
+  linkedReportPeriod?: Record<string, unknown> | null,
+): string | null {
+  if (type === 'moms_monthly') {
+    const match = /^(\d{4})-(\d{2})$/.exec(period)
+    if (!match) return null
+    const year = Number(match[1])
+    const month = Number(match[2])
+    if (month < 1 || month > 12) return null
+    return `${match[1]}-${match[2]}-${String(lastDayOfMonth(year, month)).padStart(2, '0')}`
+  }
+
+  if (type === 'moms_quarterly') {
+    const match = /^(\d{4})-Q([1-4])$/.exec(period)
+    if (!match) return null
+    const year = Number(match[1])
+    const month = Number(match[2]) * 3
+    return `${match[1]}-${String(month).padStart(2, '0')}-${String(lastDayOfMonth(year, month)).padStart(2, '0')}`
+  }
+
+  if (type === 'moms_yearly') {
+    const exactEnd = linkedReportPeriod?.fiscalPeriodEnd
+    return typeof exactEnd === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(exactEnd)
+      ? exactEnd
+      : null
+  }
+
+  return null
+}
+
+function isVatDeadlineWhollyBeforeLiability(
+  type: TaxDeadlineType,
+  period: string,
+  settings: CompanySettingsForDeadlines,
+  linkedReportPeriod?: Record<string, unknown> | null,
+): boolean {
+  if (!settings.vat_liability_start_date || !VAT_DEADLINE_TYPES.has(type)) {
+    return false
+  }
+  const periodEnd = vatDeadlinePeriodEnd(type, period, settings, linkedReportPeriod)
+  return periodEnd !== null && periodEnd < settings.vat_liability_start_date
+}
+
+function fiscalPeriodIdFromLinkedPeriod(
+  linkedReportPeriod: Record<string, unknown> | null | undefined,
+): string | null {
+  const id = linkedReportPeriod?.fiscalPeriodId
+  return typeof id === 'string' && id.length > 0 ? id : null
+}
+
+function deadlineObligationKey(
+  type: string | null,
+  period: string | null,
+  linkedReportPeriod?: Record<string, unknown> | null,
+): string {
+  const fiscalPeriodId = type === 'moms_yearly'
+    ? fiscalPeriodIdFromLinkedPeriod(linkedReportPeriod)
+    : null
+  return fiscalPeriodId
+    ? `${type}:fiscal-period:${fiscalPeriodId}`
+    : `${type}:${period}`
+}
+
+interface PreservedDeadlineIdentityRow {
+  tax_deadline_type: string | null
+  tax_period: string | null
+  linked_report_period: Record<string, unknown> | null
+}
+
+function hasOwnField(value: Record<string, unknown>, field: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, field)
+}
+
+function legacyAnnualVatYears(
+  row: PreservedDeadlineIdentityRow,
+): { startYear: number; endYear: number } | null {
+  if (
+    row.tax_deadline_type !== 'moms_yearly' ||
+    fiscalPeriodIdFromLinkedPeriod(row.linked_report_period)
+  ) {
+    return null
+  }
+
+  const linked = row.linked_report_period
+  if (linked && hasOwnField(linked, 'fiscalPeriodId')) return null
+
+  const startYears: number[] = []
+  const endYears: number[] = []
+  const calendarMatch = /^(\d{4})$/.exec(row.tax_period ?? '')
+  const brokenMatch = /^(\d{4})\/(\d{4})$/.exec(row.tax_period ?? '')
+  if (calendarMatch) {
+    const year = Number(calendarMatch[1])
+    startYears.push(year)
+    endYears.push(year)
+  } else if (brokenMatch) {
+    startYears.push(Number(brokenMatch[1]))
+    endYears.push(Number(brokenMatch[2]))
+  } else {
+    return null
+  }
+
+  if (linked) {
+    if (hasOwnField(linked, 'year')) {
+      if (!Number.isInteger(linked.year)) return null
+      startYears.push(linked.year as number)
+      endYears.push(linked.year as number)
+    }
+
+    const hasStartYear = hasOwnField(linked, 'startYear')
+    const hasEndYear = hasOwnField(linked, 'endYear')
+    if (hasStartYear !== hasEndYear) return null
+    if (hasStartYear) {
+      if (!Number.isInteger(linked.startYear) || !Number.isInteger(linked.endYear)) {
+        return null
+      }
+      startYears.push(linked.startYear as number)
+      endYears.push(linked.endYear as number)
+    }
+  }
+
+  const uniqueStartYears = new Set(startYears)
+  const uniqueEndYears = new Set(endYears)
+  if (uniqueStartYears.size !== 1 || uniqueEndYears.size !== 1) return null
+
+  return {
+    startYear: startYears[0],
+    endYear: endYears[0],
+  }
+}
+
+function resolveLegacyAnnualVatFiscalPeriod(
+  row: PreservedDeadlineIdentityRow,
+  fiscalPeriods: FiscalPeriodForDeadlines[],
+): FiscalPeriodForDeadlines | null {
+  const years = legacyAnnualVatYears(row)
+  if (!years) return null
+
+  const candidates = fiscalPeriods.filter((period) =>
+    /^\d{4}-\d{2}-\d{2}$/.test(period.period_start) &&
+    /^\d{4}-\d{2}-\d{2}$/.test(period.period_end) &&
+    period.period_start <= period.period_end &&
+    Number(period.period_start.slice(0, 4)) === years.startYear &&
+    Number(period.period_end.slice(0, 4)) === years.endYear,
+  )
+
+  const exactBoundsMatches = candidates.filter((period) =>
+    getActualFiscalPeriodLabel(period.period_start, period.period_end) === row.tax_period,
+  )
+  const matches = exactBoundsMatches.length > 0 ? exactBoundsMatches : candidates
+  return matches.length === 1 ? matches[0] : null
+}
+
+function preservedDeadlineObligationKeys(
+  row: PreservedDeadlineIdentityRow,
+  fiscalPeriods: FiscalPeriodForDeadlines[],
+): string[] {
+  const keys = [deadlineObligationKey(
+    row.tax_deadline_type,
+    row.tax_period,
+    row.linked_report_period,
+  )]
+  const fiscalPeriod = resolveLegacyAnnualVatFiscalPeriod(row, fiscalPeriods)
+  if (fiscalPeriod) {
+    keys.push(`moms_yearly:fiscal-period:${fiscalPeriod.id}`)
+  }
+  return keys
+}
+
+function isLegacyAnnualVatRow(row: PreservedDeadlineIdentityRow): boolean {
+  return row.tax_deadline_type === 'moms_yearly' &&
+    fiscalPeriodIdFromLinkedPeriod(row.linked_report_period) === null
+}
+
 /**
  * Generate all tax deadlines for a user based on their company settings
  */
@@ -296,6 +554,17 @@ export async function generateTaxDeadlinesForUser(
   settings: CompanySettingsForDeadlines,
   years: number[] = []
 ): Promise<{ created: number; deleted: number }> {
+  if (
+    settings.vat_registered &&
+    settings.moms_period === 'yearly' &&
+    settings.fiscal_periods === undefined
+  ) {
+    settings = {
+      ...settings,
+      fiscal_periods: await fetchFiscalPeriodsForDeadlines(supabase, companyId),
+    }
+  }
+  assertAnnualVatFiscalPeriodsAvailable(settings)
   if (settings.tax_assessment_notices === undefined) {
     const notices = await fetchActiveTaxAssessmentNotices(supabase, companyId)
     settings = {
@@ -362,7 +631,7 @@ export async function generateTaxDeadlinesForUser(
   const completedFloor = `${Math.min(...years) - 1}-01-01`
   const { data: preservedRows, error: preservedRowsError } = await supabase
     .from('deadlines')
-    .select('tax_deadline_type, tax_period')
+    .select('tax_deadline_type, tax_period, linked_report_period')
     .eq('company_id', companyId)
     .eq('source', 'system')
     .or('is_completed.eq.true,dismissed_at.not.is.null')
@@ -373,19 +642,19 @@ export async function generateTaxDeadlinesForUser(
     throw preservedRowsError
   }
 
-  const completedKeys = new Set(
-    (preservedRows ?? []).map(
-      (row: { tax_deadline_type: string | null; tax_period: string | null }) =>
-        `${row.tax_deadline_type}:${row.tax_period}`,
-    ),
-  )
+  const completedKeys = new Set<string>()
+  for (const row of (preservedRows ?? []) as PreservedDeadlineIdentityRow[]) {
+    for (const key of preservedDeadlineObligationKeys(row, settings.fiscal_periods ?? [])) {
+      completedKeys.add(key)
+    }
+  }
 
   // Everything the user (or the status flow) put on the rows about to be
   // replaced, keyed by the same tax_deadline_type:tax_period identity the
-  // completed/dismissed check uses. See SUPERSEDED_ROW_SELECT for the rule.
+  // completed/dismissed check uses. See the superseded-row field selection above for the rule.
   const { data: supersededRows, error: supersededError } = await supabase
     .from('deadlines')
-    .select(SUPERSEDED_ROW_SELECT)
+    .select('id, tax_deadline_type, tax_period, status, status_changed_at, notes, due_time, priority, customer_id, linked_report_period')
     .eq('company_id', companyId)
     .eq('source', 'system')
     .eq('is_completed', false)
@@ -396,10 +665,62 @@ export async function generateTaxDeadlinesForUser(
     throw supersededError
   }
 
+  const pendingRows = (supersededRows ?? []) as SupersededDeadlineRow[]
   const supersededByKey = new Map<string, SupersededDeadlineRow>()
-  for (const row of (supersededRows ?? []) as SupersededDeadlineRow[]) {
-    supersededByKey.set(`${row.tax_deadline_type}:${row.tax_period}`, row)
+  const authoritativeAnnualCounts = new Map<string, number>()
+  for (const row of pendingRows) {
+    const key = deadlineObligationKey(
+      row.tax_deadline_type,
+      row.tax_period,
+      row.linked_report_period,
+    )
+    supersededByKey.set(deadlineObligationKey(
+      row.tax_deadline_type,
+      row.tax_period,
+      row.linked_report_period,
+    ), row)
+    if (row.tax_deadline_type === 'moms_yearly' && !isLegacyAnnualVatRow(row)) {
+      authoritativeAnnualCounts.set(key, (authoritativeAnnualCounts.get(key) ?? 0) + 1)
+    }
   }
+
+  // Legacy annual rows have no authoritative fiscal-period UUID. Reuse the
+  // completed/dismissed resolver, but only carry a row forward when exactly
+  // one legacy candidate maps to a key that has no canonical pending row.
+  const legacyRows = pendingRows.filter(isLegacyAnnualVatRow)
+  const legacyKeyById = new Map<string, string>()
+  const legacyRowsByKey = new Map<string, SupersededDeadlineRow[]>()
+  for (const row of legacyRows) {
+    const fiscalPeriod = resolveLegacyAnnualVatFiscalPeriod(
+      row,
+      settings.fiscal_periods ?? [],
+    )
+    if (!fiscalPeriod) continue
+    const key = `moms_yearly:fiscal-period:${fiscalPeriod.id}`
+    legacyKeyById.set(row.id, key)
+    const candidates = legacyRowsByKey.get(key) ?? []
+    candidates.push(row)
+    legacyRowsByKey.set(key, candidates)
+  }
+  for (const [key, candidates] of legacyRowsByKey) {
+    if (candidates.length === 1 && (authoritativeAnnualCounts.get(key) ?? 0) === 0) {
+      supersededByKey.set(key, candidates[0])
+    }
+  }
+
+  const stalePreLiabilityVatDeadlineIds = pendingRows
+    .filter((row) =>
+      row.id &&
+      row.tax_deadline_type &&
+      row.tax_period &&
+      isVatDeadlineWhollyBeforeLiability(
+        row.tax_deadline_type as TaxDeadlineType,
+        row.tax_period,
+        settings,
+        row.linked_report_period,
+      ),
+    )
+    .map((row) => row.id)
 
   // Generate new deadlines. Every row carries the identical key set: a
   // PostgREST bulk insert rejects objects whose keys differ (PGRST102), so
@@ -434,6 +755,15 @@ export async function generateTaxDeadlinesForUser(
       const instances = config.generateDates(year, settings)
 
       for (const instance of instances) {
+        const linkedReportPeriod = createLinkedReportPeriod(instance, config.type)
+        if (isVatDeadlineWhollyBeforeLiability(
+          config.type,
+          instance.period,
+          settings,
+          linkedReportPeriod,
+        )) {
+          continue
+        }
         // Create the raw deadline date
         const rawDate = new Date(instance.year, instance.month, instance.day)
 
@@ -455,13 +785,17 @@ export async function generateTaxDeadlinesForUser(
           continue
         }
 
-        const deadlineKey = `${config.type}:${instance.period}`
+        const deadlineKey = deadlineObligationKey(
+          config.type,
+          instance.period,
+          linkedReportPeriod,
+        )
         if (completedKeys.has(deadlineKey)) {
           continue
         }
 
         // The row this one replaces, if any: its user-owned columns and its
-        // manually reported progress carry across (see SUPERSEDED_ROW_SELECT).
+        // manually reported progress carry across (see the superseded-row field selection above).
         const superseded = supersededByKey.get(deadlineKey)
 
         // Determine initial status based on days until deadline, keeping a
@@ -475,9 +809,6 @@ export async function generateTaxDeadlinesForUser(
 
         // Generate title from template
         const title = config.titleTemplate.replace('{periodLabel}', instance.periodLabel)
-
-        // Create linked report period data
-        const linkedReportPeriod = createLinkedReportPeriod(instance, config.type)
 
         deadlines.push({
           company_id: companyId,
@@ -509,11 +840,33 @@ export async function generateTaxDeadlinesForUser(
   const uniqueDeadlines = Array.from(
     new Map(
       deadlines.map((deadline) => [
-        `${deadline.tax_deadline_type}:${deadline.tax_period}`,
+        deadlineObligationKey(
+          deadline.tax_deadline_type,
+          deadline.tax_period,
+          deadline.linked_report_period,
+        ),
         deadline,
       ]),
     ).values(),
   )
+  const replacementKeys = new Set(uniqueDeadlines.map((deadline) => deadlineObligationKey(
+    deadline.tax_deadline_type,
+    deadline.tax_period,
+    deadline.linked_report_period,
+  )))
+  const replaceableLegacyAnnualIds = legacyRows
+    .filter((row) => {
+      const key = legacyKeyById.get(row.id)
+      return key != null &&
+        (legacyRowsByKey.get(key)?.length ?? 0) === 1 &&
+        (authoritativeAnnualCounts.get(key) ?? 0) === 0 &&
+        replacementKeys.has(key)
+    })
+    .map((row) => row.id)
+  const replaceableLegacyAnnualIdSet = new Set(replaceableLegacyAnnualIds)
+  const protectedLegacyAnnualIds = legacyRows
+    .filter((row) => !replaceableLegacyAnnualIdSet.has(row.id))
+    .map((row) => row.id)
 
   // Insert the replacement rows BEFORE deleting the old set. A failed insert
   // then leaves the previous deadlines intact: the old delete-first order
@@ -559,11 +912,35 @@ export async function generateTaxDeadlinesForUser(
     .eq('source', 'system')
     .eq('is_completed', false)
     .is('dismissed_at', null)
-    .gte('due_date', todayIso)
-    .lte('due_date', endDate)
+
+  // The ordinary replacement window starts today. A pre-liability VAT row or
+  // a proven legacy annual row replaced above can have an already-passed
+  // filing date, so include only those known row IDs in the cleanup filter.
+  // This removes stale VAT obligations without widening deletion to old
+  // non-VAT or user-created deadlines.
+  const explicitDeletionIds = Array.from(new Set([
+    ...stalePreLiabilityVatDeadlineIds,
+    ...replaceableLegacyAnnualIds,
+  ]))
+  if (explicitDeletionIds.length > 0) {
+    deleteQuery = deleteQuery.or(
+      `and(due_date.gte.${todayIso},due_date.lte.${endDate}),id.in.(${explicitDeletionIds.join(',')})`,
+    )
+  } else {
+    deleteQuery = deleteQuery
+      .gte('due_date', todayIso)
+      .lte('due_date', endDate)
+  }
 
   if (newIds.length > 0) {
     deleteQuery = deleteQuery.not('id', 'in', `(${newIds.join(',')})`)
+  }
+  if (protectedLegacyAnnualIds.length > 0) {
+    deleteQuery = deleteQuery.not(
+      'id',
+      'in',
+      `(${protectedLegacyAnnualIds.join(',')})`,
+    )
   }
 
   const { data: deletedData, error: deleteError } = await deleteQuery.select('id')
@@ -587,6 +964,20 @@ function createLinkedReportPeriod(
   _type: TaxDeadlineType
 ): Record<string, unknown> | null {
   const period = instance.period
+
+  if (
+    instance.fiscalPeriodId &&
+    instance.fiscalPeriodStart &&
+    instance.fiscalPeriodEnd
+  ) {
+    return {
+      year: Number(instance.fiscalPeriodEnd.slice(0, 4)),
+      period: 1,
+      fiscalPeriodId: instance.fiscalPeriodId,
+      fiscalPeriodStart: instance.fiscalPeriodStart,
+      fiscalPeriodEnd: instance.fiscalPeriodEnd,
+    }
+  }
 
   // Parse the period string
   if (period.includes('-Q')) {
@@ -639,6 +1030,7 @@ interface UpcomingDeadlineCompanyRow {
   due_date: string | null
   is_completed: boolean | null
   dismissed_at: string | null
+  linked_report_period: Record<string, unknown> | null
 }
 
 // The due date is part of the identity: rows created by older schedule logic
@@ -648,17 +1040,9 @@ function deadlineIdentity(
   type: string | null,
   period: string | null,
   dueDate: string | null,
+  linkedReportPeriod?: Record<string, unknown> | null,
 ): string {
-  return `${type}:${period}:${dueDate}`
-}
-
-// Completed and dismissed rows use the looser type:period identity (no due
-// date): a filed or opted-out obligation is satisfied even when its stored
-// date comes from a superseded schedule, and the generator never replaces
-// either kind, so flagging them by date would make the repair loop re-run
-// for the same company every day without ever converging.
-function completedIdentity(type: string | null, period: string | null): string {
-  return `${type}:${period}`
+  return `${deadlineObligationKey(type, period, linkedReportPeriod)}:${dueDate}`
 }
 
 export function getExpectedUpcomingDeadlineKeys(
@@ -666,6 +1050,7 @@ export function getExpectedUpcomingDeadlineKeys(
   years: number[] = [],
   fromDate: Date = new Date(),
 ): Set<string> {
+  assertAnnualVatFiscalPeriodsAvailable(settings)
   if (years.length === 0) {
     const currentYear = fromDate.getFullYear()
     years = [currentYear, currentYear + 1]
@@ -679,6 +1064,15 @@ export function getExpectedUpcomingDeadlineKeys(
     const horizonEnd = horizonEndFor(config.type, today)
     for (const year of years) {
       for (const instance of config.generateDates(year, settings)) {
+        const linkedReportPeriod = createLinkedReportPeriod(instance, config.type)
+        if (isVatDeadlineWhollyBeforeLiability(
+          config.type,
+          instance.period,
+          settings,
+          linkedReportPeriod,
+        )) {
+          continue
+        }
         const rawDate = new Date(instance.year, instance.month, instance.day)
         const adjustedDate = config.skipBankingDayAdjustment
           ? rawDate
@@ -686,7 +1080,12 @@ export function getExpectedUpcomingDeadlineKeys(
         // Same window as the generator: past rows and rows beyond the
         // rolling horizon are never expected.
         if (adjustedDate >= today && adjustedDate <= horizonEnd) {
-          keys.add(deadlineIdentity(config.type, instance.period, formatDateISO(adjustedDate)))
+          keys.add(deadlineIdentity(
+            config.type,
+            instance.period,
+            formatDateISO(adjustedDate),
+            linkedReportPeriod,
+          ))
         }
       }
     }
@@ -703,14 +1102,28 @@ export function findSettingsMissingUpcomingDeadlines(
 ): DeadlineSettingsRow[] {
   const actualKeysByCompany = new Map<string, Set<string>>()
   const completedKeysByCompany = new Map<string, Set<string>>()
+  const settingsByCompany = new Map(
+    settingsRows.map((settings) => [settings.company_id, settings]),
+  )
   for (const row of upcomingDeadlineRows) {
     const keys = actualKeysByCompany.get(row.company_id) ?? new Set<string>()
-    keys.add(deadlineIdentity(row.tax_deadline_type, row.tax_period, row.due_date))
+    keys.add(deadlineIdentity(
+      row.tax_deadline_type,
+      row.tax_period,
+      row.due_date,
+      row.linked_report_period,
+    ))
     actualKeysByCompany.set(row.company_id, keys)
 
     if (row.is_completed || row.dismissed_at) {
       const completed = completedKeysByCompany.get(row.company_id) ?? new Set<string>()
-      completed.add(completedIdentity(row.tax_deadline_type, row.tax_period))
+      const companySettings = settingsByCompany.get(row.company_id)
+      for (const key of preservedDeadlineObligationKeys(
+        row,
+        companySettings?.fiscal_periods ?? [],
+      )) {
+        completed.add(key)
+      }
       completedKeysByCompany.set(row.company_id, completed)
     }
   }
@@ -802,7 +1215,7 @@ export async function backfillMissingTaxDeadlines(
     fetchAllRows<UpcomingDeadlineCompanyRow>(({ from, to }) =>
       supabase
         .from('deadlines')
-        .select('id, company_id, tax_deadline_type, tax_period, due_date, is_completed, dismissed_at')
+        .select('id, company_id, tax_deadline_type, tax_period, due_date, is_completed, dismissed_at, linked_report_period')
         .eq('source', 'system')
         .eq('deadline_type', 'tax')
         .gte('due_date', pastFloor)
@@ -810,7 +1223,17 @@ export async function backfillMissingTaxDeadlines(
         .range(from, to),
     ),
   ])
-  const allSettings = await hydrateTaxAssessmentNotices(supabase, rawSettings)
+  const settingsWithNotices = await hydrateTaxAssessmentNotices(supabase, rawSettings)
+  let allSettings: DeadlineSettingsRow[]
+  try {
+    allSettings = await hydrateFiscalPeriods(supabase, settingsWithNotices)
+  } catch (err) {
+    log.error('Error fetching fiscal periods for annual VAT deadline recovery:', err)
+    // Annual settings remain unhydrated and are therefore selected for repair,
+    // where their company-scoped generator query fails independently. Monthly
+    // and quarterly companies can still be detected and repaired.
+    allSettings = settingsWithNotices
+  }
 
   const missingSettings = findSettingsMissingUpcomingDeadlines(allSettings, upcomingDeadlineRows)
   let companiesRepaired = 0

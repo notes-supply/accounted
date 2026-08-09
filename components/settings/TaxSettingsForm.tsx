@@ -165,6 +165,20 @@ export function TaxSettingsForm({
           </SettingsRow>
 
           <SettingsRow
+            label={t('vat_liability_start_label')}
+            htmlFor="vat_liability_start_date"
+            help={t('vat_liability_start_help')}
+            align="baseline"
+          >
+            <SettingsInput
+              id="vat_liability_start_date"
+              name="vat_liability_start_date"
+              type="date"
+              defaultValue={settings.vat_liability_start_date || ''}
+            />
+          </SettingsRow>
+
+          <SettingsRow
             label={t('vat_taxable_base_over_40m_label')}
             htmlFor="vat_taxable_base_over_40m"
             help={t('vat_taxable_base_over_40m_help')}

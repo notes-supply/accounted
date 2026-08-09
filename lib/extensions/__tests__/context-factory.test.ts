@@ -110,6 +110,31 @@ describe('createExtensionContext', () => {
     expect(result).toBeNull()
   })
 
+  it('settings.get() propagates query errors instead of treating state as missing', async () => {
+    const { supabase, mockResult } = createMockSupabase()
+    mockResult({ data: null, error: { message: 'connection reset' } })
+
+    const ctx = createExtensionContext(supabase as never, 'user-1', 'company-1', 'test-ext')
+
+    await expect(ctx.settings.get('submission_202606')).rejects.toThrow(
+      /extension_data get failed.*connection reset/,
+    )
+  })
+
+  it('settings.get() rejects multiple stored rows instead of treating state as missing', async () => {
+    const { supabase, mockResult } = createMockSupabase()
+    mockResult({
+      data: null,
+      error: { code: 'PGRST116', message: 'JSON object requested, multiple rows returned' },
+    })
+
+    const ctx = createExtensionContext(supabase as never, 'user-1', 'company-1', 'test-ext')
+
+    await expect(ctx.settings.get('submission_202606')).rejects.toThrow(
+      /multiple rows returned/,
+    )
+  })
+
   it('settings.set() upserts into extension_data table', async () => {
     const { supabase, mockResult } = createMockSupabase()
     mockResult({ data: null, error: null })

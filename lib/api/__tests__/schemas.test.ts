@@ -1367,6 +1367,20 @@ describe('UpdateSettingsSchema', () => {
     expect(result.success).toBe(true)
   })
 
+  it('accepts an ISO VAT liability start date', () => {
+    const result = UpdateSettingsSchema.safeParse({
+      vat_liability_start_date: '2026-05-01',
+    })
+    expect(result.success).toBe(true)
+  })
+
+  it('rejects malformed and impossible VAT liability start dates', () => {
+    for (const vat_liability_start_date of ['01/05/2026', '2026-99-99']) {
+      const result = UpdateSettingsSchema.safeParse({ vat_liability_start_date })
+      expect(result.success).toBe(false)
+    }
+  })
+
   it('accepts vat_registered: true without vat_number at schema level (route-level check uses effective state)', () => {
     const result = UpdateSettingsSchema.safeParse({
       vat_registered: true,
@@ -2079,6 +2093,16 @@ describe('VatDeclarationQuerySchema', () => {
       period: '1',
     })
     expect(result.success).toBe(false)
+  })
+
+  it.each([
+    { periodType: 'monthly', year: '2025', period: '1.5' },
+    { periodType: 'monthly', year: '2e3', period: '1' },
+    { periodType: 'monthly', year: '2025tail', period: '1' },
+    { periodType: 'quarterly', year: '2025', period: '5' },
+    { periodType: 'yearly', year: '2025', period: '2' },
+  ])('rejects non-canonical or type-specific VAT period input: $periodType $year $period', (input) => {
+    expect(VatDeclarationQuerySchema.safeParse(input).success).toBe(false)
   })
 })
 

@@ -6,6 +6,7 @@ import type {
 } from '@/types'
 import type { VatCheckAccountTotals } from './vat-declaration-checks'
 import { fetchDynamicRuta05Accounts } from './vat-revenue-accounts'
+import { parseVatPeriodInput } from '@/lib/vat/period-input'
 
 /**
  * Calculate VAT declaration (Momsdeklaration) for a given period.
@@ -170,19 +171,20 @@ export function calculatePeriodDates(
   year: number,
   period: number
 ): { start: string; end: string } {
+  const validated = parseVatPeriodInput({ periodType, year, period })
   let startMonth: number
   let endMonth: number
 
-  switch (periodType) {
+  switch (validated.periodType) {
     case 'monthly':
       // period is 1-12
-      startMonth = period
-      endMonth = period
+      startMonth = validated.period
+      endMonth = validated.period
       break
     case 'quarterly':
       // period is 1-4
-      startMonth = (period - 1) * 3 + 1
-      endMonth = period * 3
+      startMonth = (validated.period - 1) * 3 + 1
+      endMonth = validated.period * 3
       break
     case 'yearly':
       // period is 1
@@ -194,8 +196,8 @@ export function calculatePeriodDates(
       endMonth = 12
   }
 
-  const startDate = new Date(year, startMonth - 1, 1)
-  const endDate = new Date(year, endMonth, 0) // Last day of end month
+  const startDate = new Date(validated.year, startMonth - 1, 1)
+  const endDate = new Date(validated.year, endMonth, 0) // Last day of end month
 
   return {
     start: formatDate(startDate),
@@ -232,9 +234,9 @@ function round(value: number): number {
  * can be extended or shortened (up to 18 months for a first/changed year per
  * BFL 3 kap 3 §), so a calendar Jan-Dec span would silently drop part of an
  * extended year (e.g. a first year 2025-07-03 → 2026-12-31). When the caller
- * supplies the fiscal period we therefore use its actual bounds. If the period
- * can't be resolved we fall back to the calendar span so behaviour degrades
- * gracefully instead of erroring.
+ * supplies the fiscal period we therefore use its actual bounds. Annual VAT
+ * fails closed when the fiscal period cannot be resolved: a calendar fallback
+ * can silently report the wrong broken fiscal year.
  */
 export async function resolvePeriodDates(
   supabase: SupabaseClient,
@@ -243,18 +245,37 @@ export async function resolvePeriodDates(
   year: number,
   period: number,
   fiscalPeriodId?: string
-): Promise<{ start: string; end: string }> {
-  if (periodType === 'yearly') {
+): Promise<{
+  start: string
+  end: string
+  fiscalPeriodId?: string
+  fiscalPeriodStart?: string
+  fiscalPeriodEnd?: string
+}> {
+  const validated = parseVatPeriodInput({ periodType, year, period })
+  let dates: { start: string; end: string } | null = null
+  let resolvedFiscalPeriodId: string | undefined
+  let fiscalPeriodBounds: { start: string; end: string } | undefined
+  if (validated.periodType === 'yearly') {
     if (fiscalPeriodId) {
-      const { data: fp } = await supabase
+      const { data: fp, error: fiscalPeriodError } = await supabase
         .from('fiscal_periods')
-        .select('period_start, period_end')
+        .select('id, period_start, period_end')
         .eq('id', fiscalPeriodId)
         .eq('company_id', companyId)
         .maybeSingle()
-      if (fp?.period_start && fp?.period_end) {
-        return { start: fp.period_start, end: fp.period_end }
+      if (fiscalPeriodError) {
+        throw new Error(`Failed to resolve annual fiscal period: ${fiscalPeriodError.message}`)
       }
+      if (!fp?.period_start || !fp?.period_end) {
+        throw new Error(`No fiscal period found for id ${fiscalPeriodId}`)
+      }
+      if (fp.period_end.slice(0, 4) !== String(validated.year)) {
+        throw new Error(`Fiscal period ${fiscalPeriodId} does not end in ${validated.year}`)
+      }
+      dates = { start: fp.period_start, end: fp.period_end }
+      fiscalPeriodBounds = dates
+      resolvedFiscalPeriodId = fiscalPeriodId
     } else {
       // No explicit fiscal period: resolve the räkenskapsår ending in `year`
       // instead of assuming a calendar FY. Helårsmoms is filed per
@@ -262,21 +283,78 @@ export async function resolvePeriodDates(
       // calendar-year assumption would put both the redovisningsperiod and
       // the figures on the wrong period. For calendar-FY companies this
       // resolves to Jan-Dec of `year`, identical to the arithmetic fallback.
-      const { data: fp } = await supabase
+      const { data: fiscalPeriodRows, error: fiscalPeriodError } = await supabase
         .from('fiscal_periods')
-        .select('period_start, period_end')
+        .select('id, period_start, period_end')
         .eq('company_id', companyId)
-        .gte('period_end', `${year}-01-01`)
-        .lte('period_end', `${year}-12-31`)
+        .gte('period_end', `${validated.year}-01-01`)
+        .lte('period_end', `${validated.year}-12-31`)
         .order('period_end', { ascending: false })
-        .limit(1)
-        .maybeSingle()
-      if (fp?.period_start && fp?.period_end) {
-        return { start: fp.period_start, end: fp.period_end }
+        .limit(2)
+      if (fiscalPeriodError) {
+        throw new Error(`Failed to resolve annual fiscal period: ${fiscalPeriodError.message}`)
       }
+      // Supabase returns an array here. The object normalization keeps older
+      // unit-test doubles compatible while production still checks two rows.
+      const fiscalPeriods = Array.isArray(fiscalPeriodRows)
+        ? fiscalPeriodRows
+        : fiscalPeriodRows ? [fiscalPeriodRows] : []
+      if (fiscalPeriods.length > 1) {
+        throw new Error(
+          `Multiple fiscal periods end in ${validated.year}; fiscal_period_id is required`,
+        )
+      }
+      const fp = fiscalPeriods[0]
+      if (!fp?.period_start || !fp?.period_end) {
+        throw new Error(`No fiscal period found ending in ${validated.year}`)
+      }
+      dates = { start: fp.period_start, end: fp.period_end }
+      fiscalPeriodBounds = dates
+      resolvedFiscalPeriodId = fp.id as string
     }
   }
-  return calculatePeriodDates(periodType, year, period)
+  dates ??= calculatePeriodDates(validated.periodType, validated.year, validated.period)
+
+  const boundedDates = await applyVatLiabilityBoundary(supabase, companyId, dates)
+  return {
+    ...boundedDates,
+    ...(resolvedFiscalPeriodId ? { fiscalPeriodId: resolvedFiscalPeriodId } : {}),
+    ...(fiscalPeriodBounds ? {
+      fiscalPeriodStart: fiscalPeriodBounds.start,
+      fiscalPeriodEnd: fiscalPeriodBounds.end,
+    } : {}),
+  }
+}
+
+/** Apply the legal VAT-liability boundary to an already resolved period. */
+export async function applyVatLiabilityBoundary(
+  supabase: SupabaseClient,
+  companyId: string,
+  dates: { start: string; end: string },
+): Promise<{ start: string; end: string }> {
+
+  // The first VAT period may start after the fiscal period itself. This is
+  // common for newly registered companies, including retroactive decisions.
+  // Clamp only the period containing the liability start: later periods retain
+  // their ordinary bounds, while ledger activity before VAT liability never
+  // leaks into the first declaration.
+  const { data: settings, error: settingsError } = await supabase
+    .from('company_settings')
+    .select('vat_liability_start_date')
+    .eq('company_id', companyId)
+    .maybeSingle()
+  if (settingsError) {
+    throw new Error(`Failed to resolve VAT liability start: ${settingsError.message}`)
+  }
+  const vatStart = settings?.vat_liability_start_date as string | null | undefined
+  if (vatStart && dates.end < vatStart) {
+    throw new Error(`Requested VAT period ends before VAT liability starts on ${vatStart}`)
+  }
+  if (vatStart && vatStart >= dates.start && vatStart <= dates.end) {
+    return { start: vatStart, end: dates.end }
+  }
+
+  return dates
 }
 
 /**
@@ -507,10 +585,16 @@ export async function calculateVatDeclaration(
   period: number,
   options: { fiscalPeriodId?: string } = {}
 ): Promise<VatDeclaration> {
+  const validated = parseVatPeriodInput({ periodType, year, period })
   // For yearly VAT this resolves to the räkenskapsår bounds (when a fiscal
   // period is supplied), not the calendar year: see resolvePeriodDates.
-  const { start, end } = await resolvePeriodDates(
-    supabase, companyId, periodType, year, period, options.fiscalPeriodId
+  const { start, end, fiscalPeriodId, fiscalPeriodStart, fiscalPeriodEnd } = await resolvePeriodDates(
+    supabase,
+    companyId,
+    validated.periodType,
+    validated.year,
+    validated.period,
+    options.fiscalPeriodId,
   )
 
   // Which of the company's OWN class 3 accounts count as momspliktig
@@ -581,7 +665,16 @@ export async function calculateVatDeclaration(
   }
 
   return {
-    period: { type: periodType, year, period, start, end },
+    period: {
+      type: validated.periodType,
+      year: validated.year,
+      period: validated.period,
+      start,
+      end,
+      ...(fiscalPeriodId ? { fiscalPeriodId } : {}),
+      ...(fiscalPeriodStart ? { fiscalPeriodStart } : {}),
+      ...(fiscalPeriodEnd ? { fiscalPeriodEnd } : {}),
+    },
     rutor,
     // The 2645/2647 pair travels with the declaration so an HTTP caller can run
     // the sharp RC_INPUT_VAT_MISMATCH comparison instead of the ruta 48

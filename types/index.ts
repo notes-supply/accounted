@@ -263,6 +263,7 @@ export interface CompanySettings {
   f_skatt: boolean
   vat_registered: boolean
   vat_number: string | null
+  vat_liability_start_date: string | null
   moms_period: MomsPeriod | null
   periodisk_sammanstallning_period: 'monthly' | 'quarterly'
   vat_taxable_base_over_40m: boolean
@@ -2949,6 +2950,9 @@ export interface VatDeclaration {
     period: number  // 1-12 for monthly, 1-4 for quarterly, 1 for yearly
     start: string   // YYYY-MM-DD
     end: string     // YYYY-MM-DD
+    fiscalPeriodId?: string
+    fiscalPeriodStart?: string
+    fiscalPeriodEnd?: string
   }
   rutor: VatDeclarationRutor
   /**

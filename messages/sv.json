@@ -2008,6 +2008,8 @@
     "vat_registered_help": "Obligatoriskt om omsättningen överstiger 120 000 kr per år.",
     "vat_number_label": "Momsregistreringsnummer",
     "vat_number_help": "Format: SE + organisationsnummer + 01",
+    "vat_liability_start_label": "Momspliktig från och med",
+    "vat_liability_start_help": "Datumet i Skatteverkets beslut. Den första momsperioden börjar tidigast detta datum.",
     "moms_period_label": "Momsredovisningsperiod",
     "select_period_placeholder": "Välj period",
     "period_monthly": "Månad",

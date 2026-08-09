@@ -100,6 +100,8 @@ export function TaxSettingsContent() {
       f_skatt: formData.get('f_skatt') === 'true',
       vat_registered: vatRegistered,
       vat_number: vatRegistered ? ((formData.get('vat_number') as string) || null) : null,
+      vat_liability_start_date:
+        vatRegistered ? ((formData.get('vat_liability_start_date') as string) || null) : null,
       moms_period: vatRegistered ? ((formData.get('moms_period') as string) || null) : null,
       vat_taxable_base_over_40m:
         vatRegistered && formData.get('vat_taxable_base_over_40m') === 'true',

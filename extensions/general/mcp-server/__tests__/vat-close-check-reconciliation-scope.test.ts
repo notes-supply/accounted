@@ -26,6 +26,11 @@ import { computeVatCloseCheck, tools } from '../server'
 
 const COMPANY_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 const PERIOD = { period_type: 'monthly', year: 2026, period: 1 }
+const VAT_SETTINGS = {
+  moms_period: 'monthly', entity_type: 'aktiebolag',
+  vat_taxable_base_over_40m: false, vat_has_eu_trade: false,
+  vat_filing_method: 'electronic', vat_liability_start_date: null,
+}
 const getReconciliationStatusMock = vi.mocked(getReconciliationStatus)
 const reconStatusTool = tools.find((t) => t.name === 'gnubok_get_reconciliation_status')!
 
@@ -53,13 +58,14 @@ function mockSupabase(
     isCashAccounts = false,
     eqCalls?: Array<[string, unknown]>,
     maybeSingleError: { message: string } | null = null,
+    singleRow: unknown = null,
   ): Record<string, unknown> => {
     const chain: Record<string, unknown> = {}
     const settled = { data: rows, error: null, count: rows.length }
     chain.range = () => settled
-    chain.single = async () => ({ data: null, error: null })
+    chain.single = async () => ({ data: singleRow, error: null })
     chain.maybeSingle = async () => {
-      if (!isCashAccounts) return { data: null, error: null }
+      if (!isCashAccounts) return { data: singleRow, error: null }
       const row = cashAccounts[lookup] ?? null
       lookup += 1
       return { data: row, error: maybeSingleError }
@@ -82,6 +88,7 @@ function mockSupabase(
     if (table === 'cash_accounts') {
       return makeChain([], true, cashAccountFilters, cashAccountError)
     }
+    if (table === 'company_settings') return makeChain([], false, undefined, null, VAT_SETTINGS)
     return makeChain([])
   })
 

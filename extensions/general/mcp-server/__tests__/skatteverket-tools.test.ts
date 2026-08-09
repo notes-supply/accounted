@@ -35,6 +35,15 @@ vi.mock('@/extensions/general/skatteverket/lib/audit', () => ({
   writeSkatteverketAudit: vi.fn(),
 }))
 
+vi.mock('@/lib/reports/rc-basis-gaps', () => ({
+  findRcBasisGaps: vi.fn(async () => []),
+}))
+
+const mockCompleteTaxDeadline = vi.fn()
+vi.mock('@/lib/deadlines/complete-tax-deadline', () => ({
+  completeTaxDeadline: (...args: unknown[]) => mockCompleteTaxDeadline(...args),
+}))
+
 import { tools } from '../server'
 import { SkatteverketAuthError } from '@/extensions/general/skatteverket/lib/api-client'
 
@@ -102,7 +111,7 @@ describe('Skatteverket tools: EXTENSION_DISABLED gate', () => {
 
 describe('gnubok_vat_declaration_validate', () => {
   it('maps a SkatteverketAuthError(NOT_CONNECTED) to SKATTEVERKET_NOT_CONNECTED', async () => {
-    mockBuildMomsuppgift.mockResolvedValue({ redovisare: '165560000000', redovisningsperiod: '202503', momsuppgift: {} })
+    mockBuildMomsuppgift.mockResolvedValue({ redovisare: '165560000000', redovisningsperiod: '202503', momsuppgift: {}, declaration: { rutor: {} } })
     mockSkvRequest.mockRejectedValue(new SkatteverketAuthError('ingen anslutning', 'NOT_CONNECTED'))
     const { supabase } = createQueuedMockSupabase()
     let thrown: unknown
@@ -115,7 +124,7 @@ describe('gnubok_vat_declaration_validate', () => {
   })
 
   it('happy path returns kontrollresultat', async () => {
-    mockBuildMomsuppgift.mockResolvedValue({ redovisare: '165560000000', redovisningsperiod: '202503', momsuppgift: { summaMoms: 100 } })
+    mockBuildMomsuppgift.mockResolvedValue({ redovisare: '165560000000', redovisningsperiod: '202503', momsuppgift: { summaMoms: 100 }, declaration: { rutor: {} } })
     mockSkvRequest.mockResolvedValue({ ok: true, status: 200, json: async () => ({ status: 'OK', resultat: [] }) })
     const { supabase } = createQueuedMockSupabase()
     const result = (await validate.execute(
@@ -130,8 +139,36 @@ describe('gnubok_vat_declaration_validate', () => {
 })
 
 describe('gnubok_vat_declaration_submit', () => {
+  it.each([
+    { period_type: 'monthly', year: 2025, period: 1.5 },
+    { period_type: 'quarterly', year: 2025, period: 5 },
+    { period_type: 'yearly', year: 2025, period: 2 },
+    { period_type: 'monthly', year: '2e3', period: 1 },
+  ])('rejects invalid period input without prep, SKV, or staging: $period_type $year $period', async (args) => {
+    const { supabase, findCall } = createQueuedMockSupabase()
+
+    await expect(vatSubmit.execute(
+      args,
+      'company-1',
+      'user-1',
+      supabase as never,
+      { type: 'api_key' },
+    )).rejects.toThrow()
+
+    expect(mockBuildMomsuppgift).not.toHaveBeenCalled()
+    expect(mockSkvRequest).not.toHaveBeenCalled()
+    expect(findCall('pending_operations', 'insert')).toBeUndefined()
+  })
+
   it('validates via /kontrollera then stages: never touches /utkast', async () => {
-    mockBuildMomsuppgift.mockResolvedValue({ redovisare: '165560000000', redovisningsperiod: '202503', momsuppgift: { summaMoms: 100 } })
+    mockBuildMomsuppgift.mockResolvedValue({
+      redovisare: '165560000000',
+      redovisningsperiod: '202503',
+      momsuppgift: { summaMoms: 100 },
+      declaration: { rutor: {} },
+      resolvedPeriodStart: '2025-03-01',
+      resolvedPeriodEnd: '2025-03-31',
+    })
     mockSkvRequest.mockResolvedValue({ ok: true, status: 200, json: async () => ({ status: 'OK' }) })
     const { supabase, enqueue } = createQueuedMockSupabase()
     // stagePendingOperation: resolvePeriodStatusForDate (company_settings + fiscal_periods) then insert
@@ -149,6 +186,383 @@ describe('gnubok_vat_declaration_submit', () => {
     // Exactly one SKV call (the stage-time /kontrollera); no /utkast.
     expect(mockSkvRequest).toHaveBeenCalledTimes(1)
     expect(mockSkvRequest.mock.calls[0][3]).toMatch(/^\/kontrollera\//)
+  })
+
+  it.each([
+    {
+      period_type: 'monthly', year: 2025, period: 3,
+      resolved_period_start: '2025-03-14', resolved_period_end: '2025-03-31',
+    },
+    {
+      period_type: 'quarterly', year: 2025, period: 2,
+      resolved_period_start: '2025-05-10', resolved_period_end: '2025-06-30',
+    },
+  ])('persists exact liability-clamped bounds for $period_type staging', async ({
+    period_type,
+    year,
+    period,
+    resolved_period_start,
+    resolved_period_end,
+  }) => {
+    mockBuildMomsuppgift.mockResolvedValue({
+      redovisare: '165560000000',
+      redovisningsperiod: period_type === 'monthly' ? '202503' : '202506',
+      momsuppgift: { summaMoms: 100 },
+      declaration: { rutor: {} },
+      resolvedPeriodStart: resolved_period_start,
+      resolvedPeriodEnd: resolved_period_end,
+    })
+    mockSkvRequest.mockResolvedValue({ ok: true, status: 200, json: async () => ({ status: 'OK' }) })
+    const { supabase, enqueue, findCall } = createQueuedMockSupabase()
+    enqueue({ data: null })
+    enqueue({ data: null })
+    enqueue({ data: { id: 'op-subannual' }, error: null })
+
+    await vatSubmit.execute(
+      { period_type, year, period },
+      'company-1',
+      'user-1',
+      supabase as never,
+      { type: 'api_key' },
+    )
+
+    expect(findCall('pending_operations', 'insert')?.[0]).toMatchObject({
+      params: {
+        period_type,
+        year,
+        period,
+        resolved_period_start,
+        resolved_period_end,
+      },
+    })
+    expect(findCall('pending_operations', 'insert')?.[0].params).not.toHaveProperty('fiscal_period_id')
+  })
+
+  it.each([
+    { label: 'absent', bounds: {} },
+    { label: 'one-sided', bounds: { resolvedPeriodStart: '2025-03-14' } },
+    {
+      label: 'malformed',
+      bounds: { resolvedPeriodStart: '2025-02-30', resolvedPeriodEnd: '2025-03-31' },
+    },
+    {
+      label: 'reversed',
+      bounds: { resolvedPeriodStart: '2025-04-01', resolvedPeriodEnd: '2025-03-31' },
+    },
+  ])('fails before SKV validation or pending-operation creation when prepared bounds are $label', async ({ bounds }) => {
+    mockBuildMomsuppgift.mockResolvedValue({
+      redovisare: '165560000000',
+      redovisningsperiod: '202503',
+      momsuppgift: { summaMoms: 100 },
+      declaration: { rutor: {} },
+      ...bounds,
+    })
+    const { supabase, findCall } = createQueuedMockSupabase()
+
+    await expect(vatSubmit.execute(
+      { period_type: 'monthly', year: 2025, period: 3 },
+      'company-1',
+      'user-1',
+      supabase as never,
+      { type: 'api_key' },
+    )).rejects.toThrow(/period bounds/i)
+
+    expect(mockSkvRequest).not.toHaveBeenCalled()
+    expect(findCall('pending_operations', 'insert')).toBeUndefined()
+  })
+
+  it('keeps the annual fiscal period id in filing prep, staged params, and the status next action', async () => {
+    const fiscalPeriodId = '11111111-1111-4111-8111-111111111111'
+    mockBuildMomsuppgift.mockResolvedValue({
+      redovisare: '165560000000',
+      redovisningsperiod: '202603',
+      momsuppgift: { summaMoms: 100 },
+      declaration: { rutor: {} },
+      fiscalPeriodId,
+      resolvedPeriodStart: '2025-04-01',
+      resolvedPeriodEnd: '2026-03-31',
+    })
+    mockSkvRequest.mockResolvedValue({ ok: true, status: 200, json: async () => ({ status: 'OK' }) })
+    const { supabase, enqueue, findCall } = createQueuedMockSupabase()
+    enqueue({ data: null })
+    enqueue({ data: null })
+    enqueue({ data: { id: 'op-1' }, error: null })
+
+    const result = (await vatSubmit.execute({
+      period_type: 'yearly',
+      year: 2026,
+      period: 1,
+      fiscal_period_id: fiscalPeriodId,
+    }, 'company-1', 'user-1', supabase as never, { type: 'api_key' })) as {
+      next: { args: Record<string, unknown> }
+    }
+
+    expect(mockBuildMomsuppgift).toHaveBeenCalledWith(
+      supabase,
+      'company-1',
+      { periodType: 'yearly', year: 2026, period: 1, fiscalPeriodId },
+    )
+    expect(result.next.args).toMatchObject({ fiscal_period_id: fiscalPeriodId })
+
+    expect(findCall('pending_operations', 'insert')?.[0]).toMatchObject({
+      params: { fiscal_period_id: fiscalPeriodId },
+    })
+  })
+
+  it('persists the resolved annual fiscal period when the caller omits the id', async () => {
+    const fiscalPeriodId = '22222222-2222-4222-8222-222222222222'
+    mockBuildMomsuppgift.mockResolvedValue({
+      redovisare: '165560000000',
+      redovisningsperiod: '202603',
+      momsuppgift: { summaMoms: 100 },
+      fiscalPeriodId,
+      resolvedPeriodStart: '2025-10-01',
+      resolvedPeriodEnd: '2026-03-31',
+      declaration: { rutor: {} },
+    })
+    mockSkvRequest.mockResolvedValue({ ok: true, status: 200, json: async () => ({ status: 'OK' }) })
+    const { supabase, enqueue, findCall } = createQueuedMockSupabase()
+    enqueue({ data: null })
+    enqueue({ data: null })
+    enqueue({ data: { id: 'op-2' }, error: null })
+
+    const result = (await vatSubmit.execute({
+      period_type: 'yearly',
+      year: 2026,
+      period: 1,
+    }, 'company-1', 'user-1', supabase as never, { type: 'api_key' })) as {
+      preview: Record<string, unknown>
+      next: { args: Record<string, unknown> }
+    }
+
+    expect(findCall('pending_operations', 'insert')?.[0]).toMatchObject({
+      params: {
+        fiscal_period_id: fiscalPeriodId,
+        resolved_period_start: '2025-10-01',
+        resolved_period_end: '2026-03-31',
+      },
+    })
+    expect(result.preview).toMatchObject({ fiscal_period_id: fiscalPeriodId })
+    expect(result.next.args).toMatchObject({ fiscal_period_id: fiscalPeriodId })
+  })
+
+  it('does not stage when an omitted annual id is ambiguous within the end year', async () => {
+    mockBuildMomsuppgift.mockRejectedValueOnce(
+      new Error('Multiple fiscal periods end in 2026; fiscal_period_id is required'),
+    )
+    const { supabase, findCall } = createQueuedMockSupabase()
+
+    await expect(vatSubmit.execute({
+      period_type: 'yearly',
+      year: 2026,
+      period: 1,
+    }, 'company-1', 'user-1', supabase as never, { type: 'api_key' }))
+      .rejects.toThrow(/Multiple fiscal periods/)
+
+    expect(findCall('pending_operations', 'insert')).toBeUndefined()
+    expect(mockSkvRequest).not.toHaveBeenCalled()
+  })
+})
+
+describe('gnubok_vat_declaration_status', () => {
+  function monthlyState(overrides: Record<string, unknown> = {}) {
+    return {
+      status: 'draft_locked',
+      redovisare: '165560000000',
+      redovisningsperiod: '202506',
+      periodType: 'monthly',
+      year: 2025,
+      period: 6,
+      resolvedPeriodStart: '2025-06-01',
+      resolvedPeriodEnd: '2025-06-30',
+      fiscalPeriodId: null,
+      fiscalPeriodStart: null,
+      fiscalPeriodEnd: null,
+      updatedAt: '2025-07-01T00:00:00.000Z',
+      ...overrides,
+    }
+  }
+
+  beforeEach(() => {
+    mockResolveRedovisare.mockResolvedValue('165560000000')
+    mockCompleteTaxDeadline.mockResolvedValue({ completed: 1 })
+  })
+
+  it.each([
+    { period_type: 'monthly', year: 2025, period: 1.5 },
+    { period_type: 'quarterly', year: 2025, period: 5 },
+    { period_type: 'yearly', year: 2025, period: 2 },
+    { period_type: 'monthly', year: '2025tail', period: 1 },
+  ])('rejects invalid period input without identity or SKV reads: $period_type $year $period', async (args) => {
+    const { supabase } = createQueuedMockSupabase()
+
+    await expect(vatStatus.execute(
+      args,
+      'company-1',
+      'user-1',
+      supabase as never,
+      { type: 'api_key' },
+    )).rejects.toThrow()
+
+    expect(mockResolveRedovisare).not.toHaveBeenCalled()
+    expect(mockSkvRequest).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { label: 'missing state', stored: null, error: undefined },
+    { label: 'malformed state', stored: { value: JSON.stringify({ status: 'draft_locked' }) }, error: undefined },
+    { label: 'state query error', stored: null, error: { message: 'extension_data unavailable' } },
+  ])('fails closed on $label before remote read or deadline completion', async ({ stored, error }) => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: stored, error })
+
+    await expect(vatStatus.execute({
+      period_type: 'monthly', year: 2025, period: 6, state: 'submitted',
+    }, 'company-1', 'user-1', supabase as never, { type: 'api_key' })).rejects.toThrow()
+
+    expect(mockSkvRequest).not.toHaveBeenCalled()
+    expect(mockCompleteTaxDeadline).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      label: 'company redovisare drift',
+      stored: monthlyState({ redovisare: '165599999999' }),
+      args: { period_type: 'monthly', year: 2025, period: 6, state: 'submitted' },
+    },
+    {
+      label: 'caller period drift',
+      stored: monthlyState(),
+      args: { period_type: 'monthly', year: 2025, period: 5, state: 'submitted' },
+    },
+    {
+      label: 'malformed immutable period drift',
+      stored: monthlyState({ period: 5 }),
+      args: { period_type: 'monthly', year: 2025, period: 6, state: 'submitted' },
+    },
+  ])('fails closed on $label before remote read or deadline completion', async ({ stored, args }) => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { value: JSON.stringify(stored) } })
+
+    await expect(vatStatus.execute(
+      args,
+      'company-1',
+      'user-1',
+      supabase as never,
+      { type: 'api_key' },
+    )).rejects.toThrow()
+
+    expect(mockSkvRequest).not.toHaveBeenCalled()
+    expect(mockCompleteTaxDeadline).not.toHaveBeenCalled()
+  })
+
+  it('uses durable identity for the submitted read and deadline completion', async () => {
+    mockSkvRequest.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ kvittensnummer: 'KV-2025-06' }),
+    })
+    const { supabase, enqueue, findCalls } = createQueuedMockSupabase()
+    enqueue({ data: { value: JSON.stringify(monthlyState()) } })
+
+    const result = await vatStatus.execute({
+      period_type: 'monthly', year: 2025, period: 6, state: 'submitted',
+    }, 'company-1', 'user-1', supabase as never, { type: 'api_key' }) as {
+      redovisningsperiod: string
+      submitted: unknown
+    }
+
+    expect(result.redovisningsperiod).toBe('202506')
+    expect(result.submitted).toEqual({ kvittensnummer: 'KV-2025-06' })
+    expect(mockSkvRequest).toHaveBeenCalledWith(
+      supabase,
+      'user-1',
+      'GET',
+      '/inlamnat/165560000000/202506',
+    )
+    expect(mockCompleteTaxDeadline).toHaveBeenCalledWith(
+      supabase,
+      'company-1',
+      'moms_monthly',
+      '2025-06',
+      'submitted',
+      undefined,
+    )
+    expect(findCalls('extension_data', 'eq')).toEqual(expect.arrayContaining([
+      ['company_id', 'company-1'],
+      ['extension_id', 'skatteverket'],
+      ['key', 'submission_202506'],
+    ]))
+  })
+
+  it('uses durable identity for the decided read and confirmed deadline completion', async () => {
+    mockSkvRequest.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ beslutsstatus: 'FASTSTALLD' }),
+    })
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { value: JSON.stringify(monthlyState()) } })
+
+    await vatStatus.execute({
+      period_type: 'monthly', year: 2025, period: 6, state: 'decided',
+    }, 'company-1', 'user-1', supabase as never, { type: 'api_key' })
+
+    expect(mockSkvRequest).toHaveBeenCalledWith(
+      supabase,
+      'user-1',
+      'GET',
+      '/beslutat/165560000000/202506',
+    )
+    expect(mockCompleteTaxDeadline).toHaveBeenCalledWith(
+      supabase,
+      'company-1',
+      'moms_monthly',
+      '2025-06',
+      'confirmed',
+      undefined,
+    )
+  })
+
+  it('uses the selected annual fiscal period end month for the Skatteverket status key', async () => {
+    const fiscalPeriodId = '11111111-1111-4111-8111-111111111111'
+    mockResolveRedovisare.mockResolvedValue('165560000000')
+    mockSkvRequest.mockResolvedValue({ ok: false, status: 404 })
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: fiscalPeriodId, period_start: '2025-01-01', period_end: '2026-03-31' } })
+    enqueue({ data: { vat_liability_start_date: null } })
+    enqueue({ data: { value: JSON.stringify({
+      status: 'draft_locked',
+      redovisare: '165560000000',
+      redovisningsperiod: '202603',
+      periodType: 'yearly',
+      year: 2026,
+      period: 1,
+      resolvedPeriodStart: '2025-01-01',
+      resolvedPeriodEnd: '2026-03-31',
+      fiscalPeriodId,
+      fiscalPeriodStart: '2025-01-01',
+      fiscalPeriodEnd: '2026-03-31',
+      updatedAt: '2026-04-01T00:00:00.000Z',
+    }) } })
+    enqueue({ data: {
+      id: fiscalPeriodId,
+      period_start: '2025-01-01',
+      period_end: '2026-03-31',
+    } })
+
+    const result = (await vatStatus.execute({
+      period_type: 'yearly',
+      year: 2026,
+      period: 1,
+      fiscal_period_id: fiscalPeriodId,
+      state: 'submitted',
+    }, 'company-1', 'user-1', supabase as never, { type: 'api_key' })) as {
+      redovisningsperiod: string
+    }
+
+    expect(result.redovisningsperiod).toBe('202603')
+    expect(mockSkvRequest.mock.calls[0][3]).toBe('/inlamnat/165560000000/202603')
   })
 })
 

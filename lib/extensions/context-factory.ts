@@ -39,13 +39,19 @@ function createSettings(
   return {
     async get<T>(key?: string): Promise<T | null> {
       const lookupKey = key ?? 'settings'
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from('extension_data')
         .select('value')
         .eq('company_id', companyId)
         .eq('extension_id', extensionId)
         .eq('key', lookupKey)
-        .single()
+        .maybeSingle()
+
+      if (error) {
+        throw new Error(
+          `extension_data get failed for ${extensionId}/${lookupKey}: ${error.message}`,
+        )
+      }
 
       return (data?.value as T) ?? null
     },

@@ -11,8 +11,13 @@ import { completeTaxDeadline } from '@/lib/deadlines/complete-tax-deadline'
 import { hasCapability } from '@/lib/entitlements/has-capability'
 import { CAPABILITY } from '@/lib/entitlements/keys'
 import type { SkatteverketInlamnatResponse } from '@/extensions/general/skatteverket/types'
-import type { VatPeriodType } from '@/types'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+import {
+  assertVatSubmissionIdentity,
+  parseVatSubmissionState,
+  resolveVatSubmissionDeadlineIdentity,
+} from '@/extensions/general/skatteverket/lib/vat-submission-state'
+import { resolveRedovisare } from '@/extensions/general/skatteverket/lib/declaration-prep'
 
 ensureInitialized()
 
@@ -68,25 +73,23 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: 'Failed to fetch submission states' }, { status: 500 })
   }
 
-  interface SubmissionState {
-    status?: string
-    redovisare?: string
-    redovisningsperiod?: string
-    periodType?: VatPeriodType
-    year?: number
-    period?: number
-    signeringsLank?: string
-    updatedAt?: string
-  }
-
   const locked = (rows ?? []).flatMap((row) => {
     try {
-      const state: SubmissionState =
-        typeof row.value === 'string' ? JSON.parse(row.value) : (row.value as SubmissionState)
-      if (state?.status !== 'draft_locked' || !state.redovisare || !state.redovisningsperiod) {
+      if (typeof row.company_id !== 'string' || typeof row.key !== 'string') {
         return []
       }
-      return [{ companyId: row.company_id as string, key: row.key as string, state }]
+      const state = parseVatSubmissionState(row.value)
+      if (
+        state.status !== 'draft_locked' ||
+        row.key !== `submission_${state.redovisningsperiod}`
+      ) {
+        return []
+      }
+      return [{
+        companyId: row.company_id,
+        key: row.key,
+        state,
+      }]
     } catch {
       return []
     }
@@ -114,13 +117,20 @@ export async function GET(request: Request) {
     }
 
     const { companyId, key, state } = item
-    const period = state.redovisningsperiod as string
+    const period = state.redovisningsperiod
 
     if (!(await hasCapability(supabase, companyId, CAPABILITY.skatteverket))) {
       continue
     }
 
     try {
+      const redovisare = await resolveRedovisare(supabase, companyId)
+      assertVatSubmissionIdentity(state, { redovisare, redovisningsperiod: period })
+      const deadlineIdentity = await resolveVatSubmissionDeadlineIdentity(
+        supabase,
+        companyId,
+        state,
+      )
       // Prefers system credentials (verified moms_ombud grant), falls back
       // to the company's user token: post-signing checks are exactly where
       // the 65-minute personal session is usually already dead.
@@ -137,7 +147,7 @@ export async function GET(request: Request) {
       const response = await skvRequestWithAuth(
         resolved.auth,
         'GET',
-        `/inlamnat/${state.redovisare}/${period}`
+        `/inlamnat/${redovisare}/${period}`
       )
 
       if (response.status === 404) {
@@ -189,36 +199,20 @@ export async function GET(request: Request) {
         continue
       }
 
-      // Complete the period's moms deadline. Only possible when the state
-      // carries the picker params (written by the one-click chain; states
-      // persisted by the older step-by-step routes lack them).
-      if (state.periodType && state.year && state.period) {
-        let taxPeriod: string | null = null
-        let deadlineTypes: ('moms_monthly' | 'moms_quarterly' | 'moms_yearly')[] = [
-          'moms_monthly',
-          'moms_quarterly',
-        ]
-        if (state.periodType === 'monthly') {
-          taxPeriod = `${state.year}-${String(state.period).padStart(2, '0')}`
-        } else if (state.periodType === 'quarterly') {
-          taxPeriod = `${state.year}-Q${state.period}`
-        } else if (state.periodType === 'yearly') {
-          // moms_yearly rows carry the generator's fiscal-year label:
-          // `YYYY` for calendar FYs, `YYYY-1/YYYY` for broken ones.
-          const { data: fySettings } = await supabase
-            .from('company_settings')
-            .select('fiscal_year_start_month')
-            .eq('company_id', companyId)
-            .maybeSingle()
-          const startMonth = fySettings?.fiscal_year_start_month ?? 1
-          const yearNum = Number(state.year)
-          taxPeriod = startMonth === 1 ? `${yearNum}` : `${yearNum - 1}/${yearNum}`
-          deadlineTypes = ['moms_yearly']
-        }
-        if (taxPeriod) {
-          await completeTaxDeadline(supabase, companyId, deadlineTypes, taxPeriod, 'confirmed')
-        }
-      }
+      await completeTaxDeadline(
+        supabase,
+        companyId,
+        deadlineIdentity.type,
+        deadlineIdentity.taxPeriod,
+        'confirmed',
+        deadlineIdentity.fiscalPeriodId
+          ? {
+            fiscalPeriodId: deadlineIdentity.fiscalPeriodId,
+            fiscalPeriodStart: deadlineIdentity.fiscalPeriodStart,
+            fiscalPeriodEnd: deadlineIdentity.fiscalPeriodEnd,
+          }
+          : undefined,
+      )
 
       if (resolved.tokenUserId) {
         await sendKvittensNotification(supabase, {

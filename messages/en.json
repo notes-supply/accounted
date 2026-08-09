@@ -2008,6 +2008,8 @@
     "vat_registered_help": "Mandatory if turnover exceeds SEK 120,000 per year.",
     "vat_number_label": "VAT registration number",
     "vat_number_help": "Format: SE + organisation number + 01",
+    "vat_liability_start_label": "VAT liability starts",
+    "vat_liability_start_help": "The date in Skatteverket's decision. The first VAT period starts no earlier than this date.",
     "moms_period_label": "VAT reporting period",
     "select_period_placeholder": "Select period",
     "period_monthly": "Monthly",

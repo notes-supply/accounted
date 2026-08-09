@@ -14,9 +14,17 @@ import { v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
 import { safeGenerate } from '@/lib/api/v1/report-period'
 import { calculateVatDeclaration } from '@/lib/reports/vat-declaration'
 import type { VatPeriodType } from '@/types'
+import { parseVatPeriodInput } from '@/lib/vat/period-input'
 
 const VatPeriodTypeEnum = z.enum(['monthly', 'quarterly', 'yearly'])
 const AccountingMethodEnum = z.enum(['accrual', 'cash'])
+const VatDeclarationQuerySchema = z.object({
+  period_type: VatPeriodTypeEnum,
+  year: z.string(),
+  period: z.string(),
+  fiscal_period_id: z.string().uuid().optional(),
+  accounting_method: AccountingMethodEnum.optional(),
+})
 
 registerEndpoint({
   operation: 'reports.vat-declaration',
@@ -32,6 +40,7 @@ registerEndpoint({
   pitfalls: [
     '`period_type` (monthly|quarterly|yearly), `year`, and `period` are all required.',
     'For monthly: period is 1-12. For quarterly: period is 1-4. For yearly: period is 1.',
+    'For yearly periods, pass `fiscal_period_id` when more than one company fiscal period ends in the requested year.',
     '`accounting_method` is accepted for backward compatibility but has no effect on the figures: the declaration is a pure ledger projection, and the method (faktureringsmetoden vs kontantmetoden per ML 15 kap 8-11 §§, ML 2023:200) is already reflected in when VAT-bearing journal entries are posted.',
     'Output ruta 49 = (10+11+12+30+31+32+60+61+62) − 48. Positive = pay; negative = refund.',
   ],
@@ -72,6 +81,7 @@ registerEndpoint({
   idempotent: true,
   reversible: false,
   dryRunSupported: false,
+  request: { query: VatDeclarationQuerySchema },
   response: { success: dataEnvelope(z.unknown()) },
 })
 
@@ -79,37 +89,32 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
   'reports.vat-declaration',
   async (request, ctx) => {
     const url = new URL(request.url)
-    const FiltersSchema = z
-      .object({
-        period_type: VatPeriodTypeEnum,
-        year: z.coerce.number().int().min(2000).max(2100),
-        period: z.coerce.number().int().min(1).max(12),
-        accounting_method: AccountingMethodEnum.optional(),
-      })
-      // Cross-field bounds: monthly accepts 1-12, quarterly 1-4, yearly only 1.
-      // Without this guard a caller could pass period_type=quarterly + period=7
-      // and silently get a nonsensical declaration that they might submit to
-      // Skatteverket.
-      .superRefine((data, ctx) => {
-        if (data.period_type === 'quarterly' && (data.period < 1 || data.period > 4)) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            path: ['period'],
-            message: 'For quarterly period_type, period must be 1-4.',
+    const FiltersSchema = VatDeclarationQuerySchema
+      .transform((data, refinement) => {
+        try {
+          const parsed = parseVatPeriodInput({
+            periodType: data.period_type,
+            year: data.year,
+            period: data.period,
           })
-        }
-        if (data.period_type === 'yearly' && data.period !== 1) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            path: ['period'],
-            message: 'For yearly period_type, period must be 1.',
+          return {
+            ...data,
+            year: parsed.year,
+            period: parsed.period,
+          }
+        } catch {
+          refinement.addIssue({
+            code: 'custom',
+            message: 'Invalid VAT period',
           })
+          return z.NEVER
         }
       })
     const filters = FiltersSchema.safeParse({
       period_type: url.searchParams.get('period_type'),
       year: url.searchParams.get('year'),
       period: url.searchParams.get('period'),
+      fiscal_period_id: url.searchParams.get('fiscal_period_id') ?? undefined,
       accounting_method: url.searchParams.get('accounting_method') ?? undefined,
     })
     if (!filters.success) {
@@ -125,7 +130,7 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
     }
     // accounting_method is still accepted (public API back-compat) but has no
     // effect: see the invariant note on calculateVatDeclaration.
-    const { period_type, year, period } = filters.data
+    const { period_type, year, period, fiscal_period_id } = filters.data
 
     const gen = await safeGenerate(
       () =>
@@ -135,6 +140,7 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
           period_type as VatPeriodType,
           year,
           period,
+          { fiscalPeriodId: fiscal_period_id },
         ),
       { log: ctx.log, requestId: ctx.requestId, reportName: 'vat-declaration' },
     )

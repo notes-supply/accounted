@@ -9,6 +9,7 @@ import { MAX_INVOICE_EMAIL_COPY_RECIPIENTS } from '@/lib/invoices/email-recipien
 import { INVOICE_POSTING_ACCOUNT_REGEX } from '@/lib/invoices/posting-account'
 import { PERSONAL_NUMBER_INPUT_RE } from '@/lib/customers/mask-personal-number'
 import type { AuditAction } from '@/types'
+import { parseVatPeriodInput } from '@/lib/vat/period-input'
 
 // ============================================================
 // Shared primitives
@@ -1692,6 +1693,7 @@ export const UpdateSettingsSchema = z.object({
     .pipe(z.string().regex(/^SE\d{12}$/, 'Momsregistreringsnummer måste vara SE följt av 12 siffror'))
     .nullable()
     .optional(),
+  vat_liability_start_date: saneIsoDate.nullable().optional(),
   moms_period: MomsPeriodSchema.nullable().optional(),
   vat_taxable_base_over_40m: z.boolean().optional(),
   vat_has_eu_trade: z.boolean().optional(),
@@ -2037,11 +2039,23 @@ export const RunReconciliationSchema = z.object({
 // Report query schemas
 // ============================================================
 
-export const VatDeclarationQuerySchema = z.object({
-  periodType: z.enum(['monthly', 'quarterly', 'yearly']),
-  year: z.coerce.number().int().min(2000).max(2100),
-  period: z.coerce.number().int().min(1).max(12),
-})
+export const VatDeclarationQuerySchema = z
+  .object({
+    periodType: z.enum(['monthly', 'quarterly', 'yearly']),
+    year: z.union([z.string(), z.number()]),
+    period: z.union([z.string(), z.number()]),
+  })
+  .transform((input, ctx) => {
+    try {
+      return parseVatPeriodInput(input)
+    } catch (error) {
+      ctx.addIssue({
+        code: 'custom',
+        message: error instanceof Error ? error.message : 'Invalid VAT period',
+      })
+      return z.NEVER
+    }
+  })
 
 export const ReportPeriodQuerySchema = z.object({
   fiscal_period_id: uuid.optional(),

@@ -8,6 +8,7 @@ import {
 import { buildManualFilingRows } from '@/lib/reports/vat-manual-filing'
 import { VatDeclarationPDF } from '@/lib/reports/vat-declaration-pdf-template'
 import type { VatPeriodType, CompanySettings } from '@/types'
+import { parseVatPeriodInput } from '@/lib/vat/period-input'
 
 /**
  * Momsdeklaration PDF for manual filing at skatteverket.se. The declaration is
@@ -35,11 +36,13 @@ export const GET = withRouteContext(
     if (!['monthly', 'quarterly', 'yearly'].includes(periodType)) {
       return NextResponse.json({ error: 'Invalid periodType' }, { status: 400 })
     }
-    const year = parseInt(yearStr, 10)
-    const period = parseInt(periodStr, 10)
-    if (isNaN(year) || isNaN(period)) {
+    let parsedPeriod: ReturnType<typeof parseVatPeriodInput>
+    try {
+      parsedPeriod = parseVatPeriodInput({ periodType, year: yearStr, period: periodStr })
+    } catch {
       return NextResponse.json({ error: 'Invalid year or period' }, { status: 400 })
     }
+    const { year, period } = parsedPeriod
 
     const { data: companyRow } = await supabase
       .from('company_settings')

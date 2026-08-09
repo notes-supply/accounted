@@ -63,6 +63,8 @@ interface CompanyInfo {
   company_name: string | null
   org_number: string | null
   moms_period: string | null
+  vat_registered: boolean | null
+  vat_liability_start_date: string | null
 }
 
 interface DocumentRow {
@@ -148,7 +150,7 @@ export async function generateFullArchive(
           })
           sieFolder.file(`${periodLabel(period)}.se`, sie)
 
-          const reports = await generatePeriodReports(supabase, companyId, period)
+          const reports = await generatePeriodReports(supabase, companyId, period, company)
           const periodFolder = rapporterFolder.folder(periodLabel(period))!
           writeReports(periodFolder, reports)
         })
@@ -163,7 +165,7 @@ export async function generateFullArchive(
     })
     zip.file('bokforing.se', sie)
 
-    const reports = await generatePeriodReports(supabase, companyId, period)
+    const reports = await generatePeriodReports(supabase, companyId, period, company)
     const rapporter = zip.folder('rapporter')!
     writeReports(rapporter, reports)
   }
@@ -307,7 +309,7 @@ export async function estimateArchiveSize(
 async function fetchCompany(supabase: SupabaseClient, companyId: string): Promise<CompanyInfo> {
   const { data } = await supabase
     .from('company_settings')
-    .select('company_name, org_number, moms_period')
+    .select('company_name, org_number, moms_period, vat_registered, vat_liability_start_date')
     .eq('company_id', companyId)
     .single()
 
@@ -353,7 +355,8 @@ async function fetchAllPeriods(
 async function generatePeriodReports(
   supabase: SupabaseClient,
   companyId: string,
-  period: FiscalPeriodRow
+  period: FiscalPeriodRow,
+  company: CompanyInfo,
 ): Promise<PeriodReports> {
   const [trialBalance, incomeStatement, balanceSheet, generalLedger, journalRegister] =
     await Promise.all([
@@ -365,21 +368,24 @@ async function generatePeriodReports(
     ])
 
   let vatDeclaration: unknown = null
-  try {
-    const startDate = new Date(period.period_start)
+  // A false or null current registration flag does not prove the company was
+  // never VAT-registered. Without a liability start date, historical
+  // provenance is unknown, so the archive conservatively calculates and
+  // retains the period's evidence, including a valid zero declaration.
+  const vatApplies = !company.vat_liability_start_date ||
+    period.period_end >= company.vat_liability_start_date
+  if (vatApplies) {
     // Annual VAT for an archive must cover the whole räkenskapsår, which may be
-    // extended/shortened: pass the fiscal period so the span isn't truncated to
-    // the calendar year that period_start happens to fall in.
+    // extended or shortened. The explicit fiscal-period contract uses its end
+    // year, matching resolvePeriodDates, while the id preserves the exact span.
     vatDeclaration = await calculateVatDeclaration(
       supabase,
       companyId,
       'yearly',
-      startDate.getFullYear(),
+      Number(period.period_end.slice(0, 4)),
       1,
       { fiscalPeriodId: period.id }
     )
-  } catch {
-    // VAT declaration may fail if no relevant entries exist, skip gracefully
   }
 
   return { trialBalance, incomeStatement, balanceSheet, generalLedger, journalRegister, vatDeclaration }

@@ -7,6 +7,7 @@ import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import type { VatPeriodType } from '@/types'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+import { parseVatPeriodInput, VatPeriodInputError } from '@/lib/vat/period-input'
 
 /**
  * GET /api/reports/vat-declaration
@@ -41,41 +42,19 @@ export const GET = withRouteContext(
       })
     }
 
-    const year = parseInt(yearStr, 10)
-    const period = parseInt(periodStr, 10)
-
-    if (isNaN(year) || year < 2000 || year > 2100) {
-      return errorResponseFromCode('VAT_REPORT_INVALID_YEAR', log, {
+    let parsedPeriod: ReturnType<typeof parseVatPeriodInput>
+    try {
+      parsedPeriod = parseVatPeriodInput({ periodType, year: yearStr, period: periodStr })
+    } catch (error) {
+      const code = error instanceof VatPeriodInputError && error.field === 'year'
+        ? 'VAT_REPORT_INVALID_YEAR'
+        : 'VAT_REPORT_INVALID_PERIOD'
+      return errorResponseFromCode(code, log, {
         requestId,
-        details: { received: yearStr },
+        details: { periodType, year: yearStr, period: periodStr },
       })
     }
-
-    if (isNaN(period)) {
-      return errorResponseFromCode('VAT_REPORT_INVALID_PERIOD', log, {
-        requestId,
-        details: { received: periodStr },
-      })
-    }
-
-    if (periodType === 'monthly' && (period < 1 || period > 12)) {
-      return errorResponseFromCode('VAT_REPORT_INVALID_PERIOD', log, {
-        requestId,
-        details: { periodType, received: period, allowed: '1-12' },
-      })
-    }
-    if (periodType === 'quarterly' && (period < 1 || period > 4)) {
-      return errorResponseFromCode('VAT_REPORT_INVALID_PERIOD', log, {
-        requestId,
-        details: { periodType, received: period, allowed: '1-4' },
-      })
-    }
-    if (periodType === 'yearly' && period !== 1) {
-      return errorResponseFromCode('VAT_REPORT_INVALID_PERIOD', log, {
-        requestId,
-        details: { periodType, received: period, allowed: '1' },
-      })
-    }
+    const { year, period } = parsedPeriod
 
     try {
       // No accounting-method argument: the method is baked into journal entry

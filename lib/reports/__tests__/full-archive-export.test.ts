@@ -11,6 +11,10 @@ import { createQueuedMockSupabase } from '@/tests/helpers'
 import { getAuditLog } from '@/lib/core/audit/audit-service'
 import type { AuditLogEntry } from '@/types'
 
+const { mockCalculateVatDeclaration } = vi.hoisted(() => ({
+  mockCalculateVatDeclaration: vi.fn(),
+}))
+
 vi.mock('../sie-export', () => ({
   generateSIEExport: vi.fn().mockResolvedValue('#FLAGGA 0\n#PROGRAM "ERPBase"'),
 }))
@@ -51,8 +55,12 @@ vi.mock('../journal-register', () => ({
   }),
 }))
 
-vi.mock('../vat-declaration', () => ({
-  calculateVatDeclaration: vi.fn().mockResolvedValue({
+vi.mock('../vat-declaration', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../vat-declaration')>(),
+  calculateVatDeclaration: mockCalculateVatDeclaration,
+}))
+
+const VAT_DECLARATION = {
     period: { type: 'yearly', year: 2024, period: 1, start: '2024-01-01', end: '2024-12-31' },
     rutor: {
       ruta05: 0, ruta06: 0, ruta07: 0,
@@ -65,8 +73,7 @@ vi.mock('../vat-declaration', () => ({
       transactions: { ruta48: 0 },
       receipts: { ruta48: 0 },
     },
-  }),
-}))
+  }
 
 vi.mock('@/lib/core/audit/audit-service', () => ({
   getAuditLog: vi.fn().mockResolvedValue({ data: [], count: 0 }),
@@ -78,6 +85,8 @@ const COMPANY_ROW = {
   company_name: 'Test AB',
   org_number: '5566778899',
   moms_period: 'quarterly',
+  vat_registered: true,
+  vat_liability_start_date: null,
 }
 
 const PERIOD_2024 = {
@@ -91,6 +100,13 @@ const PERIOD_2023 = {
   id: 'period-2023',
   period_start: '2023-01-01',
   period_end: '2023-12-31',
+  opening_balance_entry_id: null,
+}
+
+const PERIOD_2022 = {
+  id: 'period-2022',
+  period_start: '2022-01-01',
+  period_end: '2022-12-31',
   opening_balance_entry_id: null,
 }
 
@@ -121,6 +137,7 @@ describe('generateFullArchive', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    mockCalculateVatDeclaration.mockResolvedValue(VAT_DECLARATION)
     mockGetAuditLog.mockResolvedValue({ data: [], count: 0 })
     const mock = createQueuedMockSupabase()
     supabase = mock.supabase
@@ -128,6 +145,184 @@ describe('generateFullArchive', () => {
   })
 
   describe('scope: period', () => {
+    it('passes a broken fiscal period end year through the real annual VAT resolver', async () => {
+      const brokenPeriod = {
+        id: 'period-2025-2026',
+        period_start: '2025-07-01',
+        period_end: '2026-06-30',
+        opening_balance_entry_id: null,
+      }
+      const actualVat = await vi.importActual<typeof import('../vat-declaration')>(
+        '../vat-declaration',
+      )
+      mockCalculateVatDeclaration.mockImplementationOnce(async (
+        calculationSupabase,
+        calculationCompanyId,
+        periodType,
+        year,
+        period,
+        options,
+      ) => {
+        const dates = await actualVat.resolvePeriodDates(
+          calculationSupabase,
+          calculationCompanyId,
+          periodType,
+          year,
+          period,
+          options?.fiscalPeriodId,
+        )
+        return {
+          ...VAT_DECLARATION,
+          period: { ...VAT_DECLARATION.period, year, start: dates.start, end: dates.end },
+        }
+      })
+      enqueueMany([
+        { data: COMPANY_ROW },
+        { data: brokenPeriod },
+        { data: { period_start: brokenPeriod.period_start, period_end: brokenPeriod.period_end }, error: null },
+        { data: [], error: null },
+      ])
+
+      const buffer = await generateFullArchive(supabase as any, 'company-1', {
+        scope: 'period',
+        period_id: brokenPeriod.id,
+        include_documents: false,
+      })
+      const zip = await JSZip.loadAsync(buffer)
+      const declaration = JSON.parse(
+        await zip.file('rapporter/momsdeklaration.json')!.async('text'),
+      )
+
+      expect(mockCalculateVatDeclaration).toHaveBeenCalledWith(
+        supabase,
+        'company-1',
+        'yearly',
+        2026,
+        1,
+        { fiscalPeriodId: brokenPeriod.id },
+      )
+      expect(declaration.period).toMatchObject({
+        year: 2026,
+        start: brokenPeriod.period_start,
+        end: brokenPeriod.period_end,
+      })
+    })
+
+    it('rejects a VAT-registered archive when declaration calculation fails', async () => {
+      mockCalculateVatDeclaration.mockRejectedValueOnce(new Error('VAT calculation unavailable'))
+      enqueueMany([
+        { data: COMPANY_ROW },
+        { data: PERIOD_2024 },
+      ])
+
+      await expect(generateFullArchive(supabase as any, 'company-1', {
+        scope: 'period',
+        period_id: PERIOD_2024.id,
+        include_documents: false,
+      })).rejects.toThrow('VAT calculation unavailable')
+    })
+
+    it('includes conservative VAT evidence after deregistration when liability provenance is unknown', async () => {
+      enqueueMany([
+        { data: { ...COMPANY_ROW, vat_registered: false } },
+        { data: PERIOD_2024 },
+        { data: [] },
+      ])
+
+      const buffer = await generateFullArchive(supabase as any, 'company-1', {
+        scope: 'period',
+        period_id: PERIOD_2024.id,
+      })
+      const zip = await JSZip.loadAsync(buffer)
+
+      expect(mockCalculateVatDeclaration).toHaveBeenCalledWith(
+        supabase,
+        'company-1',
+        'yearly',
+        2024,
+        1,
+        { fiscalPeriodId: PERIOD_2024.id },
+      )
+      expect(zip.file('rapporter/momsdeklaration.json')).not.toBeNull()
+      expect(zip.file('dokument/manifest.json')).not.toBeNull()
+    })
+
+    it('fails visibly when registration and liability history are both unknown and VAT calculation fails', async () => {
+      mockCalculateVatDeclaration.mockRejectedValueOnce(new Error('Unknown-history VAT unavailable'))
+      enqueueMany([
+        {
+          data: {
+            ...COMPANY_ROW,
+            vat_registered: null,
+            vat_liability_start_date: null,
+          },
+        },
+        { data: PERIOD_2024 },
+      ])
+
+      await expect(generateFullArchive(supabase as any, 'company-1', {
+        scope: 'period',
+        period_id: PERIOD_2024.id,
+        include_documents: false,
+      })).rejects.toThrow('Unknown-history VAT unavailable')
+      expect(mockCalculateVatDeclaration).toHaveBeenCalledWith(
+        supabase,
+        'company-1',
+        'yearly',
+        2024,
+        1,
+        { fiscalPeriodId: PERIOD_2024.id },
+      )
+    })
+
+    it('omits VAT evidence for a fiscal period wholly before VAT liability', async () => {
+      enqueueMany([
+        { data: { ...COMPANY_ROW, vat_liability_start_date: '2025-01-01' } },
+        { data: PERIOD_2024 },
+        { data: [] },
+      ])
+
+      const buffer = await generateFullArchive(supabase as any, 'company-1', {
+        scope: 'period',
+        period_id: PERIOD_2024.id,
+      })
+      const zip = await JSZip.loadAsync(buffer)
+
+      expect(mockCalculateVatDeclaration).not.toHaveBeenCalled()
+      expect(zip.file('rapporter/momsdeklaration.json')).toBeNull()
+      expect(zip.file('dokument/manifest.json')).not.toBeNull()
+    })
+
+    it('includes historical VAT evidence after deregistration', async () => {
+      enqueueMany([
+        {
+          data: {
+            ...COMPANY_ROW,
+            vat_registered: false,
+            vat_liability_start_date: '2023-07-01',
+          },
+        },
+        { data: PERIOD_2024 },
+        { data: [] },
+      ])
+
+      const buffer = await generateFullArchive(supabase as any, 'company-1', {
+        scope: 'period',
+        period_id: PERIOD_2024.id,
+      })
+      const zip = await JSZip.loadAsync(buffer)
+
+      expect(mockCalculateVatDeclaration).toHaveBeenCalledWith(
+        supabase,
+        'company-1',
+        'yearly',
+        2024,
+        1,
+        { fiscalPeriodId: PERIOD_2024.id },
+      )
+      expect(zip.file('rapporter/momsdeklaration.json')).not.toBeNull()
+    })
+
     it('generates a ZIP with expected file structure', async () => {
       enqueueMany([
         { data: COMPANY_ROW }, // company_settings
@@ -412,6 +607,65 @@ describe('generateFullArchive', () => {
       expect(readmeText).toContain('Hela bokföringen')
       // No root bokforing.se in all-mode
       expect(zip.file('bokforing.se')).toBeNull()
+    })
+
+    it('includes every historically applicable VAT period after deregistration', async () => {
+      enqueueMany([
+        {
+          data: {
+            ...COMPANY_ROW,
+            vat_registered: false,
+            vat_liability_start_date: '2023-07-01',
+          },
+        },
+        { data: [PERIOD_2022, PERIOD_2023, PERIOD_2024] },
+        { data: [] },
+      ])
+
+      const buffer = await generateFullArchive(supabase as any, 'company-1', {
+        scope: 'all',
+      })
+      const zip = await JSZip.loadAsync(buffer)
+
+      expect(mockCalculateVatDeclaration).toHaveBeenCalledTimes(2)
+      expect(mockCalculateVatDeclaration).toHaveBeenCalledWith(
+        supabase,
+        'company-1',
+        'yearly',
+        2023,
+        1,
+        { fiscalPeriodId: PERIOD_2023.id },
+      )
+      expect(mockCalculateVatDeclaration).toHaveBeenCalledWith(
+        supabase,
+        'company-1',
+        'yearly',
+        2024,
+        1,
+        { fiscalPeriodId: PERIOD_2024.id },
+      )
+      expect(zip.file('rapporter/2022-01-01_2022-12-31/momsdeklaration.json')).toBeNull()
+      expect(zip.file('rapporter/2023-01-01_2023-12-31/momsdeklaration.json')).not.toBeNull()
+      expect(zip.file('rapporter/2024-01-01_2024-12-31/momsdeklaration.json')).not.toBeNull()
+    })
+
+    it('fails the full-history archive visibly when historical VAT calculation fails', async () => {
+      mockCalculateVatDeclaration.mockRejectedValueOnce(new Error('Historical VAT unavailable'))
+      enqueueMany([
+        {
+          data: {
+            ...COMPANY_ROW,
+            vat_registered: false,
+            vat_liability_start_date: '2023-07-01',
+          },
+        },
+        { data: [PERIOD_2024] },
+      ])
+
+      await expect(generateFullArchive(supabase as any, 'company-1', {
+        scope: 'all',
+        include_documents: false,
+      })).rejects.toThrow('Historical VAT unavailable')
     })
 
     it('does not filter audit trail by date in all-mode', async () => {
