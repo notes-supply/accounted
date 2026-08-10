@@ -464,6 +464,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
         isBusiness: is_business,
         category: finalCategory,
         journalEntryId,
+        requireVerifiedTransaction: true,
       },
       txLog,
     )
@@ -490,6 +491,14 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       })
     }
 
+    const verifiedTransaction = attachment.verifiedTransaction
+    if (!verifiedTransaction) {
+      return v1ErrorResponseFromCode('BOOKKEEPING_DATABASE_ERROR', txLog, {
+        requestId: ctx.requestId,
+        details: { operation: 'verify_attached_transaction' },
+      })
+    }
+
     // Best-effort learning happens only after the categorization is durably
     // attached. A compensated conflict is not evidence for future mappings.
     if (is_business && transaction.merchant_name && !mappingResult.direction_mismatch) {
@@ -512,7 +521,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       await upsertCounterpartyTemplate(
         ctx.supabase,
         ctx.companyId!,
-        transaction as Transaction,
+        verifiedTransaction,
         mappingResult,
         'user_approved',
       )
@@ -524,7 +533,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       await eventBus.emit({
         type: 'transaction.categorized',
         payload: {
-          transaction: transaction as Transaction,
+          transaction: verifiedTransaction,
           account: mappingResult.debit_account,
           taxCode: mappingResult.vat_lines[0]?.account_number || '',
           userId: ctx.userId,

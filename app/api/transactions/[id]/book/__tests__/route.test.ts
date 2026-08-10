@@ -32,8 +32,25 @@ vi.mock('@/lib/auth/require-write', () => ({
 }))
 
 const mockCreateJournalEntry = vi.fn()
+const mockCompensateTransactionCategorization = vi.fn()
 vi.mock('@/lib/bookkeeping/engine', () => ({
   createJournalEntry: (...args: unknown[]) => mockCreateJournalEntry(...args),
+  compensateTransactionCategorization: (...args: unknown[]) =>
+    mockCompensateTransactionCategorization(...args),
+}))
+
+const mockAttachCategorizedTransaction = vi.fn()
+const mockCompensatePostCommitReadbackFailure = vi.fn()
+vi.mock('@/lib/transactions/settlement-attachment', () => ({
+  attachCategorizedTransaction: (...args: unknown[]) =>
+    mockAttachCategorizedTransaction(...args),
+  compensatePostCommitReadbackFailure: (...args: unknown[]) =>
+    mockCompensatePostCommitReadbackFailure(...args),
+}))
+
+const mockResolveSettlementAccount = vi.fn()
+vi.mock('@/lib/bookkeeping/settlement-account', () => ({
+  resolveSettlementAccount: (...args: unknown[]) => mockResolveSettlementAccount(...args),
 }))
 
 // Booking-time duplicate guard: mocked so route tests exercise the WIRING
@@ -79,6 +96,18 @@ describe('POST /api/transactions/[id]/book', () => {
     // No booking-duplicate by default; guard tests override per-case.
     mockDetectDup.mockResolvedValue(null)
     mockAppendProcessingHistory.mockResolvedValue('evt-1')
+    mockResolveSettlementAccount.mockResolvedValue('1930')
+    mockAttachCategorizedTransaction.mockResolvedValue({
+      ok: true,
+      verifiedTransaction: makeTransaction({
+        id: 'tx-1',
+        company_id: 'company-1',
+        journal_entry_id: 'je-new',
+        category: 'uncategorized',
+        is_business: true,
+      }),
+    })
+    mockCompensatePostCommitReadbackFailure.mockResolvedValue({ handled: false })
   })
 
   it('returns 401 when not authenticated', async () => {
@@ -196,9 +225,6 @@ describe('POST /api/transactions/[id]/book', () => {
 
     mockCreateJournalEntry.mockResolvedValue(je)
 
-    // Update transaction
-    enqueue({ data: null, error: null })
-
     const emitSpy = vi.spyOn(eventBus, 'emit')
 
     const request = createMockRequest('/api/transactions/tx-1/book', {
@@ -223,32 +249,236 @@ describe('POST /api/transactions/[id]/book', () => {
       description: 'Test booking',
       source_type: 'bank_transaction',
       source_id: 'tx-1',
+      categorization_category: 'uncategorized',
+      categorization_is_business: true,
       lines: validBody.lines,
     })
 
+    expect(mockAttachCategorizedTransaction).toHaveBeenCalledWith(
+      mockSupabase,
+      expect.objectContaining({
+        companyId: 'company-1',
+        transactionId: 'tx-1',
+        expectedJournalEntryId: null,
+        expectedCashAccountId: tx.cash_account_id ?? null,
+        expectedSettlementAccount: '1930',
+        category: 'uncategorized',
+        isBusiness: true,
+        journalEntryId: 'je-new',
+        requireVerifiedTransaction: true,
+      }),
+      expect.anything(),
+    )
+
     expect(emitSpy).toHaveBeenCalledWith(
-      expect.objectContaining({ type: 'transaction.categorized' })
+      expect.objectContaining({
+        type: 'transaction.categorized',
+        payload: expect.objectContaining({
+          transaction: expect.objectContaining({
+            journal_entry_id: 'je-new',
+            category: 'uncategorized',
+            is_business: true,
+          }),
+        }),
+      })
     )
   })
 
-  it('returns 500 when transaction update fails', async () => {
+  it('does not emit when the authoritative attachment readback fails and compensation is verified', async () => {
+    const tx = makeTransaction({ id: 'tx-1', journal_entry_id: null })
+    const je = makeJournalEntry({ id: 'je-new' })
+    enqueue({ data: tx, error: null })
+    mockCreateJournalEntry.mockResolvedValue(je)
+    mockAttachCategorizedTransaction.mockResolvedValue({
+      ok: false,
+      reason: 'database_error',
+      error: new Error('missing readback'),
+    })
+    const emitSpy = vi.spyOn(eventBus, 'emit')
+
+    const response = await POST(
+      createMockRequest('/api/transactions/tx-1/book', { method: 'POST', body: validBody }),
+      createMockRouteParams({ id: 'tx-1' }),
+    )
+
+    expect(response.status).toBe(500)
+    expect(emitSpy).not.toHaveBeenCalled()
+    expect(mockAppendProcessingHistory).not.toHaveBeenCalled()
+  })
+
+  it('treats settlement drift or a CAS race as terminal and emits no event', async () => {
+    const tx = makeTransaction({ id: 'tx-1', journal_entry_id: null })
+    enqueue({ data: tx, error: null })
+    mockCreateJournalEntry.mockResolvedValue(makeJournalEntry({ id: 'je-new' }))
+    mockAttachCategorizedTransaction.mockResolvedValue({ ok: false, reason: 'conflict' })
+    const emitSpy = vi.spyOn(eventBus, 'emit')
+
+    const response = await POST(
+      createMockRequest('/api/transactions/tx-1/book', { method: 'POST', body: validBody }),
+      createMockRouteParams({ id: 'tx-1' }),
+    )
+
+    expect(response.status).toBe(409)
+    expect(emitSpy).not.toHaveBeenCalled()
+    expect(mockAppendProcessingHistory).not.toHaveBeenCalled()
+  })
+
+  it('discloses failed_partial durable ids when attachment compensation is unverifiable', async () => {
+    const tx = makeTransaction({ id: 'tx-1', journal_entry_id: null })
+    enqueue({ data: tx, error: null })
+    mockCreateJournalEntry.mockResolvedValue(makeJournalEntry({ id: 'je-new' }))
+    mockAttachCategorizedTransaction.mockResolvedValue({
+      ok: false,
+      reason: 'conflict',
+      partialPostedIds: {
+        journal_entry_id: 'je-new',
+        reversal_journal_entry_id: 'je-storno',
+      },
+    })
+
+    const response = await POST(
+      createMockRequest('/api/transactions/tx-1/book', { method: 'POST', body: validBody }),
+      createMockRouteParams({ id: 'tx-1' }),
+    )
+    const { status, body } = await parseJsonResponse<{
+      error: { details: Record<string, unknown> }
+    }>(response)
+
+    expect(status).toBe(409)
+    expect(body.error.details).toMatchObject({
+      failed_partial: true,
+      compensation_verified: false,
+      partial_posted_ids: {
+        journal_entry_id: 'je-new',
+        reversal_journal_entry_id: 'je-storno',
+      },
+    })
+  })
+
+  it('resolves and preserves a non-default settlement account before posting', async () => {
+    const tx = makeTransaction({
+      id: 'tx-1',
+      amount: -500,
+      cash_account_id: 'cash-revolut-sek',
+      journal_entry_id: null,
+    })
+    enqueue({ data: tx, error: null })
+    mockResolveSettlementAccount.mockResolvedValueOnce('1931')
+    mockCreateJournalEntry.mockResolvedValue(makeJournalEntry({ id: 'je-new' }))
+
+    const response = await POST(
+      createMockRequest('/api/transactions/tx-1/book', {
+        method: 'POST',
+        body: {
+          ...validBody,
+          lines: [
+            { account_number: '6200', debit_amount: 500, credit_amount: 0 },
+            { account_number: '1931', debit_amount: 0, credit_amount: 500 },
+          ],
+        },
+      }),
+      createMockRouteParams({ id: 'tx-1' }),
+    )
+
+    expect(response.status).toBe(200)
+    expect(mockResolveSettlementAccount).toHaveBeenCalledWith(
+      mockSupabase,
+      'company-1',
+      'cash-revolut-sek',
+      expect.anything(),
+    )
+    expect(mockAttachCategorizedTransaction).toHaveBeenCalledWith(
+      mockSupabase,
+      expect.objectContaining({
+        expectedCashAccountId: 'cash-revolut-sek',
+        expectedSettlementAccount: '1931',
+      }),
+      expect.anything(),
+    )
+  })
+
+  it('fails before posting when a non-null cash account cannot be resolved', async () => {
+    const tx = makeTransaction({
+      id: 'tx-1',
+      cash_account_id: 'cash-other-company',
+      journal_entry_id: null,
+    })
+    enqueue({ data: tx, error: null })
+    mockResolveSettlementAccount.mockRejectedValueOnce(new Error('cash account unavailable'))
+
+    const response = await POST(
+      createMockRequest('/api/transactions/tx-1/book', { method: 'POST', body: validBody }),
+      createMockRouteParams({ id: 'tx-1' }),
+    )
+
+    expect(response.status).toBe(500)
+    expect(mockCreateJournalEntry).not.toHaveBeenCalled()
+    expect(mockAttachCategorizedTransaction).not.toHaveBeenCalled()
+  })
+
+  it('preserves original and reversal ids when post-commit compensation is unverifiable', async () => {
+    const tx = makeTransaction({ id: 'tx-1', journal_entry_id: null })
+    enqueue({ data: tx, error: null })
+    mockCreateJournalEntry.mockRejectedValueOnce(new Error('posted readback failed'))
+    mockCompensatePostCommitReadbackFailure.mockResolvedValueOnce({
+      handled: true,
+      journalEntryId: 'je-posted',
+      voucherNumber: 42,
+      compensationVerified: false,
+      partialPostedIds: {
+        journal_entry_id: 'je-posted',
+        reversal_journal_entry_id: 'je-storno',
+      },
+    })
+
+    const response = await POST(
+      createMockRequest('/api/transactions/tx-1/book', { method: 'POST', body: validBody }),
+      createMockRouteParams({ id: 'tx-1' }),
+    )
+    const { status, body } = await parseJsonResponse<{
+      error: { details: Record<string, unknown> }
+    }>(response)
+
+    expect(status).toBe(500)
+    expect(body.error.details).toMatchObject({
+      failed_partial: true,
+      compensation_verified: false,
+      journal_entry_id: 'je-posted',
+      voucher_number: 42,
+      partial_posted_ids: {
+        journal_entry_id: 'je-posted',
+        reversal_journal_entry_id: 'je-storno',
+      },
+    })
+    expect(mockAttachCategorizedTransaction).not.toHaveBeenCalled()
+  })
+
+  it('returns 500 when atomic attachment fails', async () => {
     const tx = makeTransaction({ id: 'tx-1', journal_entry_id: null })
     const je = makeJournalEntry({ id: 'je-new' })
 
     enqueue({ data: tx, error: null })
     mockCreateJournalEntry.mockResolvedValue(je)
-    // Update fails
-    enqueue({ data: null, error: { message: 'Update failed' } })
+    mockAttachCategorizedTransaction.mockResolvedValue({
+      ok: false,
+      reason: 'database_error',
+      error: new Error('Update failed'),
+    })
 
     const request = createMockRequest('/api/transactions/tx-1/book', {
       method: 'POST',
       body: validBody,
     })
     const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
-    const { status, body } = await parseJsonResponse<{ error: string }>(response)
+    const { status, body } = await parseJsonResponse<{
+      error: { code: string; details: { operation: string } }
+    }>(response)
 
     expect(status).toBe(500)
-    expect(body.error).toBe('Failed to update transaction')
+    expect(body.error).toMatchObject({
+      code: 'BOOKKEEPING_DATABASE_ERROR',
+      details: { operation: 'attach_transaction_categorization' },
+    })
   })
 
   // ── Booking-time duplicate guard ──────────────────────────────────────

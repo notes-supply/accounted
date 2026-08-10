@@ -5,6 +5,7 @@ import type {
   VatPeriodType,
 } from '@/types'
 import type { VatCheckAccountTotals } from './vat-declaration-checks'
+import { rcBasisTotalsByRate } from './vat-filing-gate'
 import { fetchDynamicRuta05Accounts } from './vat-revenue-accounts'
 import { parseVatPeriodInput } from '@/lib/vat/period-input'
 
@@ -109,6 +110,12 @@ export const ACCOUNT_RUTA: Record<string, { box: keyof VatDeclarationRutor; side
   '3404': { box: 'ruta42', side: 'credit' },  // Momsfria uttag
   '3980': { box: 'ruta42', side: 'credit' },  // Erhållna offentliga stöd m.m.
   '3994': { box: 'ruta42', side: 'credit' },  // Övriga rörelseintäkter momsfria
+  // Revenue: omvänd skattskyldighet inom Sverige → ruta 41. The seller books
+  // NO output VAT (the buyer accounts for it via rutor 23-24/30-32), so these
+  // deliberately stay OUT of the ruta 05-08 vs 10-12 pairing checks.
+  '3231': { box: 'ruta41', side: 'credit' },  // Försäljning byggsektorn, omvänd betalningsskyldighet
+  '3232': { box: 'ruta41', side: 'credit' },  // Omvänd betalningsskyldighet, övriga (skrot m.m.)
+  '3233': { box: 'ruta41', side: 'credit' },  // Omvänd betalningsskyldighet, övriga
   // Reverse-charge purchase bases (debit on cost accounts) → ruta 20-24, 50
   '4515': { box: 'ruta20', side: 'debit' },   // Inköp varor EU 25%
   '4516': { box: 'ruta20', side: 'debit' },   // Inköp varor EU 12%
@@ -347,6 +354,14 @@ export async function applyVatLiabilityBoundary(
     throw new Error(`Failed to resolve VAT liability start: ${settingsError.message}`)
   }
   const vatStart = settings?.vat_liability_start_date as string | null | undefined
+  return applyVatLiabilityStartBoundary(dates, vatStart ?? null)
+}
+
+/** Apply one already-validated VAT-liability identity without another read. */
+export function applyVatLiabilityStartBoundary(
+  dates: { start: string; end: string },
+  vatStart: string | null,
+): { start: string; end: string } {
   if (vatStart && dates.end < vatStart) {
     throw new Error(`Requested VAT period ends before VAT liability starts on ${vatStart}`)
   }
@@ -680,6 +695,9 @@ export async function calculateVatDeclaration(
     // the sharp RC_INPUT_VAT_MISMATCH comparison instead of the ruta 48
     // fallback: see VatDeclaration.rcInputAccountTotals.
     rcInputAccountTotals: rcInputTotals(totals),
+    // Per-momssats RC basis balances (44xx/45xx), the downgrade evidence for
+    // the per-voucher gap tiering: see VatDeclaration.rcBasisByRate.
+    rcBasisByRate: rcBasisTotalsByRate(totals),
     invoiceCount,
     transactionCount,
     breakdown: {

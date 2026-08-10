@@ -103,6 +103,7 @@ vi.mock('@/lib/bookkeeping/settlement-account', () => ({
 
 import { validateApiKey, createServiceClientNoCookies } from '@/lib/auth/api-keys'
 import { PostCommitReadbackError } from '@/lib/bookkeeping/errors'
+import { eventBus } from '@/lib/events/bus'
 import { POST } from '../route'
 
 const mockValidate = validateApiKey as ReturnType<typeof vi.fn>
@@ -174,6 +175,7 @@ function batchParams() {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  eventBus.clear()
   findMissingAccountsMock.mockResolvedValue([])
   reverseEntryMock.mockResolvedValue(undefined)
   resolveSettlementAccountMock.mockResolvedValue('1931')
@@ -188,6 +190,133 @@ beforeEach(() => {
 })
 
 describe('POST batch-categorize', () => {
+  it('emits the authoritative post-attachment transaction state', async () => {
+    const before = {
+      id: TX_A,
+      company_id: COMPANY_ID,
+      user_id: 'user-1',
+      date: '2026-05-12',
+      amount: -349.5,
+      currency: 'SEK',
+      merchant_name: 'ICA',
+      description: 'Office supplies',
+      reference: 'CARD-123',
+      journal_entry_id: null,
+      cash_account_id: 'cash-revolut-sek',
+      category: null,
+      is_business: null,
+    }
+    const after = {
+      ...before,
+      journal_entry_id: 'je-fresh',
+      category: 'expense_office',
+      is_business: true,
+      updated_at: '2026-08-09T12:00:00.000Z',
+    }
+    const { supabase } = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      company_settings: { data: { entity_type: 'enskild_firma' }, error: null },
+      transactions: [
+        { data: before, error: null },
+        { data: after, error: null },
+      ],
+      fiscal_periods: { data: { id: 'period-1', is_closed: false, locked_at: null }, error: null },
+      'rpc:attach_transaction_categorization': { data: true, error: null },
+    })
+    mockServiceClient.mockReturnValue(supabase)
+    const emitSpy = vi.spyOn(eventBus, 'emit')
+
+    const res = await POST(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/batch-categorize`,
+        { items: [{ transaction_id: TX_A, categorization: { is_business: true, category: 'expense_office' } }] },
+      ),
+      batchParams(),
+    )
+    const body = await res.json()
+
+    expect(res.status, JSON.stringify(body)).toBe(200)
+    expect(body.data.results[0].ok).toBe(true)
+    expect(emitSpy).toHaveBeenCalledTimes(1)
+    expect(emitSpy).toHaveBeenCalledWith({
+      type: 'transaction.categorized',
+      payload: expect.objectContaining({
+        transaction: after,
+        userId: 'user-1',
+        companyId: COMPANY_ID,
+      }),
+    })
+  })
+
+  it.each([
+    {
+      name: 'readback query failure',
+      readback: { data: null, error: { message: 'connection reset', code: '08006' } },
+      expectedCode: 'BOOKKEEPING_DATABASE_ERROR',
+    },
+    {
+      name: 'unverifiable stale readback',
+      readback: {
+        data: {
+          id: TX_A,
+          company_id: COMPANY_ID,
+          date: '2026-05-12',
+          amount: -349.5,
+          currency: 'SEK',
+          journal_entry_id: null,
+          cash_account_id: 'cash-revolut-sek',
+          category: null,
+          is_business: null,
+        },
+        error: null,
+      },
+      expectedCode: 'TX_CATEGORIZE_RACE',
+    },
+  ])('emits no event and compensates after $name', async ({ readback, expectedCode }) => {
+    const before = {
+      id: TX_A,
+      company_id: COMPANY_ID,
+      date: '2026-05-12',
+      amount: -349.5,
+      currency: 'SEK',
+      merchant_name: 'ICA',
+      journal_entry_id: null,
+      cash_account_id: 'cash-revolut-sek',
+    }
+    const { supabase } = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      company_settings: { data: { entity_type: 'enskild_firma' }, error: null },
+      transactions: [
+        { data: before, error: null },
+        readback,
+      ],
+      fiscal_periods: { data: { id: 'period-1', is_closed: false, locked_at: null }, error: null },
+      'rpc:attach_transaction_categorization': { data: true, error: null },
+      'rpc:compensate_transaction_categorization': compensationSuccess,
+    })
+    mockServiceClient.mockReturnValue(supabase)
+    const emitSpy = vi.spyOn(eventBus, 'emit')
+
+    const res = await POST(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/batch-categorize`,
+        { items: [{ transaction_id: TX_A, categorization: { is_business: true, category: 'expense_office' } }] },
+      ),
+      batchParams(),
+    )
+    const body = await res.json()
+
+    expect(body.data.results[0]).toMatchObject({
+      ok: false,
+      error: { code: expectedCode },
+    })
+    expect(emitSpy).not.toHaveBeenCalled()
+    expect(supabase.rpc).toHaveBeenCalledWith(
+      'compensate_transaction_categorization',
+      expect.objectContaining({ p_original_journal_entry_id: 'je-fresh' }),
+    )
+  })
+
   it('compensates a readback-unverified posting and discloses its durable id', async () => {
     const { supabase } = makeFlexibleSupabase({
       company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
@@ -664,19 +793,36 @@ describe('POST batch-categorize', () => {
       const database = {
         company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
         company_settings: { data: { entity_type: 'enskild_firma' }, error: null },
-        transactions: {
-          data: {
-            id: TX_A,
-            company_id: COMPANY_ID,
-            date: '2026-05-12',
-            amount: testCase.amount,
-            currency: 'SEK',
-            merchant_name: 'Fixture',
-            journal_entry_id: null,
-            cash_account_id: `cash-${testCase.settlementAccount}`,
+        transactions: [
+          {
+            data: {
+              id: TX_A,
+              company_id: COMPANY_ID,
+              date: '2026-05-12',
+              amount: testCase.amount,
+              currency: 'SEK',
+              merchant_name: 'Fixture',
+              journal_entry_id: null,
+              cash_account_id: `cash-${testCase.settlementAccount}`,
+            },
+            error: null,
           },
-          error: null,
-        },
+          {
+            data: {
+              id: TX_A,
+              company_id: COMPANY_ID,
+              date: '2026-05-12',
+              amount: testCase.amount,
+              currency: 'SEK',
+              merchant_name: 'Fixture',
+              journal_entry_id: 'je-fresh',
+              cash_account_id: `cash-${testCase.settlementAccount}`,
+              category: testCase.expectedCategory,
+              is_business: true,
+            },
+            error: null,
+          },
+        ],
         fiscal_periods: { data: { id: 'period-1', is_closed: false, locked_at: null }, error: null },
         'rpc:attach_transaction_categorization': { data: true, error: null },
         ...testCase.extraDatabase,
@@ -829,6 +975,91 @@ describe('POST batch-categorize', () => {
     }
   })
 
+  it('isolates a settlement lookup failure to its item and continues the batch', async () => {
+    const { supabase } = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      transactions: [
+        {
+          data: {
+            id: TX_A,
+            company_id: COMPANY_ID,
+            date: '2026-05-12',
+            amount: -100,
+            currency: 'SEK',
+            cash_account_id: 'cash-broken',
+            journal_entry_id: null,
+          },
+          error: null,
+        },
+        {
+          data: {
+            id: TX_B,
+            company_id: COMPANY_ID,
+            date: '2026-05-13',
+            amount: -200,
+            currency: 'SEK',
+            cash_account_id: 'cash-ok',
+            journal_entry_id: null,
+          },
+          error: null,
+        },
+        {
+          data: {
+            id: TX_B,
+            company_id: COMPANY_ID,
+            date: '2026-05-13',
+            amount: -200,
+            currency: 'SEK',
+            cash_account_id: 'cash-ok',
+            journal_entry_id: 'je-fresh',
+            category: 'expense_office',
+            is_business: true,
+          },
+          error: null,
+        },
+      ],
+      company_settings: { data: { entity_type: 'enskild_firma' }, error: null },
+      fiscal_periods: { data: { id: 'period-1', is_closed: false, locked_at: null }, error: null },
+      'rpc:attach_transaction_categorization': { data: true, error: null },
+    })
+    mockServiceClient.mockReturnValue(supabase)
+    resolveSettlementAccountMock
+      .mockRejectedValueOnce(new Error('temporary lookup failure'))
+      .mockResolvedValueOnce('1931')
+
+    const res = await POST(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/batch-categorize`,
+        {
+          items: [
+            { transaction_id: TX_A, categorization: { is_business: true, category: 'expense_office' } },
+            { transaction_id: TX_B, categorization: { is_business: true, category: 'expense_office' } },
+          ],
+        },
+      ),
+      batchParams(),
+    )
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.data.results[0]).toMatchObject({
+      ok: false,
+      error: { code: 'BOOKKEEPING_DATABASE_ERROR' },
+    })
+    expect(body.data.results[1].ok).toBe(true)
+    expect(body.data.summary).toEqual({ total: 2, succeeded: 1, failed: 1 })
+    expect(createTxJE).toHaveBeenCalledTimes(1)
+    expect(createTxJE).toHaveBeenCalledWith(
+      expect.anything(),
+      COMPANY_ID,
+      'user-1',
+      expect.objectContaining({ id: TX_B }),
+      expect.objectContaining({ credit_account: '1931' }),
+      undefined,
+      { category: 'expense_office', isBusiness: true },
+    )
+  })
+
   it('returns per-item ACCOUNTS_NOT_IN_CHART for items whose mapping references inactive accounts; clean items still succeed', async () => {
     mockServiceClient.mockReturnValue(
       makeFlexibleSupabase({
@@ -836,17 +1067,49 @@ describe('POST batch-categorize', () => {
         // Each `transactions` lookup returns the same shape; the flexible
         // proxy serves both items from this single result. amount is < 0 so
         // both map to an expense flow.
-        transactions: {
-          data: {
-            company_id: COMPANY_ID,
-            date: '2026-05-12',
-            amount: -349.5,
-            currency: 'SEK',
-            merchant_name: 'ICA',
-            journal_entry_id: null,
+        transactions: [
+          {
+            data: {
+              id: TX_A,
+              company_id: COMPANY_ID,
+              date: '2026-05-12',
+              amount: -349.5,
+              currency: 'SEK',
+              merchant_name: 'ICA',
+              journal_entry_id: null,
+              cash_account_id: null,
+            },
+            error: null,
           },
-          error: null,
-        },
+          {
+            data: {
+              id: TX_B,
+              company_id: COMPANY_ID,
+              date: '2026-05-12',
+              amount: -349.5,
+              currency: 'SEK',
+              merchant_name: 'ICA',
+              journal_entry_id: null,
+              cash_account_id: null,
+            },
+            error: null,
+          },
+          {
+            data: {
+              id: TX_B,
+              company_id: COMPANY_ID,
+              date: '2026-05-12',
+              amount: -349.5,
+              currency: 'SEK',
+              merchant_name: 'ICA',
+              journal_entry_id: 'je-fresh',
+              cash_account_id: null,
+              category: 'expense_office',
+              is_business: true,
+            },
+            error: null,
+          },
+        ],
         company_settings: { data: { entity_type: 'enskild_firma' }, error: null },
         fiscal_periods: { data: { id: 'period-1', is_closed: false, locked_at: null }, error: null },
         'rpc:attach_transaction_categorization': { data: true, error: null },

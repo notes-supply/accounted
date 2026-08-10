@@ -1,7 +1,13 @@
 import { z } from 'zod'
 import { normaliseSwish, isValidSwish } from '@/lib/payments/swish'
 import { normalizeVatNumber } from '@/lib/vat/vat-number'
-import { isSaneDateString } from '@/lib/utils'
+import {
+  accountNumberSchema,
+  isoDateSchema,
+  saneIsoDateSchema,
+  fiscalYearSchema,
+} from '@/lib/invariants/zod'
+import { ISO_DATE_RE, ISO_DATE_MESSAGE_SV } from '@/lib/invariants/iso-date'
 import { countCalendarMonths } from '@/lib/bookkeeping/accruals/compute'
 import { DimensionsBagSchema } from '@/lib/bookkeeping/dimension-resolver'
 import { validateEmployeeBankAccount } from '@/lib/salary/payment/bank-account'
@@ -18,8 +24,13 @@ import { parseVatPeriodInput } from '@/lib/vat/period-input'
 /** UUID v4 string */
 const uuid = z.string().uuid()
 
-/** ISO date string (YYYY-MM-DD) */
-const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Expected YYYY-MM-DD date format')
+/**
+ * ISO date string (YYYY-MM-DD).
+ *
+ * Shape only. From `lib/invariants/iso-date.ts` so that every schema below, the
+ * v1 routes, and the MCP surface reject a malformed date the same way.
+ */
+const isoDate = isoDateSchema
 
 /**
  * ISO date that must also be a real, in-range calendar date: not just the
@@ -27,12 +38,10 @@ const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Expected YYYY-MM-DD dat
  * transaction form) so a 6-digit year or impossible date can't slip through
  * for user-entered dates. Use this over `isoDate` for free-text date input.
  */
-const saneIsoDate = z
-  .string()
-  .refine(isSaneDateString, 'Invalid or out-of-range date (expected YYYY-MM-DD, year 1900-2100)')
+const saneIsoDate = saneIsoDateSchema
 
 /** BAS account number: always a string of 4 digits */
-const accountNumber = z.string().regex(/^\d{4}$/, 'Account number must be exactly 4 digits')
+const accountNumber = accountNumberSchema
 
 /** Non-negative monetary amount (>= 0) */
 const nonNegativeAmount = z.number().nonnegative()
@@ -717,6 +726,9 @@ export const CreateRecurringScheduleSchema = z.object({
   customer_id: uuid,
   name: z.string().min(1, 'Schedule name is required').max(200),
   day_of_month: z.number().int().min(1).max(31),
+  // Months between runs: 1 = monthly (default), 3 = quarterly, 6 = half-
+  // yearly, 12 = yearly. Any 1-12 is accepted (e.g. every 2 months).
+  interval_months: z.number().int().min(1).max(12).default(1),
   // Whole hour (0-23) in Europe/Stockholm at which the invoice is sent.
   send_hour: z.number().int().min(0).max(23).default(8),
   payment_terms_days: z.number().int().min(0).max(90).default(30),
@@ -737,6 +749,9 @@ export const UpdateRecurringScheduleSchema = z.object({
   customer_id: uuid.optional(),
   name: z.string().min(1).max(200).optional(),
   day_of_month: z.number().int().min(1).max(31).optional(),
+  // Changing the interval alone leaves next_run_date untouched: the new
+  // cadence applies from the next run onward.
+  interval_months: z.number().int().min(1).max(12).optional(),
   send_hour: z.number().int().min(0).max(23).optional(),
   payment_terms_days: z.number().int().min(0).max(90).optional(),
   currency: CurrencySchema.optional(),
@@ -816,8 +831,11 @@ export const CreateCustomerSchema = z.object({
     .max(32, 'Customer number must be 32 characters or fewer')
     .nullable()
     .optional(),
+  contact_person: z.string().trim().max(200).nullable().optional(),
   email: z.string().email('Invalid email address').optional(),
   phone: z.string().optional(),
+  invoice_email_cc_addresses: invoiceEmailAddressList.nullable().optional(),
+  invoice_email_bcc_addresses: invoiceEmailAddressList.nullable().optional(),
   address_line1: z.string().optional(),
   address_line2: z.string().optional(),
   postal_code: z.string().optional(),
@@ -841,14 +859,28 @@ export const CreateCustomerSchema = z.object({
       message: 'Personal number is only allowed for individual customers',
     })
   }
+  if (
+    (customer.invoice_email_cc_addresses?.length ?? 0)
+    + (customer.invoice_email_bcc_addresses?.length ?? 0)
+    > MAX_INVOICE_EMAIL_COPY_RECIPIENTS
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['invoice_email_cc_addresses'],
+      message: `At most ${MAX_INVOICE_EMAIL_COPY_RECIPIENTS} customer invoice copy recipients are allowed in total`,
+    })
+  }
 })
 
 export const UpdateCustomerSchema = z.object({
   name: z.string().min(1, 'Customer name is required').optional(),
   customer_type: CustomerTypeSchema.optional(),
   customer_number: z.string().trim().max(32).nullable().optional(),
+  contact_person: z.string().trim().max(200).nullable().optional(),
   email: z.string().email('Invalid email address').optional(),
   phone: z.string().optional(),
+  invoice_email_cc_addresses: invoiceEmailAddressList.nullable().optional(),
+  invoice_email_bcc_addresses: invoiceEmailAddressList.nullable().optional(),
   address_line1: z.string().optional(),
   address_line2: z.string().optional(),
   postal_code: z.string().optional(),
@@ -875,6 +907,18 @@ export const UpdateCustomerSchema = z.object({
   language: z.enum(['sv', 'en']).optional(),
   default_payment_terms: z.number().int().positive().optional(),
   notes: z.string().optional(),
+}).superRefine((customer, ctx) => {
+  if (
+    (customer.invoice_email_cc_addresses?.length ?? 0)
+    + (customer.invoice_email_bcc_addresses?.length ?? 0)
+    > MAX_INVOICE_EMAIL_COPY_RECIPIENTS
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['invoice_email_cc_addresses'],
+      message: `At most ${MAX_INVOICE_EMAIL_COPY_RECIPIENTS} customer invoice copy recipients are allowed in total`,
+    })
+  }
 })
 
 // ============================================================
@@ -1346,6 +1390,12 @@ export const BookInboxItemDirectlySchema = z.object({
   fiscal_period_id: uuid,
   entry_date: isoDate,
   description: z.string().min(1, 'Beskrivning krävs'),
+  // `.optional()` here carries meaning the route depends on: ABSENT means
+  // "caller has no opinion", so the route may default the notes from the
+  // item's chat context, while an explicit '' means the user cleared the
+  // prefilled note and nothing must be written back onto the verifikat.
+  // Keep it `.optional()`, never `.default('')` or a min(1): both would
+  // collapse those two cases into one.
   notes: z.string().max(2000).optional(),
   lines: z.array(CreateJournalEntryLineSchema).min(2, 'Minst två rader krävs för dubbel bokföring'),
   transaction_id: uuid.optional(),
@@ -1383,6 +1433,33 @@ export const BulkBookInboxSchema = z.object({
   dimensions: DimensionsBagSchema.nullish().transform((v) => v ?? undefined),
 })
 export type BulkBookInboxInput = z.infer<typeof BulkBookInboxSchema>
+
+const BulkBookInboxExpectedSettlementSchema = z.object({
+  item_id: uuid,
+  transaction_id: uuid,
+  cash_account_id: uuid.nullable(),
+  settlement_account: accountNumber,
+}).strict().superRefine((settlement, ctx) => {
+  if (settlement.cash_account_id === null && settlement.settlement_account !== '1930') {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['settlement_account'],
+      message: 'A legacy transaction without a cash account must settle through 1930',
+    })
+  }
+})
+
+/**
+ * Approval-only contract for MCP-staged bulk inbox booking. The public direct
+ * batch API deliberately continues to use BulkBookInboxSchema: it resolves
+ * live settlement state in one request and has no staging boundary to bind.
+ */
+export const BulkBookInboxPendingParamsSchema = BulkBookInboxSchema.extend({
+  expected_settlements: z
+    .array(BulkBookInboxExpectedSettlementSchema)
+    .min(1)
+    .max(200),
+}).strict()
 
 export const MatchInvoiceSchema = z
   .object({
@@ -1753,7 +1830,7 @@ export const UpdateSettingsSchema = z.object({
   pays_salaries: z.boolean().optional(),
   sector_slug: z.string().nullable().optional(),
   // Bookkeeping lock
-  bookkeeping_locked_through: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Ogiltigt datumformat (YYYY-MM-DD)').nullable().optional(),
+  bookkeeping_locked_through: z.string().regex(ISO_DATE_RE, ISO_DATE_MESSAGE_SV).nullable().optional(),
   auto_lock_period_days: z.number().int().positive().nullable().optional(),
   // Voucher series
   default_voucher_series: z.string().regex(/^[A-Z]$/, 'Verifikationsserie måste vara en bokstav A-Z').optional(),
@@ -1991,10 +2068,7 @@ export const BankLinkSchema = z.object({
   // Settlement account being reconciled. The voucher must have a line on this
   // account and the transaction must belong to it. Defaults to '1930' in the
   // route for back-compat.
-  account_number: z
-    .string()
-    .regex(/^[0-9]{4}$/, 'Kontonummer måste vara 4 siffror')
-    .optional(),
+  account_number: accountNumber.optional(),
 })
 
 export const BankUnlinkSchema = z.object({
@@ -2016,10 +2090,7 @@ export const RunReconciliationSchema = z.object({
   date_to: isoDate.optional(),
   // BAS settlement account to reconcile against (e.g. '1930', '1932'). Defaults
   // to '1930' server-side so existing clients stay correct.
-  account_number: z
-    .string()
-    .regex(/^[0-9]{4}$/, 'Kontonummer måste vara 4 siffror')
-    .optional(),
+  account_number: accountNumber.optional(),
   dry_run: z.boolean().optional(),
   // Pairs the user ticked in the dry-run preview. When present on an apply
   // (dry_run false), only these pairs are committed: intersected server-side
@@ -2758,8 +2829,13 @@ const openingBalancesShape = {
   ytd_tax: z.number().min(0).default(0),
   ytd_net: z.number().min(0).default(0),
   vacation_paid_days_remaining: z.number().min(0).max(40).default(0),
+  // Paid days already taken in the CURRENT vacation year under the previous
+  // system. The ledger's cutover-year row derives entitled = remaining +
+  // taken_this_year and folds this into taken_days; remaining keeps meaning
+  // "remaining at cutover".
+  vacation_days_taken_this_year: z.number().min(0).max(40).default(0),
   vacation_saved_days_by_year: z
-    .record(z.string().regex(/^\d{4}$/, 'Nyckel måste vara ett fyrsiffrigt år'), z.number().min(0).max(40))
+    .record(fiscalYearSchema, z.number().min(0).max(40))
     .default({}),
   opening_semester_liability: z.number().min(0).default(0),
   opening_semester_liability_avgifter: z.number().min(0).default(0),
@@ -3129,3 +3205,80 @@ export const DimensionTaggingApplySchema = z.object({
   dimensions: DimensionsBagSchema,
   reason: z.string().trim().min(3).max(500),
 })
+
+// ============================================================
+// Körjournal (mileage trips)
+// ============================================================
+
+const mileageVehicleType = z.enum(['own_car', 'company_car_fossil', 'company_car_electric'])
+
+export const CreateMileageTripSchema = z
+  .object({
+    trip_date: saneIsoDate,
+    vehicle_type: mileageVehicleType.default('own_car'),
+    vehicle_registration: z.string().trim().max(20).optional().nullable(),
+    odometer_start: z.number().int().nonnegative().optional().nullable(),
+    odometer_end: z.number().int().nonnegative().optional().nullable(),
+    distance_km: z.number().positive().max(100000),
+    from_location: z.string().trim().min(1).max(200),
+    to_location: z.string().trim().min(1).max(200),
+    purpose: z.string().trim().min(1).max(500),
+    visited: z.string().trim().max(200).optional().nullable(),
+    is_round_trip: z.boolean().default(false),
+    employee_id: uuid.optional().nullable(),
+    notes: z.string().trim().max(1000).optional().nullable(),
+  })
+  .refine(
+    (t) =>
+      t.odometer_start == null || t.odometer_end == null || t.odometer_end > t.odometer_start,
+    { message: 'Mätarställning vid ankomst måste vara högre än vid start' }
+  )
+  .refine((t) => t.vehicle_type === 'own_car' || Boolean(t.vehicle_registration?.trim()), {
+    message: 'Ange registreringsnummer för förmånsbilen',
+  })
+
+export const UpdateMileageTripSchema = z
+  .object({
+    trip_date: saneIsoDate.optional(),
+    vehicle_type: mileageVehicleType.optional(),
+    vehicle_registration: z.string().trim().max(20).optional().nullable(),
+    odometer_start: z.number().int().nonnegative().optional().nullable(),
+    odometer_end: z.number().int().nonnegative().optional().nullable(),
+    distance_km: z.number().positive().max(100000).optional(),
+    from_location: z.string().trim().min(1).max(200).optional(),
+    to_location: z.string().trim().min(1).max(200).optional(),
+    purpose: z.string().trim().min(1).max(500).optional(),
+    visited: z.string().trim().max(200).optional().nullable(),
+    is_round_trip: z.boolean().optional(),
+    employee_id: uuid.optional().nullable(),
+    notes: z.string().trim().max(1000).optional().nullable(),
+  })
+  .refine((t) => Object.keys(t).length > 0, { message: 'Inga fält att uppdatera' })
+
+export const BookMileagePeriodSchema = z
+  .object({
+    from: saneIsoDate,
+    to: saneIsoDate,
+    entry_date: saneIsoDate,
+    counter_account: z.enum(['2820', '2893', '1930']).default('2820'),
+    employee_id: uuid.optional(),
+  })
+  .refine((p) => p.from <= p.to, { message: 'Ogiltigt datumintervall' })
+  // Schablon rates are per calendar year: a cross-year period would book
+  // every trip at one year's rate.
+  .refine((p) => p.from.slice(0, 4) === p.to.slice(0, 4), {
+    message: 'Milersättning bokförs per kalenderår: dela upp perioden per år',
+  })
+
+export const MileageSalaryPushSchema = z
+  .object({
+    run_id: uuid,
+    employee_id: uuid,
+    from: saneIsoDate,
+    to: saneIsoDate,
+    include_unassigned: z.boolean().default(true),
+  })
+  .refine((p) => p.from <= p.to, { message: 'Ogiltigt datumintervall' })
+  .refine((p) => p.from.slice(0, 4) === p.to.slice(0, 4), {
+    message: 'Milersättning bokförs per kalenderår: dela upp perioden per år',
+  })

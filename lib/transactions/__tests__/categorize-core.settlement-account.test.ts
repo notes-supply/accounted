@@ -76,6 +76,14 @@ const revolutFee = {
   journal_entry_id: null,
 }
 
+const verifiedRevolutFee = {
+  ...revolutFee,
+  company_id: 'company-1',
+  category: 'expense_bank_fees',
+  is_business: true,
+  journal_entry_id: 'je-revolut-fee',
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   eventBus.clear()
@@ -83,7 +91,10 @@ beforeEach(() => {
   mockHasLiveLink.mockResolvedValue(false)
   mockResolveSettlementAccount.mockResolvedValue('1931')
   mockCreateJournalEntry.mockResolvedValue({ id: 'je-revolut-fee' })
-  mockAttachCategorizedTransaction.mockResolvedValue({ ok: true })
+  mockAttachCategorizedTransaction.mockResolvedValue({
+    ok: true,
+    verifiedTransaction: verifiedRevolutFee,
+  })
   mockCompensatePostCommitReadbackFailure.mockResolvedValue({ handled: false })
   mockAppendProcessingHistory.mockResolvedValue('history-1')
   mockUpsertCounterpartyTemplate.mockResolvedValue(undefined)
@@ -209,6 +220,7 @@ describe('categorizeMatchedTransaction settlement account', () => {
       expect.anything(),
     )
     expect(mockAttachCategorizedTransaction).not.toHaveBeenCalled()
+    expect(mockUpsertCounterpartyTemplate).not.toHaveBeenCalled()
   })
 
   it('never invokes categorization attachment when journal creation returns no id', async () => {
@@ -271,9 +283,108 @@ describe('categorizeMatchedTransaction settlement account', () => {
         isBusiness: true,
         category: 'expense_bank_fees',
         journalEntryId: 'je-revolut-fee',
+        requireVerifiedTransaction: true,
       },
       expect.anything(),
     )
+  })
+
+  it('emits only the authoritative post-attachment transaction state', async () => {
+    const categorized = vi.fn()
+    eventBus.on('transaction.categorized', categorized)
+    const authoritative = {
+      ...verifiedRevolutFee,
+      description: 'Authoritative post-attachment row',
+    }
+    mockAttachCategorizedTransaction.mockResolvedValueOnce({
+      ok: true,
+      verifiedTransaction: authoritative,
+    })
+    const supabase = queuedSupabase([
+      { data: revolutFee },
+      { data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 } },
+      { data: [{ id: 'period-2026' }] },
+      { data: [] },
+    ])
+
+    const result = await categorizeMatchedTransaction(
+      supabase,
+      'user-1',
+      'company-1',
+      revolutFee.id,
+      { category: 'expense_bank_fees', vatTreatment: 'exempt' },
+    )
+
+    expect(result.data?.journal_entry_id).toBe('je-revolut-fee')
+    expect(categorized).toHaveBeenCalledWith(expect.objectContaining({
+      transaction: expect.objectContaining({
+        id: revolutFee.id,
+        company_id: 'company-1',
+        category: 'expense_bank_fees',
+        is_business: true,
+        journal_entry_id: 'je-revolut-fee',
+        cash_account_id: 'cash-revolut-sek',
+        description: 'Authoritative post-attachment row',
+      }),
+    }))
+    expect(mockUpsertCounterpartyTemplate).toHaveBeenCalledWith(
+      supabase,
+      'company-1',
+      authoritative,
+      expect.objectContaining({
+        debit_account: '6570',
+        credit_account: '1931',
+      }),
+      'user_approved',
+    )
+  })
+
+  it.each([
+    {
+      label: 'conflicting verified readback',
+      attachment: { ok: false, reason: 'conflict' },
+      expected: { status: 409, errorCode: 'SETTLEMENT_ACCOUNT_DRIFT' },
+    },
+    {
+      label: 'failed verified readback with durable compensation ids',
+      attachment: {
+        ok: false,
+        reason: 'database_error',
+        partialPostedIds: {
+          journal_entry_id: 'je-revolut-fee',
+          reversal_journal_entry_id: 'je-storno',
+        },
+      },
+      expected: {
+        status: 500,
+        errorCode: 'BOOKKEEPING_DATABASE_ERROR',
+        partialPostedIds: {
+          journal_entry_id: 'je-revolut-fee',
+          reversal_journal_entry_id: 'je-storno',
+        },
+      },
+    },
+  ])('suppresses transaction.categorized after $label', async ({ attachment, expected }) => {
+    const categorized = vi.fn()
+    eventBus.on('transaction.categorized', categorized)
+    mockAttachCategorizedTransaction.mockResolvedValueOnce(attachment)
+    const supabase = queuedSupabase([
+      { data: revolutFee },
+      { data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 } },
+      { data: [{ id: 'period-2026' }] },
+    ])
+
+    const result = await categorizeMatchedTransaction(
+      supabase,
+      'user-1',
+      'company-1',
+      revolutFee.id,
+      { category: 'expense_bank_fees', vatTreatment: 'exempt' },
+    )
+
+    expect(result).toMatchObject(expected)
+    expect(categorized).not.toHaveBeenCalled()
+    expect(mockUpsertCounterpartyTemplate).not.toHaveBeenCalled()
   })
 
   it('stornoes the just-created voucher when the approval CAS loses a race', async () => {

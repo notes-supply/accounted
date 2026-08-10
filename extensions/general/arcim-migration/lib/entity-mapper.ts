@@ -8,6 +8,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { fetchExchangeRate } from '@/lib/currency/riksbanken'
 import { encryptCustomerPersonalNumber } from '@/lib/customers/protect-personal-number'
+import { normalizeVatRateToFraction } from '@/lib/vat/vat-rate-unit'
 import type { Currency, CustomerType, ExchangeRate, SupplierType, VatTreatment } from '@/types'
 import type {
   CustomerDto,
@@ -439,8 +440,11 @@ export function mapCustomer(dto: CustomerDto, userId: string, companyId: string)
     company_id: companyId,
     name: dto.party.name,
     customer_type: customerType,
+    contact_person: dto.party.contact?.name || null,
     email: dto.party.contact?.email || null,
     phone: dto.party.contact?.telephone || null,
+    invoice_email_cc_addresses: dto.invoiceEmailCcAddresses ?? null,
+    invoice_email_bcc_addresses: dto.invoiceEmailBccAddresses ?? null,
     ...addr,
     org_number: isIndividual ? null : number,
     personal_number: isIndividual ? encryptCustomerPersonalNumber(number) : null,
@@ -513,7 +517,10 @@ export function mapSalesInvoice(
     user_id: userId,
     company_id: companyId,
     customer_id: customerId,
-    invoice_number: dto.invoiceNumber,
+    // Empty string must become NULL: the UNIQUE (company_id, invoice_number)
+    // index is partial on NOT NULL, so '' from a provider payload missing the
+    // field would collide on the second invoice and reject the insert.
+    invoice_number: dto.invoiceNumber || null,
     invoice_date: dto.issueDate,
     due_date: dto.dueDate || dto.issueDate,
     status: statusMap[dto.status] || 'sent',
@@ -536,6 +543,9 @@ export function mapSalesInvoice(
     document_type: isCreditNote ? 'credit_note' : 'invoice',
     paid_at: dto.paymentStatus.paid ? dto.paymentStatus.lastPaymentDate || dto.issueDate : null,
     paid_amount: dto.paymentStatus.paid ? total : round2(total - dto.paymentStatus.balance.value),
+    // remaining_amount is NOT NULL DEFAULT 0, so omitting it makes every
+    // migrated open invoice look fully settled in AR aging.
+    remaining_amount: dto.paymentStatus.paid ? 0 : Math.max(0, round2(dto.paymentStatus.balance.value)),
   }
 
   const items = dto.lines.map((line, idx) => mapSalesInvoiceLine(line, idx))
@@ -621,7 +631,11 @@ export function mapSupplierInvoice(
     user_id: userId,
     company_id: companyId,
     supplier_id: supplierId,
-    supplier_invoice_number: dto.invoiceNumber,
+    // Empty string must become NULL: with '' every number-less invoice from
+    // the same supplier collides on the UNIQUE
+    // (company_id, supplier_id, supplier_invoice_number) index, while NULLs
+    // are treated as distinct.
+    supplier_invoice_number: dto.invoiceNumber || null,
     invoice_date: dto.issueDate,
     due_date: dto.dueDate || dto.issueDate,
     received_date: dto.issueDate,
@@ -664,7 +678,10 @@ function mapSupplierInvoiceLine(line: SupplierInvoiceLineDto, index: number): Re
     unit_price: round2(line.unitPrice?.value ?? line.lineExtensionAmount.value),
     line_total: round2(line.lineExtensionAmount.value),
     account_number: line.accountNumber || '4000', // Default to purchases
-    vat_rate: inferVatRate(line.taxPercent),
+    // supplier_invoice_items stores decimal fractions (0.25 = 25 %), unlike
+    // customer invoice_items which store percent; foreign rates (19 % DE)
+    // must survive as 0.19 rather than be coerced to a Swedish rate.
+    vat_rate: normalizeVatRateToFraction(line.taxPercent ?? 25),
     vat_amount: round2(line.taxAmount?.value ?? 0),
   }
 }

@@ -24,12 +24,14 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { eventBus } from '@/lib/events'
 import { buildMappingResultFromCategory } from '@/lib/bookkeeping/category-mapping'
-import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
+import { applySettlementAccount } from '@/lib/bookkeeping/mapping-engine'
 import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
+import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
 import { loadCategorizationCompanySettings } from '@/lib/bookkeeping/company-settings'
 import { upsertCounterpartyTemplate } from '@/lib/bookkeeping/counterparty-templates'
 import { BookkeepingDatabaseError, isBookkeepingError } from '@/lib/bookkeeping/errors'
 import { linkToJournalEntry } from '@/lib/core/documents/document-service'
+import { renderChannelContextNotes } from '@/lib/documents/channel-context-notes'
 import {
   attachCategorizedTransaction,
   compensatePostCommitReadbackFailure,
@@ -42,7 +44,7 @@ import {
 import { hasLiveJournalEntryLink } from '@/lib/transactions/link-journal-entry'
 import { appendProcessingHistory } from '@/lib/processing-history/append'
 import { createLogger } from '@/lib/logger'
-import type { Transaction, TransactionCategory, VatTreatment } from '@/types'
+import type { InboxChannelContext, Transaction, TransactionCategory, VatTreatment } from '@/types'
 
 const log = createLogger('transactions/categorize-core')
 
@@ -366,10 +368,11 @@ export async function categorizeMatchedTransaction(
     }
   }
 
-  const mappingResult = buildMappingResultFromCategory(
+  let mappingResult = buildMappingResultFromCategory(
     category, transaction as Transaction, isBusiness, entityType, vatTreatment, vatAmount,
     settlementAccount,
   )
+  mappingResult = applySettlementAccount(mappingResult, settlementAccount, transaction.amount)
   // Dimensions PR7: tag the business lines of the generated verifikat.
   if (dimensions && Object.keys(dimensions).length > 0) {
     mappingResult.dimensions = dimensions
@@ -429,6 +432,7 @@ export async function categorizeMatchedTransaction(
       isBusiness,
       category,
       journalEntryId,
+      requireVerifiedTransaction: true,
     },
     log,
   )
@@ -453,6 +457,15 @@ export async function categorizeMatchedTransaction(
       ...(attachment.partialPostedIds
         ? { partialPostedIds: attachment.partialPostedIds }
         : {}),
+    }
+  }
+
+  const verifiedTransaction = attachment.verifiedTransaction
+  if (!verifiedTransaction) {
+    return {
+      error: 'Post-attachment transaction state could not be verified.',
+      errorCode: 'BOOKKEEPING_DATABASE_ERROR',
+      status: 500,
     }
   }
 
@@ -519,14 +532,14 @@ export async function categorizeMatchedTransaction(
 
   try {
     await upsertCounterpartyTemplate(
-      supabase, companyId, transaction as Transaction, mappingResult, 'user_approved'
+      supabase, companyId, verifiedTransaction, mappingResult, 'user_approved'
     )
   } catch { /* non-critical */ }
 
   await eventBus.emit({
     type: 'transaction.categorized',
     payload: {
-      transaction: transaction as Transaction,
+      transaction: verifiedTransaction,
       account: mappingResult.debit_account,
       taxCode: mappingResult.vat_lines[0]?.account_number || '',
       userId,
@@ -551,6 +564,13 @@ export interface BulkBookInboxInput {
    * verifikat in the batch (same semantics as single categorize).
    */
   dimensions?: Record<string, string>
+  /** Approval-only settlement provenance, captured per staged inbox item. */
+  expected_settlements?: Array<{
+    item_id: string
+    transaction_id: string
+    cash_account_id: string | null
+    settlement_account: string
+  }>
 }
 
 export interface BulkBookInboxResult {
@@ -559,6 +579,7 @@ export interface BulkBookInboxResult {
     item_id: string
     reason: string
     detail?: string
+    error_code?: string
     partial_posted_ids?: Record<string, string>
   }>
   partial_posted_ids?: Record<string, string>
@@ -598,7 +619,16 @@ export async function bulkBookMatchedInboxItems(
   companyId: string,
   input: BulkBookInboxInput,
 ): Promise<BulkBookInboxResult> {
-  const { item_ids, category, vat_treatment, vat_amount, notes, allow_duplicate, dimensions } = input
+  const {
+    item_ids,
+    category,
+    vat_treatment,
+    vat_amount,
+    notes,
+    allow_duplicate,
+    dimensions,
+    expected_settlements,
+  } = input
 
   const booked: BulkBookInboxResult['booked'] = []
   const skipped: BulkBookInboxResult['skipped'] = []
@@ -611,11 +641,14 @@ export async function bulkBookMatchedInboxItems(
   // these lists, so the guard still catches them (see BookingDuplicateExclusions).
   const bookedTransactionIds: string[] = []
   const bookedJournalEntryIds: string[] = []
+  const expectedSettlementsByItem = expected_settlements
+    ? new Map(expected_settlements.map((expected) => [expected.item_id, expected]))
+    : null
 
   for (const itemId of item_ids) {
     const { data: item, error: itemError } = await supabase
       .from('invoice_inbox_items')
-      .select('id, matched_transaction_id, created_journal_entry_id, created_supplier_invoice_id')
+      .select('id, matched_transaction_id, created_journal_entry_id, created_supplier_invoice_id, channel_context')
       .eq('id', itemId)
       .eq('company_id', companyId)
       .maybeSingle()
@@ -637,6 +670,46 @@ export async function bulkBookMatchedInboxItems(
       continue
     }
 
+    const expectedSettlement = expectedSettlementsByItem?.get(itemId)
+    if (expectedSettlementsByItem && !expectedSettlement) {
+      skipped.push({
+        item_id: itemId,
+        reason: 'settlement_provenance_missing',
+        error_code: 'SETTLEMENT_PROVENANCE_MISSING',
+      })
+      continue
+    }
+    if (
+      expectedSettlement &&
+      expectedSettlement.transaction_id !== item.matched_transaction_id
+    ) {
+      skipped.push({
+        item_id: itemId,
+        reason: 'settlement_account_drift',
+        error_code: 'SETTLEMENT_ACCOUNT_DRIFT',
+        detail: 'Underlaget har matchats mot en annan banktransaktion sedan förhandsgranskningen.',
+      })
+      continue
+    }
+
+    // WhatsApp-sourced underlag carry verified human context (representation
+    // deltagare + syfte, sender note) in channel_context. Thread it into the
+    // verifikat description ALONGSIDE the caller's shared batch note: bulk
+    // booking never shows a per-item notes field, so dropping the chat
+    // answers here would silently lose the Skatteverket representation
+    // documentation that only exists on this one item.
+    //
+    // Answers only, never the photo caption (the renderer leaves it out
+    // unless asked for it): this loop books without any per-item review and
+    // the verifikat description is immutable under BFL 5 kap, so unreviewed
+    // chat text must not land there. Captions only reach a verifikat through
+    // Bokför direkt, where the user reads them in an editable field first.
+    const channelNotes = renderChannelContextNotes(
+      (item as { channel_context?: InboxChannelContext | null }).channel_context,
+    )
+    const itemNotes =
+      [notes?.trim(), channelNotes].filter(Boolean).join(' · ') || undefined
+
     let result: CategorizeCoreResult
     try {
       result = await categorizeMatchedTransaction(
@@ -644,7 +717,22 @@ export async function bulkBookMatchedInboxItems(
         userId,
         companyId,
         item.matched_transaction_id as string,
-        { category, vatTreatment: vat_treatment, vatAmount: vat_amount, notes, allowDuplicate: allow_duplicate, dimensions },
+        {
+          category,
+          vatTreatment: vat_treatment,
+          vatAmount: vat_amount,
+          notes: itemNotes,
+          allowDuplicate: allow_duplicate,
+          dimensions,
+          ...(expectedSettlement
+            ? {
+                expectedSettlement: {
+                  cashAccountId: expectedSettlement.cash_account_id,
+                  ledgerAccount: expectedSettlement.settlement_account,
+                },
+              }
+            : {}),
+        },
         // Snapshot copies so the guard sees only the prior bookings of this batch.
         { excludeTransactionIds: [...bookedTransactionIds], excludeJournalEntryIds: [...bookedJournalEntryIds] },
       )
@@ -662,7 +750,8 @@ export async function bulkBookMatchedInboxItems(
 
     if (result.error) {
       const reason =
-        result.status === 404 ? 'transaction_not_found'
+        result.errorCode === 'SETTLEMENT_ACCOUNT_DRIFT' ? 'settlement_account_drift'
+        : result.status === 404 ? 'transaction_not_found'
         : result.status === 409 ? 'already_booked_or_duplicate'
         : result.status === 400 ? 'no_account_mapping'
         : 'error'
@@ -673,6 +762,9 @@ export async function bulkBookMatchedInboxItems(
         item_id: itemId,
         reason,
         detail: result.error,
+        ...(result.errorCode === 'SETTLEMENT_ACCOUNT_DRIFT'
+          ? { error_code: result.errorCode }
+          : {}),
         ...(result.partialPostedIds
           ? { partial_posted_ids: result.partialPostedIds }
           : {}),

@@ -253,11 +253,28 @@ describe('POST /transactions/batch-categorize', () => {
           {
             data: {
               id: TX_ID,
+              company_id: COMPANY_ID,
               date: '2026-05-12',
               amount: -100,
               currency: 'SEK',
               merchant_name: 'ICA',
               journal_entry_id: null,
+              cash_account_id: null,
+            },
+            error: null,
+          },
+          {
+            data: {
+              id: TX_ID,
+              company_id: COMPANY_ID,
+              date: '2026-05-12',
+              amount: -100,
+              currency: 'SEK',
+              merchant_name: 'ICA',
+              journal_entry_id: 'je-bc',
+              cash_account_id: null,
+              category: 'expense_office',
+              is_business: true,
             },
             error: null,
           },

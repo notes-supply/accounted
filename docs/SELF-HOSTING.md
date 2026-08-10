@@ -32,6 +32,9 @@ still disables hosted-only services, but no longer overrides an explicit MFA
 policy. Set both MFA settings explicitly and identically. Use `false` for both
 to allow optional enrollment; missing, malformed, or mismatched values are rejected.
 
+Idle and absolute session timeouts are off by default for self-hosted installs;
+operators can opt in with the variables below.
+
 ## 3. Apply Database Migrations
 
 The `supabase/migrations/` directory contains the ordered SQL files that set up the full schema, including tables, RLS policies, triggers, and functions.
@@ -98,6 +101,22 @@ CRON_SECRET=<generate with: openssl rand -hex 32>
 ```
 
 `NEXT_PUBLIC_APP_URL` must match your public-facing URL. It is used in invoice reminder emails, calendar feed links, and PSD2 callbacks. If left as a placeholder, links will be broken.
+
+Hosted Accounted sessions default to a 30-minute idle limit, a 12-hour absolute
+limit, and a warning 2 minutes before expiry. Self-hosted installations leave
+both limits disabled unless you opt in (values are milliseconds):
+
+```bash
+NEXT_PUBLIC_SESSION_IDLE_TIMEOUT_MS=1800000
+NEXT_PUBLIC_SESSION_ABSOLUTE_TIMEOUT_MS=43200000
+NEXT_PUBLIC_SESSION_WARNING_MS=120000
+```
+
+Set either timeout to `0` to disable only that limit. Timeout state is signed
+with `SUPABASE_SERVICE_ROLE_KEY` by default; set `SESSION_TIMEOUT_SECRET` to a
+separate random value if you want to rotate it independently. Changing either
+signing secret invalidates existing timeout cookies and requires users to sign
+in again.
 
 ## 5. Start the Application
 
@@ -196,27 +215,22 @@ Additionally, migration 048 schedules a `pg_cron` job inside the database that m
 
 ### AI Features
 
-The self-hosted Docker image includes these AI-powered extensions: receipt OCR, AI categorization, AI chat, and invoice inbox. To enable them, add API keys to your `.env`:
+All AI features (automatic interpretation of uploaded receipts and invoices via the `document-extraction` and `invoice-inbox` extensions, and the in-app AI assistant) run Claude via AWS Bedrock. To enable them, add AWS credentials for an account with Bedrock model access to Claude:
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-...    # Required for all AI features
-OPENAI_API_KEY=sk-...           # Required for embedding-based features (categorization, chat)
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=eu-north-1                          # default; keeps inference in the EU
+BEDROCK_MODEL_ID=eu.anthropic.claude-sonnet-5  # optional: document extraction model
+BEDROCK_OPUS_MODEL_ID=...                      # optional: assistant model, heavy intents
+BEDROCK_SONNET_MODEL_ID=...                    # optional: assistant model, standard intents
 ```
 
-Each user must individually grant AI consent in the UI before AI features activate (per GDPR requirements).
+Set the two static keys explicitly. The AI assistant's client can fall back to the standard AWS credential provider chain (instance profile, IRSA) when they are absent, but document extraction requires `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` and silently returns empty results without them.
 
-**AI chat knowledge base** (optional): The AI chat can answer Swedish tax and accounting questions using a RAG knowledge base. To populate it, create `dev_docs/ai_knowledge_base/` with markdown files and run:
+Without working credentials the rest of the app runs normally: uploads are stored but not auto-interpreted, and the AI assistant cannot answer.
 
-```bash
-npx tsx extensions/general/ai-chat/ingestion/ingest.ts
-```
-
-**Booking template embeddings** (optional): For AI-powered transaction categorization suggestions, seed the template embeddings by calling:
-
-```bash
-curl -X POST -H "Authorization: Bearer $CRON_SECRET" \
-  https://your-domain.com/api/admin/seed-template-embeddings
-```
+> **Note:** `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` from earlier versions are no longer read by any code path. Support for a plain Anthropic API key (and pluggable providers) is tracked in [#1406](https://github.com/erp-mafia/accounted/issues/1406).
 
 ### Email (Invoice Sending and Reminders)
 
@@ -260,14 +274,7 @@ Sentry is disabled if these are not set. No errors are thrown.
 
 ## Storage Buckets
 
-Migration 024 automatically creates the `documents` storage bucket (private, 50 MB limit, WORM, no update/delete).
-
-If you enable the **receipt-ocr** extension, you must manually create a `receipts` storage bucket in the Supabase dashboard:
-
-1. Go to **Storage** in the Supabase dashboard.
-2. Create a new bucket named `receipts`.
-3. Set it as **public** (receipt images are referenced by public URL).
-4. Set an appropriate file size limit (e.g., 10 MB).
+Migration 024 automatically creates the `documents` storage bucket (private, 50 MB limit, WORM, no update/delete). No other buckets need to be created manually.
 
 ## Updating
 
@@ -388,6 +395,106 @@ flowchart LR
 
 5. **Reverse proxy** in front of both hosts. The app container and the Supabase `kong` container must share an external Docker network so the proxy can route to them by name.
 
+### Synology DSM and Xpenology notes
+
+Run Accounted and Supabase as two separate Container Manager Projects with two
+separate project directories. Accounted owns the Compose files in this
+repository. Supabase owns its database, Auth, Realtime, Storage, and pooler
+configuration. Choose one upstream release tag or full commit and copy the
+complete `docker/` directory from that immutable revision, following the
+[official Supabase Docker guide](https://supabase.com/docs/guides/self-hosting/docker).
+Do not copy individual snippets into Accounted's Compose file or mix files from
+different upstream revisions.
+
+For the **Accounted project**, follow the
+[Accounted Container Manager file layout](DOCKER.md#synology-dsm-and-xpenology).
+For the **Supabase project**:
+
+1. Copy the entire upstream `supabase/docker/` directory into the project
+   directory. Do not upload only its `docker-compose.yml`: it bind-mounts SQL,
+   gateway, function, pooler, and Storage files from the accompanying
+   `volumes/` tree.
+2. Create the two runtime directories that upstream deliberately excludes from
+   Git before the first deployment. File Station is fine, or from the Supabase
+   project directory use:
+
+   ```bash
+   mkdir -p volumes/db/data volumes/storage
+   ```
+
+   Container Manager must be able to write to both directories. Use the
+   narrowest NAS ACL that works for the container runtime; do not make the
+   whole shared folder world-writable.
+3. Supavisor publishes two host ports. Before starting the project, make sure
+   both `POSTGRES_PORT` and `POOLER_PROXY_PORT_TRANSACTION` in the **Supabase**
+   `.env` are unused on the NAS. If the defaults conflict, examples are
+   `POSTGRES_PORT=5433` for session mode and
+   `POOLER_PROXY_PORT_TRANSACTION=6544` for transaction mode. Changing only
+   `POSTGRES_PORT` does not resolve a conflict on the transaction port.
+   Accounted's `PORT` only changes the web app port and cannot resolve either
+   database conflict. Do not expose the Supabase `db` container directly just
+   to solve a conflict: the official stack exposes PostgreSQL through
+   Supavisor.
+
+   Supabase's default Supavisor port mappings listen on every host interface.
+   Accounted does not need either database port over the network, so on a
+   shared NAS bind both mappings to loopback in the version-matched Supabase
+   Compose file:
+
+   ```yaml
+   services:
+     supavisor:
+       ports:
+         - "127.0.0.1:${POSTGRES_PORT}:5432"
+         - "127.0.0.1:${POOLER_PROXY_PORT_TRANSACTION}:6543"
+   ```
+
+   If another trusted machine must connect, bind to a specific private NAS
+   address and restrict both ports to trusted source addresses in the DSM
+   firewall. Never forward either database port to the public internet.
+4. The default Accounted integration uses Supabase's legacy `ANON_KEY` and
+   `SERVICE_ROLE_KEY`, so asymmetric keys and `JWT_JWKS` are optional. Leave
+   the upstream JWKS lines commented when using legacy-only mode. If you enable
+   Supabase's new asymmetric keys, generate them with the upstream
+   `utils/add-new-auth-keys.sh` script and follow the
+   [official authentication-key guide](https://supabase.com/docs/guides/self-hosting/self-hosted-auth-keys).
+
+Some older Compose parsers reject the inline JSON fallback in Supabase's
+optional Realtime setting:
+
+```yaml
+API_JWT_JWKS: ${JWT_JWKS:-{"keys":[]}}
+```
+
+After `JWT_JWKS` has been generated and saved in the Supabase `.env`, use the
+direct substitution documented by Supabase for limited Compose parsers:
+
+```yaml
+# Supabase PostgREST
+PGRST_JWT_SECRET: ${JWT_JWKS}
+
+# Supabase Realtime
+API_JWT_JWKS: ${JWT_JWKS}
+
+# Supabase Storage
+JWT_JWKS: ${JWT_JWKS}
+```
+
+Do not invent an empty or placeholder JWKS for a production deployment. Either
+keep asymmetric authentication disabled or configure the generated value
+consistently for every Supabase service that verifies tokens.
+
+Accounted's base Compose file intentionally omits the optional `cpus` and
+`healthcheck.start_interval` settings because older Container Manager Compose
+builds can reject them. Operators who need a CPU cap can set one through DSM's
+resource controls or a local Compose override. Existing deployments that
+relied on the previous two-CPU cap must reapply it before restarting with the
+new base file. Command-line deployments on Docker Compose 2.20.2 or newer and
+Docker Engine 25.0 or newer can use the version-controlled
+`docker-compose.resources.yml` overlay to restore both the cap and faster
+startup health checks; older NAS container stacks should keep using the
+portable base file alone.
+
 ### What you give up vs. cloud Supabase
 
 - **Backups** are entirely your responsibility: set up `pg_dump` (or a tool like restic) to off-host storage. As a portable, vendor-neutral *logical* backup on top of the raw dump, you can also export each fiscal period as a standard **SIE4** file via the API and archive it: any Swedish bookkeeping system can re-import it:
@@ -421,4 +528,4 @@ Ensure `https://your-domain.com/auth/callback` is in the Supabase **Redirect URL
 `pg_cron` requires a paid Supabase plan. On the free tier, you can safely comment out migration 048 or let it fail: the overdue supplier invoice check is non-critical and can be triggered manually.
 
 **Container restarts in a loop:**
-Check logs with `docker compose logs app`. The app requires all five core env vars (`NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `NEXT_PUBLIC_APP_URL`, `CRON_SECRET`) and will crash on startup if any are missing.
+Check logs with `docker compose logs app`. The app requires all seven core env vars (`NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `NEXT_PUBLIC_APP_URL`, `CRON_SECRET`, `REQUIRE_MFA`, `NEXT_PUBLIC_REQUIRE_MFA`) and will crash on startup if any are missing.

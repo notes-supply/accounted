@@ -63,6 +63,19 @@ function queuedSupabase(results: Array<{ data?: unknown; error?: unknown }>) {
   return { from, rpc: from } as never
 }
 
+function verifiedTransaction(transactionId: string, cashAccountId: string | null = null) {
+  return {
+    data: {
+      id: transactionId,
+      company_id: 'c1',
+      category: 'expense_software',
+      is_business: true,
+      journal_entry_id: 'je-1',
+      cash_account_id: cashAccountId,
+    },
+  }
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   eventBus.clear()
@@ -224,7 +237,9 @@ describe('bulkBookMatchedInboxItems: booking', () => {
       { data: [{ id: 'fp-1' }] },
       // 5. atomic settlement attachment
       { data: true, error: null },
-      // 6. propagation select (no matched inbox rows to stamp in this mock)
+      // 6. authoritative post-attachment transaction readback
+      verifiedTransaction('tx-1'),
+      // 7. propagation select (no matched inbox rows to stamp in this mock)
       { data: [] },
     ])
 
@@ -249,6 +264,110 @@ describe('bulkBookMatchedInboxItems: booking', () => {
     )
   })
 
+  it('books against the linked cash account instead of the 1930 mapping default', async () => {
+    const supabase = queuedSupabase([
+      { data: { id: 'i1', matched_transaction_id: 'tx-1', created_journal_entry_id: null, created_supplier_invoice_id: null } },
+      {
+        data: {
+          id: 'tx-1',
+          date: '2026-06-01',
+          amount: -700.28,
+          currency: 'SEK',
+          cash_account_id: 'cash-1',
+          journal_entry_id: null,
+        },
+      },
+      { data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 } },
+      { data: { ledger_account: '1931' } },
+      { data: [{ id: 'fp-1' }] },
+      { data: true, error: null },
+      verifiedTransaction('tx-1', 'cash-1'),
+      { data: [] },
+    ])
+
+    const { booked, skipped } = await bulkBookMatchedInboxItems(supabase, 'u1', 'c1', {
+      item_ids: ['i1'],
+      category: 'expense_software',
+      expected_settlements: [{
+        item_id: 'i1',
+        transaction_id: 'tx-1',
+        cash_account_id: 'cash-1',
+        settlement_account: '1931',
+      }],
+    })
+
+    expect(skipped).toEqual([])
+    expect(booked).toHaveLength(1)
+    expect(mockCreateJE).toHaveBeenCalledWith(
+      expect.anything(),
+      'c1',
+      'u1',
+      expect.objectContaining({ id: 'tx-1', cash_account_id: 'cash-1' }),
+      expect.objectContaining({ debit_account: '5420', credit_account: '1931' }),
+      undefined,
+      { category: 'expense_software', isBusiness: true },
+    )
+  })
+
+  it.each([
+    {
+      name: 'transaction cash-account drift',
+      currentCashAccountId: 'cash-current',
+      currentLedgerAccount: '1931',
+      expectedCashAccountId: 'cash-staged',
+      expectedLedgerAccount: '1931',
+    },
+    {
+      name: 'cash-account ledger mapping drift',
+      currentCashAccountId: 'cash-revolut',
+      currentLedgerAccount: '1930',
+      expectedCashAccountId: 'cash-revolut',
+      expectedLedgerAccount: '1931',
+    },
+  ])('rejects $name before creating a journal entry', async (testCase) => {
+    const supabase = queuedSupabase([
+      {
+        data: {
+          id: 'i1',
+          matched_transaction_id: 'tx-1',
+          created_journal_entry_id: null,
+          created_supplier_invoice_id: null,
+        },
+      },
+      {
+        data: {
+          id: 'tx-1',
+          date: '2026-06-01',
+          amount: -150,
+          currency: 'SEK',
+          cash_account_id: testCase.currentCashAccountId,
+          journal_entry_id: null,
+        },
+      },
+      { data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 } },
+      { data: { ledger_account: testCase.currentLedgerAccount } },
+    ])
+
+    const result = await bulkBookMatchedInboxItems(supabase, 'u1', 'c1', {
+      item_ids: ['i1'],
+      category: 'expense_bank_fees',
+      expected_settlements: [{
+        item_id: 'i1',
+        transaction_id: 'tx-1',
+        cash_account_id: testCase.expectedCashAccountId,
+        settlement_account: testCase.expectedLedgerAccount,
+      }],
+    })
+
+    expect(result.booked).toEqual([])
+    expect(result.skipped).toEqual([expect.objectContaining({
+      item_id: 'i1',
+      reason: 'settlement_account_drift',
+      error_code: 'SETTLEMENT_ACCOUNT_DRIFT',
+    })])
+    expect(mockCreateJE).not.toHaveBeenCalled()
+  })
+
   it('forwards the shared dimensions bag onto every booked mapping result', async () => {
     // Fresh mapping object per call: the core mutates it in place, and a
     // shared fixture would leak dimensions across tests.
@@ -269,6 +388,7 @@ describe('bulkBookMatchedInboxItems: booking', () => {
       { data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 } },
       { data: [{ id: 'fp-1' }] },
       { data: true, error: null },
+      verifiedTransaction('tx-1'),
       { data: [] },
     ])
 
@@ -301,6 +421,7 @@ describe('bulkBookMatchedInboxItems: booking', () => {
       { data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 } },
       { data: [{ id: 'fp-1' }] },
       { data: true, error: null },
+      verifiedTransaction('tx-2'),
       { data: [] },
     ])
 
@@ -433,14 +554,193 @@ describe('bulkBookMatchedInboxItems: booking', () => {
   })
 })
 
+describe('bulkBookMatchedInboxItems: WhatsApp channel-context notes threading', () => {
+  const WA_CONTEXT = {
+    channel: 'whatsapp',
+    representation: {
+      participants: [
+        { name: 'Anna Berg', company: 'Volvo' },
+        { name: 'Jakob W', company: null },
+      ],
+      purpose: 'uppföljning av avtal',
+      event_date: null,
+      raw_answer: 'raw',
+      answered_at: '2026-08-01T12:00:00Z',
+    },
+  }
+  const RENDERED = 'Representation: Anna Berg (Volvo), Jakob W · Syfte: uppföljning av avtal'
+
+  const bookableWaItem = () => [
+    { data: { id: 'i1', matched_transaction_id: 'tx-1', created_journal_entry_id: null, created_supplier_invoice_id: null, channel_context: WA_CONTEXT } },
+    { data: { id: 'tx-1', date: '2026-06-01', amount: -700, currency: 'SEK', cash_account_id: null, journal_entry_id: null } },
+    { data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 } },
+    { data: [{ id: 'fp-1' }] },
+    { data: true, error: null },
+    verifiedTransaction('tx-1'),
+    { data: [] },
+  ]
+
+  it('threads the rendered channel context into the verifikat notes', async () => {
+    const supabase = queuedSupabase(bookableWaItem())
+
+    const { booked, skipped } = await bulkBookMatchedInboxItems(supabase, 'u1', 'c1', {
+      item_ids: ['i1'],
+      category: 'expense_software',
+    })
+
+    expect(skipped).toEqual([])
+    expect(booked).toHaveLength(1)
+    // createTransactionJournalEntry(supabase, companyId, userId, tx, mapping, notes)
+    expect(mockCreateJE).toHaveBeenCalledWith(
+      expect.anything(),
+      'c1',
+      'u1',
+      expect.objectContaining({ id: 'tx-1' }),
+      expect.anything(),
+      RENDERED,
+      { category: 'expense_software', isBusiness: true },
+    )
+  })
+
+  it('keeps the shared batch note AND the per-item channel context', async () => {
+    const supabase = queuedSupabase(bookableWaItem())
+
+    await bulkBookMatchedInboxItems(supabase, 'u1', 'c1', {
+      item_ids: ['i1'],
+      category: 'expense_software',
+      notes: 'Gemensam batchanteckning',
+    })
+
+    expect(mockCreateJE).toHaveBeenCalledWith(
+      expect.anything(),
+      'c1',
+      'u1',
+      expect.objectContaining({ id: 'tx-1' }),
+      expect.anything(),
+      `Gemensam batchanteckning · ${RENDERED}`,
+      { category: 'expense_software', isBusiness: true },
+    )
+  })
+
+  // Regression (adversarial review): the photo caption is chat text nobody
+  // was asked for and nobody reviewed, and this loop books every selected item
+  // with no per-item notes field. Burning it into a posted verifikat
+  // description would need a formal rättelse to undo, so only the answered
+  // parts (representation, user_note) are threaded here.
+  it('does NOT thread an unreviewed photo caption into the verifikat notes', async () => {
+    const supabase = queuedSupabase([
+      {
+        data: {
+          id: 'i1',
+          matched_transaction_id: 'tx-1',
+          created_journal_entry_id: null,
+          created_supplier_invoice_id: null,
+          channel_context: {
+            channel: 'whatsapp',
+            caption: 'kvittot från igår, Annas sjukbesök, hon betalade',
+          },
+        },
+      },
+      { data: { id: 'tx-1', date: '2026-06-01', amount: -700, currency: 'SEK', cash_account_id: null, journal_entry_id: null } },
+      { data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 } },
+      { data: [{ id: 'fp-1' }] },
+      { data: true, error: null },
+      verifiedTransaction('tx-1'),
+      { data: [] },
+    ])
+
+    await bulkBookMatchedInboxItems(supabase, 'u1', 'c1', {
+      item_ids: ['i1'],
+      category: 'expense_software',
+      notes: 'Gemensam batchanteckning',
+    })
+
+    expect(mockCreateJE).toHaveBeenCalledWith(
+      expect.anything(),
+      'c1',
+      'u1',
+      expect.objectContaining({ id: 'tx-1' }),
+      expect.anything(),
+      'Gemensam batchanteckning',
+      { category: 'expense_software', isBusiness: true },
+    )
+    const passedNotes = mockCreateJE.mock.calls[0][5] as string | undefined
+    expect(passedNotes).not.toContain('sjukbesök')
+  })
+
+  it('threads the answered parts of a captioned item and drops the caption', async () => {
+    const supabase = queuedSupabase([
+      {
+        data: {
+          id: 'i1',
+          matched_transaction_id: 'tx-1',
+          created_journal_entry_id: null,
+          created_supplier_invoice_id: null,
+          channel_context: { ...WA_CONTEXT, caption: 'random bildtext' },
+        },
+      },
+      { data: { id: 'tx-1', date: '2026-06-01', amount: -700, currency: 'SEK', cash_account_id: null, journal_entry_id: null } },
+      { data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 } },
+      { data: [{ id: 'fp-1' }] },
+      { data: true, error: null },
+      verifiedTransaction('tx-1'),
+      { data: [] },
+    ])
+
+    await bulkBookMatchedInboxItems(supabase, 'u1', 'c1', {
+      item_ids: ['i1'],
+      category: 'expense_software',
+    })
+
+    expect(mockCreateJE).toHaveBeenCalledWith(
+      expect.anything(),
+      'c1',
+      'u1',
+      expect.objectContaining({ id: 'tx-1' }),
+      expect.anything(),
+      RENDERED,
+      { category: 'expense_software', isBusiness: true },
+    )
+  })
+
+  it('passes notes through unchanged for items without channel context', async () => {
+    const supabase = queuedSupabase([
+      { data: { id: 'i1', matched_transaction_id: 'tx-1', created_journal_entry_id: null, created_supplier_invoice_id: null, channel_context: null } },
+      { data: { id: 'tx-1', date: '2026-06-01', amount: -700, currency: 'SEK', cash_account_id: null, journal_entry_id: null } },
+      { data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 } },
+      { data: [{ id: 'fp-1' }] },
+      { data: true, error: null },
+      verifiedTransaction('tx-1'),
+      { data: [] },
+    ])
+
+    await bulkBookMatchedInboxItems(supabase, 'u1', 'c1', {
+      item_ids: ['i1'],
+      category: 'expense_software',
+      notes: 'Bara batchanteckningen',
+    })
+
+    expect(mockCreateJE).toHaveBeenCalledWith(
+      expect.anything(),
+      'c1',
+      'u1',
+      expect.objectContaining({ id: 'tx-1' }),
+      expect.anything(),
+      'Bara batchanteckningen',
+      { category: 'expense_software', isBusiness: true },
+    )
+  })
+})
+
 describe('bulkBookMatchedInboxItems: intra-batch duplicate handling', () => {
-  /** Six queued from() results for one successfully-booked item. */
+  /** Seven queued results for one successfully-booked item. */
   const bookableItem = (itemId: string, txId: string, amount: number) => [
     { data: { id: itemId, matched_transaction_id: txId, created_journal_entry_id: null, created_supplier_invoice_id: null } },
     { data: { id: txId, date: '2026-06-01', amount, currency: 'SEK', cash_account_id: null, journal_entry_id: null } },
     { data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 } },
     { data: [{ id: 'fp-1' }] },
     { data: true, error: null },
+    verifiedTransaction(txId),
     { data: [] },
   ]
 

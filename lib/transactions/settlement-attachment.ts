@@ -5,7 +5,7 @@ import {
 } from '@/lib/bookkeeping/errors'
 import { compensateTransactionCategorization } from '@/lib/bookkeeping/engine'
 import type { Logger } from '@/lib/logger'
-import type { TransactionCategory } from '@/types'
+import type { Transaction, TransactionCategory } from '@/types'
 
 export interface CategorizationAttachmentParams {
   companyId: string
@@ -17,10 +17,12 @@ export interface CategorizationAttachmentParams {
   isBusiness: boolean
   category: TransactionCategory
   journalEntryId: string
+  /** Require an authoritative post-attachment transaction row on success. */
+  requireVerifiedTransaction?: boolean
 }
 
 export type CategorizationAttachmentResult =
-  | { ok: true }
+  | { ok: true; verifiedTransaction?: Transaction }
   | {
       ok: false
       reason: 'conflict' | 'database_error'
@@ -192,7 +194,66 @@ export async function attachCategorizedTransaction(
     attachmentError = error
   }
 
-  if (!attachmentError && data === true) return { ok: true }
+  if (!attachmentError && data === true) {
+    if (!params.requireVerifiedTransaction) return { ok: true }
+
+    let verifiedTransaction: Transaction | null = null
+    let readbackError: unknown = null
+    try {
+      const result = await supabase
+        .from('transactions')
+        .select('*')
+        .eq('id', params.transactionId)
+        .eq('company_id', params.companyId)
+        .maybeSingle()
+      verifiedTransaction = result.data as Transaction | null
+      readbackError = result.error
+    } catch (error) {
+      readbackError = error
+    }
+
+    const readbackMatches = Boolean(
+      verifiedTransaction &&
+      verifiedTransaction.id === params.transactionId &&
+      verifiedTransaction.company_id === params.companyId &&
+      (verifiedTransaction.journal_entry_id ?? null) === params.journalEntryId &&
+      (verifiedTransaction.cash_account_id ?? null) === params.expectedCashAccountId &&
+      verifiedTransaction.is_business === params.isBusiness &&
+      verifiedTransaction.category === params.category,
+    )
+    if (!readbackError && readbackMatches) {
+      return { ok: true, verifiedTransaction: verifiedTransaction! }
+    }
+
+    const reason = readbackError || !verifiedTransaction ? 'database_error' : 'conflict'
+    const databaseError = reason === 'database_error'
+      ? new BookkeepingDatabaseError(
+          'attach_transaction_categorization',
+          readbackError
+            ? databaseErrorCause(readbackError, verifiedTransaction)
+            : 'Post-attachment transaction readback returned no row',
+        )
+      : undefined
+    const compensation = await compensateCategorizationPosting(
+      supabase,
+      {
+        companyId: params.companyId,
+        userId: params.userId,
+        transactionId: params.transactionId,
+        journalEntryId: params.journalEntryId,
+      },
+      log,
+      reason === 'database_error' ? 'readback_database_error' : 'readback_conflict',
+    )
+    return {
+      ok: false,
+      reason,
+      ...(databaseError ? { error: databaseError } : {}),
+      ...(!compensation.compensationVerified
+        ? { partialPostedIds: compensation.partialPostedIds }
+        : {}),
+    }
+  }
 
   const reason = !attachmentError && data === false ? 'conflict' : 'database_error'
   const databaseError = reason === 'database_error'

@@ -5,8 +5,60 @@ vi.mock('@/lib/company/context', () => ({
   getActiveCompanyId: vi.fn(),
 }))
 
-import { requireWritePermission, getCompanyRole } from '../require-write'
+import {
+  canWriteCompany,
+  requireWritePermission,
+  getCompanyRole,
+} from '../require-write'
 import { getActiveCompanyId } from '@/lib/company/context'
+
+function createExactCompanyRoleSupabase(result: {
+  data: { role: string } | null
+  error: unknown
+}) {
+  const maybeSingle = vi.fn().mockResolvedValue(result)
+  const eqUser = vi.fn().mockReturnValue({ maybeSingle })
+  const eqCompany = vi.fn().mockReturnValue({ eq: eqUser })
+  const select = vi.fn().mockReturnValue({ eq: eqCompany })
+  const from = vi.fn().mockReturnValue({ select })
+
+  return {
+    supabase: { from },
+    from,
+    eqCompany,
+    eqUser,
+  }
+}
+
+describe('canWriteCompany', () => {
+  it('checks the exact supplied company and allows a canonical writable role', async () => {
+    const { supabase, from, eqCompany, eqUser } = createExactCompanyRoleSupabase({
+      data: { role: 'member' },
+      error: null,
+    })
+
+    await expect(
+      canWriteCompany(supabase as never, 'user-1', 'resolved-company'),
+    ).resolves.toBe(true)
+    expect(from).toHaveBeenCalledWith('company_members')
+    expect(eqCompany).toHaveBeenCalledWith('company_id', 'resolved-company')
+    expect(eqUser).toHaveBeenCalledWith('user_id', 'user-1')
+    expect(getActiveCompanyId).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    [{ role: 'viewer' }, null],
+    [null, null],
+    [{ role: 'owner' }, { message: 'query failed' }],
+    [{ role: 'unexpected' }, null],
+  ])('fails closed for role/query result %#', async (data, error) => {
+    const { supabase } = createExactCompanyRoleSupabase({ data, error })
+
+    await expect(
+      canWriteCompany(supabase as never, 'user-1', 'company-1'),
+    ).resolves.toBe(false)
+  })
+})
 
 describe('requireWritePermission', () => {
   beforeEach(() => {

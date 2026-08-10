@@ -107,6 +107,11 @@ function createQueueMockSupabase() {
 
 const USER_ID = 'user-1'
 const COMPANY_ID = 'company-1'
+const cashAccountEvidence = (
+  id: string,
+  ledgerAccount: string,
+  companyId = COMPANY_ID,
+) => ({ id, company_id: companyId, ledger_account: ledgerAccount })
 const postCommitReadbackError = () => {
   const error = new Error('readback failed') as Error & {
     name: string
@@ -164,7 +169,25 @@ function makeMappingResult(overrides: Record<string, unknown> = {}) {
 describe('ingestTransactions', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    mockAttachCategorizedTransaction.mockResolvedValue({ ok: true })
+    mockAttachCategorizedTransaction.mockImplementation(
+      async (_supabase: unknown, params: {
+        transactionId: string
+        journalEntryId: string
+        category: string
+        isBusiness: boolean
+        expectedCashAccountId: string | null
+      }) => ({
+        ok: true,
+        verifiedTransaction: makeTransaction({
+          id: params.transactionId,
+          company_id: COMPANY_ID,
+          journal_entry_id: params.journalEntryId,
+          category: params.category as never,
+          is_business: params.isBusiness,
+          cash_account_id: params.expectedCashAccountId,
+        }),
+      }),
+    )
     mockCompensatePostCommitReadbackFailure.mockResolvedValue({ handled: false })
     mockUpsertCounterpartyTemplate.mockResolvedValue(undefined)
   })
@@ -206,11 +229,11 @@ describe('ingestTransactions', () => {
     const raw = makeRaw({ amount: -100 })
     const inserted = makeTransaction({ id: 'tx-1', external_id: raw.external_id })
 
+    enqueue({ data: cashAccountEvidence('ca-1931', '1931'), error: null }) // cash_accounts lookup
     enqueue({ data: [], error: null }) // booked map
     enqueue({ data: [], error: null }) // unbooked map
     enqueue({ data: [], error: null }) // supplier invoices
     enqueue({ data: [], error: null }) // external_id dedup
-    enqueue({ data: { id: 'ca-1931' }, error: null }) // cash_accounts lookup
     enqueue({ data: inserted, error: null }) // insert
     mockEvaluateMappingRules.mockResolvedValue(makeMappingResult({ confidence: 0.5 }))
 
@@ -223,6 +246,130 @@ describe('ingestTransactions', () => {
     const txInserts = inserts['transactions'] ?? []
     expect(txInserts).toHaveLength(1)
     expect((txInserts[0] as { cash_account_id?: string | null }).cash_account_id).toBe('ca-1931')
+  })
+
+  it.each([
+    {
+      label: 'lookup error',
+      evidence: { data: null, error: { code: '42501', message: 'permission denied' } },
+    },
+    { label: 'missing row', evidence: { data: null, error: null } },
+    {
+      label: 'ambiguous rows',
+      evidence: {
+        data: null,
+        error: { code: 'PGRST116', message: 'JSON object requested, multiple rows returned' },
+      },
+    },
+    {
+      label: 'cross-company row',
+      evidence: { data: cashAccountEvidence('ca-1931', '1931', 'company-other'), error: null },
+    },
+    {
+      label: 'missing ledger account',
+      evidence: {
+        data: { id: 'ca-1931', company_id: COMPANY_ID, ledger_account: null },
+        error: null,
+      },
+    },
+    {
+      label: 'account-number mismatch',
+      evidence: { data: cashAccountEvidence('ca-1931', '1930'), error: null },
+    },
+  ])('fails ingestion before persistence when supplied settlement evidence has $label', async ({ evidence }) => {
+    const { supabase, enqueue, inserts, updates } = createQueueMockSupabase()
+    const raw = makeRaw({ amount: -100 })
+
+    enqueue(evidence)
+
+    await expect(
+      ingestTransactions(supabase as never, COMPANY_ID, USER_ID, [raw], {
+        settlementAccount: '1931',
+      }),
+    ).rejects.toThrow(/settlement account/i)
+
+    expect(inserts['transactions']).toBeUndefined()
+    expect(updates['transactions']).toBeUndefined()
+    expect(mockEvaluateMappingRules).not.toHaveBeenCalled()
+    expect(mockCreateTransactionJournalEntry).not.toHaveBeenCalled()
+    expect(mockAttachCategorizedTransaction).not.toHaveBeenCalled()
+    expect(mockUpsertCounterpartyTemplate).not.toHaveBeenCalled()
+  })
+
+  it('keeps supplied 1931 provenance bound through automatic categorization', async () => {
+    const { supabase, enqueue, inserts } = createQueueMockSupabase()
+    const raw = makeRaw({ amount: -500, merchant_name: 'Revolut' })
+    const inserted = makeTransaction({
+      id: 'tx-1931',
+      amount: -500,
+      external_id: raw.external_id,
+      cash_account_id: 'ca-1931',
+    })
+    const authoritative = makeTransaction({
+      ...inserted,
+      company_id: COMPANY_ID,
+      category: 'expense_bank_fees',
+      is_business: true,
+      journal_entry_id: 'je-1931',
+      cash_account_id: 'ca-1931',
+    })
+
+    enqueue({ data: cashAccountEvidence('ca-1931', '1931'), error: null })
+    enqueue({ data: [], error: null })
+    enqueue({ data: [], error: null })
+    enqueue({ data: [], error: null })
+    enqueue({ data: [], error: null })
+    enqueue({ data: inserted, error: null })
+    mockEvaluateMappingRules.mockResolvedValue(
+      makeMappingResult({
+        confidence: 0.9,
+        requires_review: false,
+        debit_account: '6570',
+        credit_account: '1931',
+        description: 'Bank fees',
+      }),
+    )
+    mockCreateTransactionJournalEntry.mockResolvedValue(makeJournalEntry({ id: 'je-1931' }))
+    mockAttachCategorizedTransaction.mockResolvedValueOnce({
+      ok: true,
+      verifiedTransaction: authoritative,
+    })
+
+    const result = await ingestTransactions(
+      supabase as never,
+      COMPANY_ID,
+      USER_ID,
+      [raw],
+      { settlementAccount: '1931' },
+    )
+
+    expect(result.auto_categorized).toBe(1)
+    expect(inserts['transactions']).toContainEqual(
+      expect.objectContaining({ cash_account_id: 'ca-1931' }),
+    )
+    expect(mockEvaluateMappingRules).toHaveBeenCalledWith(
+      supabase,
+      COMPANY_ID,
+      expect.objectContaining({ id: 'tx-1931', cash_account_id: 'ca-1931' }),
+      undefined,
+      '1931',
+    )
+    expect(mockAttachCategorizedTransaction).toHaveBeenCalledWith(
+      supabase,
+      expect.objectContaining({
+        transactionId: 'tx-1931',
+        expectedCashAccountId: 'ca-1931',
+        expectedSettlementAccount: '1931',
+      }),
+      expect.anything(),
+    )
+    expect(mockUpsertCounterpartyTemplate).toHaveBeenCalledWith(
+      supabase,
+      COMPANY_ID,
+      authoritative,
+      expect.objectContaining({ credit_account: '1931' }),
+      'auto_learned',
+    )
   })
 
   it('inserts cash_account_id null when no settlementAccount is given', async () => {
@@ -244,6 +391,108 @@ describe('ingestTransactions', () => {
     expect(supabase.from).not.toHaveBeenCalledWith('cash_accounts')
     const txInserts = inserts['transactions'] ?? []
     expect((txInserts[0] as { cash_account_id?: string | null }).cash_account_id).toBeNull()
+  })
+
+  // -----------------------------------------------------------------------
+  // 1d. Transaction-method classification at the insert boundary
+  // -----------------------------------------------------------------------
+  it('classifies transaction_method, strips the channel phrase from the title, and persists the raw codes', async () => {
+    const { supabase, enqueue, inserts } = createQueueMockSupabase()
+    const raw = makeRaw({
+      description: 'Vercel Jul Överföring via internet',
+      bank_transaction_code: 'PMNT/ICDT',
+      proprietary_bank_transaction_code: 'Överföring',
+    })
+    const inserted = makeTransaction({ id: 'tx-1', external_id: raw.external_id })
+
+    enqueue({ data: [], error: null }) // booked map
+    enqueue({ data: [], error: null }) // unbooked map
+    enqueue({ data: [], error: null }) // supplier invoices
+    enqueue({ data: [], error: null }) // external_id dedup
+    enqueue({ data: inserted, error: null }) // insert
+    mockEvaluateMappingRules.mockResolvedValue(makeMappingResult({ confidence: 0.5 }))
+
+    const result = await ingestTransactions(supabase as never, COMPANY_ID, USER_ID, [raw])
+
+    expect(result.imported).toBe(1)
+    const payload = (inserts['transactions'] ?? [])[0] as Record<string, unknown>
+    // Working title is the clean prefix; the immutable original keeps the
+    // full bank string (dedup-bridge + restore-original source).
+    expect(payload.description).toBe('Vercel Jul')
+    expect(payload.original_description).toBe('Vercel Jul Överföring via internet')
+    // The phrase beats the generic ISO family (ICDT = credit transfer).
+    expect(payload.transaction_method).toBe('transfer')
+    expect(payload.bank_transaction_code).toBe('PMNT/ICDT')
+    expect(payload.proprietary_bank_transaction_code).toBe('Överföring')
+  })
+
+  it('treats a bank_connection_id row as a feed even without import_source', async () => {
+    // The oldest PSD2 rows predate the import_source column; a live bank
+    // connection is the unambiguous feed marker (isImportedTransaction).
+    const { supabase, enqueue, inserts } = createQueueMockSupabase()
+    const raw = makeRaw({
+      description: 'Vercel Jul Överföring via internet',
+      import_source: undefined,
+      bank_connection_id: 'bc-1',
+    })
+    const inserted = makeTransaction({ id: 'tx-1', external_id: raw.external_id })
+
+    enqueue({ data: [], error: null }) // booked map
+    enqueue({ data: [], error: null }) // unbooked map
+    enqueue({ data: [], error: null }) // supplier invoices
+    enqueue({ data: [], error: null }) // external_id dedup
+    enqueue({ data: inserted, error: null }) // insert
+    mockEvaluateMappingRules.mockResolvedValue(makeMappingResult({ confidence: 0.5 }))
+
+    await ingestTransactions(supabase as never, COMPANY_ID, USER_ID, [raw])
+
+    const feedPayload = (inserts['transactions'] ?? [])[0] as Record<string, unknown>
+    expect(feedPayload.transaction_method).toBe('transfer')
+    expect(feedPayload.description).toBe('Vercel Jul')
+    expect(feedPayload.original_description).toBe('Vercel Jul Överföring via internet')
+  })
+
+  it('never classifies or strips user-created sources (manual/mcp)', async () => {
+    const { supabase, enqueue, inserts } = createQueueMockSupabase()
+    // A user-authored title that WOULD classify+strip if it came from a feed.
+    const raw = makeRaw({ description: 'Egen insättning', import_source: 'manual' })
+    const inserted = makeTransaction({ id: 'tx-1', external_id: raw.external_id })
+
+    enqueue({ data: [], error: null }) // booked map
+    enqueue({ data: [], error: null }) // unbooked map
+    enqueue({ data: [], error: null }) // supplier invoices
+    enqueue({ data: [], error: null }) // external_id dedup
+    enqueue({ data: inserted, error: null }) // insert
+    mockEvaluateMappingRules.mockResolvedValue(makeMappingResult({ confidence: 0.5 }))
+
+    await ingestTransactions(supabase as never, COMPANY_ID, USER_ID, [raw])
+
+    const payload = (inserts['transactions'] ?? [])[0] as Record<string, unknown>
+    expect(payload.description).toBe('Egen insättning')
+    expect(payload.original_description).toBe('Egen insättning')
+    expect(payload.transaction_method).toBeNull()
+  })
+
+  it('leaves the title untouched and method null when nothing classifies', async () => {
+    const { supabase, enqueue, inserts } = createQueueMockSupabase()
+    const raw = makeRaw({ description: 'Test transaction' })
+    const inserted = makeTransaction({ id: 'tx-1', external_id: raw.external_id })
+
+    enqueue({ data: [], error: null }) // booked map
+    enqueue({ data: [], error: null }) // unbooked map
+    enqueue({ data: [], error: null }) // supplier invoices
+    enqueue({ data: [], error: null }) // external_id dedup
+    enqueue({ data: inserted, error: null }) // insert
+    mockEvaluateMappingRules.mockResolvedValue(makeMappingResult({ confidence: 0.5 }))
+
+    await ingestTransactions(supabase as never, COMPANY_ID, USER_ID, [raw])
+
+    const payload = (inserts['transactions'] ?? [])[0] as Record<string, unknown>
+    expect(payload.description).toBe('Test transaction')
+    expect(payload.original_description).toBe('Test transaction')
+    expect(payload.transaction_method).toBeNull()
+    expect(payload.bank_transaction_code).toBeNull()
+    expect(payload.proprietary_bank_transaction_code).toBeNull()
   })
 
   // -----------------------------------------------------------------------
@@ -518,6 +767,7 @@ describe('ingestTransactions', () => {
     })
     const inserted = makeTransaction({ id: 'tx-acctB', amount: -941 })
 
+    enqueue({ data: cashAccountEvidence('acct-B', '1931'), error: null }) // cash_accounts lookup
     // Booked transaction map query: none
     enqueue({ data: [], error: null })
     // Stored cross-feed twin, but it settled on a DIFFERENT account (A).
@@ -529,8 +779,6 @@ describe('ingestTransactions', () => {
     enqueue({ data: [], error: null })
     // Batch external_id dedup query: no match
     enqueue({ data: [], error: null })
-    // cash_accounts lookup → batch settled on account B
-    enqueue({ data: { id: 'acct-B' }, error: null })
     // Insert: different account, not a duplicate
     enqueue({ data: inserted, error: null })
 
@@ -842,6 +1090,7 @@ describe('ingestTransactions', () => {
     })
     const inserted = makeTransaction({ id: 'tx-acctB', amount: -520 })
 
+    enqueue({ data: cashAccountEvidence('acct-B', '1931'), error: null }) // cash_accounts lookup
     // Booked hand-entered row explicitly bound to a DIFFERENT cash account.
     enqueue({
       data: [{
@@ -856,7 +1105,6 @@ describe('ingestTransactions', () => {
     enqueue({ data: [], error: null }) // unbooked map
     enqueue({ data: [], error: null }) // supplier invoices
     enqueue({ data: [], error: null }) // external_id dedup
-    enqueue({ data: { id: 'acct-B' }, error: null }) // cash_accounts → batch on account B
     enqueue({ data: inserted, error: null }) // insert: kept
     mockEvaluateMappingRules.mockResolvedValue(makeMappingResult({ confidence: 0.5 }))
 
@@ -878,6 +1126,7 @@ describe('ingestTransactions', () => {
       import_source: 'enable_banking',
     })
 
+    enqueue({ data: cashAccountEvidence('acct-A', '1930'), error: null }) // cash_accounts lookup
     // Booked MANUAL row, account-unbound (cash_account_id null).
     enqueue({
       data: [{
@@ -893,7 +1142,6 @@ describe('ingestTransactions', () => {
     enqueue({ data: [], error: null }) // unbooked map
     enqueue({ data: [], error: null }) // supplier invoices
     enqueue({ data: [], error: null }) // external_id dedup
-    enqueue({ data: { id: 'acct-A' }, error: null }) // cash_accounts → batch on account A
     enqueue({ data: null, error: null }) // adoption stamp update
 
     const result = await ingestTransactions(supabase as never, COMPANY_ID, USER_ID, [raw], {
@@ -952,6 +1200,7 @@ describe('ingestTransactions', () => {
     ]
     const inserted = makeTransaction({ id: 'tx-r1', amount: -10000 })
 
+    enqueue({ data: cashAccountEvidence('acct-B', '1931'), error: null }) // cash_accounts lookup
     enqueue({
       data: [
         { id: 'm1', date: '2026-06-24', amount: -10000, original_description: 'Hyra avtal 12', description: 'Hyra avtal 12', import_source: 'mcp', bank_connection_id: null, cash_account_id: null, currency: 'SEK' },
@@ -962,7 +1211,6 @@ describe('ingestTransactions', () => {
     enqueue({ data: [], error: null }) // unbooked map
     enqueue({ data: [], error: null }) // supplier invoices
     enqueue({ data: [], error: null }) // external_id dedup
-    enqueue({ data: { id: 'acct-B' }, error: null }) // cash_accounts → account B
     enqueue({ data: inserted, error: null }) // insert R1
     enqueue({ data: null, error: null }) // adoption stamp for M1 (text-bridged by R2)
     mockEvaluateMappingRules.mockResolvedValue(makeMappingResult({ confidence: 0.5 }))
@@ -1002,6 +1250,7 @@ describe('ingestTransactions', () => {
     })
     const inserted = makeTransaction({ id: 'tx-new', external_id: raw.external_id })
 
+    enqueue({ data: cashAccountEvidence('ca-1930', '1930'), error: null }) // cash_accounts lookup
     enqueue({ data: [], error: null }) // booked map: none
     // Unbooked map: the stored twin from the SAME feed under the OLD id scope.
     enqueue({
@@ -1015,7 +1264,6 @@ describe('ingestTransactions', () => {
     })
     enqueue({ data: [], error: null }) // supplier invoices: none
     enqueue({ data: [], error: null }) // external_id dedup: OLD id not among incoming NEW ids
-    enqueue({ data: { id: 'ca-1930' }, error: null }) // cash_accounts: same account as the stored row
     enqueue({ data: inserted, error: null }) // insert: STILL imported (shadow only logs)
     mockEvaluateMappingRules.mockResolvedValue(makeMappingResult({ confidence: 0.5 }))
 
@@ -1060,6 +1308,7 @@ describe('ingestTransactions', () => {
     const { supabase, enqueue } = createQueueMockSupabase()
     const raw = makeRaw({ date: '2024-06-15', amount: -250, description: 'TELENOR', external_id: 'eb_NEW_acctB', import_source: 'enable_banking' })
     const inserted = makeTransaction({ id: 'tx-b', external_id: raw.external_id })
+    enqueue({ data: cashAccountEvidence('acct-B', '1931'), error: null }) // cash_accounts lookup
     enqueue({ data: [], error: null }) // booked
     enqueue({
       data: [{ date: '2024-06-15', amount: -250, original_description: 'OCR', description: 'OCR', import_source: 'enable_banking', cash_account_id: 'acct-A', external_id: 'eb_OLD_acctA' }],
@@ -1067,7 +1316,6 @@ describe('ingestTransactions', () => {
     }) // unbooked twin on account A
     enqueue({ data: [], error: null }) // supplier
     enqueue({ data: [], error: null }) // external_id dedup
-    enqueue({ data: { id: 'acct-B' }, error: null }) // cash_accounts → batch settled on account B
     enqueue({ data: inserted, error: null }) // insert
     mockEvaluateMappingRules.mockResolvedValue(makeMappingResult({ confidence: 0.5 }))
 
@@ -1236,6 +1484,7 @@ describe('ingestTransactions', () => {
     })
     const inserted = makeTransaction({ id: 'tx-acctB', amount: -250 })
 
+    enqueue({ data: cashAccountEvidence('acct-B', '1931'), error: null }) // cash_accounts lookup
     enqueue({ data: [], error: null }) // booked map: none
     // Unbooked enable_banking twin, but it settled on a DIFFERENT account (A).
     enqueue({
@@ -1244,7 +1493,6 @@ describe('ingestTransactions', () => {
     })
     enqueue({ data: [], error: null }) // supplier invoices
     enqueue({ data: [], error: null }) // external_id dedup: no match
-    enqueue({ data: { id: 'acct-B' }, error: null }) // cash_accounts lookup → batch settled on account B
     enqueue({ data: inserted, error: null }) // insert: not a duplicate
     mockEvaluateMappingRules.mockResolvedValue(makeMappingResult({ confidence: 0.5 }))
 
@@ -1267,6 +1515,7 @@ describe('ingestTransactions', () => {
       import_source: 'enable_banking',
     })
 
+    enqueue({ data: cashAccountEvidence('acct-A', '1930'), error: null }) // cash_accounts lookup
     enqueue({ data: [], error: null }) // booked map: none
     enqueue({
       data: [{ date: '2026-04-07', amount: -250, original_description: 'Avgift', description: 'Avgift', cash_account_id: 'acct-A' }],
@@ -1274,7 +1523,6 @@ describe('ingestTransactions', () => {
     })
     enqueue({ data: [], error: null }) // supplier invoices
     enqueue({ data: [], error: null }) // external_id dedup: no match
-    enqueue({ data: { id: 'acct-A' }, error: null }) // cash_accounts lookup → batch settled on account A (same)
     // No insert: deduped.
 
     const result = await ingestTransactions(supabase as never, COMPANY_ID, USER_ID, [raw], {
@@ -1305,6 +1553,7 @@ describe('ingestTransactions', () => {
     })
     const inserted = makeTransaction({ id: 'tx-drift', external_id: raw.external_id })
 
+    enqueue({ data: cashAccountEvidence('ca-1930', '1930'), error: null }) // cash_accounts lookup
     enqueue({ data: [], error: null }) // booked map: none
     // Unbooked EB twin one day earlier: same amount/desc/account, OLD-scheme id.
     enqueue({
@@ -1318,7 +1567,6 @@ describe('ingestTransactions', () => {
     })
     enqueue({ data: [], error: null }) // supplier invoices
     enqueue({ data: [], error: null }) // external_id dedup: different date bucket, no match
-    enqueue({ data: { id: 'ca-1930' }, error: null }) // cash_accounts: same account
     enqueue({ data: inserted, error: null }) // insert: STILL imported (shadow only logs)
     mockEvaluateMappingRules.mockResolvedValue(makeMappingResult({ confidence: 0.5 }))
 
@@ -1378,6 +1626,7 @@ describe('ingestTransactions', () => {
     })
     const inserted = makeTransaction({ id: 'tx-b', external_id: raw.external_id })
 
+    enqueue({ data: cashAccountEvidence('acct-B', '1931'), error: null }) // cash_accounts lookup
     enqueue({ data: [], error: null }) // booked
     enqueue({
       data: [{
@@ -1390,7 +1639,6 @@ describe('ingestTransactions', () => {
     }) // bridging twin one day earlier, but on account A
     enqueue({ data: [], error: null }) // supplier
     enqueue({ data: [], error: null }) // external_id dedup
-    enqueue({ data: { id: 'acct-B' }, error: null }) // cash_accounts → batch on account B
     enqueue({ data: inserted, error: null }) // insert
     mockEvaluateMappingRules.mockResolvedValue(makeMappingResult({ confidence: 0.5 }))
 
@@ -1719,6 +1967,7 @@ describe('ingestTransactions', () => {
         expectedCashAccountId: null,
         expectedSettlementAccount: '1930',
         journalEntryId: 'je-1',
+        requireVerifiedTransaction: true,
       }),
       expect.anything(),
     )
@@ -1843,39 +2092,26 @@ describe('ingestTransactions', () => {
     expect(mockAttachCategorizedTransaction).not.toHaveBeenCalled()
   })
 
-  it('does not create a voucher when a requested settlement account lacks exact company cash-account provenance', async () => {
-    const { supabase, enqueue } = createQueueMockSupabase()
+  it('fails before high-confidence auto-booking when requested settlement provenance cannot be read', async () => {
+    const { supabase, enqueue, inserts } = createQueueMockSupabase()
     const raw = makeRaw({ amount: -500, merchant_name: 'ICA' })
-    const inserted = makeTransaction({
-      id: 'tx-unverified-settlement',
-      amount: -500,
-      external_id: raw.external_id,
-      cash_account_id: null,
-    })
-    enqueue({ data: [], error: null })
-    enqueue({ data: [], error: null })
-    enqueue({ data: [], error: null })
-    enqueue({ data: [], error: null })
     enqueue({ data: null, error: { code: '42501', message: 'permission denied' } })
-    enqueue({ data: inserted, error: null })
     mockEvaluateMappingRules.mockResolvedValue(
       makeMappingResult({ confidence: 0.9, requires_review: false, credit_account: '1931' }),
     )
 
-    const result = await ingestTransactions(
-      supabase as never,
-      COMPANY_ID,
-      USER_ID,
-      [raw],
-      { settlementAccount: '1931' },
-    )
+    await expect(
+      ingestTransactions(
+        supabase as never,
+        COMPANY_ID,
+        USER_ID,
+        [raw],
+        { settlementAccount: '1931' },
+      ),
+    ).rejects.toThrow(/settlement account/i)
 
-    expect(result.imported).toBe(1)
-    expect(result.auto_categorized).toBe(0)
-    expect(result.auto_categorization_failures).toEqual([{
-      transaction_id: inserted.id,
-      code: 'SETTLEMENT_PROVENANCE_UNAVAILABLE',
-    }])
+    expect(inserts['transactions']).toBeUndefined()
+    expect(mockEvaluateMappingRules).not.toHaveBeenCalled()
     expect(mockCreateTransactionJournalEntry).not.toHaveBeenCalled()
     expect(mockAttachCategorizedTransaction).not.toHaveBeenCalled()
   })

@@ -4,6 +4,7 @@
  */
 
 import type { TaxDeadlineType, EntityType, MomsPeriod, TaxFilingMethod } from '@/types'
+import { ISO_DATE_RE } from '@/lib/invariants'
 import { adjustDeadlineToNextBankingDay, isBankingDay } from './swedish-holidays'
 
 // Condition function type for determining if a deadline applies
@@ -207,8 +208,8 @@ function generateAnnualVatDates(
   const results: DeadlineInstance[] = []
 
   for (const fiscalPeriod of settings.fiscal_periods) {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(fiscalPeriod.period_start) ||
-        !/^\d{4}-\d{2}-\d{2}$/.test(fiscalPeriod.period_end) ||
+    if (!ISO_DATE_RE.test(fiscalPeriod.period_start) ||
+        !ISO_DATE_RE.test(fiscalPeriod.period_end) ||
         fiscalPeriod.period_start > fiscalPeriod.period_end) {
       throw new Error(`Invalid fiscal period ${fiscalPeriod.id}`)
     }

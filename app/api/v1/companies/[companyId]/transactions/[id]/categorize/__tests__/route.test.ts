@@ -105,6 +105,7 @@ vi.mock('@/lib/bookkeeping/mapping-engine', async () => {
 
 import { validateApiKey, createServiceClientNoCookies } from '@/lib/auth/api-keys'
 import { PostCommitReadbackError } from '@/lib/bookkeeping/errors'
+import { eventBus } from '@/lib/events/bus'
 import { POST } from '../route'
 
 const mockValidate = validateApiKey as ReturnType<typeof vi.fn>
@@ -197,8 +198,44 @@ function casRaceSupabase(compensation: MockResult = compensationSuccess) {
   })
 }
 
+const uncategorizedTransaction = {
+  id: TX_ID,
+  company_id: COMPANY_ID,
+  date: '2026-05-12',
+  amount: -349.5,
+  currency: 'SEK',
+  merchant_name: 'ICA',
+  cash_account_id: null,
+  journal_entry_id: null,
+}
+
+const verifiedCategorizedTransaction = {
+  ...uncategorizedTransaction,
+  category: 'expense_office',
+  is_business: true,
+  journal_entry_id: 'je-fresh',
+}
+
+function postAttachmentReadbackSupabase(
+  readback: MockResult,
+  compensation: MockResult = compensationSuccess,
+) {
+  return makeFlexibleSupabase({
+    company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+    transactions: [
+      { data: uncategorizedTransaction, error: null },
+      readback,
+    ],
+    company_settings: { data: { entity_type: 'enskild_firma' }, error: null },
+    fiscal_periods: { data: { id: 'period-1', is_closed: false, locked_at: null }, error: null },
+    'rpc:attach_transaction_categorization': { data: true, error: null },
+    'rpc:compensate_transaction_categorization': compensation,
+  })
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
+  eventBus.clear()
   findMissingAccountsMock.mockResolvedValue([])
   reverseEntryMock.mockResolvedValue(undefined)
   createTxJE.mockResolvedValue({ id: 'je-fresh' })
@@ -513,21 +550,27 @@ describe('POST /api/v1/.../transactions/{id}/categorize CAS race', () => {
   })
 
   it('uses exact company-scoped cash-account and ledger provenance', async () => {
+    const categorized = vi.fn()
+    eventBus.on('transaction.categorized', categorized)
     const { supabase } = makeFlexibleSupabase({
       company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
-      transactions: {
-        data: {
-          id: TX_ID,
-          company_id: COMPANY_ID,
-          date: '2026-05-12',
-          amount: -349.5,
-          currency: 'SEK',
-          merchant_name: 'ICA',
-          cash_account_id: 'cash-revolut-sek',
-          journal_entry_id: null,
+      transactions: [
+        {
+          data: {
+            ...uncategorizedTransaction,
+            cash_account_id: 'cash-revolut-sek',
+          },
+          error: null,
         },
-        error: null,
-      },
+        {
+          data: {
+            ...verifiedCategorizedTransaction,
+            cash_account_id: 'cash-revolut-sek',
+            description: 'Fresh attached state',
+          },
+          error: null,
+        },
+      ],
       company_settings: { data: { entity_type: 'enskild_firma' }, error: null },
       cash_accounts: { data: { ledger_account: '1931' }, error: null },
       fiscal_periods: { data: { id: 'period-1', is_closed: false, locked_at: null }, error: null },
@@ -564,6 +607,90 @@ describe('POST /api/v1/.../transactions/{id}/categorize CAS race', () => {
     const attachmentOrder = supabase.rpc.mock.invocationCallOrder[0]
     expect(attachmentOrder).toBeLessThan(saveUserMappingRuleMock.mock.invocationCallOrder[0])
     expect(attachmentOrder).toBeLessThan(upsertCounterpartyTemplateMock.mock.invocationCallOrder[0])
+    expect(upsertCounterpartyTemplateMock).toHaveBeenCalledWith(
+      supabase,
+      COMPANY_ID,
+      expect.objectContaining({
+        id: TX_ID,
+        category: 'expense_office',
+        is_business: true,
+        journal_entry_id: 'je-fresh',
+        cash_account_id: 'cash-revolut-sek',
+        description: 'Fresh attached state',
+      }),
+      expect.objectContaining({ credit_account: '1931' }),
+      'user_approved',
+    )
+    expect(categorized).toHaveBeenCalledWith(expect.objectContaining({
+      transaction: expect.objectContaining({
+        id: TX_ID,
+        company_id: COMPANY_ID,
+        category: 'expense_office',
+        is_business: true,
+        journal_entry_id: 'je-fresh',
+        cash_account_id: 'cash-revolut-sek',
+        description: 'Fresh attached state',
+      }),
+    }))
+  })
+
+  it.each([
+    { label: 'missing row', readback: { data: null, error: null } },
+    {
+      label: 'ambiguous row',
+      readback: { data: null, error: { message: 'JSON object requested, multiple rows returned' } },
+    },
+    {
+      label: 'wrong tenant',
+      readback: { data: { ...verifiedCategorizedTransaction, company_id: 'company-other' }, error: null },
+    },
+    {
+      label: 'wrong transaction id',
+      readback: { data: { ...verifiedCategorizedTransaction, id: 'tx-other' }, error: null },
+    },
+    {
+      label: 'stale category',
+      readback: { data: { ...verifiedCategorizedTransaction, category: 'expense_software' }, error: null },
+    },
+    {
+      label: 'stale business flag',
+      readback: { data: { ...verifiedCategorizedTransaction, is_business: false }, error: null },
+    },
+    {
+      label: 'wrong journal entry',
+      readback: { data: { ...verifiedCategorizedTransaction, journal_entry_id: 'je-other' }, error: null },
+    },
+    {
+      label: 'wrong cash account',
+      readback: { data: { ...verifiedCategorizedTransaction, cash_account_id: 'cash-other' }, error: null },
+    },
+    {
+      label: 'read error',
+      readback: { data: null, error: { message: 'read timeout', code: '57014' } },
+    },
+  ])('compensates and publishes no event on $label post-attachment readback', async ({ readback }) => {
+    const categorized = vi.fn()
+    eventBus.on('transaction.categorized', categorized)
+    const { supabase } = postAttachmentReadbackSupabase(readback)
+    mockServiceClient.mockReturnValue(supabase)
+
+    const res = await POST(
+      makeRequest({ is_business: true, category: 'expense_office' }),
+      routeParams(),
+    )
+
+    expect([409, 500]).toContain(res.status)
+    expect(categorized).not.toHaveBeenCalled()
+    expect(compensateTransactionCategorizationMock).toHaveBeenCalledWith(
+      supabase,
+      {
+        companyId: COMPANY_ID,
+        userId: 'user-1',
+        transactionId: TX_ID,
+        originalJournalEntryId: 'je-fresh',
+      },
+    )
+    expect(upsertCounterpartyTemplateMock).not.toHaveBeenCalled()
   })
 
   it('returns an ordinary database error without a partial marker when storno succeeds', async () => {

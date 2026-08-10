@@ -36,8 +36,8 @@
     "version": 1
   },
   "horizontal/swedish-asset-accounting/leasing-and-disposal": {
-    "hash": "485d7f1d4669f718dbba8611a3644fc3b307b22fb59448af65eebce8466c5b8a",
-    "version": 1
+    "hash": "cefd92341d2946c97ae10f456634a7cf569b7d0eab65d9ca9f8ca7017675f66e",
+    "version": 2
   },
   "horizontal/swedish-e-invoicing": {
     "hash": "287a9a7d4239de8db25b941345bb9b418e5fcf5b4dd65963c06b68215f54b2ce",
@@ -192,12 +192,12 @@
     "version": 1
   },
   "horizontal/swedish-sru-filing": {
-    "hash": "5a8f288a668b8c67f6f77986d45ceb1921fe483c8d1c00a28039a8fb89f584c4",
-    "version": 5
+    "hash": "56a1ce1be4908e15b6e3c9dcad64e5a3fb0f4400c47a2f88504d0bf897f4a9da",
+    "version": 6
   },
   "horizontal/swedish-sru-filing/sru-codes": {
-    "hash": "90b588d78894bc7c546c5bff42c1c43a339c21db4efd51f8b4a0930e2609db83",
-    "version": 2
+    "hash": "39625f1122caf0d3d034a98f2e5daabc2d60d2a44fd299010c9d39f58cf6635f",
+    "version": 3
   },
   "horizontal/swedish-tax-planning": {
     "hash": "99b87fac9eacf0ad168434c2bce99f21cdb8a53cb26ccabb64ba291b9059aa24",

@@ -115,7 +115,17 @@ beforeEach(() => {
   eventBus.clear()
   mockResolveSettlementAccount.mockResolvedValue('1930')
   mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-new' })
-  mockAttachCategorizedTransaction.mockResolvedValue({ ok: true })
+  mockAttachCategorizedTransaction.mockResolvedValue({
+    ok: true,
+    verifiedTransaction: {
+      id: 'tx-1',
+      company_id: 'company-1',
+      category: 'income',
+      is_business: true,
+      journal_entry_id: 'je-new',
+      cash_account_id: null,
+    },
+  })
 })
 
 describe('commit duplicate guard: categorize_transaction (reverse / book the bank line)', () => {

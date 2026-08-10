@@ -22,6 +22,7 @@
  */
 
 import { promises as dns } from 'node:dns'
+import { BlockList, isIP } from 'node:net'
 
 export type WebhookUrlValidationReason =
   | 'invalid_url'
@@ -33,6 +34,8 @@ export type WebhookUrlValidationReason =
   | 'link_local_address'
   | 'cgnat_address'
   | 'metadata_address'
+  | 'unspecified_address'
+  | 'unsafe_address'
 
 export interface WebhookUrlValidationError {
   ok: false
@@ -60,9 +63,8 @@ export type WebhookUrlValidationResult = WebhookUrlValidationOk | WebhookUrlVali
  * either non-deterministically per call. Single-lookup validation could
  * return the public IP at create time and the private IP at dispatch
  * time. Resolving ALL records and rejecting if ANY is unsafe forecloses
- * that path. A separate DNS-rebinding window (between dispatch-time
- * validation and the actual fetch) remains; closing that requires a
- * custom HTTPS agent that pins the resolved IP: tracked for follow-up.
+ * that path. Callers that connect through pinnedHttpsFetch also close the
+ * validation-to-connection rebinding window by pinning one vetted address.
  */
 export async function validateWebhookUrl(
   rawUrl: string,
@@ -81,6 +83,21 @@ export async function validateWebhookUrl(
       reason: 'non_https_scheme',
       detail: `webhook_url must use https:// (got ${parsed.protocol}).`,
     }
+  }
+
+  const literal = parsed.hostname.startsWith('[') && parsed.hostname.endsWith(']')
+    ? parsed.hostname.slice(1, -1)
+    : parsed.hostname
+  if (isIP(literal)) {
+    const classification = classifyAddress(literal)
+    if (classification !== 'public') {
+      return {
+        ok: false,
+        reason: classification,
+        detail: `Address ${literal} is not publicly routable (${classification}).`,
+      }
+    }
+    return { ok: true, hostname: parsed.hostname, resolvedAddresses: [literal] }
   }
 
   const resolve4 = opts?.resolve4 ?? dns.resolve4
@@ -110,13 +127,18 @@ export async function validateWebhookUrl(
     }
   }
 
+  if (hardFailure) {
+    return {
+      ok: false,
+      reason: 'dns_lookup_failed',
+      detail: `DNS lookup failed for ${parsed.hostname}: ${hardFailure.message}`,
+    }
+  }
   if (addresses.length === 0) {
     return {
       ok: false,
-      reason: hardFailure ? 'dns_lookup_failed' : 'no_dns_records',
-      detail: hardFailure
-        ? `DNS lookup failed for ${parsed.hostname}: ${hardFailure.message}`
-        : `No A/AAAA records for ${parsed.hostname}.`,
+      reason: 'no_dns_records',
+      detail: `No A/AAAA records for ${parsed.hostname}.`,
     }
   }
 
@@ -141,17 +163,53 @@ type AddressClass =
   | 'link_local_address'
   | 'cgnat_address'
   | 'metadata_address'
+  | 'unspecified_address'
+  | 'unsafe_address'
+
+const PRIVATE_V4 = new BlockList()
+PRIVATE_V4.addSubnet('10.0.0.0', 8, 'ipv4')
+PRIVATE_V4.addSubnet('172.16.0.0', 12, 'ipv4')
+PRIVATE_V4.addSubnet('192.168.0.0', 16, 'ipv4')
+
+const UNSAFE_V4 = new BlockList()
+UNSAFE_V4.addSubnet('192.0.0.0', 24, 'ipv4')
+UNSAFE_V4.addSubnet('192.0.2.0', 24, 'ipv4')
+UNSAFE_V4.addSubnet('192.88.99.0', 24, 'ipv4')
+UNSAFE_V4.addSubnet('198.18.0.0', 15, 'ipv4')
+UNSAFE_V4.addSubnet('198.51.100.0', 24, 'ipv4')
+UNSAFE_V4.addSubnet('203.0.113.0', 24, 'ipv4')
+UNSAFE_V4.addSubnet('224.0.0.0', 4, 'ipv4')
+UNSAFE_V4.addSubnet('240.0.0.0', 4, 'ipv4')
+
+// IPv6 is fail-closed: only the IANA global-unicast allocation 2000::/3 is
+// eligible, then special-purpose subranges inside it are excluded. This is an
+// explicit allow policy, not an open-ended denylist. It therefore rejects
+// newly introduced protocol/special ranges outside 2000::/3 until reviewed.
+//
+// Sources: IANA IPv6 Special-Purpose Address Registry and RFC 4291 section 2.4.
+// We conservatively reject the whole 2001::/23 IETF protocol-assignment block,
+// including Teredo, benchmarking, ORCHID, AMT, AS112, and related anycast
+// assignments, even where a narrower entry may carry a globally-reachable
+// flag. Webhook destinations have no reason to depend on those protocols.
+const GLOBAL_UNICAST_V6 = new BlockList()
+GLOBAL_UNICAST_V6.addSubnet('2000::', 3, 'ipv6')
+
+const NON_GLOBAL_UNICAST_V6 = new BlockList()
+NON_GLOBAL_UNICAST_V6.addSubnet('2001::', 23, 'ipv6')
+NON_GLOBAL_UNICAST_V6.addSubnet('2001:db8::', 32, 'ipv6')
+NON_GLOBAL_UNICAST_V6.addSubnet('2002::', 16, 'ipv6')
+NON_GLOBAL_UNICAST_V6.addSubnet('2620:4f:8000::', 48, 'ipv6')
+NON_GLOBAL_UNICAST_V6.addSubnet('3fff::', 20, 'ipv6')
 
 /**
- * Map an IPv4 or IPv6 address string to a safety class. Returns 'public'
- * only when the address falls outside every known unsafe range we care
- * about for SSRF prevention.
+ * Map an IPv4 or IPv6 address string to a safety class. IPv4 preserves its
+ * complete explicit classification. IPv6 returns public only for ordinary
+ * global unicast after the special-purpose exclusions above.
  */
 function classifyAddress(address: string): AddressClass {
-  // IPv4
-  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(address)
-  if (v4) {
-    const o = [v4[1], v4[2], v4[3], v4[4]].map((s) => Number.parseInt(s, 10))
+  const family = isIP(address)
+  if (family === 4) {
+    const o = address.split('.').map((part) => Number.parseInt(part, 10))
     // Cloud metadata endpoint: explicit class so we surface it distinctly.
     // 169.254.169.254 is AWS/GCP/Azure/Hetzner; classify before the broader
     // 169.254.0.0/16 link-local check.
@@ -160,26 +218,21 @@ function classifyAddress(address: string): AddressClass {
     }
     if (o[0] === 169 && o[1] === 254) return 'link_local_address'
     if (o[0] === 127) return 'loopback_address'
-    if (o[0] === 10) return 'private_address'
-    if (o[0] === 172 && o[1] >= 16 && o[1] <= 31) return 'private_address'
-    if (o[0] === 192 && o[1] === 168) return 'private_address'
+    if (PRIVATE_V4.check(address, 'ipv4')) return 'private_address'
     if (o[0] === 100 && o[1] >= 64 && o[1] <= 127) return 'cgnat_address'
-    // 0.0.0.0/8: "this network", treat as loopback-equivalent.
-    if (o[0] === 0) return 'loopback_address'
+    if (o[0] === 0) return 'unspecified_address'
+    if (UNSAFE_V4.check(address, 'ipv4')) return 'unsafe_address'
     return 'public'
   }
 
-  // IPv6: minimal classification. Lower-case for case-insensitive match.
+  if (family !== 6) return 'unsafe_address'
   const v6 = address.toLowerCase()
   if (v6 === '::1' || v6 === '0:0:0:0:0:0:0:1') return 'loopback_address'
-  if (v6 === '::' || v6 === '0:0:0:0:0:0:0:0') return 'loopback_address'
-  // ::ffff:0:0/96: IPv4-mapped IPv6. Re-classify the embedded IPv4.
-  const mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(v6)
-  if (mapped) return classifyAddress(mapped[1])
-  // fc00::/7: unique local
+  if (v6 === '::' || v6 === '0:0:0:0:0:0:0:0') return 'unspecified_address'
   if (/^f[cd]/.test(v6)) return 'private_address'
-  // fe80::/10: link-local
   if (/^fe[89ab]/.test(v6)) return 'link_local_address'
+  if (!GLOBAL_UNICAST_V6.check(address, 'ipv6')) return 'unsafe_address'
+  if (NON_GLOBAL_UNICAST_V6.check(address, 'ipv6')) return 'unsafe_address'
   return 'public'
 }
 

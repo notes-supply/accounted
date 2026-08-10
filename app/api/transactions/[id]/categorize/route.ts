@@ -863,6 +863,7 @@ export const POST = withRouteContext(
         isBusiness: is_business,
         category: finalCategory,
         journalEntryId,
+        requireVerifiedTransaction: true,
       },
       txLog,
     )
@@ -874,7 +875,11 @@ export const POST = withRouteContext(
         details: {
           operation: 'attach_transaction_categorization',
           ...(attachment.partialPostedIds
-            ? { partial_posted_ids: attachment.partialPostedIds }
+            ? {
+                failed_partial: true,
+                compensation_verified: false,
+                partial_posted_ids: attachment.partialPostedIds,
+              }
             : {}),
         },
       })
@@ -884,8 +889,24 @@ export const POST = withRouteContext(
       return errorResponseFromCode('TX_CATEGORIZE_RACE', txLog, {
         requestId,
         ...(attachment.partialPostedIds
-          ? { details: { partial_posted_ids: attachment.partialPostedIds } }
+          ? {
+              details: {
+                failed_partial: true,
+                compensation_verified: false,
+                partial_posted_ids: attachment.partialPostedIds,
+              },
+            }
           : {}),
+      })
+    }
+
+    const verifiedTransaction = attachment.verifiedTransaction
+    if (!verifiedTransaction) {
+      return errorResponseFromCode('BOOKKEEPING_DATABASE_ERROR', txLog, {
+        requestId,
+        details: {
+          operation: 'attach_transaction_categorization.readback',
+        },
       })
     }
 
@@ -920,7 +941,7 @@ export const POST = withRouteContext(
       // Templates are company-scoped since the multi-tenant refactor: passing
       // user.id here broke learning entirely (FK/RLS reject the write).
       await upsertCounterpartyTemplate(
-        supabase, companyId, transaction as Transaction, mappingResult, 'user_approved',
+        supabase, companyId, verifiedTransaction, mappingResult, 'user_approved',
       )
     } catch (err) {
       txLog.warn('failed to upsert counterparty template (non-critical)', err as Error)
@@ -1046,7 +1067,7 @@ export const POST = withRouteContext(
     await eventBus.emit({
       type: 'transaction.categorized',
       payload: {
-        transaction: transaction as Transaction,
+        transaction: verifiedTransaction,
         account: mappingResult.debit_account,
         taxCode: mappingResult.vat_lines[0]?.account_number || '',
         userId: user.id,

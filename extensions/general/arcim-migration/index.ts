@@ -81,6 +81,17 @@ function translateOAuthError(error: string, description: string | null): string 
  * The override exists so dev environments can route through a single
  * registered URI instead of registering every ngrok URL on the OAuth client.
  */
+/**
+ * WINT ships dark until the connection is verified against a live WINT
+ * account (its API is spec-derived, not sandbox-verified) and the relationship
+ * question is settled. Flipping WINT_MIGRATION_ENABLED=true is the launch
+ * switch; the rest of the provider is fully wired.
+ */
+function enabledProviders(): typeof ARCIM_PROVIDERS {
+  if (process.env.WINT_MIGRATION_ENABLED === 'true') return ARCIM_PROVIDERS
+  return ARCIM_PROVIDERS.filter(p => p.id !== 'wint')
+}
+
 function resolveArcimCallbackUrl(provider: ArcimProvider | ProviderName): string {
   const providerRedirectEnv =
     provider === 'visma'
@@ -140,7 +151,7 @@ export const arcimMigrationExtension: Extension = {
       method: 'GET',
       path: '/providers',
       handler: async () => {
-        return NextResponse.json({ providers: ARCIM_PROVIDERS })
+        return NextResponse.json({ providers: enabledProviders() })
       },
     },
 
@@ -234,7 +245,7 @@ export const arcimMigrationExtension: Extension = {
           })
         }
 
-        const providerInfo = ARCIM_PROVIDERS.find(p => p.id === provider)
+        const providerInfo = enabledProviders().find(p => p.id === provider)
         if (!providerInfo) {
           return errorResponseFromCode('PROVIDER_INVALID', moduleLog, {
             details: { provider },
@@ -407,8 +418,10 @@ export const arcimMigrationExtension: Extension = {
         }
 
         // Briox needs the account ID (the /token clientid param) alongside
-        // the application token; Bokio/BL need their company GUID.
-        if ((provider === 'bokio' || provider === 'bjornlunden' || provider === 'briox') && !providerCompanyId) {
+        // the application token; Bokio/BL need their company GUID. WINT
+        // reuses the field for the login mail (paired with the password in
+        // apiToken; both are exchanged for tokens and never stored).
+        if ((provider === 'bokio' || provider === 'bjornlunden' || provider === 'briox' || provider === 'wint') && !providerCompanyId) {
           return errorResponseFromCode('PROVIDER_COMPANY_ID_REQUIRED', moduleLog, {
             details: { provider },
           })
@@ -627,6 +640,16 @@ export const arcimMigrationExtension: Extension = {
             const companyInfo = await fetchCompanyInfoDirect(provider, resolved.accessToken, resolved.providerCompanyId)
             mapped = companyInfo ? mapCompanyInfo(companyInfo) : null
           } catch (err) {
+            // A missing integration license / inactive API module dooms every
+            // later call in the wizard too: fail the preview with the typed
+            // code (via the outer catch) so the user reads the remediation at
+            // connect time, not after a silently empty migration. Other
+            // failures stay soft: the preview is still useful without company
+            // info (e.g. SIE-over-API can work with narrower scopes).
+            const classified = classifyProviderError(err)
+            if (classified === 'PROVIDER_API_MODULE_INACTIVE' || classified === 'PROVIDER_LICENSE_MISSING') {
+              throw err
+            }
             log.info('Company info fetch failed:', err instanceof Error ? err.message : String(err))
           }
 

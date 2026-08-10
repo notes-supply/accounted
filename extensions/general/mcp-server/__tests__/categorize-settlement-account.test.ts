@@ -83,6 +83,7 @@ describe('gnubok_categorize_transaction settlement account preview', () => {
       cash_account_id: 'cash-revolut-sek',
       settlement_account: '1931',
     })
+    expect(findCall('transactions', 'update')).toBeUndefined()
   })
 
   it('uses legacy sole-trader defaults only when the company-settings row is absent', async () => {

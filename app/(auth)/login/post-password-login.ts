@@ -14,3 +14,32 @@ export function completePasswordLogin(
 ): void {
   navigate(safeReturnTo(destination, '/'))
 }
+
+interface PerformPasswordLoginOptions<TError> {
+  signIn: () => Promise<{ error: TError | null }>
+  onSignedIn: () => void
+  acceptPendingInvite: () => Promise<boolean>
+  destination: string
+  navigate?: (destination: string) => void
+}
+
+/**
+ * Keep the pending-invite handoff on the successful side of the password
+ * grant. The invite consumer owns definitive cookie clearing and retryable
+ * retention; this helper only selects the final document destination.
+ */
+export async function performPasswordLogin<TError>({
+  signIn,
+  onSignedIn,
+  acceptPendingInvite,
+  destination,
+  navigate,
+}: PerformPasswordLoginOptions<TError>): Promise<TError | null> {
+  const { error } = await signIn()
+  if (error) return error
+
+  onSignedIn()
+  const acceptedInvite = await acceptPendingInvite()
+  completePasswordLogin(acceptedInvite ? '/' : destination, navigate)
+  return null
+}

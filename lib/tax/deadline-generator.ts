@@ -3,6 +3,7 @@
  */
 
 import { SupabaseClient } from '@supabase/supabase-js'
+import { FISCAL_YEAR_RE, ISO_DATE_RE } from '@/lib/invariants'
 import { createLogger } from '@/lib/logger'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import type { TaxDeadlineType, DeadlineStatus } from '@/types'
@@ -394,7 +395,7 @@ function vatDeadlinePeriodEnd(
 
   if (type === 'moms_yearly') {
     const exactEnd = linkedReportPeriod?.fiscalPeriodEnd
-    return typeof exactEnd === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(exactEnd)
+    return typeof exactEnd === 'string' && ISO_DATE_RE.test(exactEnd)
       ? exactEnd
       : null
   }
@@ -510,8 +511,8 @@ function resolveLegacyAnnualVatFiscalPeriod(
   if (!years) return null
 
   const candidates = fiscalPeriods.filter((period) =>
-    /^\d{4}-\d{2}-\d{2}$/.test(period.period_start) &&
-    /^\d{4}-\d{2}-\d{2}$/.test(period.period_end) &&
+    ISO_DATE_RE.test(period.period_start) &&
+    ISO_DATE_RE.test(period.period_end) &&
     period.period_start <= period.period_end &&
     Number(period.period_start.slice(0, 4)) === years.startYear &&
     Number(period.period_end.slice(0, 4)) === years.endYear,
@@ -999,7 +1000,7 @@ function createLinkedReportPeriod(
   }
 
   // Annual: "2025"
-  if (/^\d{4}$/.test(period)) {
+  if (FISCAL_YEAR_RE.test(period)) {
     return { year: parseInt(period) }
   }
 

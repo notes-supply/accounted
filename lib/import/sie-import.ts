@@ -9,7 +9,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { normalizeLineDimensions } from '@/lib/bookkeeping/dimension-resolver'
 import { importDimensionRegistry } from './sie-dimensions'
-import { createJournalEntry, reverseEntry } from '@/lib/bookkeeping/engine'
+import { createJournalEntry, replaceOpeningBalanceEntry } from '@/lib/bookkeeping/engine'
 import type {
   ParsedSIEFile,
   AccountMapping,
@@ -735,9 +735,10 @@ async function createOpeningBalanceEntry(
 }
 
 /**
- * Returns true when the company already has at least one posted (or reversed)
- * non-IB journal entry, i.e. this is a continuation import, not the first
- * ever SIE upload for the company.
+ * Returns true when the company already has at least one posted non-IB
+ * journal entry dated no later than the target fiscal period, i.e. this is a
+ * continuation import rather than the first SIE upload for that point in the
+ * company's chronology.
  *
  * Used to gate IB-entry creation: when a company is already live, each year's
  * #IB equals the prior year's UB, which is the sum of already-imported
@@ -746,7 +747,8 @@ async function createOpeningBalanceEntry(
  */
 export async function companyHasPriorActivity(
   supabase: SupabaseClient,
-  companyId: string
+  companyId: string,
+  targetPeriodEnd: string,
 ): Promise<boolean> {
   // Only count currently-effective real activity. Excluding 'reversed' drops
   // cancelled originals; excluding source_type 'storno' drops their matching
@@ -760,6 +762,9 @@ export async function companyHasPriorActivity(
     .neq('source_type', 'opening_balance')
     .neq('source_type', 'storno')
     .eq('status', 'posted')
+    // Keep same-period activity in the continuation guard, but ignore a
+    // later year that happened to be imported first.
+    .lte('entry_date', targetPeriodEnd)
 
   return (count ?? 0) > 0
 }
@@ -839,6 +844,21 @@ export async function resyncNextPeriodOpeningBalance(
     return { resynced: false, reason: 'no_next_period' }
   }
 
+  const importedPeriodEnd = new Date(`${justImportedPeriodEnd}T00:00:00Z`)
+  importedPeriodEnd.setUTCDate(importedPeriodEnd.getUTCDate() + 1)
+  const expectedNextPeriodStart = importedPeriodEnd.toISOString().slice(0, 10)
+
+  if (nextPeriod.period_start !== expectedNextPeriodStart) {
+    // A later period separated by a gap has its own authoritative IB. It must
+    // not be replaced with a non-adjacent year's UB while the middle year is
+    // still missing.
+    return {
+      resynced: false,
+      reason: 'next_period_not_adjacent',
+      nextPeriodName: nextPeriod.name,
+    }
+  }
+
   if (!nextPeriod.opening_balance_entry_id) {
     // No existing IB on the next period: caller has nothing to resync; the
     // user's first IB for the next period will be derived from the import
@@ -909,52 +929,26 @@ export async function resyncNextPeriodOpeningBalance(
     }
   }
 
-  // Ordering note: create the new IB FIRST, then storno the old one. If we
-  // stornoed first and the createJournalEntry call failed, the next period
-  // would be left with a reversed IB and nothing to replace it, and
-  // executeSIEImport swallows our error as a non-fatal warning. By creating
-  // first we guarantee the worst case is "new IB exists but not yet linked",
-  // which getOpeningBalances() can still reason about.
-
-  // Build the new IB entry on the next period.
-  const newEntry = await createJournalEntry(supabase, companyId, userId, {
-    fiscal_period_id: nextPeriod.id,
-    entry_date: nextPeriod.period_start as string,
-    description: 'Ingående balanser (resynk efter prior-year SIE-import)',
-    source_type: 'opening_balance',
-    voucher_series: 'A',
-    lines: newLines,
-  })
-
-  // Atomically swap the period FK pointer (two-step around the
-  // immutability trigger).
-  const { error: relinkError } = await supabase.rpc('replace_period_opening_balance_link', {
-    p_company_id: companyId,
-    p_period_id: nextPeriod.id,
-    p_new_entry_id: newEntry.id,
-  })
-
-  if (relinkError) {
-    throw new Error(`Failed to relink opening balance on next period: ${relinkError.message}`)
-  }
-
-  // Now that the period points at the new IB, storno the old one. If this
-  // throws, the period is already on the correct entry: the orphaned old
-  // entry shows up as a stray verifikat but the FK stays consistent.
-  const storno = await reverseEntry(
+  const replacement = await replaceOpeningBalanceEntry(
     supabase,
     companyId,
     userId,
     nextPeriod.opening_balance_entry_id,
-    nextPeriod.period_start as string,
+    {
+      fiscal_period_id: nextPeriod.id,
+      entry_date: nextPeriod.period_start as string,
+      description: 'Ingående balanser (resynk efter prior-year SIE-import)',
+      source_type: 'opening_balance',
+      lines: newLines,
+    },
   )
 
   return {
     resynced: true,
     nextPeriodId: nextPeriod.id,
     nextPeriodName: nextPeriod.name,
-    stornoEntryId: storno.id,
-    newOpeningBalanceEntryId: newEntry.id,
+    stornoEntryId: replacement.stornoEntryId,
+    newOpeningBalanceEntryId: replacement.newEntryId,
   }
 }
 
@@ -1706,11 +1700,32 @@ export async function finalizeImportRecord(
   // overlapping-period check would block any retry. Flipping to 'failed'
   // (which the partial index already excludes) keeps the slot free so the
   // caller can re-import the same file once the mapping is fixed.
+  //
+  // Exception: a file the parser found NO vouchers in (documentation
+  // carries the parsed count) is a legitimate no-op, not a failure.
+  // Fortnox exports an empty SIE file for a fiscal year with nothing
+  // booked yet, and failing it aborts the whole migration wizard. A later
+  // export with actual vouchers has a different hash, so the claimed slot
+  // never blocks it: the Fortnox flow replaces completed imports, and the
+  // manual flow offers "Ersätt import".
   const noEntriesCreated =
     result.success &&
     result.journalEntriesCreated === 0 &&
     !result.openingBalanceEntryId
-  if (noEntriesCreated) {
+  // The parsed count alone can't prove the year was empty: a separator or
+  // encoding mismatch can swallow every #VER block without a parse error
+  // (the parser only warns). Cross-check the raw content; a file that
+  // declares #VER but parsed to 0 vouchers must keep failing, or real
+  // affärshändelser would silently never be bokförda (BFL 5 kap).
+  const rawDeclaresVouchers = /^\s*#VER\b/m.test(fileContent)
+  const fileHadNoVouchers =
+    documentation?.vouchers.total === 0 && !rawDeclaresVouchers
+  if (noEntriesCreated && fileHadNoVouchers) {
+    result.warnings.push(
+      'SIE-filen innehåller inga verifikationer för räkenskapsåret: inget ' +
+      'att importera. Räkenskapsåret är skapat och redo att bokföras i.',
+    )
+  } else if (noEntriesCreated) {
     result.success = false
     if (result.errors.length === 0) {
       result.errors.push(
@@ -2199,7 +2214,11 @@ export async function executeSIEImport(
         // first-ever import creates the legitimate pre-system IB; subsequent
         // imports must rely on the prior entries to derive opening balances
         // on the fly (via getOpeningBalances() fallback).
-        const isContinuationImport = await companyHasPriorActivity(supabase, companyId)
+        const isContinuationImport = await companyHasPriorActivity(
+          supabase,
+          companyId,
+          fiscalYearEnd,
+        )
 
         if (isContinuationImport) {
           result.warnings.push(
@@ -2464,7 +2483,16 @@ export async function executeSIEImport(
     // exists with its own opening_balance entry, the customer is doing a
     // prior-year backfill. Sync the next period's IB to match the UB we
     // just imported so reports stay consistent.
-    if (result.success && fiscalYearEnd && result.fiscalPeriodId && parsed.closingBalances.length > 0) {
+    // result.success is finalized below, after diagnostics and documentation.
+    // Use the same error condition here so this block is reachable, but require
+    // a target-period entry so a no-op file cannot succeed through resync alone.
+    if (
+      result.errors.length === 0 &&
+      result.journalEntriesCreated > 0 &&
+      fiscalYearEnd &&
+      result.fiscalPeriodId &&
+      parsed.closingBalances.length > 0
+    ) {
       try {
         const resync = await resyncNextPeriodOpeningBalance(
           supabase,
