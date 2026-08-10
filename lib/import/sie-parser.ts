@@ -300,7 +300,9 @@ function splitSIELine(line: string): string[] {
       continue
     }
 
-    if (char === '\\') {
+    // SIE defines backslash only as the marker immediately before a quote.
+    // A literal backslash is data and must not escape the next backslash.
+    if (char === '\\' && line[i + 1] === '"') {
       escaped = true
       current += char
       continue

@@ -27,6 +27,11 @@ function jsonError(message: string, status = 500): Response {
 /** How far back a newly connected mailbox may be searched, in days. */
 const BACKFILL_CHOICES = new Set([30, 90, 365])
 
+/** Mailbox search is not resumable enough for the production route yet. */
+export function isMailHuntConnectionAvailable(): boolean {
+  return process.env.NODE_ENV !== 'production'
+}
+
 async function canMutateMail(ctx: ExtensionContext): Promise<boolean> {
   return canWriteCompany(ctx.supabase, ctx.userId, ctx.companyId)
 }
@@ -58,6 +63,7 @@ export const mailExtension: Extension = {
       handler: async (request, ctx) => {
         if (!ctx) return jsonError('Missing context', 500)
         if (!(await canMutateMail(ctx))) return jsonError('forbidden', 403)
+        if (!isMailHuntConnectionAvailable()) return jsonError('preview_disabled', 503)
         if (!(await canUseMailAi(ctx))) return jsonError('entitlement_required', 403)
         if (!isGoogleMailConfigured()) return jsonError('provider_not_configured', 400)
         try {
@@ -89,6 +95,9 @@ export const mailExtension: Extension = {
         // The user declining is a normal outcome, not an error to shout about.
         if (error) return NextResponse.redirect(`${settingsUrl}?mail=denied`)
         if (!code || !state) return NextResponse.redirect(`${settingsUrl}?mail=invalid`)
+        if (!isMailHuntConnectionAvailable()) {
+          return NextResponse.redirect(`${settingsUrl}?mail=preview_disabled`)
+        }
 
         const verified = verifyOAuthState(state)
         if (!verified) return NextResponse.redirect(`${settingsUrl}?mail=expired`)
@@ -155,7 +164,13 @@ export const mailExtension: Extension = {
       handler: async (_request, ctx) => {
         if (!ctx) return jsonError('Missing context', 500)
         const connections = await listConnections(createServiceClientNoCookies(), ctx.companyId)
-        return NextResponse.json({ data: { connections, configured: isGoogleMailConfigured() } })
+        return NextResponse.json({
+          data: {
+            connections,
+            configured: isGoogleMailConfigured(),
+            connectAvailable: isMailHuntConnectionAvailable(),
+          },
+        })
       },
     },
 
@@ -181,6 +196,7 @@ export const mailExtension: Extension = {
       handler: async (request, ctx) => {
         if (!ctx) return jsonError('Missing context', 500)
         if (!(await canMutateMail(ctx))) return jsonError('forbidden', 403)
+        if (!isMailHuntConnectionAvailable()) return jsonError('preview_disabled', 503)
         if (!(await canUseMailAi(ctx))) return jsonError('entitlement_required', 403)
         const body = (await request.json().catch(() => ({}))) as { id?: string; days?: number }
         if (!body.id || !body.days || !BACKFILL_CHOICES.has(body.days)) {

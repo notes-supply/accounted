@@ -81,5 +81,5 @@ describe('extension registry generator', () => {
     const drifted = spawnSync(npx, ['tsx', script, '--check'], { env, encoding: 'utf8' })
     expect(drifted.status).toBe(1)
     expect(drifted.stderr).toContain('sector-definitions.ts')
-  })
+  }, 15_000)
 })

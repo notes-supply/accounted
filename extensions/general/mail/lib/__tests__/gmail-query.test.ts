@@ -39,6 +39,22 @@ describe('amountTerms', () => {
   it('ignores the sign, since bank outflows are negative', () => {
     expect(amountTerms(-425)).toEqual(amountTerms(425))
   })
+
+  it('rounds fractional ore before formatting exact decimal terms', () => {
+    expect(amountTerms(438.754)).toEqual(expect.arrayContaining(['438.75', '438,75']))
+    expect(amountTerms(438.754)).not.toContain('438.754')
+  })
+
+  it('uses rounded cents for whole and grouped-thousands boundaries', () => {
+    expect(amountTerms(424.999)).toEqual(expect.arrayContaining(['425.00', '425,00', '425']))
+    expect(amountTerms(999.999)).toEqual(expect.arrayContaining([
+      '1000.00',
+      '1000,00',
+      '1000',
+      '1 000,00',
+      '1 000',
+    ]))
+  })
 })
 
 describe('buildGmailQuery', () => {

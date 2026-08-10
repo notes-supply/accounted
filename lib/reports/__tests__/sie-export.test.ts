@@ -37,6 +37,7 @@ function makeClient() {
 }
 
 import { generateSIEExport } from '../sie-export'
+import { parseSIEFile } from '@/lib/import/sie-parser'
 
 let supabase: ReturnType<typeof makeClient>
 
@@ -522,6 +523,37 @@ describe('generateSIEExport', () => {
     const output = await generateSIEExport(supabase, 'company-1', baseOptions)
 
     expect(output).toContain('#VER "A" 1 20240115 "Invoice for \\"consulting\\""')
+  })
+
+  it('round-trips a literal backslash immediately followed by a quote', async () => {
+    const description = 'Archive path C:\\receipts\\"final copy" preserved'
+    results = [
+      { data: { id: 'period-1', period_start: '2024-01-01', period_end: '2024-12-31' }, error: null },
+      { data: null, error: null }, // prevPeriod
+      { data: [], error: null }, // accounts
+      {
+        data: [
+          { id: 'e1', entry_date: '2024-01-15', voucher_number: 1, voucher_series: 'A', description, status: 'posted' },
+        ],
+        error: null,
+      },
+      {
+        data: [
+          { journal_entry_id: 'e1', account_number: '1930', debit_amount: 100, credit_amount: 0, line_description: null, dimensions: {} },
+          { journal_entry_id: 'e1', account_number: '3001', debit_amount: 0, credit_amount: 100, line_description: null, dimensions: {} },
+        ],
+        error: null,
+      },
+      { data: [], error: null }, // dimensions
+      { data: [], error: null }, // dimension_values
+      { data: [], error: null }, // RPC fallback
+    ]
+
+    const output = await generateSIEExport(supabase, 'company-1', baseOptions)
+    const parsed = parseSIEFile(output)
+
+    expect(output).toContain('C:\\receipts\\\\\"final copy\\" preserved')
+    expect(parsed.vouchers[0].description).toBe(description)
   })
 
   it('uses \\r\\n line endings', async () => {

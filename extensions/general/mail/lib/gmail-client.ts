@@ -27,6 +27,7 @@ interface GmailPart {
   filename?: string
   mimeType?: string
   body?: { attachmentId?: string; size?: number; data?: string }
+  headers?: GmailHeader[]
   parts?: GmailPart[]
 }
 
@@ -83,7 +84,31 @@ function header(msg: GmailMessage, name: string): string | null {
   return found?.value ?? null
 }
 
-/** Attachments anywhere in the MIME tree, ignoring inline images. */
+function partHeader(part: GmailPart, name: string): string | null {
+  const normalizedName = name.trim().toLowerCase()
+  const found = part.headers?.find((h) => h.name.trim().toLowerCase() === normalizedName)
+  return found?.value ?? null
+}
+
+function dispositionKind(part: GmailPart): string {
+  const raw = partHeader(part, 'Content-Disposition')
+  if (!raw) return ''
+  return raw.split(';', 1)[0].trim().toLowerCase()
+}
+
+function supportedAttachmentKind(part: GmailPart): 'pdf' | 'image' | null {
+  const mimeType = (part.mimeType ?? '').split(';', 1)[0].trim().toLowerCase()
+  if (mimeType === 'application/pdf') return 'pdf'
+  if (mimeType === 'image/jpeg' || mimeType === 'image/png' || mimeType === 'image/webp') {
+    return 'image'
+  }
+  if (mimeType !== 'application/octet-stream') return null
+  if (/\.pdf$/i.test(part.filename ?? '')) return 'pdf'
+  if (/\.(?:jpe?g|png|webp)$/i.test(part.filename ?? '')) return 'image'
+  return null
+}
+
+/** Attachments anywhere in the MIME tree, excluding every explicit inline part. */
 function collectAttachments(
   part: GmailPart | undefined,
   out: Array<{ id: string; filename: string }>,
@@ -91,9 +116,14 @@ function collectAttachments(
   if (!part) return
   const id = part.body?.attachmentId
   const named = part.filename && part.filename.length > 0
-  const isDocument =
-    named &&
-    !/^image\/(png|gif)$/i.test(part.mimeType ?? '') // inline logos, not receipts
+  const disposition = dispositionKind(part)
+  const attachmentKind = supportedAttachmentKind(part)
+  const isExplicitAttachment = disposition === 'attachment'
+  const isExplicitInline = disposition === 'inline'
+  // An explicit inline disposition is authoritative for every MIME type.
+  // Images are additionally fail-closed when the disposition is absent.
+  const isDocument = named && attachmentKind !== null && !isExplicitInline &&
+    (attachmentKind === 'pdf' || isExplicitAttachment)
   if (id && isDocument) out.push({ id, filename: part.filename as string })
   for (const child of part.parts ?? []) collectAttachments(child, out)
 }

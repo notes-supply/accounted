@@ -176,10 +176,10 @@ export const EXTENSION_DEFINITIONS: Record<string, ExtensionDefinition[]> = {
           "category": "operations",
           "icon": "Mail",
           "dataPattern": "manual",
-          "description": "Låt Kvittojakten leta upp kvitton i era brevlådor",
-          "longDescription": "Koppla en eller flera brevlådor, så letar Kvittojakten efter kvitton till kortköp som saknar underlag. Åtkomsten är läsbehörighet: agenten kan aldrig skicka, ändra eller radera mejl. Kandidatmejl och bilagor hämtas, och deras metadata, brödtext, bilagenamn och bilageinnehåll kan behandlas av den konfigurerade externa AI- eller modellleverantören. Kandidatbilagor och härledda dokument- eller inkorgsposter kan lagras varaktigt före mänsklig granskning. Avvisat eller ogranskat material kan ligga kvar enligt produktens lagrings- och raderingskontroller.",
+          "description": "Automatisk kvittojakt i brevlådor är avstängd i förhandsversionen",
+          "longDescription": "Automatisk sökning efter kvitton i brevlådor, nya kopplingar och historisk sökning är inte tillgängliga i produktion. Befintliga kopplingar kan fortfarande visas och kopplas från, vilket raderar sparade OAuth-behörighetsuppgifter. Tidigare härledda dokument, inkorgsposter och affärsposter ligger kvar enligt produktens lagrings- och raderingskontroller.",
           "hasOwnData": true,
-          "subscriptionNotice": "Kräver ett Google-konto. Varje brevlåda kopplas av sin egen ägare. Frånkoppling stoppar framtida åtkomst och raderar OAuth-behörighetsuppgifter, men raderar inte automatiskt redan importerade affärsposter eller material."
+          "subscriptionNotice": "Förhandsfunktionen är avstängd. Begär inte nya brevlådebehörigheter. Befintliga kopplingar kan visas och kopplas från."
     },
   ],
 }

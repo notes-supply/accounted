@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   canWriteCompany: vi.fn(),
@@ -77,6 +77,8 @@ beforeEach(() => {
   })
 })
 
+afterEach(() => vi.unstubAllEnvs())
+
 describe('mail extension write authorization', () => {
   it.each([
     ['POST', '/oauth/start', 'https://app.test/api/extensions/ext/mail/oauth/start'],
@@ -147,6 +149,63 @@ describe('mail AI entitlement boundaries', () => {
     expect(response.status).toBe(403)
     expect(mocks.createOAuthState).not.toHaveBeenCalled()
     expect(mocks.updateBackfill).not.toHaveBeenCalled()
+  })
+})
+
+describe('production availability', () => {
+  it('denies new connect and backfill while allowing list and disconnect', async () => {
+    vi.stubEnv('NODE_ENV', 'production')
+    mocks.listConnections.mockResolvedValue([])
+
+    const start = await route('/oauth/start', 'POST').handler(
+      new Request('https://app.test/api/extensions/ext/mail/oauth/start', { method: 'POST' }),
+      ctx as never,
+    )
+    const backfill = await route('/connections/backfill', 'POST').handler(
+      new Request('https://app.test/api/extensions/ext/mail/connections/backfill', {
+        method: 'POST',
+        body: JSON.stringify({ id: 'conn-1', days: 30 }),
+      }),
+      ctx as never,
+    )
+    const list = await route('/connections', 'GET').handler(
+      new Request('https://app.test/api/extensions/ext/mail/connections'),
+      ctx as never,
+    )
+    const revoke = await route('/connections', 'DELETE').handler(
+      new Request('https://app.test/api/extensions/ext/mail/connections?id=conn-1', {
+        method: 'DELETE',
+      }),
+      ctx as never,
+    )
+
+    expect(start.status).toBe(503)
+    expect(backfill.status).toBe(503)
+    expect(list.status).toBe(200)
+    expect(await list.json()).toMatchObject({ data: { connectAvailable: false } })
+    expect(revoke.status).toBe(200)
+    expect(mocks.createOAuthState).not.toHaveBeenCalled()
+    expect(mocks.updateBackfill).not.toHaveBeenCalled()
+    expect(mocks.listConnections).toHaveBeenCalledTimes(1)
+    expect(mocks.disconnect).toHaveBeenCalledTimes(1)
+  })
+
+  it('fails the callback closed before inspecting state or exchanging credentials', async () => {
+    vi.stubEnv('NODE_ENV', 'production')
+
+    const response = await route('/oauth/callback', 'GET').handler(
+      new Request(
+        'https://app.test/api/extensions/ext/mail/oauth/callback?code=code-1&state=state-1',
+      ),
+      ctx as never,
+    )
+
+    expect(response.headers.get('location')).toContain('mail=preview_disabled')
+    expect(mocks.verifyOAuthState).not.toHaveBeenCalled()
+    expect(mocks.canWriteCompany).not.toHaveBeenCalled()
+    expect(mocks.hasCapability).not.toHaveBeenCalled()
+    expect(mocks.exchangeCodeForTokens).not.toHaveBeenCalled()
+    expect(mocks.saveConnection).not.toHaveBeenCalled()
   })
 })
 

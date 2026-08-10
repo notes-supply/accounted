@@ -74,19 +74,20 @@ export function merchantTerms(merchant: string | null): string[] {
  * write 1234.50. Both forms are offered.
  */
 export function amountTerms(amount: number): string[] {
-  const abs = Math.abs(amount)
-  const twoDp = abs.toFixed(2)
+  const cents = Math.round(Math.abs(amount) * 100)
+  const whole = String(Math.floor(cents / 100))
+  const fraction = String(cents % 100).padStart(2, '0')
+  const twoDp = `${whole}.${fraction}`
   const terms = new Set<string>([twoDp, twoDp.replace('.', ',')])
-  if (Number.isInteger(abs)) terms.add(String(abs))
+  if (cents % 100 === 0) terms.add(whole)
 
   // Swedish invoices group thousands with a space: 15 000,00, not 15000,00.
   // Measured against a real mailbox, the Sting office invoice was findable as
   // "15 000,00" and "15 000" and by nothing else: every ungrouped form
   // returned zero. Cheap to add and it is pure recall.
   const group = (v: string) => v.replace(/\B(?=(\d{3})+(?!\d))/g, ' ')
-  const [whole] = twoDp.split('.')
   if (whole.length > 3) {
-    terms.add(`${group(whole)},${twoDp.split('.')[1]}`)
+    terms.add(`${group(whole)},${fraction}`)
     terms.add(group(whole))
   }
   return [...terms]

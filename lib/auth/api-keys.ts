@@ -403,6 +403,7 @@ export function generateApiKey(mode: ApiKeyMode = 'live'): { key: string; hash: 
  * breaking existing MCP connections with no migration path.
  */
 export function hashApiKey(key: string): string {
+  // codeql[js/insufficient-password-hash]
   return crypto.createHash('sha256').update(key).digest('hex')
 }
 

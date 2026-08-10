@@ -31,6 +31,7 @@ export function MailConnectionsPanel() {
   const t = useTranslations('mail')
   const [connections, setConnections] = useState<MailConnection[]>([])
   const [configured, setConfigured] = useState(true)
+  const [connectAvailable, setConnectAvailable] = useState(false)
   const [loading, setLoading] = useState(true)
   const [connecting, setConnecting] = useState(false)
   const [pendingDisconnect, setPendingDisconnect] = useState<MailConnection | null>(null)
@@ -40,10 +41,15 @@ export function MailConnectionsPanel() {
       const response = await fetch(`${BASE}/connections`)
       if (!response.ok) return
       const body = (await response.json()) as {
-        data: { connections: MailConnection[]; configured: boolean }
+        data: {
+          connections: MailConnection[]
+          configured: boolean
+          connectAvailable: boolean
+        }
       }
       setConnections(body.data.connections)
       setConfigured(body.data.configured)
+      setConnectAvailable(body.data.connectAvailable)
     } finally {
       setLoading(false)
     }
@@ -122,20 +128,21 @@ export function MailConnectionsPanel() {
         )}
       </SettingsGroup>
 
-      <div className="flex flex-wrap items-center gap-3">
-        <Button onClick={connect} disabled={connecting || !configured}>
-          {connecting ? (
-            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-          ) : (
-            <GoogleMark className="mr-2 h-4 w-4" />
-          )}
-          {t('connect')}
-        </Button>
-        {!configured ? <SettingsRowNote>{t('not_configured')}</SettingsRowNote> : null}
-      </div>
-
-      <p className="max-w-[62ch] text-xs text-muted-foreground">{t('promise')}</p>
-      <p className="max-w-[62ch] text-xs text-muted-foreground">{t('ai_disclosure')}</p>
+      {connectAvailable ? (
+        <div className="flex flex-wrap items-center gap-3">
+          <Button onClick={connect} disabled={connecting || !configured}>
+            {connecting ? (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <GoogleMark className="mr-2 h-4 w-4" />
+            )}
+            {t('connect')}
+          </Button>
+          {!configured ? <SettingsRowNote>{t('not_configured')}</SettingsRowNote> : null}
+        </div>
+      ) : (
+        <SettingsRowNote>{t('preview_disabled')}</SettingsRowNote>
+      )}
 
       <ConfirmDialog
         open={pendingDisconnect !== null}

@@ -336,6 +336,7 @@ function formatAmount(amount: number): string {
  * because the rule assumes a grammar in which backslash escapes itself.
  */
 function escapeQuotes(str: string): string {
+  // codeql[js/incomplete-sanitization]
   return str.replace(/"/g, '\\"')
 }
 
