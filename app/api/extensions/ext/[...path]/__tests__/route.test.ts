@@ -302,6 +302,42 @@ describe('Extension Catch-All Route', () => {
     },
   )
 
+  it.each([
+    { method: 'POST', dispatcher: POST, routeSegments: ['oauth', 'start'] },
+    { method: 'POST', dispatcher: POST, routeSegments: ['connections', 'backfill'] },
+    { method: 'DELETE', dispatcher: DELETE, routeSegments: ['connections'] },
+  ] as const)(
+    'denies a viewer mail $method mutation before the mail handler runs',
+    async ({ method, dispatcher, routeSegments }) => {
+      const path = `/${routeSegments.join('/')}`
+      const handler = vi.fn()
+      extensionRegistry.register({
+        id: 'mail',
+        name: 'Mail',
+        version: '1.0.0',
+        apiRoutes: [{ method, path, handler }],
+      })
+
+      const { supabase } = createQueuedMockSupabase()
+      supabase.auth.getUser.mockResolvedValue({
+        data: { user: { id: 'user-1' } },
+        error: null,
+      })
+      mockCreateClient.mockResolvedValue(supabase as never)
+      mockCanWriteCompany.mockResolvedValue(false)
+
+      const request = createMockRequest(`/api/extensions/ext/mail${path}`, { method })
+      const response = await dispatcher(
+        request,
+        createPathParams(['mail', ...routeSegments]),
+      )
+
+      expect(response.status).toBe(403)
+      expect(mockCanWriteCompany).toHaveBeenCalledWith(supabase, 'user-1', 'company-1')
+      expect(handler).not.toHaveBeenCalled()
+    },
+  )
+
   it('does not apply the company write-role gate to authenticated routes without company context', async () => {
     const handler = vi.fn().mockResolvedValue(NextResponse.json({ ok: true }))
     extensionRegistry.register({

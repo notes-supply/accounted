@@ -3354,6 +3354,8 @@ export type DocumentUploadSource =
   | 'api'
   | 'system'
   | 'whatsapp'
+  /** Fetched by the receipt hunt out of a connected mailbox. */
+  | 'mail_hunt'
 
 export interface DocumentAttachment {
   id: string
@@ -3407,6 +3409,7 @@ export type AuditAction =
   | 'RETENTION_BLOCK'
   | 'SECURITY_EVENT'
   | 'INTEGRITY_FAILURE'
+  | 'COMMITTED_AT_OVERRIDE'
 
 export interface AuditLogEntry {
   id: string

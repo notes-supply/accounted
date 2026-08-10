@@ -1281,14 +1281,20 @@ export const BOOKING_TEMPLATES: readonly BookingTemplate[] = [
     vat_rate: 0.06,
     deductibility: 'full',
     mcc_codes: [],
-    keywords: ['bok', 'böcker', 'tidning', 'tidskrift', 'e-bok', 'persontransport', 'taxi', 'buss', 'tåg', 'kultur', 'konsert', 'teater', 'museum', 'bio', 'idrott', 'books', 'culture', 'transport'],
+    // Dance keywords: tillträde till danstillställningar dropped from 25% to
+    // 6% on 2026-07-01 (2025/26:SkU25, aligned with other cultural events).
+    // Admission sold and paid before that stays 25%; the descriptor reflects
+    // current law only. Deliberately admission-specific terms only: bare
+    // 'dans' or 'entré' would also match dance courses, artist fees and
+    // generic entrance charges, which are not all reduced-rate. (#1483)
+    keywords: ['bok', 'böcker', 'tidning', 'tidskrift', 'e-bok', 'persontransport', 'taxi', 'buss', 'tåg', 'kultur', 'konsert', 'teater', 'museum', 'bio', 'idrott', 'danstillställning', 'dansband', 'danskväll', 'books', 'culture', 'transport'],
     risk_level: 'NONE',
     requires_review: false,
     impact_score: 5,
     auto_match_confidence: 0.75,
     default_private: false,
     fallback_category: 'income_services',
-    description_sv: 'Intäkter med 6% moms (böcker, persontransport, kultur, idrott)',
+    description_sv: 'Intäkter med 6% moms (böcker, persontransport, kultur, idrott, danstillställningar fr.o.m. 2026-07-01)',
     common: true,
   },
   {
@@ -1764,6 +1770,22 @@ export function stripBankNoise(lowerText: string): string {
   return out.replace(/\s+/g, ' ').trim()
 }
 
+const DANCE_EVENT_KEYWORDS = new Set(['danstillställning', 'dansband', 'danskväll'])
+
+function isIsoDateOnOrAfter(value: string | null | undefined, cutover: string): boolean {
+  if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false
+  const [year, month, day] = value.split('-').map(Number)
+  const parsed = new Date(Date.UTC(year, month - 1, day))
+  if (
+    parsed.getUTCFullYear() !== year ||
+    parsed.getUTCMonth() !== month - 1 ||
+    parsed.getUTCDate() !== day
+  ) {
+    return false
+  }
+  return value >= cutover
+}
+
 /**
  * Multi-signal matching against a transaction.
  * Returns top matches sorted by confidence descending.
@@ -1782,6 +1804,7 @@ export function findMatchingTemplates(
   // Strip bank-method noise so e.g. "Överföring via internet" doesn't make
   // the matcher believe the merchant is "Internet" (→ 6230 telecom).
   const searchText = stripBankNoise(rawSearchText)
+  const danceReducedRateApplies = isIsoDateOnOrAfter(transaction.date, '2026-07-01')
 
   for (const t of BOOKING_TEMPLATES) {
     // Filter entity applicability
@@ -1805,6 +1828,13 @@ export function findMatchingTemplates(
     if (t.keywords.length > 0) {
       let matchedKeywords = 0
       for (const kw of t.keywords) {
+        if (
+          t.id === 'revenue_reduced_6' &&
+          DANCE_EVENT_KEYWORDS.has(kw) &&
+          !danceReducedRateApplies
+        ) {
+          continue
+        }
         if (searchText.includes(kw.toLowerCase())) {
           matchedKeywords++
         }

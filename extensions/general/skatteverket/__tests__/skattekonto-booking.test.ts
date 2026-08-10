@@ -23,7 +23,7 @@ const SEED_RULES = [
   {
     id: 'sys-3', priority: 20, pattern: 'debiterad preliminärskatt,preliminärskatt,f-skatt,fskatt',
     amount_min: null, amount_max: null, company_type: 'all',
-    counter_account: '2510', counter_account_ef: '2012',
+    counter_account: '2510', counter_account_ef: '2013',
     label: 'Preliminär skatt', active: true,
   },
   {
@@ -120,7 +120,7 @@ describe('guessCounterAccount', () => {
     ).toBe('1930')
   })
 
-  it('uses 2510 for AB preliminär skatt and 2012 for EF', async () => {
+  it('uses 2510 for AB preliminär skatt and 2013 for EF', async () => {
     const { supabase, enqueue } = makeSupabase()
     enqueue({ data: SEED_RULES })
     expect(
@@ -130,7 +130,9 @@ describe('guessCounterAccount', () => {
     enqueue({ data: SEED_RULES })
     expect(
       (await guessCounterAccount(supabase as unknown as SupabaseClient, 'company-1', 'Debiterad preliminärskatt', 'enskild_firma'))?.account,
-    ).toBe('2012')
+    ).toBe('2013')
+    expect(SEED_RULES.filter((rule) => rule.id === 'sys-3'))
+      .not.toEqual(expect.arrayContaining([expect.objectContaining({ counter_account_ef: '2012' })]))
   })
 
   it('routes employer payroll taxes to 2730 (clearing/redovisningskonto, not 2731 accrual)', async () => {

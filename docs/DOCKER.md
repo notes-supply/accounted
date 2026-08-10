@@ -180,6 +180,39 @@ AWS_REGION=eu-north-1
 
 `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` from earlier versions are no longer used (plain-key support is tracked in [#1406](https://github.com/erp-mafia/accounted/issues/1406)). See [SELF-HOSTING.md](./SELF-HOSTING.md#ai-features) for optional model overrides.
 
+### Gmail Receipt Search
+
+Create a dedicated Google OAuth client, register
+`https://your-domain.com/api/extensions/ext/mail/oauth/callback`, and configure:
+
+```env
+GOOGLE_MAIL_CLIENT_ID=your-google-oauth-client-id
+GOOGLE_MAIL_CLIENT_SECRET=replace-with-google-oauth-client-secret
+MAIL_TOKEN_ENCRYPTION_KEY=<64 hex characters from openssl rand -hex 32>
+RECEIPT_HUNT_COMPANY_IDS=comma-separated-company-uuids
+RECEIPT_HUNT_MODEL_ID=eu.anthropic.claude-sonnet-5
+RECEIPT_HUNT_MIN_CONFIDENCE=0.7
+RECEIPT_HUNT_MAX_RECEIPTS=25
+RECEIPT_HUNT_MAX_MAILS=40
+```
+
+The receipt and mail limits must be plain positive integers. Their hard maxima
+are 100 across all connected mailboxes in one company hunt. The company
+allowlist accepts at most 25 unique entries.
+
+Production requires the dedicated mail-token key. Only development can fall
+back to a key derived from `SUPABASE_SERVICE_ROLE_KEY`. The volume defaults are
+25 stored receipts and 40 model-processed messages across all connected
+mailboxes in one company hunt.
+
+Candidate email and attachments are downloaded, and their metadata, body,
+names, and content may be processed by the configured external AI or model
+provider. Selected attachments and derived records may be stored before human
+review. Rejected or unreviewed material can remain under the product's normal
+retention and deletion controls. Disconnecting deletes OAuth credentials and
+stops future access, but does not automatically erase imported records. This is
+disclosed in the mailbox connection UI.
+
 ### Email (invoice sending, reminders)
 
 ```env

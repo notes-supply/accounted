@@ -5,6 +5,7 @@
   "license": "AGPL-3.0-or-later",
   "scripts": {
     "setup:extensions": "npx tsx scripts/generate-extension-registry.ts",
+    "extensions:check": "npx tsx scripts/generate-extension-registry.ts --check",
     "skills:generate": "npx tsx scripts/generate-skill-bodies.ts",
     "skills:check": "npx tsx scripts/generate-skill-bodies.ts --check",
     "crontabs:generate": "npx tsx scripts/generate-crontabs.ts",

@@ -169,5 +169,17 @@ export const EXTENSION_DEFINITIONS: Record<string, ExtensionDefinition[]> = {
           "longDescription": "Anslut din Shopify-butik så hämtas betalda ordrar och återbetalningar automatiskt varje natt till transaktionsinkorgen, som ett bankflöde för butiken. Inget bokförs automatiskt: du bokför raderna själv precis som vanliga banktransaktioner.",
           "hasOwnData": true
     },
+    {
+          "slug": "mail",
+          "name": "Brevlådor",
+          "sector": "general",
+          "category": "operations",
+          "icon": "Mail",
+          "dataPattern": "manual",
+          "description": "Låt Kvittojakten leta upp kvitton i era brevlådor",
+          "longDescription": "Koppla en eller flera brevlådor, så letar Kvittojakten efter kvitton till kortköp som saknar underlag. Åtkomsten är läsbehörighet: agenten kan aldrig skicka, ändra eller radera mejl. Kandidatmejl och bilagor hämtas, och deras metadata, brödtext, bilagenamn och bilageinnehåll kan behandlas av den konfigurerade externa AI- eller modellleverantören. Kandidatbilagor och härledda dokument- eller inkorgsposter kan lagras varaktigt före mänsklig granskning. Avvisat eller ogranskat material kan ligga kvar enligt produktens lagrings- och raderingskontroller.",
+          "hasOwnData": true,
+          "subscriptionNotice": "Kräver ett Google-konto. Varje brevlåda kopplas av sin egen ägare. Frånkoppling stoppar framtida åtkomst och raderar OAuth-behörighetsuppgifter, men raderar inte automatiskt redan importerade affärsposter eller material."
+    },
   ],
 }

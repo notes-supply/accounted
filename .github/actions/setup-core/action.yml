@@ -31,6 +31,12 @@ runs:
       shell: bash
       run: npm ci
 
+    # Verify the checked-in registry against the branch's real manifest before
+    # the core-only build deliberately replaces the config with an empty one.
+    - name: Verify extension registry is generated
+      shell: bash
+      run: npm run extensions:check
+
     # CI builds core with zero extensions enabled: that property is the entire
     # reason this workflow exists, so every job that compiles or runs code needs
     # the registry regenerated from an empty config first.

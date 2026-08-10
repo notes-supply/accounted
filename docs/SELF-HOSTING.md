@@ -232,6 +232,49 @@ Without working credentials the rest of the app runs normally: uploads are store
 
 > **Note:** `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` from earlier versions are no longer read by any code path. Support for a plain Anthropic API key (and pluggable providers) is tracked in [#1406](https://github.com/erp-mafia/accounted/issues/1406).
 
+### Gmail Receipt Search
+
+The optional mail extension lets the receipt hunt search connected Gmail
+mailboxes. Create a dedicated Google OAuth client and register this callback:
+
+```text
+https://app.example.com/api/extensions/ext/mail/oauth/callback
+```
+
+Configure the client credentials and a dedicated token-encryption key:
+
+```bash
+GOOGLE_MAIL_CLIENT_ID=your-google-oauth-client-id
+GOOGLE_MAIL_CLIENT_SECRET=replace-with-google-oauth-client-secret
+MAIL_TOKEN_ENCRYPTION_KEY=<openssl rand -hex 32>
+RECEIPT_HUNT_COMPANY_IDS=comma-separated-company-uuids
+RECEIPT_HUNT_MODEL_ID=eu.anthropic.claude-sonnet-5
+RECEIPT_HUNT_MIN_CONFIDENCE=0.7
+RECEIPT_HUNT_MAX_RECEIPTS=25
+RECEIPT_HUNT_MAX_MAILS=40
+```
+
+`RECEIPT_HUNT_MAX_RECEIPTS` defaults to 25 and has a hard maximum of 100 stored
+receipts across all connected mailboxes in one company hunt.
+`RECEIPT_HUNT_MAX_MAILS` defaults to 40 and has a hard maximum of 100 candidate
+messages processed across all connected mailboxes in one company hunt. Both
+values must be plain positive integers. The company allowlist is limited to 25
+unique entries. An unset `RECEIPT_HUNT_COMPANY_IDS` runs the hunt
+for nobody.
+
+`MAIL_TOKEN_ENCRYPTION_KEY` must be exactly 32 bytes encoded as 64 hex
+characters. Production has no fallback to `SUPABASE_SERVICE_ROLE_KEY`.
+Development may derive a local-only key from the service-role key when the
+dedicated key is absent.
+
+Candidate messages and attachments are downloaded, and their metadata, sender,
+subject, body, names, and content may be processed by the configured external
+AI or model provider. Selected attachments and derived records may be stored
+before human review. Rejected or unreviewed material can remain under the
+product's normal retention and deletion controls. Disconnecting deletes OAuth
+credentials and stops future access, but does not automatically erase imported
+records. Operators must present this disclosure before users connect a mailbox.
+
 ### Email (Invoice Sending and Reminders)
 
 Configure Cloudflare Email Service:
