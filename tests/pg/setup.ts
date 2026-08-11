@@ -23,11 +23,12 @@ export async function getClient(): Promise<PoolClient> {
 
 // Run `fn` inside a role/JWT context that auth.uid() / user_company_ids() will
 // observe. Uses SET LOCAL inside a transaction so the role reverts on commit
-// or rollback. Always rolls back so the test's writes do not persist: tests
-// that need to seed data must do that on the superuser connection first.
+// or rollback. Rolls back by default so test writes do not persist; callers
+// that explicitly test durable authenticated mutations may opt into commit.
 export async function withUserContext<T>(
   userId: string,
   fn: (client: PoolClient) => Promise<T>,
+  options: { commit?: boolean } = {},
 ): Promise<T> {
   const client = await getClient()
   try {
@@ -54,7 +55,7 @@ export async function withUserContext<T>(
       )
     }
     const result = await fn(client)
-    await client.query('ROLLBACK')
+    await client.query(options.commit ? 'COMMIT' : 'ROLLBACK')
     return result
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {})

@@ -359,7 +359,7 @@ describe('commerce order sync durable progress', () => {
         [connectionId, companyId],
       )
       expect(expired.rows[0].result).toBe('disconnected')
-    })
+    }, { commit: true })
     const cleaned = await getPool().query(
       `SELECT status, consumer_key_encrypted, consumer_secret_encrypted,
               order_sync_claim_token, order_sync_claimed_until,
@@ -402,7 +402,7 @@ describe('commerce order sync durable progress', () => {
         [connectionId, companyId],
       )
       expect(disconnected.rows[0].result).toBe('disconnected')
-    })
+    }, { commit: true })
     const staleToken = randomUUID()
     const claim = await getPool().query(
       `SELECT public.claim_commerce_order_sync_connection(
