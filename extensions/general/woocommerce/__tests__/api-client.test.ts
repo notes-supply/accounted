@@ -4,10 +4,12 @@ import type { RequestOptions } from 'node:https'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { validateWebhookUrl } from '@/lib/webhooks/url-guard'
 import {
+  listOrdersPage,
   listOrderRefunds,
   testConnectionAndFetchStoreInfo,
   wcGet,
   WooCommerceApiError,
+  WooCommerceDeadlineError,
   type WooApiClientDeps,
   type WooCredentials,
 } from '../lib/api-client'
@@ -18,6 +20,36 @@ const CREDS: WooCredentials = {
   consumerSecret: 'cs_test',
 }
 
+describe('listOrdersPage', () => {
+  it('bounds an exact cohort strictly and orders it by stable order ID', async () => {
+    const pinnedFetch = vi.fn().mockResolvedValue(pinnedJson(200, [], {
+      'x-wp-total': '0',
+      'x-wp-totalpages': '0',
+    }))
+
+    await listOrdersPage(
+      CREDS,
+      {
+        modifiedAfter: '2026-08-01T09:04:59.000Z',
+        modifiedBefore: '2026-08-01T09:05:01.000Z',
+        orderBy: 'id',
+        page: 7,
+      },
+      { pinnedFetch },
+    )
+
+    const url = new URL(String(pinnedFetch.mock.calls[0][0]))
+    expect(Object.fromEntries(url.searchParams)).toMatchObject({
+      modified_after: '2026-08-01T09:04:59.000Z',
+      modified_before: '2026-08-01T09:05:01.000Z',
+      dates_are_gmt: 'true',
+      orderby: 'id',
+      order: 'asc',
+      page: '7',
+    })
+  })
+})
+
 function makeRefunds(startId: number, count: number) {
   return Array.from({ length: count }, (_, i) => ({
     id: startId + i,
@@ -27,11 +59,11 @@ function makeRefunds(startId: number, count: number) {
   }))
 }
 
-function pinnedJson(status: number, body: unknown) {
+function pinnedJson(status: number, body: unknown, headers: Record<string, string> = {}) {
   return {
     kind: 'ok' as const,
     status,
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...headers },
     body: JSON.stringify(body),
     bodyTruncated: false,
     pinnedAddress: '93.184.216.34',
@@ -346,9 +378,18 @@ describe('WooCommerce pinned transport', () => {
 })
 
 describe('listOrderRefunds', () => {
-  function depsForBodies(bodies: unknown[]): WooApiClientDeps {
+  function depsForBodies(
+    bodies: unknown[],
+    total: number,
+    totalPages: number,
+  ): WooApiClientDeps {
     const pinnedFetch = vi.fn()
-    for (const body of bodies) pinnedFetch.mockResolvedValueOnce(pinnedJson(200, body))
+    for (const body of bodies) {
+      pinnedFetch.mockResolvedValueOnce(pinnedJson(200, body, {
+        'x-wp-total': String(total),
+        'x-wp-totalpages': String(totalPages),
+      }))
+    }
     return {
       pinnedFetch,
       validateUrl: vi.fn().mockResolvedValue({
@@ -360,31 +401,60 @@ describe('listOrderRefunds', () => {
     }
   }
 
-  it('terminates on an empty page, not a short one because hosts may cap per_page', async () => {
-    const deps = depsForBodies([makeRefunds(1, 50), makeRefunds(51, 50), []])
-
-    const refunds = await listOrderRefunds(CREDS, 42, deps)
-    expect(refunds).toHaveLength(100)
-    expect(deps.pinnedFetch).toHaveBeenCalledTimes(3)
-  })
-
-  it('stops when a host ignoring page repeats the same rows', async () => {
-    const repeated = makeRefunds(1, 100)
-    const deps = depsForBodies([repeated, repeated])
+  it('uses collection metadata rather than a short page as completion proof', async () => {
+    const deps = depsForBodies([makeRefunds(1, 50), makeRefunds(51, 50)], 100, 2)
 
     const refunds = await listOrderRefunds(CREDS, 42, deps)
     expect(refunds).toHaveLength(100)
     expect(deps.pinnedFetch).toHaveBeenCalledTimes(2)
   })
 
-  it('throws instead of returning a silently partial list when the page cap is exhausted', async () => {
-    const deps = depsForBodies(
-      Array.from({ length: 10 }, (_, page) => makeRefunds((page + 1) * 1000, 100)),
+  it('fails when a host ignoring page repeats the same rows', async () => {
+    const repeated = makeRefunds(1, 100)
+    const deps = depsForBodies([repeated, repeated], 200, 2)
+
+    await expect(listOrderRefunds(CREDS, 42, deps)).rejects.toThrow(
+      /repeated or was not ID-monotonic/,
     )
+    expect(deps.pinnedFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('throws instead of returning a silently partial list when the page cap is exhausted', async () => {
+    const deps = depsForBodies([makeRefunds(1, 100)], 1100, 11)
 
     await expect(listOrderRefunds(CREDS, 42, deps)).rejects.toThrow(
       /Refund pagination cap exceeded/,
     )
-    expect(deps.pinnedFetch).toHaveBeenCalledTimes(10)
+    expect(deps.pinnedFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not start another refund page after the provider work-start deadline', async () => {
+    let nowMs = 0
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => nowMs)
+    const deps = depsForBodies([], 200, 2)
+    vi.mocked(deps.pinnedFetch!).mockImplementationOnce(async () => {
+      nowMs = 10
+      return pinnedJson(200, makeRefunds(1, 100), {
+        'x-wp-total': '200',
+        'x-wp-totalpages': '2',
+      })
+    })
+    deps.startDeadlineMs = 10
+
+    try {
+      await expect(listOrderRefunds(CREDS, 42, deps)).rejects.toBeInstanceOf(
+        WooCommerceDeadlineError,
+      )
+      expect(deps.pinnedFetch).toHaveBeenCalledTimes(1)
+    } finally {
+      now.mockRestore()
+    }
+  })
+
+  it('fails closed when pagination metadata is omitted', async () => {
+    const pinnedFetch = vi.fn().mockResolvedValue(pinnedJson(200, makeRefunds(1, 1)))
+    await expect(listOrderRefunds(CREDS, 42, { pinnedFetch })).rejects.toThrow(
+      /omitted valid x-wp-total/,
+    )
   })
 })

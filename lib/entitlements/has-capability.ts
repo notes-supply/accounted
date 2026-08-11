@@ -59,6 +59,63 @@ function isUuid(v: string): boolean {
 
 const CAPABILITY_SCOPE_CHUNK_SIZE = 100
 
+export interface BulkCapabilityQueryOptions {
+  signal?: AbortSignal
+  deadlineMs?: number
+}
+
+interface AbortableCapabilityQuery<T> extends PromiseLike<T> {
+  abortSignal?: (signal: AbortSignal) => PromiseLike<T>
+}
+
+async function awaitCapabilityQuery<T>(
+  query: AbortableCapabilityQuery<T>,
+  options: BulkCapabilityQueryOptions,
+): Promise<T> {
+  const controller = new AbortController()
+  let rejectForCallerAbort: ((reason: Error) => void) | undefined
+  const callerAbort = new Promise<never>((_resolve, reject) => {
+    rejectForCallerAbort = reject
+  })
+  const abortFromCaller = () => {
+    controller.abort(options.signal?.reason)
+    rejectForCallerAbort?.(new Error('Capability resolution aborted'))
+  }
+  if (options.signal?.aborted) {
+    throw new Error('Capability resolution aborted')
+  }
+  options.signal?.addEventListener('abort', abortFromCaller, { once: true })
+
+  const remainingMs = options.deadlineMs === undefined
+    ? undefined
+    : options.deadlineMs - Date.now()
+  if (remainingMs !== undefined && remainingMs <= 0) {
+    controller.abort()
+    throw new Error('Capability resolution deadline reached')
+  }
+
+  const operation = query.abortSignal ? query.abortSignal(controller.signal) : query
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  try {
+    if (remainingMs === undefined) {
+      return await Promise.race([Promise.resolve(operation), callerAbort])
+    }
+    return await Promise.race([
+      Promise.resolve(operation),
+      callerAbort,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => {
+          controller.abort()
+          reject(new Error('Capability resolution deadline reached'))
+        }, remainingMs)
+      }),
+    ])
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout)
+    options.signal?.removeEventListener('abort', abortFromCaller)
+  }
+}
+
 function chunksOf<T>(values: T[], size: number): T[][] {
   const chunks: T[][] = []
   for (let index = 0; index < values.length; index += size) {
@@ -84,6 +141,7 @@ export async function getCompanyIdsWithCapability(
   supabase: SupabaseClient,
   companyIds: readonly string[],
   key: CapabilityKey,
+  options: BulkCapabilityQueryOptions = {},
 ): Promise<Set<string>> {
   const validCompanyIds = [...new Set(companyIds.filter(isUuid))]
   if (validCompanyIds.length === 0) return new Set()
@@ -103,13 +161,19 @@ export async function getCompanyIdsWithCapability(
   for (const chunk of chunksOf(validCompanyIds, CAPABILITY_SCOPE_CHUNK_SIZE)) {
     const [{ data: companyRows, error: companiesError }, { data: configRows, error: configError }] =
       await Promise.all([
-        supabase.from('companies').select('id, team_id').in('id', chunk),
-        supabase
-          .from('company_capability_config')
-          .select('company_id')
-          .eq('capability_key', key)
-          .eq('enabled', false)
-          .in('company_id', chunk),
+        awaitCapabilityQuery(
+          supabase.from('companies').select('id, team_id').in('id', chunk),
+          options,
+        ),
+        awaitCapabilityQuery(
+          supabase
+            .from('company_capability_config')
+            .select('company_id')
+            .eq('capability_key', key)
+            .eq('enabled', false)
+            .in('company_id', chunk),
+          options,
+        ),
       ])
 
     if (companiesError) throw new Error(`Failed to resolve capability company scopes: ${companiesError.message}`)
@@ -122,21 +186,27 @@ export async function getCompanyIdsWithCapability(
   const grants: GrantScope[] = []
 
   for (const chunk of chunksOf(validCompanyIds, CAPABILITY_SCOPE_CHUNK_SIZE)) {
-    const { data, error } = await supabase
-      .from('capability_grants')
-      .select('company_id, team_id, expires_at')
-      .eq('capability_key', key)
-      .in('company_id', chunk)
+    const { data, error } = await awaitCapabilityQuery(
+      supabase
+        .from('capability_grants')
+        .select('company_id, team_id, expires_at')
+        .eq('capability_key', key)
+        .in('company_id', chunk),
+      options,
+    )
     if (error) throw new Error(`Failed to resolve company capability grants: ${error.message}`)
     grants.push(...((data ?? []) as GrantScope[]))
   }
 
   for (const chunk of chunksOf(teamIds, CAPABILITY_SCOPE_CHUNK_SIZE)) {
-    const { data, error } = await supabase
-      .from('capability_grants')
-      .select('company_id, team_id, expires_at')
-      .eq('capability_key', key)
-      .in('team_id', chunk)
+    const { data, error } = await awaitCapabilityQuery(
+      supabase
+        .from('capability_grants')
+        .select('company_id, team_id, expires_at')
+        .eq('capability_key', key)
+        .in('team_id', chunk),
+      options,
+    )
     if (error) throw new Error(`Failed to resolve firm capability grants: ${error.message}`)
     grants.push(...((data ?? []) as GrantScope[]))
   }

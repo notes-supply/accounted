@@ -18,6 +18,24 @@ export interface WooCommerceConnection {
   transaction_sync_enabled: boolean
   /** Order-polling cursor (max date_modified_gmt processed). */
   last_order_synced_at: string | null
+  /** Durable fair-scheduling key, independent from provider cursor progress. */
+  order_sync_priority_at: string
+  /** Exact tokenized lease shared by cron and manual sync. */
+  order_sync_claim_token: string | null
+  order_sync_claimed_until: string | null
+  /** Durable strict lower bound for the in-progress overlap scan. */
+  order_sync_scan_modified_after: string | null
+  /** Exact modified-at cohort currently being swept, if any. */
+  order_sync_cohort_modified_at: string | null
+  /** One-based provider page within the current exact cohort pass. */
+  order_sync_cohort_page: number
+  /** Whether the current pass completed any previously unseen order. */
+  order_sync_cohort_pass_found_new: boolean
+  /** Snapshot metadata for the current exact-second verification pass. */
+  order_sync_cohort_expected_total: number | null
+  order_sync_cohort_expected_pages: number | null
+  order_sync_cohort_pass_seen_count: number
+  order_sync_cohort_pass_last_order_id: number | null
   error_message: string | null
   connected_at: string | null
   disconnected_at: string | null

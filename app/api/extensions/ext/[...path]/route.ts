@@ -316,7 +316,18 @@ async function handleRequest(
   }
 
   // Build context and dispatch
-  const ctx = createExtensionContext(supabase, user.id, companyId, extensionId, requestId)
+  const ctx = createExtensionContext(
+    supabase,
+    user.id,
+    companyId,
+    extensionId,
+    requestId,
+    {
+      requestStartedAtMs: start,
+      workStartDeadlineMs: start + 180_000,
+      cleanupDeadlineMs: start + 285_000,
+    },
+  )
   const response = await matchedRoute.handler(handlerRequest, ctx)
   log.info('extension call completed', {
     durationMs: Date.now() - start,

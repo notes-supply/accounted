@@ -24,6 +24,12 @@ vi.mock('@/lib/auth/api-keys', () => ({
   createServiceClientNoCookies: vi.fn(() => ({ service: true })),
 }))
 
+vi.mock('@/lib/commerce/order-sync-scheduler', () => ({
+  claimCommerceOrderSyncConnection: vi.fn(),
+  releaseCommerceOrderSyncClaim: vi.fn(),
+  restoreCommerceOrderSyncClaim: vi.fn(),
+}))
+
 import { shopifyExtension } from '../index'
 import { requireCapability, capabilityBlockedResponse } from '@/lib/entitlements/has-capability'
 import { CAPABILITY } from '@/lib/entitlements/keys'
@@ -32,6 +38,12 @@ import { syncShopifyOrders } from '../lib/order-sync'
 import { decryptCredential } from '../lib/credentials'
 import { createQueuedMockSupabase } from '@/tests/helpers'
 import type { ExtensionContext } from '@/lib/extensions/types'
+import {
+  claimCommerceOrderSyncConnection,
+  releaseCommerceOrderSyncClaim,
+  restoreCommerceOrderSyncClaim,
+} from '@/lib/commerce/order-sync-scheduler'
+import { CommerceSyncPersistenceError } from '@/lib/commerce/order-sync-errors'
 
 function findRoute(method: string, path: string) {
   const route = shopifyExtension.apiRoutes?.find(
@@ -75,10 +87,28 @@ const VALID_CONNECT_BODY = {
   client_secret: 'client-secret',
 }
 
+const SYNC_SUMMARY = {
+  fetched: 3,
+  refundsFetched: 1,
+  imported: 4,
+  duplicates: 0,
+  skippedLocked: 0,
+  errors: 0,
+}
+
 describe('shopify extension routes', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     vi.mocked(requireCapability).mockResolvedValue(null)
+    vi.mocked(claimCommerceOrderSyncConnection).mockImplementation(
+      async (_client, _table, connection) => ({
+        connection,
+        claimToken: 'opaque-claim-token',
+        previousPriorityAt: connection.order_sync_priority_at,
+      }),
+    )
+    vi.mocked(releaseCommerceOrderSyncClaim).mockResolvedValue(undefined)
+    vi.mocked(restoreCommerceOrderSyncClaim).mockResolvedValue(undefined)
     vi.stubEnv('SHOPIFY_CREDENTIALS_ENCRYPTION_KEY', 'test-key')
   })
 
@@ -266,14 +296,7 @@ describe('shopify extension routes', () => {
       const { supabase, enqueue } = createQueuedMockSupabase()
       supabase.auth.getUser.mockResolvedValue({ data: { user: USER }, error: null })
       enqueue({ data: { id: 'conn-1', status: 'active' } })
-      vi.mocked(syncShopifyOrders).mockResolvedValue({
-        fetched: 3,
-        refundsFetched: 1,
-        imported: 4,
-        duplicates: 0,
-        skippedLocked: 0,
-        errors: 0,
-      })
+      vi.mocked(syncShopifyOrders).mockResolvedValue(SYNC_SUMMARY)
       const res = await findRoute('POST', '/sync').handler(
         makeRequest('POST'),
         makeContext(supabase),
@@ -282,6 +305,155 @@ describe('shopify extension routes', () => {
       const body = await res.json()
       expect(body.transactions.imported).toBe(4)
       expect(vi.mocked(syncShopifyOrders).mock.calls[0][0]).toEqual({ service: true })
+      expect(releaseCommerceOrderSyncClaim).toHaveBeenCalledWith(
+        { service: true },
+        'shopify_connections',
+        'conn-1',
+        'opaque-claim-token',
+        expect.any(Number),
+      )
+      expect(JSON.stringify(body)).not.toContain('opaque-claim-token')
+    })
+
+    it('returns 409 when cron or another manual sync owns the lease', async () => {
+      const { supabase, enqueue } = createQueuedMockSupabase()
+      supabase.auth.getUser.mockResolvedValue({ data: { user: USER }, error: null })
+      enqueue({
+        data: {
+          id: 'conn-1',
+          status: 'active',
+          order_sync_priority_at: '1970-01-01T00:00:00.000Z',
+        },
+      })
+      vi.mocked(claimCommerceOrderSyncConnection).mockResolvedValueOnce(null)
+
+      const res = await findRoute('POST', '/sync').handler(
+        makeRequest('POST'),
+        makeContext(supabase),
+      )
+
+      expect(res.status).toBe(409)
+      expect(syncShopifyOrders).not.toHaveBeenCalled()
+      expect(releaseCommerceOrderSyncClaim).not.toHaveBeenCalled()
+    })
+
+    it('releases its exact claim token when provider work throws', async () => {
+      const { supabase, enqueue } = createQueuedMockSupabase()
+      supabase.auth.getUser.mockResolvedValue({ data: { user: USER }, error: null })
+      enqueue({
+        data: {
+          id: 'conn-1',
+          status: 'active',
+          order_sync_priority_at: '1970-01-01T00:00:00.000Z',
+        },
+      })
+      vi.mocked(syncShopifyOrders).mockRejectedValueOnce(new Error('provider failed'))
+
+      const res = await findRoute('POST', '/sync').handler(
+        makeRequest('POST'),
+        makeContext(supabase),
+      )
+
+      expect(res.status).toBe(502)
+      expect(releaseCommerceOrderSyncClaim).toHaveBeenCalledWith(
+        { service: true },
+        'shopify_connections',
+        'conn-1',
+        'opaque-claim-token',
+        expect.any(Number),
+      )
+      expect(restoreCommerceOrderSyncClaim).not.toHaveBeenCalled()
+    })
+
+    it('returns non-2xx and preserves totals when release cannot be persisted', async () => {
+      const { supabase, enqueue } = createQueuedMockSupabase()
+      supabase.auth.getUser.mockResolvedValue({ data: { user: USER }, error: null })
+      enqueue({ data: { id: 'conn-1', status: 'active' } })
+      vi.mocked(syncShopifyOrders).mockResolvedValueOnce(SYNC_SUMMARY)
+      vi.mocked(releaseCommerceOrderSyncClaim).mockRejectedValueOnce(new Error('release failed'))
+
+      const res = await findRoute('POST', '/sync').handler(
+        makeRequest('POST'),
+        makeContext(supabase),
+      )
+
+      expect(res.status).toBe(500)
+      expect((await res.json()).transactions).toMatchObject({ imported: 4, errors: 0 })
+    })
+
+    it('returns non-2xx with partial totals for typed progress persistence failure', async () => {
+      const { supabase, enqueue } = createQueuedMockSupabase()
+      supabase.auth.getUser.mockResolvedValue({ data: { user: USER }, error: null })
+      enqueue({ data: { id: 'conn-1', status: 'active' } })
+      vi.mocked(syncShopifyOrders).mockRejectedValueOnce(
+        new CommerceSyncPersistenceError('checkpoint failed', 'scan_checkpoint', SYNC_SUMMARY),
+      )
+
+      const res = await findRoute('POST', '/sync').handler(
+        makeRequest('POST'),
+        makeContext(supabase),
+      )
+
+      expect(res.status).toBe(500)
+      expect((await res.json()).transactions).toMatchObject({ imported: 4, errors: 0 })
+    })
+
+    it('does not release a lease already terminated by checked revocation', async () => {
+      const { supabase, enqueue } = createQueuedMockSupabase()
+      supabase.auth.getUser.mockResolvedValue({ data: { user: USER }, error: null })
+      enqueue({ data: { id: 'conn-1', status: 'active' } })
+      vi.mocked(syncShopifyOrders).mockResolvedValueOnce({ ...SYNC_SUMMARY, revoked: true })
+
+      const res = await findRoute('POST', '/sync').handler(
+        makeRequest('POST'),
+        makeContext(supabase),
+      )
+
+      expect(res.status).toBe(200)
+      expect(releaseCommerceOrderSyncClaim).not.toHaveBeenCalled()
+      expect(restoreCommerceOrderSyncClaim).not.toHaveBeenCalled()
+    })
+
+    it('restores queue priority when the start deadline expires before provider work', async () => {
+      let nowMs = 0
+      const now = vi.spyOn(Date, 'now').mockImplementation(() => nowMs)
+      const { supabase, enqueue } = createQueuedMockSupabase()
+      supabase.auth.getUser.mockResolvedValue({ data: { user: USER }, error: null })
+      const connection = {
+        id: 'conn-1',
+        status: 'active',
+        order_sync_priority_at: '1970-01-01T00:00:00.000Z',
+      }
+      enqueue({ data: connection })
+      vi.mocked(claimCommerceOrderSyncConnection).mockImplementationOnce(
+        async () => {
+          nowMs = 180_000
+          return {
+            connection,
+            claimToken: 'opaque-claim-token',
+            previousPriorityAt: connection.order_sync_priority_at,
+          }
+        },
+      )
+
+      try {
+        const res = await findRoute('POST', '/sync').handler(
+          makeRequest('POST'),
+          makeContext(supabase),
+        )
+
+        expect(res.status).toBe(504)
+        expect(syncShopifyOrders).not.toHaveBeenCalled()
+        expect(restoreCommerceOrderSyncClaim).toHaveBeenCalledWith(
+          { service: true },
+          'shopify_connections',
+          expect.objectContaining({ claimToken: 'opaque-claim-token' }),
+          expect.any(Number),
+        )
+        expect(releaseCommerceOrderSyncClaim).not.toHaveBeenCalled()
+      } finally {
+        now.mockRestore()
+      }
     })
   })
 
@@ -343,26 +515,56 @@ describe('shopify extension routes', () => {
       expect(res.status).toBe(404)
     })
 
+    it('returns 409 when an exact non-expired lease owns the connection', async () => {
+      const { supabase, enqueue } = createQueuedMockSupabase()
+      supabase.auth.getUser.mockResolvedValue({ data: { user: USER }, error: null })
+      enqueue({ data: [{ id: 'conn-1', status: 'active', shop_domain: 'minbutik.myshopify.com' }] })
+      enqueue({ data: 'conflict' })
+
+      const res = await findRoute('DELETE', '/disconnect').handler(
+        makeRequest('DELETE', {}),
+        makeContext(supabase),
+      )
+
+      expect(res.status).toBe(409)
+    })
+
+    it('returns 500 when atomic operational cleanup fails', async () => {
+      const { supabase, enqueue } = createQueuedMockSupabase()
+      supabase.auth.getUser.mockResolvedValue({ data: { user: USER }, error: null })
+      enqueue({ data: [{ id: 'conn-1', status: 'active', shop_domain: 'minbutik.myshopify.com' }] })
+      enqueue({ error: { message: 'cleanup failed' } })
+
+      const res = await findRoute('DELETE', '/disconnect').handler(
+        makeRequest('DELETE', {}),
+        makeContext(supabase),
+      )
+
+      expect(res.status).toBe(500)
+    })
+
     it('revokes (never deletes), drops credentials and emits the audit event', async () => {
-      const { supabase, enqueue, findCall } = createQueuedMockSupabase()
+      const { supabase, enqueue } = createQueuedMockSupabase()
       supabase.auth.getUser.mockResolvedValue({ data: { user: USER }, error: null })
       enqueue({
         data: [{ id: 'conn-1', status: 'active', shop_domain: 'minbutik.myshopify.com' }],
       })
-      enqueue({ data: null }) // update
+      enqueue({ data: 'disconnected' })
       const ctx = makeContext(supabase)
       const res = await findRoute('DELETE', '/disconnect').handler(
         makeRequest('DELETE', {}),
         ctx,
       )
       expect(res.status).toBe(200)
-      const updated = findCall('shopify_connections', 'update')?.[0] as Record<
-        string,
-        unknown
-      >
-      expect(updated.status).toBe('revoked')
-      expect(updated.client_id_encrypted).toBeNull()
-      expect(updated.client_secret_encrypted).toBeNull()
+      expect(supabase.rpc).toHaveBeenCalledWith(
+        'disconnect_commerce_connection',
+        expect.objectContaining({
+          p_provider: 'shopify',
+          p_connection_id: 'conn-1',
+          p_company_id: 'company-1',
+          p_disconnected_at: expect.any(String),
+        }),
+      )
       expect(ctx.emit).toHaveBeenCalledWith(
         expect.objectContaining({ type: 'shopify.disconnected' }),
       )

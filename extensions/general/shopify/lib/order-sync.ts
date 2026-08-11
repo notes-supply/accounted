@@ -4,6 +4,17 @@ import { ensureManualCashAccount } from '@/lib/cash-accounts/service'
 import { syncMappedAccounts } from '@/lib/import/account-sync'
 import { createLogger, type Logger } from '@/lib/logger'
 import { roundOre } from '@/lib/money'
+import {
+  CommerceSyncPersistenceError,
+  CommerceSyncProviderError,
+} from '@/lib/commerce/order-sync-errors'
+import {
+  awaitCommerceOperation,
+  awaitDurableCommerceOperation,
+  canonicalInstant,
+  deadlineReached,
+  sameInstant,
+} from '@/lib/commerce/order-sync-runtime'
 import type { RawTransaction } from '@/types'
 import {
   createShopifySession,
@@ -35,18 +46,14 @@ const defaultLog = createLogger('shopify/order-sync')
  * Stripe) report no fees through Shopify at all. The gateway names ride along
  * as the row reference for later gateway-side reconciliation.
  *
- * Pagination: one fixed updated_at window per run, walked with Relay cursors
- * (sortKey UPDATED_AT ascending). Cursors are stable across same-second ties,
- * so there is no offset fallback (unlike the WooCommerce sync). The persisted
- * cursor is shopify_connections.last_order_synced_at: per page the max
- * updatedAt processed, and after a fully-listed window the run's start time
- * (a scanned-through watermark, so quiet and empty-first-run stores still
- * rotate to the back of the cron's oldest-first selection). Re-polled with a
- * 24h overlap; (company_id, external_id) dedup makes overlaps no-ops. It
- * never advances past failed work: a page with ingest errors caps the
- * persisted cursor just below the page's first updatedAt, so the next run
- * re-lists exactly the orders whose rows are incomplete. First run fetches
- * BACKFILL_DAYS back.
+ * Pagination: one durable updated_at window is split into exact timestamp
+ * cohorts. Relay continuation is persisted only for an exact-cohort query,
+ * so its query identity never changes across invocations. Each cohort is
+ * replayed from page one until one complete pass finds no unseen provider ID;
+ * durable completion markers make mutation or cursor reordering cause replay,
+ * never omission. Only provider exhaustion advances last_order_synced_at to
+ * the fixed window maximum. The next scan re-polls a 24h overlap, while first
+ * run fetches BACKFILL_DAYS back.
  *
  * Lock-date guard: the window selects on updatedAt, but rows are dated by
  * processedAt / refund createdAt, which can be arbitrarily older (a refund
@@ -211,12 +218,19 @@ export function mapRefund(
 async function fetchLockThrough(
   supabase: SupabaseClient,
   companyId: string,
+  deadlineMs?: number,
 ): Promise<string | null> {
-  const { data: settings } = await supabase
+  const query = supabase
     .from('company_settings')
     .select('bookkeeping_locked_through')
     .eq('company_id', companyId)
     .maybeSingle()
+  const { data: settings, error } = await awaitCommerceOperation(
+    query,
+    deadlineMs,
+    'fetch Shopify bookkeeping lock',
+  )
+  if (error) throw new Error(`Failed to fetch company lock date: ${error.message}`)
   return (
     (settings as { bookkeeping_locked_through?: string | null } | null)
       ?.bookkeeping_locked_through ?? null
@@ -234,12 +248,247 @@ export function rowBehindLock(rowDate: string, lockThrough: string | null): bool
  * not floor the window: it selects on updatedAt while rows are dated by
  * processedAt, so the real guard is rowBehindLock at map time, every run.)
  */
-function resolveWindowStartIso(connection: ShopifyConnection): string {
-  if (connection.last_order_synced_at) {
+function resolveWindowStartIso(connection: ShopifyConnection, runStartMs: number): string {
+  if (
+    connection.last_order_synced_at &&
+    Date.parse(connection.last_order_synced_at) <= runStartMs
+  ) {
     const cursorMs = Date.parse(connection.last_order_synced_at)
     return new Date(Math.max(0, cursorMs - CURSOR_OVERLAP_MS)).toISOString()
   }
-  return new Date(Date.now() - BACKFILL_DAYS * 86_400_000).toISOString()
+  return new Date(runStartMs - BACKFILL_DAYS * 86_400_000).toISOString()
+}
+
+function requireClaimToken(connection: ShopifyConnection): string {
+  if (!connection.order_sync_claim_token) {
+    throw new CommerceSyncPersistenceError(
+      'Shopify sync has no exact claim token',
+      'lease_validation',
+    )
+  }
+  return connection.order_sync_claim_token
+}
+
+async function validateActiveLease(
+  supabase: SupabaseClient,
+  connection: ShopifyConnection,
+  summary: ShopifySyncSummary,
+  deadlineMs?: number,
+): Promise<void> {
+  const query = supabase
+    .from('shopify_connections')
+    .select('id')
+    .eq('id', connection.id)
+    .eq('status', 'active')
+    .eq('order_sync_claim_token', requireClaimToken(connection))
+    .gt('order_sync_claimed_until', new Date().toISOString())
+    .maybeSingle()
+  const { data, error } = await awaitCommerceOperation(
+    query,
+    deadlineMs,
+    'validate Shopify sync lease',
+  )
+  if (error || !data) {
+    throw new CommerceSyncPersistenceError(
+      `Shopify sync lease is no longer active${error ? `: ${error.message}` : ''}`,
+      'lease_validation',
+      summary,
+    )
+  }
+}
+
+async function fetchSeenOrderIds(
+  supabase: SupabaseClient,
+  connectionId: string,
+  updatedAt: string,
+  orderIds: string[],
+  summary: ShopifySyncSummary,
+  deadlineMs?: number,
+): Promise<Set<string>> {
+  if (orderIds.length === 0) return new Set()
+  const query = supabase
+    .from('shopify_order_sync_seen')
+    .select('order_id')
+    .eq('connection_id', connectionId)
+    .eq('updated_at', updatedAt)
+    .in('order_id', orderIds)
+  const { data, error } = await awaitCommerceOperation(
+    query,
+    deadlineMs,
+    'read Shopify cohort markers',
+  )
+  if (error) {
+    throw new CommerceSyncPersistenceError(
+      `Failed to read Shopify cohort progress: ${error.message}`,
+      'cohort_read',
+      summary,
+    )
+  }
+  return new Set((data ?? []).map(row => String((row as { order_id: string }).order_id)))
+}
+
+async function checkpointShopifyScan(
+  supabase: SupabaseClient,
+  connection: ShopifyConnection,
+  state: {
+    scanMinUpdatedAt: string
+    scanMinInclusive: boolean
+    scanMaxUpdatedAt: string
+    cohortUpdatedAt: string | null
+    after: string | null
+    passFoundNew: boolean
+  },
+  completedOrderIds: string[],
+  summary: ShopifySyncSummary,
+  deadlineMs?: number,
+): Promise<void> {
+  const query = supabase.rpc('checkpoint_shopify_order_sync', {
+    p_connection_id: connection.id,
+    p_claim_token: requireClaimToken(connection),
+    p_scan_min_updated_at: state.scanMinUpdatedAt,
+    p_scan_min_inclusive: state.scanMinInclusive,
+    p_scan_max_updated_at: state.scanMaxUpdatedAt,
+    p_cohort_updated_at: state.cohortUpdatedAt,
+    p_after: state.after,
+    p_pass_found_new: state.passFoundNew,
+    p_completed_order_ids: completedOrderIds,
+  })
+  const { data, error } = await awaitDurableCommerceOperation(
+    query,
+    deadlineMs,
+    'checkpoint Shopify order scan',
+    'scan_checkpoint',
+    summary,
+  )
+  if (error || data !== true) {
+    throw new CommerceSyncPersistenceError(
+      `Failed to checkpoint Shopify order scan${error ? `: ${error.message}` : ': exact active lease was not matched'}`,
+      'scan_checkpoint',
+      summary,
+    )
+  }
+}
+
+async function completeShopifyCohort(
+  supabase: SupabaseClient,
+  connection: ShopifyConnection,
+  cohortUpdatedAt: string,
+  summary: ShopifySyncSummary,
+  deadlineMs?: number,
+): Promise<void> {
+  const query = supabase.rpc('complete_shopify_order_sync_cohort', {
+    p_connection_id: connection.id,
+    p_claim_token: requireClaimToken(connection),
+    p_cohort_updated_at: cohortUpdatedAt,
+  })
+  const { data, error } = await awaitDurableCommerceOperation(
+    query,
+    deadlineMs,
+    'complete Shopify cohort',
+    'cohort_completion',
+    summary,
+  )
+  if (error || data !== true) {
+    throw new CommerceSyncPersistenceError(
+      `Failed to complete Shopify order cohort${error ? `: ${error.message}` : ': exact active lease and cohort were not matched'}`,
+      'cohort_completion',
+      summary,
+    )
+  }
+}
+
+async function completeShopifyScan(
+  supabase: SupabaseClient,
+  connection: ShopifyConnection,
+  scanMaxUpdatedAt: string,
+  summary: ShopifySyncSummary,
+  deadlineMs?: number,
+): Promise<void> {
+  const query = supabase.rpc('complete_shopify_order_sync', {
+    p_connection_id: connection.id,
+    p_claim_token: requireClaimToken(connection),
+    p_scan_max_updated_at: scanMaxUpdatedAt,
+  })
+  const { data, error } = await awaitDurableCommerceOperation(
+    query,
+    deadlineMs,
+    'complete Shopify scan',
+    'scan_completion',
+    summary,
+  )
+  if (error || data !== true) {
+    throw new CommerceSyncPersistenceError(
+      `Failed to complete Shopify order scan${error ? `: ${error.message}` : ': exact active lease was not matched'}`,
+      'scan_completion',
+      summary,
+    )
+  }
+  connection.last_order_synced_at = scanMaxUpdatedAt
+  connection.order_sync_scan_min_updated_at = null
+  connection.order_sync_scan_min_inclusive = true
+  connection.order_sync_scan_max_updated_at = null
+  connection.order_sync_scan_cohort_updated_at = null
+  connection.order_sync_scan_after = null
+  connection.order_sync_scan_pass_found_new = false
+}
+
+async function revokeShopifyConnection(
+  supabase: SupabaseClient,
+  connection: ShopifyConnection,
+  summary: ShopifySyncSummary,
+  deadlineMs?: number,
+): Promise<void> {
+  const query = supabase.rpc('revoke_commerce_connection_for_sync', {
+    p_provider: 'shopify',
+    p_connection_id: connection.id,
+    p_claim_token: requireClaimToken(connection),
+    p_error_message: 'Butiken avvisade appens uppgifter. Anslut butiken igen.',
+    p_disconnected_at: new Date().toISOString(),
+  })
+  const { data, error } = await awaitDurableCommerceOperation(
+    query,
+    deadlineMs,
+    'persist Shopify credential revocation',
+    'credential_revocation',
+    summary,
+  )
+  if (error || data !== true) {
+    throw new CommerceSyncPersistenceError(
+      `Failed to persist Shopify credential revocation${error ? `: ${error.message}` : ': exact active lease was not matched'}`,
+      'credential_revocation',
+      summary,
+    )
+  }
+}
+
+async function persistShopifyConnectionError(
+  supabase: SupabaseClient,
+  connection: ShopifyConnection,
+  message: string,
+  summary: ShopifySyncSummary,
+  deadlineMs?: number,
+): Promise<void> {
+  const query = supabase
+    .from('shopify_connections')
+    .update({ error_message: message })
+    .eq('id', connection.id)
+    .eq('status', 'active')
+    .eq('order_sync_claim_token', requireClaimToken(connection))
+    .select('id')
+    .maybeSingle()
+  const { data, error } = await awaitDurableCommerceOperation(
+    query,
+    deadlineMs,
+    'persist Shopify connection error',
+    'connection_error',
+    summary,
+  )
+  if (error || !data) {
+    throw new CommerceSyncPersistenceError(
+      `Failed to persist Shopify connection error${error ? `: ${error.message}` : ''}`,
+      'connection_error',
+    )
+  }
 }
 
 /**
@@ -260,6 +509,9 @@ async function ensureStoreAccount(
   fallbackCurrency: string | undefined,
   firstRun: boolean,
   log: Logger,
+  claimToken: string,
+  summary: ShopifySyncSummary,
+  deadlineMs?: number,
 ): Promise<void> {
   const currency =
     connection.currency?.toUpperCase() || fallbackCurrency?.toUpperCase() || 'SEK'
@@ -275,13 +527,14 @@ async function ensureStoreAccount(
     // Typically a currency conflict with an existing 1584 cash account. Made
     // visible on the connection: without this the panel shows a healthy
     // "Ansluten" store that silently never syncs.
-    await supabase
-      .from('shopify_connections')
-      .update({
-        error_message:
-          'Kassakontot för butiken (1584) kunde inte skapas. Kontrollera att befintligt konto 1584 har samma valuta som butiken.',
-      })
-      .eq('id', connection.id)
+    connection.order_sync_claim_token = claimToken
+    await persistShopifyConnectionError(
+      supabase,
+      connection,
+      'Kassakontot för butiken (1584) kunde inte skapas. Kontrollera att befintligt konto 1584 har samma valuta som butiken.',
+      summary,
+      deadlineMs,
+    )
     throw accountError
   }
   if (firstRun) {
@@ -321,8 +574,9 @@ function buildPageRows(
   lockThrough: string | null,
   summary: ShopifySyncSummary,
   log: Logger,
-): RawTransaction[] {
+): { rows: RawTransaction[]; incompleteOrderIds: Set<string> } {
   const rows: RawTransaction[] = []
+  const incompleteOrderIds = new Set<string>()
 
   const push = (mapped: RawTransaction[]) => {
     for (const row of mapped) {
@@ -345,6 +599,7 @@ function buildPageRows(
         orderId: order.legacyResourceId,
         total: order.totalPriceSet.shopMoney.amount,
       })
+      incompleteOrderIds.add(order.legacyResourceId)
     }
     push(mapOrder(shopScope, order))
     // Refunds only exist in the feed for qualifying (paid) orders: a refund
@@ -360,11 +615,12 @@ function buildPageRows(
           refundId: refund.legacyResourceId,
           amount: refund.totalRefundedSet.shopMoney.amount,
         })
+        incompleteOrderIds.add(order.legacyResourceId)
       }
       push(mapRefund(shopScope, order, refund))
     }
   }
-  return rows
+  return { rows, incompleteOrderIds }
 }
 
 export async function syncShopifyOrders(
@@ -394,30 +650,71 @@ export async function syncShopifyOrders(
     return summary
   }
 
+  const runStartMs = Date.now()
   const shopScope = shopifyShopScope(connection.shop_domain)
   const firstRun = !connection.last_order_synced_at
-  const lockThrough = await fetchLockThrough(supabase, connection.company_id)
-
-  const runStartMs = Date.now()
-  const updatedAtMin = resolveWindowStartIso(connection)
-  let after: string | null = null
-  let prevCursorMs = connection.last_order_synced_at
-    ? Date.parse(connection.last_order_synced_at)
-    : 0
-  // Earliest incomplete work this run; the persisted cursor never passes it.
-  let failureFloorMs = Number.POSITIVE_INFINITY
-  // True once the whole window was listed to its end (empty page or last page).
-  let windowExhausted = false
+  const claimToken = requireClaimToken(connection)
+  const resumingScan = connection.order_sync_scan_max_updated_at !== null
+  const scanMaxUpdatedAt = connection.order_sync_scan_max_updated_at
+    ? canonicalInstant(connection.order_sync_scan_max_updated_at, 'Shopify scan maximum')
+    : new Date(runStartMs).toISOString()
+  let scanMinUpdatedAt = connection.order_sync_scan_min_updated_at
+    ? canonicalInstant(connection.order_sync_scan_min_updated_at, 'Shopify scan minimum')
+    : resolveWindowStartIso(connection, runStartMs)
+  let scanMinInclusive = resumingScan
+    ? connection.order_sync_scan_min_inclusive
+    : true
+  let cohortUpdatedAt = connection.order_sync_scan_cohort_updated_at
+    ? canonicalInstant(connection.order_sync_scan_cohort_updated_at, 'Shopify cohort')
+    : null
+  let after = connection.order_sync_scan_after ?? null
+  let cohortPassFoundNew = connection.order_sync_scan_pass_found_new ?? false
+  let scannedThisRun = 0
   let accountEnsured = false
 
+  if (deadlineReached(deadlineMs)) {
+    summary.deadlineReached = true
+    return summary
+  }
+
+  const durableState = () => ({
+    scanMinUpdatedAt,
+    scanMinInclusive,
+    scanMaxUpdatedAt,
+    cohortUpdatedAt,
+    after,
+    passFoundNew: cohortPassFoundNew,
+  })
+
   try {
+    const lockThrough = await fetchLockThrough(supabase, connection.company_id, deadlineMs)
+    if (deadlineReached(deadlineMs)) {
+      summary.deadlineReached = true
+      return summary
+    }
+    if (!resumingScan) {
+      await checkpointShopifyScan(
+        supabase,
+        connection,
+        durableState(),
+        [],
+        summary,
+        deadlineMs,
+      )
+    }
+    if (deadlineReached(deadlineMs)) {
+      summary.deadlineReached = true
+      return summary
+    }
     // Token exchange happens up front (the token lives ~24h, far longer than
     // any run); a dead client secret surfaces here as a revoked-classified
     // error before any paging starts.
-    const session = await createShopifySession(credentialsOf(connection))
+    const session = await createShopifySession(credentialsOf(connection), {
+      startDeadlineMs: deadlineMs,
+    })
 
     for (;;) {
-      if (deadlineMs !== undefined && Date.now() >= deadlineMs) {
+      if (deadlineReached(deadlineMs)) {
         summary.deadlineReached = true
         log.info('time budget exhausted; stopping order sync', {
           connectionId: connection.id,
@@ -426,76 +723,233 @@ export async function syncShopifyOrders(
         break
       }
 
-      const page = await listOrdersPage(session, { updatedAtMin, after })
-      if (page.orders.length === 0) {
-        windowExhausted = true
-        break
-      }
-      summary.fetched += page.orders.length
-
-      // Deferred until the window is known non-empty so a quiet store costs
-      // one API call and zero DB writes; also gives us a real order currency
-      // as the fallback when the shop currency was unreadable at connect.
-      if (!accountEnsured) {
-        await ensureStoreAccount(
+      if (cohortUpdatedAt === null) {
+        const discovery = await listOrdersPage(session, {
+          updatedAtMin: scanMinUpdatedAt,
+          updatedAtMinInclusive: scanMinInclusive,
+          updatedAtMax: scanMaxUpdatedAt,
+          after: null,
+        }, { startDeadlineMs: deadlineMs })
+        if (deadlineMs !== undefined && Date.now() >= deadlineMs) {
+          summary.deadlineReached = true
+          break
+        }
+        if (discovery.orders.length === 0) {
+          await completeShopifyScan(supabase, connection, scanMaxUpdatedAt, summary, deadlineMs)
+          break
+        }
+        cohortUpdatedAt = canonicalInstant(discovery.orders[0].updatedAt, 'Shopify updatedAt')
+        after = null
+        cohortPassFoundNew = false
+        await checkpointShopifyScan(
           supabase,
           connection,
-          page.orders[0].totalPriceSet.shopMoney.currencyCode,
-          firstRun,
-          log,
+          durableState(),
+          [],
+          summary,
+          deadlineMs,
+        )
+        continue
+      }
+
+      let page
+      try {
+        page = await listOrdersPage(session, {
+          updatedAtMin: cohortUpdatedAt,
+          updatedAtMinInclusive: true,
+          updatedAtMax: cohortUpdatedAt,
+          after,
+        }, { startDeadlineMs: deadlineMs })
+      } catch (error) {
+        // Relay cursors are scoped to this fixed exact-cohort query, but a
+        // provider mutation can still invalidate the opaque continuation.
+        // Reset only the continuation and retain completion markers so a
+        // fresh invocation safely replays from page one without omission.
+        if (after !== null) {
+          after = null
+          await checkpointShopifyScan(
+            supabase,
+            connection,
+            durableState(),
+            [],
+            summary,
+            deadlineMs,
+          )
+        }
+        throw error
+      }
+      if (deadlineReached(deadlineMs)) {
+        summary.deadlineReached = true
+        break
+      }
+      if (page.orders.length === 0) {
+        if (cohortPassFoundNew) {
+          after = null
+          cohortPassFoundNew = false
+          await checkpointShopifyScan(
+            supabase,
+            connection,
+            durableState(),
+            [],
+            summary,
+            deadlineMs,
+          )
+          continue
+        }
+        const completedCohort = cohortUpdatedAt
+        await completeShopifyCohort(
+          supabase,
+          connection,
+          completedCohort,
+          summary,
+          deadlineMs,
+        )
+        scanMinUpdatedAt = completedCohort
+        scanMinInclusive = false
+        cohortUpdatedAt = null
+        after = null
+        cohortPassFoundNew = false
+        continue
+      }
+      summary.fetched += page.orders.length
+      scannedThisRun += page.orders.length
+      const exactOrders = page.orders.filter(order => sameInstant(order.updatedAt, cohortUpdatedAt!))
+      if (exactOrders.length !== page.orders.length) {
+        throw new Error('Shopify exact-cohort query returned a different updatedAt')
+      }
+      const seenOrderIds = await fetchSeenOrderIds(
+        supabase,
+        connection.id,
+        cohortUpdatedAt,
+        exactOrders.map(order => order.legacyResourceId),
+        summary,
+        deadlineMs,
+      )
+      const workOrders = exactOrders.filter(
+        order => !seenOrderIds.has(order.legacyResourceId),
+      )
+
+      // Deferred until there is unseen work; verification pages must not index
+      // an empty workOrders array or recreate the cash account unnecessarily.
+      if (!accountEnsured && workOrders.length > 0) {
+        await awaitDurableCommerceOperation(
+          ensureStoreAccount(
+            supabase,
+            connection,
+            workOrders[0].totalPriceSet.shopMoney.currencyCode,
+            firstRun,
+            log,
+            claimToken,
+            summary,
+            deadlineMs,
+          ),
+          deadlineMs,
+          'ensure Shopify store account',
+          'store_account_setup',
+          summary,
         )
         accountEnsured = true
       }
 
-      const rows = buildPageRows(shopScope, page.orders, lockThrough, summary, log)
+      const pageRows = buildPageRows(shopScope, workOrders, lockThrough, summary, log)
 
-      const firstMs = Date.parse(page.orders[0].updatedAt)
-      const lastMs = Date.parse(page.orders[page.orders.length - 1].updatedAt)
-
-      if (rows.length > 0) {
+      let ingestHadErrors = false
+      if (pageRows.rows.length > 0) {
         // Auto-categorization is skipped on purpose: booking Shopify money is
         // a human decision in the inbox (feed-only doctrine, same as the
         // Stripe and WooCommerce feeds). Invoice matching still runs
         // (suggestions only), and FX enrichment covers non-SEK stores.
-        const result = await ingestTransactions(
-          supabase,
-          connection.company_id,
-          connection.user_id,
-          rows,
-          { settlementAccount: SHOPIFY_LEDGER_ACCOUNT, skipAutoCategorization: true },
+        await validateActiveLease(supabase, connection, summary, deadlineMs)
+        const result = await awaitDurableCommerceOperation(
+          ingestTransactions(
+            supabase,
+            connection.company_id,
+            connection.user_id,
+            pageRows.rows,
+            { settlementAccount: SHOPIFY_LEDGER_ACCOUNT, skipAutoCategorization: true },
+          ),
+          deadlineMs,
+          'ingest Shopify transactions',
+          'transaction_ingest',
+          summary,
         )
         summary.imported += result.imported
         summary.duplicates += result.duplicates
         summary.errors += result.errors
-        if (result.errors > 0) {
-          // Failed inserts are dropped inside ingest; hold the cursor below
-          // this page so the next run re-lists and retries it rather than
-          // turning a transient DB error into permanently missing rows.
-          failureFloorMs = Math.min(failureFloorMs, firstMs - 1000)
-        }
+        ingestHadErrors = result.errors > 0
       }
 
-      // Persist the cursor after each page: monotonic (never regresses below
-      // the pre-run cursor) and capped by the failure floor. error_message is
-      // cleared on progress so a resolved incident stops showing in the panel.
-      const candidateMs = Math.min(lastMs, failureFloorMs)
-      if (candidateMs > prevCursorMs) {
-        const cursorIso = new Date(candidateMs).toISOString()
-        await supabase
-          .from('shopify_connections')
-          .update({ last_order_synced_at: cursorIso, error_message: null })
-          .eq('id', connection.id)
-        connection.last_order_synced_at = cursorIso
-        prevCursorMs = candidateMs
+      if (page.hasNextPage && !page.endCursor) {
+        throw new Error('Shopify returned hasNextPage without an endCursor')
+      }
+      cohortPassFoundNew = cohortPassFoundNew || workOrders.length > 0
+      after = page.hasNextPage ? page.endCursor : null
+      const completedOrderIds = ingestHadErrors
+        ? []
+        : workOrders
+            .filter(order => !pageRows.incompleteOrderIds.has(order.legacyResourceId))
+            .map(order => order.legacyResourceId)
+      await checkpointShopifyScan(
+        supabase,
+        connection,
+        durableState(),
+        completedOrderIds,
+        summary,
+        deadlineMs,
+      )
+
+      if (ingestHadErrors) break
+      if (pageRows.incompleteOrderIds.size > 0) {
+        after = null
+        cohortPassFoundNew = false
+        await checkpointShopifyScan(
+          supabase,
+          connection,
+          durableState(),
+          [],
+          summary,
+          deadlineMs,
+        )
+        throw new CommerceSyncProviderError(
+          'Shopify order or refund amount was malformed and remains pending',
+          summary,
+        )
       }
 
       if (!page.hasNextPage) {
-        windowExhausted = true
-        break
+        if (cohortPassFoundNew) {
+          after = null
+          cohortPassFoundNew = false
+          await checkpointShopifyScan(
+            supabase,
+            connection,
+            durableState(),
+            [],
+            summary,
+            deadlineMs,
+          )
+        } else {
+          const completedCohort = cohortUpdatedAt
+          await completeShopifyCohort(
+            supabase,
+            connection,
+            completedCohort,
+            summary,
+            deadlineMs,
+          )
+          scanMinUpdatedAt = completedCohort
+          scanMinInclusive = false
+          cohortUpdatedAt = null
+          after = null
+          cohortPassFoundNew = false
+        }
       }
-      after = page.endCursor
 
-      if (summary.fetched >= MAX_ORDERS_PER_RUN) {
+      // Apply the cap only after the end-of-cohort transition is durable. If
+      // an exact cohort contains exactly MAX_ORDERS_PER_RUN rows, checking the
+      // cap first would strand every no-new verification pass at its final
+      // page and replay the same cohort forever.
+      if (scannedThisRun >= MAX_ORDERS_PER_RUN) {
         log.warn('order cap reached; remaining orders resume next run', {
           connectionId: connection.id,
           cap: MAX_ORDERS_PER_RUN,
@@ -503,51 +957,29 @@ export async function syncShopifyOrders(
         break
       }
     }
-
-    // Watermark advance: a fully-listed window means "scanned through run
-    // start", even when it produced no rows. Without this, an empty first run
-    // keeps a NULL cursor forever, and the cron's oldest-first selection
-    // (nullsFirst, limit 50) lets quiet stores permanently occupy the batch
-    // and starve other connections. Capped by the failure floor like every
-    // other cursor write; the 24h overlap re-poll still covers updates that
-    // landed while the run was in flight.
-    if (windowExhausted) {
-      const watermarkMs = Math.min(runStartMs, failureFloorMs)
-      if (watermarkMs > prevCursorMs) {
-        const cursorIso = new Date(watermarkMs).toISOString()
-        await supabase
-          .from('shopify_connections')
-          .update({ last_order_synced_at: cursorIso, error_message: null })
-          .eq('id', connection.id)
-        connection.last_order_synced_at = cursorIso
-        prevCursorMs = watermarkMs
-      }
-    }
   } catch (err) {
     if (isRevokedCredentialsError(err)) {
       // The app was deleted or its secret rotated in the Dev Dashboard: flip
       // the connection so the UI offers a reconnect instead of the cron
       // retrying forever.
+      await revokeShopifyConnection(supabase, connection, summary, deadlineMs)
       summary.revoked = true
-      await supabase
-        .from('shopify_connections')
-        .update({
-          status: 'revoked',
-          error_message: 'Butiken avvisade appens uppgifter. Anslut butiken igen.',
-          // The store already rejected these; keeping decryptable dead
-          // credentials would be pure data retention (same as /disconnect).
-          client_id_encrypted: null,
-          client_secret_encrypted: null,
-          disconnected_at: new Date().toISOString(),
-        })
-        .eq('id', connection.id)
-        .eq('status', 'active')
       log.warn('credentials revoked upstream; connection flipped to revoked', {
         connectionId: connection.id,
       })
       return summary
     }
-    throw err
+    if (
+      err instanceof CommerceSyncPersistenceError ||
+      err instanceof CommerceSyncProviderError
+    ) {
+      throw err
+    }
+    throw new CommerceSyncProviderError(
+      err instanceof Error ? err.message : String(err),
+      summary,
+      { cause: err },
+    )
   }
 
   if (summary.skippedLocked > 0) {

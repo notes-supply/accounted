@@ -37,6 +37,17 @@ export interface ShopifySession {
   accessToken: string
 }
 
+export interface ShopifyDeadlineOptions {
+  startDeadlineMs?: number
+}
+
+export class ShopifyDeadlineError extends Error {
+  constructor() {
+    super('Shopify provider work-start deadline reached')
+    this.name = 'ShopifyDeadlineError'
+  }
+}
+
 export class ShopifyApiError extends Error {
   constructor(
     message: string,
@@ -86,12 +97,37 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-async function postJson(url: string, body: unknown, headers: Record<string, string>) {
+function assertBeforeDeadline(deadlineMs?: number): void {
+  if (deadlineMs !== undefined && Date.now() >= deadlineMs) {
+    throw new ShopifyDeadlineError()
+  }
+}
+
+async function sleepBeforeRetry(delayMs: number, deadlineMs?: number): Promise<void> {
+  if (deadlineMs !== undefined && Date.now() + delayMs >= deadlineMs) {
+    throw new ShopifyDeadlineError()
+  }
+  await sleep(delayMs)
+  assertBeforeDeadline(deadlineMs)
+}
+
+async function postJson(
+  url: string,
+  body: unknown,
+  headers: Record<string, string>,
+  deadlineMs?: number,
+) {
+  assertBeforeDeadline(deadlineMs)
+  const remainingMs = deadlineMs === undefined ? REQUEST_TIMEOUT_MS : deadlineMs - Date.now()
+  if (remainingMs <= 0) throw new ShopifyDeadlineError()
+  const timeoutMs = deadlineMs === undefined
+    ? REQUEST_TIMEOUT_MS
+    : Math.min(REQUEST_TIMEOUT_MS, remainingMs)
   return fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json', ...headers },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   })
 }
 
@@ -102,9 +138,13 @@ async function postJson(url: string, body: unknown, headers: Record<string, stri
  * it is reported as status 401 and classified as revoked; 429/5xx retry on
  * the normal backoff schedule.
  */
-export async function exchangeAccessToken(creds: ShopifyCredentials): Promise<string> {
+export async function exchangeAccessToken(
+  creds: ShopifyCredentials,
+  options: ShopifyDeadlineOptions = {},
+): Promise<string> {
   let lastError: unknown
   for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+    assertBeforeDeadline(options.startDeadlineMs)
     let response: Response
     try {
       response = await postJson(
@@ -115,14 +155,16 @@ export async function exchangeAccessToken(creds: ShopifyCredentials): Promise<st
           grant_type: 'client_credentials',
         },
         {},
+        options.startDeadlineMs,
       )
     } catch (err) {
+      if (err instanceof ShopifyDeadlineError) throw err
       lastError = new ShopifyApiError(
         `Shopify token exchange failed: ${err instanceof Error ? err.message : String(err)}`,
         0,
       )
       if (attempt < RETRY_DELAYS_MS.length) {
-        await sleep(RETRY_DELAYS_MS[attempt])
+        await sleepBeforeRetry(RETRY_DELAYS_MS[attempt], options.startDeadlineMs)
         continue
       }
       throw lastError
@@ -143,7 +185,7 @@ export async function exchangeAccessToken(creds: ShopifyCredentials): Promise<st
         `Shopify token exchange ${response.status}`,
         response.status,
       )
-      await sleep(RETRY_DELAYS_MS[attempt])
+      await sleepBeforeRetry(RETRY_DELAYS_MS[attempt], options.startDeadlineMs)
       continue
     }
 
@@ -174,8 +216,13 @@ export async function exchangeAccessToken(creds: ShopifyCredentials): Promise<st
 /** Exchange the credentials for a run-scoped session. */
 export async function createShopifySession(
   creds: ShopifyCredentials,
+  options: ShopifyDeadlineOptions = {},
 ): Promise<ShopifySession> {
-  return { shopDomain: creds.shopDomain, accessToken: await exchangeAccessToken(creds) }
+  assertBeforeDeadline(options.startDeadlineMs)
+  return {
+    shopDomain: creds.shopDomain,
+    accessToken: await exchangeAccessToken(creds, options),
+  }
 }
 
 interface GraphQLErrorShape {
@@ -193,22 +240,25 @@ export async function shopifyGraphQL<T>(
   session: ShopifySession,
   query: string,
   variables: Record<string, unknown> = {},
+  options: ShopifyDeadlineOptions = {},
 ): Promise<T> {
   const url = `https://${session.shopDomain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`
   let lastError: unknown
   for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+    assertBeforeDeadline(options.startDeadlineMs)
     let response: Response
     try {
       response = await postJson(url, { query, variables }, {
         'X-Shopify-Access-Token': session.accessToken,
-      })
+      }, options.startDeadlineMs)
     } catch (err) {
+      if (err instanceof ShopifyDeadlineError) throw err
       lastError = new ShopifyApiError(
         `Shopify request failed: ${err instanceof Error ? err.message : String(err)}`,
         0,
       )
       if (attempt < RETRY_DELAYS_MS.length) {
-        await sleep(RETRY_DELAYS_MS[attempt])
+        await sleepBeforeRetry(RETRY_DELAYS_MS[attempt], options.startDeadlineMs)
         continue
       }
       throw lastError
@@ -217,7 +267,7 @@ export async function shopifyGraphQL<T>(
     if (!response.ok) {
       if (RETRYABLE_STATUS.has(response.status) && attempt < RETRY_DELAYS_MS.length) {
         lastError = new ShopifyApiError(`Shopify API ${response.status}`, response.status)
-        await sleep(RETRY_DELAYS_MS[attempt])
+        await sleepBeforeRetry(RETRY_DELAYS_MS[attempt], options.startDeadlineMs)
         continue
       }
       throw new ShopifyApiError(`Shopify API ${response.status}`, response.status)
@@ -232,7 +282,7 @@ export async function shopifyGraphQL<T>(
       const throttled = body.errors.some((e) => e.extensions?.code === 'THROTTLED')
       if (throttled && attempt < RETRY_DELAYS_MS.length) {
         lastError = new ShopifyApiError('Shopify API throttled', 0, 'THROTTLED')
-        await sleep(RETRY_DELAYS_MS[attempt])
+        await sleepBeforeRetry(RETRY_DELAYS_MS[attempt], options.startDeadlineMs)
         continue
       }
       const accessDenied = body.errors.some((e) => e.extensions?.code === 'ACCESS_DENIED')
@@ -290,8 +340,12 @@ export interface OrdersPage {
 }
 
 export interface ListOrdersOptions {
-  /** ISO timestamp; orders with updated_at >= this are listed. */
+  /** ISO lower timestamp bound. */
   updatedAtMin: string
+  /** Defaults to inclusive; discovery after a completed cohort is exclusive. */
+  updatedAtMinInclusive?: boolean
+  /** Fixed scan upper bound; orders with updated_at <= this are listed. */
+  updatedAtMax?: string
   /** Relay cursor from the previous page's endCursor, or null for page one. */
   after: string | null
 }
@@ -305,6 +359,7 @@ export interface ListOrdersOptions {
 export async function listOrdersPage(
   session: ShopifySession,
   options: ListOrdersOptions,
+  deadline: ShopifyDeadlineOptions = {},
 ): Promise<OrdersPage> {
   const data = await shopifyGraphQL<{
     orders: {
@@ -314,8 +369,11 @@ export async function listOrdersPage(
   }>(session, ORDERS_QUERY, {
     first: SHOPIFY_PAGE_SIZE,
     after: options.after,
-    query: `updated_at:>='${options.updatedAtMin}'`,
-  })
+    query: [
+      `updated_at:${options.updatedAtMinInclusive === false ? '>' : '>='}'${options.updatedAtMin}'`,
+      ...(options.updatedAtMax ? [`updated_at:<='${options.updatedAtMax}'`] : []),
+    ].join(' '),
+  }, deadline)
   return {
     orders: data.orders.nodes,
     hasNextPage: data.orders.pageInfo.hasNextPage,

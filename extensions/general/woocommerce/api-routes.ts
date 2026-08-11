@@ -5,6 +5,19 @@ import { requireCapability } from '@/lib/entitlements/has-capability'
 import { CAPABILITY } from '@/lib/entitlements/keys'
 import { guardSandbox, sandboxBlockedResponse } from '@/lib/sandbox/guard'
 import { createServiceClientNoCookies } from '@/lib/auth/api-keys'
+import {
+  claimCommerceOrderSyncConnection,
+  releaseCommerceOrderSyncClaim,
+  restoreCommerceOrderSyncClaim,
+  type ClaimedCommerceConnection,
+} from '@/lib/commerce/order-sync-scheduler'
+import {
+  CommerceSyncPersistenceError,
+  CommerceSyncTimeoutError,
+  commerceSyncFailureSummary,
+  type CommerceSyncTotals,
+} from '@/lib/commerce/order-sync-errors'
+import { awaitCommerceOperation } from '@/lib/commerce/order-sync-runtime'
 import { isWooCommerceConfigured, encryptCredential } from './lib/credentials'
 import { normalizeStoreUrl, testConnectionAndFetchStoreInfo } from './lib/api-client'
 import { buildAuthorizeUrl } from './lib/connect'
@@ -336,34 +349,85 @@ export const woocommerceApiRoutes: ApiRouteDefinition[] = [
     method: 'POST',
     path: '/sync',
     handler: async (_request: Request, ctx?: ExtensionContext) => {
+      const routeStartMs = ctx?.requestStartedAtMs ?? Date.now()
+      const workStartDeadlineMs = ctx?.workStartDeadlineMs ?? routeStartMs + 180_000
+      const cleanupDeadlineMs = ctx?.cleanupDeadlineMs ?? routeStartMs + 285_000
       const log = ctx?.log ?? console
-      const auth = await requireUserAndCompany(ctx)
-      if (auth instanceof NextResponse) return auth
-
-      const capabilityBlocked = await requireCapability(
-        auth.supabase,
-        auth.companyId,
-        CAPABILITY.woocommerce_sync,
+      const deadlineResponse = () => NextResponse.json(
+        { error: 'Tidsgränsen nåddes innan synkroniseringen kunde starta.' },
+        { status: 504 },
       )
-      if (capabilityBlocked) return capabilityBlocked
+      if (Date.now() >= workStartDeadlineMs) return deadlineResponse()
 
-      const rl = await checkRateLimit({
-        prefix: 'woocommerce:sync',
-        identifier: auth.userId,
-        ...RATE_LIMIT_SYNC,
-      })
+      let auth: Awaited<ReturnType<typeof requireUserAndCompany>>
+      try {
+        auth = await awaitCommerceOperation(
+          requireUserAndCompany(ctx),
+          workStartDeadlineMs,
+          'authorize manual WooCommerce sync',
+        )
+      } catch (error) {
+        if (error instanceof CommerceSyncTimeoutError) return deadlineResponse()
+        throw error
+      }
+      if (auth instanceof NextResponse) return auth
+      if (Date.now() >= workStartDeadlineMs) return deadlineResponse()
+
+      let capabilityBlocked: Awaited<ReturnType<typeof requireCapability>>
+      try {
+        capabilityBlocked = await awaitCommerceOperation(
+          requireCapability(auth.supabase, auth.companyId, CAPABILITY.woocommerce_sync),
+          workStartDeadlineMs,
+          'authorize WooCommerce sync capability',
+        )
+      } catch (error) {
+        if (error instanceof CommerceSyncTimeoutError) return deadlineResponse()
+        throw error
+      }
+      if (capabilityBlocked) return capabilityBlocked
+      if (Date.now() >= workStartDeadlineMs) return deadlineResponse()
+
+      let rl: Awaited<ReturnType<typeof checkRateLimit>>
+      try {
+        rl = await awaitCommerceOperation(
+          checkRateLimit({
+            prefix: 'woocommerce:sync',
+            identifier: auth.userId,
+            ...RATE_LIMIT_SYNC,
+          }),
+          workStartDeadlineMs,
+          'rate limit manual WooCommerce sync',
+        )
+      } catch (error) {
+        if (error instanceof CommerceSyncTimeoutError) return deadlineResponse()
+        throw error
+      }
       if (!rl.ok) return rl.response!
+      if (Date.now() >= workStartDeadlineMs) return deadlineResponse()
 
       // Membership-scoped lookup via the user client; the sync itself runs on
       // the service client (cursor updates and ingest are service paths). The
       // manual button ignores transaction_sync_enabled (that flag gates the
       // nightly cron): pressing it IS the opt-in.
-      const { data: connection } = await auth.supabase
+      const connectionQuery = auth.supabase
         .from('woocommerce_connections')
         .select('*')
         .eq('company_id', auth.companyId)
         .eq('status', 'active')
         .maybeSingle()
+      let connectionResult: Awaited<typeof connectionQuery>
+      try {
+        connectionResult = await awaitCommerceOperation(
+          connectionQuery,
+          workStartDeadlineMs,
+          'fetch manual WooCommerce connection',
+        )
+      } catch (error) {
+        if (error instanceof CommerceSyncTimeoutError) return deadlineResponse()
+        throw error
+      }
+      const { data: connection } = connectionResult
+      if (Date.now() >= workStartDeadlineMs) return deadlineResponse()
 
       if (!connection) {
         return NextResponse.json(
@@ -372,29 +436,115 @@ export const woocommerceApiRoutes: ApiRouteDefinition[] = [
         )
       }
 
+      let serviceClient: ReturnType<typeof createServiceClientNoCookies>
+      let claim: ClaimedCommerceConnection<WooCommerceConnection> | null
       try {
-        const serviceClient = createServiceClientNoCookies()
-        // Bounded like the cron: without a deadline a huge first sync against
-        // a slow host would be killed at the dispatcher's maxDuration with no
-        // cursor persisted; with one it stops cleanly, reports a partial sync
-        // and resumes where it stopped on the next press.
-        const summary = await syncWooCommerceOrders(
+        serviceClient = createServiceClientNoCookies()
+        claim = await claimCommerceOrderSyncConnection(
           serviceClient,
+          'woocommerce_connections',
           connection as WooCommerceConnection,
-          undefined,
-          Date.now() + 240_000,
+          workStartDeadlineMs,
+          cleanupDeadlineMs,
         )
-        return NextResponse.json({ success: true, transactions: summary })
       } catch (error) {
-        log.error('[woocommerce] Manual sync failed', {
+        log.error('[woocommerce] Manual sync claim failed', {
           message: error instanceof Error ? error.message : String(error),
           connection_id: connection.id,
         })
         return NextResponse.json(
-          { error: 'Synkroniseringen misslyckades. Försök igen.' },
-          { status: 502 },
+          { error: 'Synkroniseringen kunde inte startas. Försök igen.' },
+          { status: 500 },
         )
       }
+      if (!claim) {
+        return NextResponse.json(
+          { error: 'En synkronisering pågår redan för den här butiken.' },
+          { status: 409 },
+        )
+      }
+
+      let providerWorkStarted = false
+      let response: NextResponse
+      let cleanupError: unknown = null
+      let summaryEvidence: CommerceSyncTotals | undefined
+      let claimTerminatedByRevocation = false
+      try {
+        if (Date.now() >= workStartDeadlineMs) {
+          response = deadlineResponse()
+        } else {
+          providerWorkStarted = true
+          // Bounded like the cron: without a deadline a huge first sync against
+          // a slow host would be killed at the dispatcher's maxDuration with no
+          // cursor persisted; with one it stops cleanly, reports a partial sync
+          // and resumes where it stopped on the next press.
+          const summary = await syncWooCommerceOrders(
+            serviceClient,
+            claim.connection,
+            undefined,
+            workStartDeadlineMs,
+          )
+          summaryEvidence = summary
+          claimTerminatedByRevocation = summary.revoked === true
+          response = summary.deadlineReached === true || Date.now() >= workStartDeadlineMs
+            ? NextResponse.json(
+                {
+                  error: 'Tidsgränsen nåddes under synkroniseringen.',
+                  transactions: summary,
+                },
+                { status: 504 },
+              )
+            : NextResponse.json({ success: true, transactions: summary })
+        }
+      } catch (error) {
+        summaryEvidence = commerceSyncFailureSummary(error)
+        log.error('[woocommerce] Manual sync failed', {
+          message: error instanceof Error ? error.message : String(error),
+          connection_id: connection.id,
+        })
+        response = NextResponse.json(
+          {
+            error: 'Synkroniseringen misslyckades. Försök igen.',
+            ...(summaryEvidence ? { transactions: summaryEvidence } : {}),
+          },
+          { status: error instanceof CommerceSyncPersistenceError ? 500 : 502 },
+        )
+      } finally {
+        try {
+          if (providerWorkStarted && !claimTerminatedByRevocation) {
+            await releaseCommerceOrderSyncClaim(
+              serviceClient,
+              'woocommerce_connections',
+              connection.id,
+              claim.claimToken,
+              cleanupDeadlineMs,
+            )
+          } else if (!providerWorkStarted) {
+            await restoreCommerceOrderSyncClaim(
+              serviceClient,
+              'woocommerce_connections',
+              claim,
+              cleanupDeadlineMs,
+            )
+          }
+        } catch (error) {
+          cleanupError = error
+          log.error('[woocommerce] Manual sync claim cleanup failed', {
+            message: error instanceof Error ? error.message : String(error),
+            connection_id: connection.id,
+          })
+        }
+      }
+      if (cleanupError) {
+        return NextResponse.json(
+          {
+            error: 'Synkroniseringslåset kunde inte uppdateras. Försök igen senare.',
+            ...(summaryEvidence ? { transactions: summaryEvidence } : {}),
+          },
+          { status: 500 },
+        )
+      }
+      return response
     },
   },
   {
@@ -481,17 +631,15 @@ export const woocommerceApiRoutes: ApiRouteDefinition[] = [
       // reconnect inserts a fresh row); the audit row keeps store_url and the
       // connect/disconnect timestamps. The panel tells the user to remove the
       // key in WooCommerce as well.
-      const { error: updateError } = await auth.supabase
-        .from('woocommerce_connections')
-        .update({
-          status: 'revoked',
-          oauth_state: null,
-          consumer_key_encrypted: null,
-          consumer_secret_encrypted: null,
-          disconnected_at: new Date().toISOString(),
-        })
-        .eq('id', connection.id)
-        .eq('company_id', auth.companyId)
+      const { data: disconnectResult, error: updateError } = await auth.supabase.rpc(
+        'disconnect_commerce_connection',
+        {
+          p_provider: 'woocommerce',
+          p_connection_id: connection.id,
+          p_company_id: auth.companyId,
+          p_disconnected_at: new Date().toISOString(),
+        },
+      )
 
       if (updateError) {
         log.error('[woocommerce] Failed to mark connection revoked', {
@@ -502,6 +650,15 @@ export const woocommerceApiRoutes: ApiRouteDefinition[] = [
           { error: 'Kunde inte koppla från. Försök igen.' },
           { status: 500 },
         )
+      }
+      if (disconnectResult === 'conflict') {
+        return NextResponse.json(
+          { error: 'En synkronisering pågår. Försök koppla från igen senare.' },
+          { status: 409 },
+        )
+      }
+      if (disconnectResult !== 'disconnected') {
+        return NextResponse.json({ error: 'Connection not found' }, { status: 404 })
       }
 
       if (ctx?.emit) {

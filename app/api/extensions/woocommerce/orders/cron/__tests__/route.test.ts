@@ -40,14 +40,14 @@ vi.mock('@supabase/supabase-js', () => ({
   })),
 }))
 
-const isShopifyConfigured = vi.fn((..._args: unknown[]) => true)
-vi.mock('@/extensions/general/shopify/lib/credentials', () => ({
-  isShopifyConfigured: (...args: unknown[]) => isShopifyConfigured(...args),
+const isWooCommerceConfigured = vi.fn((..._args: unknown[]) => true)
+vi.mock('@/extensions/general/woocommerce/lib/credentials', () => ({
+  isWooCommerceConfigured: (...args: unknown[]) => isWooCommerceConfigured(...args),
 }))
 
-const syncShopifyOrders = vi.fn()
-vi.mock('@/extensions/general/shopify/lib/order-sync', () => ({
-  syncShopifyOrders: (...args: unknown[]) => syncShopifyOrders(...args),
+const syncWooCommerceOrders = vi.fn()
+vi.mock('@/extensions/general/woocommerce/lib/order-sync', () => ({
+  syncWooCommerceOrders: (...args: unknown[]) => syncWooCommerceOrders(...args),
 }))
 
 const getCompanyIdsWithCapability = vi.fn()
@@ -81,20 +81,20 @@ function connections(count: number, companyId: string, prefix = 'conn') {
 
 async function callRoute() {
   const { GET } = await import('../route')
-  return GET(new Request('https://example.test/api/extensions/shopify/orders/cron'))
+  return GET(new Request('https://example.test/api/extensions/woocommerce/orders/cron'))
 }
 
 beforeEach(() => {
   vi.clearAllMocks()
   verifyCronSecret.mockReturnValue(null)
-  registryGet.mockReturnValue({ id: 'shopify' })
-  isShopifyConfigured.mockReturnValue(true)
+  registryGet.mockReturnValue({ id: 'woocommerce' })
+  isWooCommerceConfigured.mockReturnValue(true)
   getCompanyIdsWithCapability.mockImplementation(
     async (_client: unknown, companyIds: string[]) => new Set(companyIds),
   )
   rpcResult.mockResolvedValue({ data: true, error: null })
   rangeResult.mockResolvedValue({ data: [CONNECTION], error: null })
-  syncShopifyOrders.mockResolvedValue(SUMMARY)
+  syncWooCommerceOrders.mockResolvedValue(SUMMARY)
   process.env.NEXT_PUBLIC_SUPABASE_URL = 'https://project.supabase.co'
   process.env.SUPABASE_SERVICE_ROLE_KEY = 'service-key'
 })
@@ -103,28 +103,27 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
-describe('GET /api/extensions/shopify/orders/cron', () => {
+describe('GET /api/extensions/woocommerce/orders/cron', () => {
   it('returns 401 when the cron secret is wrong', async () => {
     verifyCronSecret.mockReturnValue({ error: 'unauthorized' })
     const res = await callRoute()
     expect(res.status).toBe(401)
-    expect(syncShopifyOrders).not.toHaveBeenCalled()
+    expect(syncWooCommerceOrders).not.toHaveBeenCalled()
   })
 
   it('refuses with 503 when the extension is not enabled', async () => {
     registryGet.mockReturnValue(undefined)
     const res = await callRoute()
     expect(res.status).toBe(503)
-    const body = await res.json()
-    expect(body.code).toBe('EXTENSION_DISABLED')
+    expect((await res.json()).code).toBe('EXTENSION_DISABLED')
   })
 
   it('no-ops when the encryption key is not configured', async () => {
-    isShopifyConfigured.mockReturnValue(false)
+    isWooCommerceConfigured.mockReturnValue(false)
     const res = await callRoute()
     expect(res.status).toBe(200)
     expect((await res.json()).processed).toBe(0)
-    expect(syncShopifyOrders).not.toHaveBeenCalled()
+    expect(syncWooCommerceOrders).not.toHaveBeenCalled()
   })
 
   it('fails loudly when the connection query errors', async () => {
@@ -138,28 +137,26 @@ describe('GET /api/extensions/shopify/orders/cron', () => {
       data: [CONNECTION, { id: 'conn-2', company_id: 'company-2' }],
       error: null,
     })
-    const res = await callRoute()
-    expect(res.status).toBe(200)
-    const body = await res.json()
+
+    const body = await (await callRoute()).json()
+
     expect(body.processed).toBe(2)
     expect(body.imported).toBe(4)
-    expect(syncShopifyOrders).toHaveBeenCalledTimes(2)
+    expect(syncWooCommerceOrders).toHaveBeenCalledTimes(2)
     expect(getCompanyIdsWithCapability).toHaveBeenCalledTimes(1)
     expect(getCompanyIdsWithCapability.mock.calls[0][1]).toEqual([
       'company-1',
       'company-2',
     ])
-    // Runs on the service client with a shared deadline.
-    expect(syncShopifyOrders.mock.calls[0][0]).toBeTruthy()
-    expect(typeof syncShopifyOrders.mock.calls[0][3]).toBe('number')
+    expect(syncWooCommerceOrders.mock.calls[0][0]).toBeTruthy()
+    expect(typeof syncWooCommerceOrders.mock.calls[0][3]).toBe('number')
   })
 
   it('skips connections whose company is not entitled', async () => {
     getCompanyIdsWithCapability.mockResolvedValue(new Set())
-    const res = await callRoute()
-    expect(res.status).toBe(200)
-    expect((await res.json()).processed).toBe(0)
-    expect(syncShopifyOrders).not.toHaveBeenCalled()
+    const body = await (await callRoute()).json()
+    expect(body.processed).toBe(0)
+    expect(syncWooCommerceOrders).not.toHaveBeenCalled()
   })
 
   it('records a failed connection without aborting the run', async () => {
@@ -167,7 +164,7 @@ describe('GET /api/extensions/shopify/orders/cron', () => {
       data: [CONNECTION, { id: 'conn-2', company_id: 'company-2' }],
       error: null,
     })
-    syncShopifyOrders
+    syncWooCommerceOrders
       .mockRejectedValueOnce(new Error('store on fire'))
       .mockResolvedValueOnce({
         fetched: 1,
@@ -177,15 +174,18 @@ describe('GET /api/extensions/shopify/orders/cron', () => {
         skippedLocked: 0,
         errors: 0,
       })
-    const res = await callRoute()
-    expect(res.status).toBe(200)
-    const body = await res.json()
+
+    const body = await (await callRoute()).json()
+
     expect(body.processed).toBe(2)
-    expect(body.results.map((r: { status: string }) => r.status)).toEqual(['error', 'synced'])
+    expect(body.results.map((result: { status: string }) => result.status)).toEqual([
+      'error',
+      'synced',
+    ])
   })
 
   it('marks a revoked connection in the results', async () => {
-    syncShopifyOrders.mockResolvedValue({
+    syncWooCommerceOrders.mockResolvedValue({
       fetched: 0,
       refundsFetched: 0,
       imported: 0,
@@ -235,10 +235,10 @@ describe('GET /api/extensions/shopify/orders/cron', () => {
   })
 
   it.each([
-    ['scan checkpoint', 'scan_checkpoint'],
+    ['progress checkpoint', 'progress_checkpoint'],
     ['credential revocation', 'credential_revocation'],
   ])('returns non-2xx with partial evidence for a typed %s failure', async (_label, operation) => {
-    syncShopifyOrders.mockRejectedValueOnce(
+    syncWooCommerceOrders.mockRejectedValueOnce(
       new CommerceSyncPersistenceError('durable write failed', operation, SUMMARY),
     )
 
@@ -267,7 +267,7 @@ describe('GET /api/extensions/shopify/orders/cron', () => {
     const body = await (await callRoute()).json()
 
     expect(body.processed).toBe(2)
-    expect(syncShopifyOrders).toHaveBeenCalledTimes(2)
+    expect(syncWooCommerceOrders).toHaveBeenCalledTimes(2)
     expect(getCompanyIdsWithCapability).toHaveBeenCalledTimes(2)
     expect(getCompanyIdsWithCapability.mock.calls[0][1]).toEqual(['company-lapsed'])
     expect(getCompanyIdsWithCapability.mock.calls[1][1]).toEqual(['company-entitled'])
@@ -283,7 +283,7 @@ describe('GET /api/extensions/shopify/orders/cron', () => {
     const body = await (await callRoute()).json()
 
     expect(body.processed).toBe(50)
-    expect(syncShopifyOrders).toHaveBeenCalledTimes(50)
+    expect(syncWooCommerceOrders).toHaveBeenCalledTimes(50)
     expect(limit).toHaveBeenCalledTimes(1)
     expect(getCompanyIdsWithCapability).toHaveBeenCalledTimes(1)
     expect(getCompanyIdsWithCapability.mock.calls[0][1]).toEqual(['company-entitled'])
@@ -297,20 +297,20 @@ describe('GET /api/extensions/shopify/orders/cron', () => {
       order_sync_priority_at: '1970-01-01T00:00:00.000Z',
     }
     rangeResult.mockResolvedValueOnce({ data: [...failures, healthy], error: null })
-    syncShopifyOrders.mockRejectedValue(new Error('permanent provider failure'))
+    syncWooCommerceOrders.mockRejectedValue(new Error('permanent provider failure'))
 
     const first = await (await callRoute()).json()
     expect(first.processed).toBe(50)
     expect(first.results.every((result: { status: string }) => result.status === 'error')).toBe(true)
 
-    syncShopifyOrders.mockReset()
-    syncShopifyOrders.mockResolvedValue({ ...SUMMARY, imported: 1 })
+    syncWooCommerceOrders.mockReset()
+    syncWooCommerceOrders.mockResolvedValue({ ...SUMMARY, imported: 1 })
     rangeResult.mockReset()
     rangeResult.mockResolvedValueOnce({ data: [healthy], error: null })
 
     const second = await (await callRoute()).json()
     expect(second.processed).toBe(1)
-    expect(syncShopifyOrders.mock.calls[0][1].id).toBe('healthy')
+    expect(syncWooCommerceOrders.mock.calls[0][1].id).toBe('healthy')
   })
 
   it('fails loudly on a later paging error before syncing partial selections', async () => {
@@ -328,7 +328,7 @@ describe('GET /api/extensions/shopify/orders/cron', () => {
     const res = await callRoute()
 
     expect(res.status).toBeGreaterThanOrEqual(500)
-    expect(syncShopifyOrders).not.toHaveBeenCalled()
+    expect(syncWooCommerceOrders).not.toHaveBeenCalled()
   })
 
   it('fails loudly when bulk entitlement resolution errors', async () => {
@@ -337,7 +337,7 @@ describe('GET /api/extensions/shopify/orders/cron', () => {
     const res = await callRoute()
 
     expect(res.status).toBeGreaterThanOrEqual(500)
-    expect(syncShopifyOrders).not.toHaveBeenCalled()
+    expect(syncWooCommerceOrders).not.toHaveBeenCalled()
   })
 
   it('fails visibly when the first connection page consumes the selection budget', async () => {
@@ -358,7 +358,7 @@ describe('GET /api/extensions/shopify/orders/cron', () => {
       message_en: 'The time budget was reached before sync selection completed.',
     })
     expect(getCompanyIdsWithCapability).not.toHaveBeenCalled()
-    expect(syncShopifyOrders).not.toHaveBeenCalled()
+    expect(syncWooCommerceOrders).not.toHaveBeenCalled()
   })
 
   it('fails visibly when bulk entitlement resolution consumes the selection budget', async () => {
@@ -373,7 +373,7 @@ describe('GET /api/extensions/shopify/orders/cron', () => {
 
     expect(res.status).toBe(504)
     expect((await res.json()).error.code).toBe('CRON_SELECTION_TIMEOUT')
-    expect(syncShopifyOrders).not.toHaveBeenCalled()
+    expect(syncWooCommerceOrders).not.toHaveBeenCalled()
   })
 
   it('fully selects the eligible batch before any sync can mutate a cursor', async () => {
@@ -393,7 +393,7 @@ describe('GET /api/extensions/shopify/orders/cron', () => {
         return new Set(companyIds.filter(companyId => companyId === 'company-paid'))
       },
     )
-    syncShopifyOrders.mockImplementationOnce(async () => {
+    syncWooCommerceOrders.mockImplementationOnce(async () => {
       events.push('sync')
       return { imported: 0, duplicates: 0 }
     })

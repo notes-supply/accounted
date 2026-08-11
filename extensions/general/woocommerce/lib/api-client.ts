@@ -37,6 +37,8 @@ export interface WooApiClientDeps extends PinnedFetchDeps {
   sleep?: (ms: number) => Promise<void>
   requestTimeoutMs?: number
   maxResponseBytes?: number
+  /** Latest time at which a new top-level provider operation may start. */
+  startDeadlineMs?: number
 }
 
 export class WooCommerceApiError extends Error {
@@ -51,6 +53,13 @@ export class WooCommerceApiError extends Error {
   ) {
     super(message)
     this.name = 'WooCommerceApiError'
+  }
+}
+
+export class WooCommerceDeadlineError extends Error {
+  constructor() {
+    super('WooCommerce provider work-start deadline reached')
+    this.name = 'WooCommerceDeadlineError'
   }
 }
 
@@ -111,6 +120,20 @@ function sleepDefault(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+async function sleepBeforeProviderRetry(
+  sleep: (ms: number) => Promise<void>,
+  delayMs: number,
+  deadlineMs?: number,
+): Promise<void> {
+  if (deadlineMs !== undefined && Date.now() + delayMs >= deadlineMs) {
+    throw new WooCommerceDeadlineError()
+  }
+  await sleep(delayMs)
+  if (deadlineMs !== undefined && Date.now() >= deadlineMs) {
+    throw new WooCommerceDeadlineError()
+  }
+}
+
 function buildUrl(
   creds: WooCredentials,
   path: string,
@@ -127,6 +150,13 @@ async function requestOnce(
   params: Record<string, string>,
   deps: WooApiClientDeps,
 ): Promise<Extract<PinnedFetchResult, { kind: 'ok' }>> {
+  if (deps.startDeadlineMs !== undefined && Date.now() >= deps.startDeadlineMs) {
+    throw new WooCommerceDeadlineError()
+  }
+  const remainingMs = deps.startDeadlineMs === undefined
+    ? deps.requestTimeoutMs ?? REQUEST_TIMEOUT_MS
+    : deps.startDeadlineMs - Date.now()
+  if (remainingMs <= 0) throw new WooCommerceDeadlineError()
   const basic = Buffer.from(`${creds.consumerKey}:${creds.consumerSecret}`).toString('base64')
   const headers: Record<string, string> = {
     Accept: 'application/json',
@@ -137,7 +167,7 @@ async function requestOnce(
     method: 'GET',
     headers,
     body: '',
-    timeoutMs: deps.requestTimeoutMs ?? REQUEST_TIMEOUT_MS,
+    timeoutMs: Math.min(deps.requestTimeoutMs ?? REQUEST_TIMEOUT_MS, remainingMs),
     maxResponseBytes: deps.maxResponseBytes ?? MAX_RESPONSE_BYTES,
     rejectOversizeResponse: true,
   }, {
@@ -234,36 +264,42 @@ function parseError(
  * GET a wc/v3 path. Retries network failures and 429/5xx with a short backoff.
  * Authorization failures are terminal.
  */
-export async function wcGet<T>(
+async function wcGetWithMetadata<T>(
   creds: WooCredentials,
   path: string,
   params: Record<string, string> = {},
   deps: WooApiClientDeps = {},
-): Promise<T> {
+): Promise<{ data: T; headers: Record<string, string> }> {
   const sleep = deps.sleep ?? sleepDefault
   let lastError: unknown
   for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+    if (deps.startDeadlineMs !== undefined && Date.now() >= deps.startDeadlineMs) {
+      throw new WooCommerceDeadlineError()
+    }
     let response: Extract<PinnedFetchResult, { kind: 'ok' }>
     try {
       response = await requestOnce(creds, path, params, deps)
     } catch (err) {
+      if (err instanceof WooCommerceDeadlineError) throw err
       // Network/timeout errors: retry on the same backoff schedule.
       const requestError = err instanceof WooCommerceApiError
         ? err
         : new WooCommerceApiError('WooCommerce request failed', 0)
       lastError = requestError
       if (requestError.retryable && attempt < RETRY_DELAYS_MS.length) {
-        await sleep(RETRY_DELAYS_MS[attempt])
+        await sleepBeforeProviderRetry(sleep, RETRY_DELAYS_MS[attempt], deps.startDeadlineMs)
         continue
       }
       throw requestError
     }
 
-    if (response.status >= 200 && response.status < 300) return parseJson<T>(response)
+    if (response.status >= 200 && response.status < 300) {
+      return { data: parseJson<T>(response), headers: response.headers }
+    }
 
     if (RETRYABLE_STATUS.has(response.status) && attempt < RETRY_DELAYS_MS.length) {
       lastError = parseError(response, creds)
-      await sleep(RETRY_DELAYS_MS[attempt])
+      await sleepBeforeProviderRetry(sleep, RETRY_DELAYS_MS[attempt], deps.startDeadlineMs)
       continue
     }
     throw parseError(response, creds)
@@ -273,10 +309,67 @@ export async function wcGet<T>(
     : new WooCommerceApiError('WooCommerce request failed', 0)
 }
 
+export async function wcGet<T>(
+  creds: WooCredentials,
+  path: string,
+  params: Record<string, string> = {},
+  deps: WooApiClientDeps = {},
+): Promise<T> {
+  return (await wcGetWithMetadata<T>(creds, path, params, deps)).data
+}
+
 export interface ListOrdersOptions {
   /** ISO timestamp; interpreted as UTC (dates_are_gmt is always sent). */
   modifiedAfter: string
+  /** Optional strict upper bound for an exact modified-at cohort. */
+  modifiedBefore?: string
+  /** Exact cohorts use stable ID ordering; moving windows use modified time. */
+  orderBy?: 'modified' | 'id'
   page: number
+}
+
+export interface WooCollectionPage<T> {
+  items: T[]
+  total: number
+  totalPages: number
+  page: number
+}
+
+function validateCollectionMetadata(
+  itemsLength: number,
+  total: number,
+  totalPages: number,
+  page: number,
+): void {
+  const empty = total === 0
+  if (
+    (empty && (totalPages !== 0 || itemsLength !== 0))
+    || (!empty && (totalPages < 1 || totalPages > total))
+    || itemsLength > total
+    || (!empty && page > totalPages)
+  ) {
+    throw new WooCommerceApiError(
+      'WooCommerce response returned inconsistent collection metadata',
+      0,
+      null,
+      false,
+    )
+  }
+}
+
+function requiredCollectionCount(
+  headers: Record<string, string>,
+  name: 'x-wp-total' | 'x-wp-totalpages',
+): number {
+  const raw = headers[name]
+  if (raw === undefined || !/^\d+$/.test(raw)) {
+    throw new WooCommerceApiError(`WooCommerce response omitted valid ${name}`, 0, null, false)
+  }
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new WooCommerceApiError(`WooCommerce response returned invalid ${name}`, 0, null, false)
+  }
+  return value
 }
 
 /**
@@ -289,16 +382,27 @@ export async function listOrdersPage(
   creds: WooCredentials,
   options: ListOrdersOptions,
   deps: WooApiClientDeps = {},
-): Promise<WooOrder[]> {
-  return wcGet<WooOrder[]>(creds, '/orders', {
+): Promise<WooCollectionPage<WooOrder>> {
+  const params: Record<string, string> = {
     modified_after: options.modifiedAfter,
     dates_are_gmt: 'true',
     status: 'any',
-    orderby: 'modified',
+    orderby: options.orderBy ?? 'modified',
     order: 'asc',
     per_page: String(WC_PAGE_SIZE),
     page: String(options.page),
-  }, deps)
+  }
+  if (options.modifiedBefore) params.modified_before = options.modifiedBefore
+  const response = await wcGetWithMetadata<WooOrder[]>(creds, '/orders', params, deps)
+  const total = requiredCollectionCount(response.headers, 'x-wp-total')
+  const totalPages = requiredCollectionCount(response.headers, 'x-wp-totalpages')
+  validateCollectionMetadata(response.data.length, total, totalPages, options.page)
+  return {
+    items: response.data,
+    total,
+    totalPages,
+    page: options.page,
+  }
 }
 
 /** Hard cap on refund pages per order; a real order never approaches this. */
@@ -317,16 +421,59 @@ export async function listOrderRefunds(
 ): Promise<WooRefund[]> {
   const refunds: WooRefund[] = []
   const seen = new Set<number>()
+  let expectedTotal: number | null = null
+  let expectedPages: number | null = null
+  let previousId: number | null = null
   for (let page = 1; page <= MAX_REFUND_PAGES; page++) {
-    const batch = await wcGet<WooRefund[]>(creds, `/orders/${orderId}/refunds`, {
+    if (deps.startDeadlineMs !== undefined && Date.now() >= deps.startDeadlineMs) {
+      throw new WooCommerceDeadlineError()
+    }
+    const response = await wcGetWithMetadata<WooRefund[]>(creds, `/orders/${orderId}/refunds`, {
       per_page: String(WC_PAGE_SIZE),
       page: String(page),
+      orderby: 'id',
+      order: 'asc',
     }, deps)
-    if (batch.length === 0) return refunds
-    const fresh = batch.filter((r) => !seen.has(r.id))
-    if (fresh.length === 0) return refunds
-    for (const refund of fresh) seen.add(refund.id)
-    refunds.push(...fresh)
+    const total = requiredCollectionCount(response.headers, 'x-wp-total')
+    const totalPages = requiredCollectionCount(response.headers, 'x-wp-totalpages')
+    validateCollectionMetadata(response.data.length, total, totalPages, page)
+    if (expectedTotal === null) {
+      expectedTotal = total
+      expectedPages = totalPages
+      if (expectedPages > MAX_REFUND_PAGES) {
+        throw new WooCommerceApiError(`Refund pagination cap exceeded for order ${orderId}`, 0)
+      }
+      if (expectedTotal === 0 && expectedPages === 0 && response.data.length === 0) {
+        return []
+      }
+    } else if (total !== expectedTotal || totalPages !== expectedPages) {
+      throw new WooCommerceApiError(
+        `Refund collection changed during pagination for order ${orderId}`,
+        0,
+        null,
+        false,
+      )
+    }
+    if (page > (expectedPages ?? 0)) {
+      throw new WooCommerceApiError(`Refund pagination exceeded advertised pages for order ${orderId}`, 0)
+    }
+    for (const refund of response.data) {
+      if (seen.has(refund.id) || (previousId !== null && refund.id <= previousId)) {
+        throw new WooCommerceApiError(`Refund page repeated or was not ID-monotonic for order ${orderId}`, 0)
+      }
+      seen.add(refund.id)
+      previousId = refund.id
+      refunds.push(refund)
+    }
+    if (page === expectedPages) {
+      if (refunds.length !== expectedTotal) {
+        throw new WooCommerceApiError(`Refund pagination total mismatch for order ${orderId}`, 0)
+      }
+      return refunds
+    }
+    if (response.data.length === 0) {
+      throw new WooCommerceApiError(`Refund pagination ended before advertised total for order ${orderId}`, 0)
+    }
   }
   // Cap exhausted with data still flowing: returning the partial list would
   // let the sync advance its cursor past refunds it never saw. Throwing

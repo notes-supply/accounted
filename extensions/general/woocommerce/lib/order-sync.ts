@@ -3,14 +3,26 @@ import { ingestTransactions } from '@/lib/transactions/ingest'
 import { ensureManualCashAccount } from '@/lib/cash-accounts/service'
 import { syncMappedAccounts } from '@/lib/import/account-sync'
 import { createLogger, type Logger } from '@/lib/logger'
+import {
+  CommerceSyncPersistenceError,
+  CommerceSyncProviderError,
+} from '@/lib/commerce/order-sync-errors'
 import type { RawTransaction } from '@/types'
 import {
   listOrdersPage,
   listOrderRefunds,
   isRevokedCredentialsError,
-  WC_PAGE_SIZE,
+  WooCommerceDeadlineError,
   type WooCredentials,
+  type WooCollectionPage,
 } from './api-client'
+import {
+  awaitCommerceOperation,
+  awaitDurableCommerceOperation,
+  canonicalInstant,
+  deadlineReached,
+  sameInstant,
+} from '@/lib/commerce/order-sync-runtime'
 import { credentialsOf } from './connect'
 import type { WooCommerceConnection, WooOrder, WooRefund } from '../types'
 
@@ -42,20 +54,22 @@ const defaultLog = createLogger('woocommerce/order-sync')
  * rows whenever an already-fetched order is modified mid-run (it re-sorts to
  * the end and shifts every later row one index down); with a moving cursor a
  * mid-run modification simply re-surfaces the order later in the same run.
- * The one case that still needs offsets is a run of >WC_PAGE_SIZE orders
- * sharing the same date_modified second (bulk edits, migrations): those are
- * paged through with an increasing page number at a FIXED cursor, because
- * modified_after is strictly exclusive and advancing it would skip the rest
- * of the tie. Ties that span a page boundary after cursor advancement are
- * picked up by the next run's overlap re-poll.
+ * A page tail can contain only a prefix of one date_modified second because
+ * modified_after is strictly exclusive. Every tail therefore becomes an
+ * exact-second, ID-ordered cohort. Durable completion markers and repeated
+ * page-one-to-empty passes allow offset progress to survive caps and
+ * deadlines; the cursor crosses the second only after one full pass finds no
+ * unseen provider ID. Provider row movement can cause replay, never a skip.
  *
  * Cursor: woocommerce_connections.last_order_synced_at, re-polled with a 24h
- * overlap. It never advances past failed work: a page with refund-fetch
- * failures, ingest errors, or deadline-skipped refunds caps the persisted
- * cursor just below the earliest affected order's date_modified, so the next
- * run re-lists exactly the orders whose rows are incomplete (re-seen complete
- * rows collide on (company_id, external_id) and are skipped). First run
- * fetches BACKFILL_DAYS back.
+ * overlap. Each complete page advances to its last date_modified, and a
+ * successfully exhausted window advances to the run start as a scanned-through
+ * watermark so quiet stores rotate behind older cursors. It never advances
+ * past failed work: a page with refund-fetch failures, ingest errors, or
+ * deadline-skipped refunds caps the persisted cursor just below the earliest
+ * affected order's date_modified, so the next run re-lists exactly the orders
+ * whose rows are incomplete (re-seen complete rows collide on (company_id,
+ * external_id) and are skipped). First run fetches BACKFILL_DAYS back.
  *
  * Lock-date guard: modified_after selects on date_modified, but rows are
  * dated by date_paid / refund date_created, which can be arbitrarily older
@@ -217,12 +231,21 @@ export function mapRefund(
 async function fetchLockThrough(
   supabase: SupabaseClient,
   companyId: string,
+  deadlineMs?: number,
 ): Promise<string | null> {
-  const { data: settings } = await supabase
+  const query = supabase
     .from('company_settings')
     .select('bookkeeping_locked_through')
     .eq('company_id', companyId)
     .maybeSingle()
+  const { data: settings, error } = await awaitCommerceOperation(
+    query,
+    deadlineMs,
+    'fetch WooCommerce bookkeeping lock',
+  )
+  if (error) {
+    throw new Error(`Failed to fetch company lock date: ${error.message}`)
+  }
   return (
     (settings as { bookkeeping_locked_through?: string | null } | null)
       ?.bookkeeping_locked_through ?? null
@@ -241,12 +264,271 @@ export function rowBehindLock(rowDate: string, lockThrough: string | null): bool
  * rows are dated by date_paid, so the real guard is rowBehindLock at map
  * time, applied on every run.)
  */
-function resolveWindowStartIso(connection: WooCommerceConnection): string {
-  if (connection.last_order_synced_at) {
+function resolveWindowStartIso(
+  connection: WooCommerceConnection,
+  runStartMs: number,
+): string {
+  if (
+    connection.last_order_synced_at &&
+    Date.parse(connection.last_order_synced_at) <= runStartMs
+  ) {
     const cursorMs = Date.parse(connection.last_order_synced_at)
     return new Date(Math.max(0, cursorMs - CURSOR_OVERLAP_MS)).toISOString()
   }
-  return new Date(Date.now() - BACKFILL_DAYS * 86_400_000).toISOString()
+  return new Date(runStartMs - BACKFILL_DAYS * 86_400_000).toISOString()
+}
+
+function secondBefore(iso: string): string {
+  return new Date(Date.parse(iso) - 1000).toISOString()
+}
+
+function secondAfter(iso: string): string {
+  return new Date(Date.parse(iso) + 1000).toISOString()
+}
+
+async function persistConnectionProgress(
+  supabase: SupabaseClient,
+  connection: WooCommerceConnection,
+  values: Record<string, unknown>,
+  summary: WooCommerceSyncSummary,
+  deadlineMs?: number,
+): Promise<void> {
+  const query = supabase
+    .from('woocommerce_connections')
+    .update(values)
+    .eq('id', connection.id)
+    .eq('status', 'active')
+    .eq('order_sync_claim_token', requireClaimToken(connection))
+    .gt('order_sync_claimed_until', new Date().toISOString())
+    .select('id')
+    .maybeSingle()
+  const { data, error } = await awaitDurableCommerceOperation(
+    query,
+    deadlineMs,
+    'persist WooCommerce progress',
+    'progress_checkpoint',
+    summary,
+  )
+  if (error) {
+    throw new CommerceSyncPersistenceError(
+      `Failed to persist WooCommerce order progress: ${error.message}`,
+      'progress_checkpoint',
+      summary,
+    )
+  }
+  if (!data) {
+    throw new CommerceSyncPersistenceError(
+      `Failed to persist WooCommerce order progress for ${connection.id}`,
+      'progress_checkpoint',
+      summary,
+    )
+  }
+}
+
+function requireClaimToken(connection: WooCommerceConnection): string {
+  if (!connection.order_sync_claim_token) {
+    throw new CommerceSyncPersistenceError(
+      'WooCommerce sync has no exact claim token',
+      'lease_validation',
+    )
+  }
+  return connection.order_sync_claim_token
+}
+
+async function validateActiveLease(
+  supabase: SupabaseClient,
+  connection: WooCommerceConnection,
+  summary: WooCommerceSyncSummary,
+  deadlineMs?: number,
+): Promise<void> {
+  const query = supabase
+    .from('woocommerce_connections')
+    .select('id')
+    .eq('id', connection.id)
+    .eq('status', 'active')
+    .eq('order_sync_claim_token', requireClaimToken(connection))
+    .gt('order_sync_claimed_until', new Date().toISOString())
+    .maybeSingle()
+  const { data, error } = await awaitCommerceOperation(
+    query,
+    deadlineMs,
+    'validate WooCommerce sync lease',
+  )
+  if (error || !data) {
+    throw new CommerceSyncPersistenceError(
+      `WooCommerce sync lease is no longer active${error ? `: ${error.message}` : ''}`,
+      'lease_validation',
+      summary,
+    )
+  }
+}
+
+async function fetchSeenOrderIds(
+  supabase: SupabaseClient,
+  connectionId: string,
+  modifiedAt: string,
+  orderIds: number[],
+  summary: WooCommerceSyncSummary,
+  deadlineMs?: number,
+): Promise<Set<number>> {
+  if (orderIds.length === 0) return new Set()
+  const query = supabase
+    .from('woocommerce_order_sync_seen')
+    .select('order_id')
+    .eq('connection_id', connectionId)
+    .eq('modified_at', modifiedAt)
+    .in('order_id', orderIds)
+  const { data, error } = await awaitCommerceOperation(
+    query,
+    deadlineMs,
+    'read WooCommerce cohort markers',
+  )
+  if (error) {
+    throw new CommerceSyncPersistenceError(
+      `Failed to read WooCommerce cohort progress: ${error.message}`,
+      'cohort_read',
+      summary,
+    )
+  }
+  return new Set((data ?? []).map(row => Number((row as { order_id: number }).order_id)))
+}
+
+async function startSeenCohort(
+  supabase: SupabaseClient,
+  connection: WooCommerceConnection,
+  modifiedAt: string,
+  scanModifiedAfter: string,
+  orderIds: number[],
+  cursorIso: string | null,
+  summary: WooCommerceSyncSummary,
+  deadlineMs?: number,
+): Promise<void> {
+  const query = supabase.rpc('start_woocommerce_order_sync_cohort', {
+    p_connection_id: connection.id,
+    p_claim_token: requireClaimToken(connection),
+    p_scan_modified_after: scanModifiedAfter,
+    p_modified_at: modifiedAt,
+    p_order_ids: orderIds,
+    p_last_order_synced_at: cursorIso,
+  })
+  const { data, error } = await awaitDurableCommerceOperation(
+    query,
+    deadlineMs,
+    'start WooCommerce cohort',
+    'cohort_start',
+    summary,
+  )
+  if (error || data !== true) {
+    throw new CommerceSyncPersistenceError(
+      `Failed to start WooCommerce cohort${error ? `: ${error.message}` : ': exact active lease was not matched'}`,
+      'cohort_start',
+      summary,
+    )
+  }
+}
+
+async function checkpointSeenCohort(
+  supabase: SupabaseClient,
+  connection: WooCommerceConnection,
+  state: {
+    scanModifiedAfter: string
+    modifiedAt: string
+    page: number
+    passFoundNew: boolean
+    expectedTotal: number | null
+    expectedPages: number | null
+    passSeenCount: number
+    passLastOrderId: number | null
+  },
+  completedOrderIds: number[],
+  summary: WooCommerceSyncSummary,
+  deadlineMs?: number,
+): Promise<void> {
+  const query = supabase.rpc('checkpoint_woocommerce_order_sync', {
+    p_connection_id: connection.id,
+    p_claim_token: requireClaimToken(connection),
+    p_scan_modified_after: state.scanModifiedAfter,
+    p_modified_at: state.modifiedAt,
+    p_page: state.page,
+    p_pass_found_new: state.passFoundNew,
+    p_expected_total: state.expectedTotal,
+    p_expected_pages: state.expectedPages,
+    p_pass_seen_count: state.passSeenCount,
+    p_pass_last_order_id: state.passLastOrderId,
+    p_completed_order_ids: completedOrderIds,
+  })
+  const { data, error } = await awaitDurableCommerceOperation(
+    query,
+    deadlineMs,
+    'checkpoint WooCommerce cohort',
+    'cohort_checkpoint',
+    summary,
+  )
+  if (error || data !== true) {
+    throw new CommerceSyncPersistenceError(
+      `Failed to checkpoint WooCommerce cohort${error ? `: ${error.message}` : ': exact active lease and cohort were not matched'}`,
+      'cohort_checkpoint',
+      summary,
+    )
+  }
+}
+
+async function completeWooScan(
+  supabase: SupabaseClient,
+  connection: WooCommerceConnection,
+  watermark: string,
+  summary: WooCommerceSyncSummary,
+  deadlineMs?: number,
+): Promise<void> {
+  const query = supabase.rpc('complete_woocommerce_order_sync', {
+    p_connection_id: connection.id,
+    p_claim_token: requireClaimToken(connection),
+    p_last_order_synced_at: watermark,
+  })
+  const { data, error } = await awaitDurableCommerceOperation(
+    query,
+    deadlineMs,
+    'complete WooCommerce scan',
+    'scan_completion',
+    summary,
+  )
+  if (error || data !== true) {
+    throw new CommerceSyncPersistenceError(
+      `Failed to complete WooCommerce scan${error ? `: ${error.message}` : ': exact active lease was not matched'}`,
+      'scan_completion',
+      summary,
+    )
+  }
+}
+
+async function completeSeenCohort(
+  supabase: SupabaseClient,
+  connection: WooCommerceConnection,
+  modifiedAt: string,
+  cursorIso: string | null,
+  summary: WooCommerceSyncSummary,
+  deadlineMs?: number,
+): Promise<void> {
+  const query = supabase.rpc('complete_woocommerce_order_sync_cohort', {
+    p_connection_id: connection.id,
+    p_claim_token: requireClaimToken(connection),
+    p_modified_at: modifiedAt,
+    p_last_order_synced_at: cursorIso,
+  })
+  const { data, error } = await awaitDurableCommerceOperation(
+    query,
+    deadlineMs,
+    'complete WooCommerce cohort',
+    'cohort_completion',
+    summary,
+  )
+  if (error || data !== true) {
+    throw new CommerceSyncPersistenceError(
+      `Failed to complete WooCommerce cohort${error ? `: ${error.message}` : ': exact active lease and cohort were not matched'}`,
+      'cohort_completion',
+      summary,
+    )
+  }
 }
 
 /**
@@ -267,6 +549,8 @@ async function ensureStoreAccount(
   fallbackCurrency: string | undefined,
   firstRun: boolean,
   log: Logger,
+  summary: WooCommerceSyncSummary,
+  deadlineMs?: number,
 ): Promise<void> {
   const currency =
     connection.currency?.toUpperCase() || fallbackCurrency?.toUpperCase() || 'SEK'
@@ -282,13 +566,16 @@ async function ensureStoreAccount(
     // Typically a currency conflict with an existing 1680 cash account. Made
     // visible on the connection: without this the panel shows a healthy
     // "Ansluten" store that silently never syncs.
-    await supabase
-      .from('woocommerce_connections')
-      .update({
+    await persistConnectionProgress(
+      supabase,
+      connection,
+      {
         error_message:
           'Kassakontot för butiken (1680) kunde inte skapas. Kontrollera att befintligt konto 1680 har samma valuta som butiken.',
-      })
-      .eq('id', connection.id)
+      },
+      summary,
+      deadlineMs,
+    )
     throw accountError
   }
   if (firstRun) {
@@ -329,6 +616,8 @@ interface PageRowsOutcome {
    * past these: the next run has to re-list them.
    */
   incompleteModifiedMs: number[]
+  incompleteOrderIds: number[]
+  malformedOrderIds: number[]
   hitDeadline: boolean
 }
 
@@ -342,7 +631,13 @@ async function buildPageRows(
   log: Logger,
   deadlineMs?: number,
 ): Promise<PageRowsOutcome> {
-  const outcome: PageRowsOutcome = { rows: [], incompleteModifiedMs: [], hitDeadline: false }
+  const outcome: PageRowsOutcome = {
+    rows: [],
+    incompleteModifiedMs: [],
+    incompleteOrderIds: [],
+    malformedOrderIds: [],
+    hitDeadline: false,
+  }
 
   const push = (mapped: RawTransaction[]) => {
     for (const row of mapped) {
@@ -365,6 +660,9 @@ async function buildPageRows(
         orderId: order.id,
         total: order.total,
       })
+      outcome.incompleteModifiedMs.push(gmtToMs(order.date_modified_gmt))
+      outcome.incompleteOrderIds.push(order.id)
+      outcome.malformedOrderIds.push(order.id)
     }
     push(mapOrder(storeScope, order))
     // Refunds only exist for qualifying (paid) orders: a refund row without
@@ -377,11 +675,14 @@ async function buildPageRows(
     if (outcome.hitDeadline || (deadlineMs !== undefined && Date.now() >= deadlineMs)) {
       outcome.hitDeadline = true
       outcome.incompleteModifiedMs.push(gmtToMs(order.date_modified_gmt))
+      outcome.incompleteOrderIds.push(order.id)
       continue
     }
 
     try {
-      const refunds = await listOrderRefunds(creds, order.id)
+      const refunds = await listOrderRefunds(creds, order.id, {
+        startDeadlineMs: deadlineMs,
+      })
       summary.refundsFetched += refunds.length
       for (const refund of refunds) {
         if (parseAmount(refund.amount) === null) {
@@ -391,14 +692,25 @@ async function buildPageRows(
             refundId: refund.id,
             amount: refund.amount,
           })
+          outcome.incompleteModifiedMs.push(gmtToMs(order.date_modified_gmt))
+          outcome.incompleteOrderIds.push(order.id)
+          outcome.malformedOrderIds.push(order.id)
         }
         push(mapRefund(storeScope, order, refund))
       }
     } catch (refundError) {
+      if (isRevokedCredentialsError(refundError)) throw refundError
+      if (refundError instanceof WooCommerceDeadlineError) {
+        outcome.hitDeadline = true
+        outcome.incompleteModifiedMs.push(gmtToMs(order.date_modified_gmt))
+        outcome.incompleteOrderIds.push(order.id)
+        continue
+      }
       // The order row still imports; the cursor is capped below this order's
       // date_modified so the next run re-lists it and retries the refunds.
       summary.errors += 1
       outcome.incompleteModifiedMs.push(gmtToMs(order.date_modified_gmt))
+      outcome.incompleteOrderIds.push(order.id)
       log.warn('refund fetch failed; order held for retry next run', {
         orderId: order.id,
         message: refundError instanceof Error ? refundError.message : String(refundError),
@@ -436,24 +748,53 @@ export async function syncWooCommerceOrders(
     return summary
   }
 
+  if (deadlineReached(deadlineMs)) {
+    summary.deadlineReached = true
+    return summary
+  }
+
+  const runStartMs = Date.now()
+  const claimToken = requireClaimToken(connection)
   const creds = credentialsOf(connection)
   const storeScope = wooStoreScope(connection.store_url)
   const firstRun = !connection.last_order_synced_at
-  const lockThrough = await fetchLockThrough(supabase, connection.company_id)
+  const lockThrough = await fetchLockThrough(supabase, connection.company_id, deadlineMs)
 
-  let modifiedAfter = resolveWindowStartIso(connection)
-  // Offset page within a same-timestamp tie only; 1 whenever the cursor moves.
-  let tiePage = 1
-  let prevCursorMs = connection.last_order_synced_at
-    ? Date.parse(connection.last_order_synced_at)
+  const storedCursorMs = connection.last_order_synced_at
+    ? Date.parse(canonicalInstant(connection.last_order_synced_at, 'WooCommerce cursor'))
     : 0
+  const recoveringFutureCursor = storedCursorMs > runStartMs
+  let modifiedAfter = connection.order_sync_scan_modified_after
+    ? canonicalInstant(connection.order_sync_scan_modified_after, 'WooCommerce scan lower bound')
+    : resolveWindowStartIso(connection, runStartMs)
+  let prevCursorMs = recoveringFutureCursor ? 0 : storedCursorMs
+  let cohortModifiedAt = connection.order_sync_cohort_modified_at
+    ? canonicalInstant(connection.order_sync_cohort_modified_at, 'WooCommerce cohort')
+    : null
+  let cohortPage = connection.order_sync_cohort_page ?? 1
+  let cohortPassFoundNew = connection.order_sync_cohort_pass_found_new ?? false
+  let cohortExpectedTotal = connection.order_sync_cohort_expected_total ?? null
+  let cohortExpectedPages = connection.order_sync_cohort_expected_pages ?? null
+  let cohortPassSeenCount = connection.order_sync_cohort_pass_seen_count ?? 0
+  let cohortPassLastOrderId = connection.order_sync_cohort_pass_last_order_id ?? null
   // Earliest incomplete work this run; the persisted cursor never passes it.
   let failureFloorMs = Number.POSITIVE_INFINITY
+  // True only after a successful empty response proves the list is exhausted.
+  let windowExhausted = false
   let accountEnsured = false
 
   try {
+    if (!connection.order_sync_scan_modified_after) {
+      await persistConnectionProgress(
+        supabase,
+        connection,
+        { order_sync_scan_modified_after: modifiedAfter },
+        summary,
+        deadlineMs,
+      )
+    }
     for (;;) {
-      if (deadlineMs !== undefined && Date.now() >= deadlineMs) {
+      if (deadlineReached(deadlineMs)) {
         summary.deadlineReached = true
         log.info('time budget exhausted; stopping order sync', {
           connectionId: connection.id,
@@ -462,25 +803,182 @@ export async function syncWooCommerceOrders(
         break
       }
 
-      const orders = await listOrdersPage(creds, { modifiedAfter, page: tiePage })
-      // Termination is an EMPTY page, not a short one: hosts and security
-      // plugins may cap per_page below our request, and treating a short page
-      // as the end would strand the cursor at the first page forever.
-      if (orders.length === 0) break
+      const inCohort = cohortModifiedAt !== null
+      const collection: WooCollectionPage<WooOrder> = await listOrdersPage(
+        creds,
+        inCohort
+          ? {
+              modifiedAfter: secondBefore(cohortModifiedAt!),
+              modifiedBefore: secondAfter(cohortModifiedAt!),
+              orderBy: 'id',
+              page: cohortPage,
+            }
+          : { modifiedAfter, orderBy: 'modified', page: 1 },
+        { startDeadlineMs: deadlineMs },
+      )
+      if (deadlineReached(deadlineMs)) {
+        summary.deadlineReached = true
+        break
+      }
+      const orders = collection.items
+      if (collection.total === 0) {
+        if (collection.totalPages !== 0 || orders.length !== 0) {
+          throw new Error('WooCommerce returned inconsistent empty collection metadata')
+        }
+        if (inCohort) {
+          if (cohortExpectedTotal !== null && cohortExpectedTotal !== 0) {
+            cohortPage = 1
+            cohortPassFoundNew = false
+            cohortExpectedTotal = null
+            cohortExpectedPages = null
+            cohortPassSeenCount = 0
+            cohortPassLastOrderId = null
+            await checkpointSeenCohort(
+              supabase,
+              connection,
+              {
+                scanModifiedAfter: modifiedAfter,
+                modifiedAt: cohortModifiedAt!,
+                page: 1,
+                passFoundNew: false,
+                expectedTotal: null,
+                expectedPages: null,
+                passSeenCount: 0,
+                passLastOrderId: null,
+              },
+              [],
+              summary,
+              deadlineMs,
+            )
+            continue
+          }
+          const completedCohortMs = Date.parse(cohortModifiedAt!)
+          const candidateMs = Math.min(completedCohortMs, failureFloorMs)
+          const completedCursorIso = candidateMs > prevCursorMs
+            ? new Date(candidateMs).toISOString()
+            : null
+          await completeSeenCohort(
+            supabase,
+            connection,
+            cohortModifiedAt!,
+            completedCursorIso,
+            summary,
+            deadlineMs,
+          )
+          if (candidateMs > prevCursorMs) {
+            connection.last_order_synced_at = new Date(candidateMs).toISOString()
+            prevCursorMs = candidateMs
+          }
+          modifiedAfter = cohortModifiedAt!
+          cohortModifiedAt = null
+          cohortPage = 1
+          cohortPassFoundNew = false
+          cohortExpectedTotal = null
+          cohortExpectedPages = null
+          cohortPassSeenCount = 0
+          cohortPassLastOrderId = null
+          continue
+        }
+        windowExhausted = true
+        break
+      }
+      if (collection.totalPages < 1 || collection.page > collection.totalPages) {
+        throw new Error('WooCommerce returned invalid collection pagination metadata')
+      }
       summary.fetched += orders.length
 
-      // Deferred until the window is known non-empty so a quiet store costs
-      // one API call and zero DB writes; also gives us a real order currency
-      // as the fallback for stores whose settings are unreadable.
-      if (!accountEnsured) {
-        await ensureStoreAccount(supabase, connection, orders[0].currency, firstRun, log)
+      const cohortOrders = orders
+      if (inCohort) {
+        if (collection.total > 100_000) {
+          throw new Error('WooCommerce cohort exceeds the 100000 marker bound')
+        }
+        if (cohortExpectedTotal === null) {
+          cohortExpectedTotal = collection.total
+          cohortExpectedPages = collection.totalPages
+        } else if (
+          collection.total !== cohortExpectedTotal
+          || collection.totalPages !== cohortExpectedPages
+        ) {
+          cohortPage = 1
+          cohortPassFoundNew = false
+          cohortExpectedTotal = null
+          cohortExpectedPages = null
+          cohortPassSeenCount = 0
+          cohortPassLastOrderId = null
+          await checkpointSeenCohort(
+            supabase,
+            connection,
+            {
+              scanModifiedAfter: modifiedAfter,
+              modifiedAt: cohortModifiedAt!,
+              page: cohortPage,
+              passFoundNew: false,
+              expectedTotal: null,
+              expectedPages: null,
+              passSeenCount: 0,
+              passLastOrderId: null,
+            },
+            [],
+            summary,
+            deadlineMs,
+          )
+          continue
+        }
+        if (cohortPage !== collection.page || cohortExpectedPages === null) {
+          throw new Error('WooCommerce ignored the requested cohort page')
+        }
+        if (orders.length === 0) {
+          throw new Error('WooCommerce ended a cohort before its advertised final page')
+        }
+        for (const order of orders) {
+          if (!sameInstant(gmtToIso(order.date_modified_gmt), cohortModifiedAt!)) {
+            throw new Error('WooCommerce exact-cohort query returned a different modified time')
+          }
+          if (cohortPassLastOrderId !== null && order.id <= cohortPassLastOrderId) {
+            throw new Error('WooCommerce cohort page repeated or was not ID-monotonic')
+          }
+          cohortPassLastOrderId = order.id
+        }
+      }
+      const seenOrderIds = inCohort
+        ? await fetchSeenOrderIds(
+            supabase,
+            connection.id,
+            cohortModifiedAt!,
+            cohortOrders.map(order => order.id),
+            summary,
+            deadlineMs,
+          )
+        : new Set<number>()
+      const workOrders = cohortOrders.filter(order => !seenOrderIds.has(order.id))
+
+      // Deferred until the window is known non-empty so a quiet store creates
+      // no cash-account or chart state; successful exhaustion only updates its
+      // cursor. The first order also provides a real currency fallback when
+      // store settings were unreadable.
+      if (!accountEnsured && workOrders.length > 0) {
+        await awaitDurableCommerceOperation(
+          ensureStoreAccount(
+            supabase,
+            connection,
+            workOrders[0].currency,
+            firstRun,
+            log,
+            summary,
+            deadlineMs,
+          ),
+          deadlineMs,
+          'ensure WooCommerce store account',
+          'store_account_setup',
+          summary,
+        )
         accountEnsured = true
       }
 
       const page = await buildPageRows(
         creds,
         storeScope,
-        orders,
+        workOrders,
         lockThrough,
         summary,
         log,
@@ -488,25 +986,36 @@ export async function syncWooCommerceOrders(
       )
       if (page.hitDeadline) summary.deadlineReached = true
 
-      const firstMs = gmtToMs(orders[0].date_modified_gmt)
+      const firstMs = workOrders.length > 0
+        ? gmtToMs(workOrders[0].date_modified_gmt)
+        : Number.POSITIVE_INFINITY
       const lastMs = gmtToMs(orders[orders.length - 1].date_modified_gmt)
+      let ingestHadErrors = false
 
       if (page.rows.length > 0) {
         // Auto-categorization is skipped on purpose: booking WooCommerce
         // money is a human decision in the inbox (feed-only doctrine, same
         // as the Stripe feed). Invoice matching still runs (suggestions
         // only), and FX enrichment covers non-SEK stores.
-        const result = await ingestTransactions(
-          supabase,
-          connection.company_id,
-          connection.user_id,
-          page.rows,
-          { settlementAccount: WOOCOMMERCE_LEDGER_ACCOUNT, skipAutoCategorization: true },
+        await validateActiveLease(supabase, connection, summary, deadlineMs)
+        const result = await awaitDurableCommerceOperation(
+          ingestTransactions(
+            supabase,
+            connection.company_id,
+            connection.user_id,
+            page.rows,
+            { settlementAccount: WOOCOMMERCE_LEDGER_ACCOUNT, skipAutoCategorization: true },
+          ),
+          deadlineMs,
+          'ingest WooCommerce transactions',
+          'transaction_ingest',
+          summary,
         )
         summary.imported += result.imported
         summary.duplicates += result.duplicates
         summary.errors += result.errors
         if (result.errors > 0) {
+          ingestHadErrors = true
           // Failed inserts are dropped inside ingest; hold the cursor below
           // this page so the next run re-lists and retries it rather than
           // turning a transient DB error into permanently missing rows.
@@ -517,33 +1026,186 @@ export async function syncWooCommerceOrders(
         failureFloorMs = Math.min(failureFloorMs, ms - 1000)
       }
 
-      // Persist the cursor after each page: monotonic (never regresses below
-      // the pre-run cursor) and capped by the failure floor. error_message is
-      // cleared on progress so a resolved incident stops showing in the panel.
-      const candidateMs = Math.min(lastMs, failureFloorMs)
-      if (candidateMs > prevCursorMs) {
-        const cursorIso = new Date(candidateMs).toISOString()
-        await supabase
-          .from('woocommerce_connections')
-          .update({ last_order_synced_at: cursorIso, error_message: null })
-          .eq('id', connection.id)
-        connection.last_order_synced_at = cursorIso
-        prevCursorMs = candidateMs
+      const incompleteOrderIds = new Set(page.incompleteOrderIds)
+      const completedOrderIds = ingestHadErrors
+        ? []
+        : workOrders
+            .filter(order => !incompleteOrderIds.has(order.id))
+            .map(order => order.id)
+
+      if (inCohort) {
+        cohortPassFoundNew = cohortPassFoundNew || workOrders.length > 0
+        cohortPassSeenCount += cohortOrders.length
+        const incomplete = ingestHadErrors || incompleteOrderIds.size > 0
+        const malformed = page.malformedOrderIds.length > 0
+        if (incomplete) {
+          await checkpointSeenCohort(
+            supabase,
+            connection,
+            {
+              scanModifiedAfter: modifiedAfter,
+              modifiedAt: cohortModifiedAt!,
+              page: 1,
+              passFoundNew: false,
+              expectedTotal: null,
+              expectedPages: null,
+              passSeenCount: 0,
+              passLastOrderId: null,
+            },
+            completedOrderIds,
+            summary,
+            deadlineMs,
+          )
+          if (malformed) {
+            throw new CommerceSyncProviderError(
+              'WooCommerce order or refund amount was malformed and remains pending',
+              summary,
+            )
+          }
+          break
+        }
+
+        const finalPage = cohortPage === cohortExpectedPages
+        if (finalPage && cohortPassSeenCount !== cohortExpectedTotal) {
+          throw new Error('WooCommerce cohort page totals did not match collection metadata')
+        }
+        if (!finalPage) {
+          cohortPage += 1
+          await checkpointSeenCohort(
+            supabase,
+            connection,
+            {
+              scanModifiedAfter: modifiedAfter,
+              modifiedAt: cohortModifiedAt!,
+              page: cohortPage,
+              passFoundNew: cohortPassFoundNew,
+              expectedTotal: cohortExpectedTotal,
+              expectedPages: cohortExpectedPages,
+              passSeenCount: cohortPassSeenCount,
+              passLastOrderId: cohortPassLastOrderId,
+            },
+            completedOrderIds,
+            summary,
+            deadlineMs,
+          )
+        } else if (cohortPassFoundNew) {
+          cohortPage = 1
+          cohortPassFoundNew = false
+          cohortExpectedTotal = null
+          cohortExpectedPages = null
+          cohortPassSeenCount = 0
+          cohortPassLastOrderId = null
+          await checkpointSeenCohort(
+            supabase,
+            connection,
+            {
+              scanModifiedAfter: modifiedAfter,
+              modifiedAt: cohortModifiedAt!,
+              page: 1,
+              passFoundNew: false,
+              expectedTotal: null,
+              expectedPages: null,
+              passSeenCount: 0,
+              passLastOrderId: null,
+            },
+            completedOrderIds,
+            summary,
+            deadlineMs,
+          )
+        } else {
+          const completedCohortMs = Date.parse(cohortModifiedAt!)
+          const candidateMs = Math.min(completedCohortMs, failureFloorMs)
+          const completedCursorIso = candidateMs > prevCursorMs
+            ? new Date(candidateMs).toISOString()
+            : null
+          await completeSeenCohort(
+            supabase,
+            connection,
+            cohortModifiedAt!,
+            completedCursorIso,
+            summary,
+            deadlineMs,
+          )
+          if (candidateMs > prevCursorMs) {
+            connection.last_order_synced_at = new Date(candidateMs).toISOString()
+            prevCursorMs = candidateMs
+          }
+          modifiedAfter = cohortModifiedAt!
+          cohortModifiedAt = null
+          cohortPage = 1
+          cohortPassFoundNew = false
+          cohortExpectedTotal = null
+          cohortExpectedPages = null
+          cohortPassSeenCount = 0
+          cohortPassLastOrderId = null
+        }
+      } else {
+        const movingPageIncomplete = ingestHadErrors || incompleteOrderIds.size > 0
+        if (movingPageIncomplete) {
+          // A failure floor exists only in this invocation. Persisting a later
+          // tail cohort would let a restart complete that cohort and forget
+          // the earlier failure. Save only monotonic progress below the
+          // earliest incomplete order, write no tail markers, and stop so the
+          // next invocation re-lists from the provider cursor plus overlap.
+          const candidateMs = Math.min(lastMs - 1000, failureFloorMs)
+          if (candidateMs > prevCursorMs) {
+            const cursorIso = new Date(candidateMs).toISOString()
+            await persistConnectionProgress(
+              supabase,
+              connection,
+              { last_order_synced_at: cursorIso, error_message: null },
+              summary,
+              deadlineMs,
+            )
+            connection.last_order_synced_at = cursorIso
+            prevCursorMs = candidateMs
+          }
+          if (page.malformedOrderIds.length > 0) {
+            throw new CommerceSyncProviderError(
+              'WooCommerce order or refund amount was malformed and remains pending',
+              summary,
+            )
+          }
+          break
+        }
+
+        // Every moving page enters an exact-second cohort at its mixed tail.
+        // A short page is not proof of completion because hosts can lower
+        // per_page. Only the subsequent no-new verification pass may cross T.
+        const tailModifiedAt = new Date(lastMs).toISOString()
+        const tailOrderIds = completedOrderIds.filter(orderId =>
+          workOrders.some(
+            order => order.id === orderId && gmtToMs(order.date_modified_gmt) === lastMs,
+          ),
+        )
+        const candidateMs = Math.min(lastMs - 1000, failureFloorMs)
+        const cursorIso = candidateMs > prevCursorMs
+          ? new Date(candidateMs).toISOString()
+          : null
+        await startSeenCohort(
+          supabase,
+          connection,
+          tailModifiedAt,
+          modifiedAfter,
+          tailOrderIds,
+          cursorIso,
+          summary,
+          deadlineMs,
+        )
+        cohortModifiedAt = tailModifiedAt
+        cohortPage = 1
+        cohortPassFoundNew = false
+        cohortExpectedTotal = null
+        cohortExpectedPages = null
+        cohortPassSeenCount = 0
+        cohortPassLastOrderId = null
+        if (candidateMs > prevCursorMs) {
+          connection.last_order_synced_at = cursorIso
+          prevCursorMs = candidateMs
+        }
       }
 
       if (summary.deadlineReached) break
-
-      // Advance. A full page entirely inside one date_modified second cannot
-      // move the cursor (modified_after is strictly exclusive): page through
-      // the tie by offset. Otherwise move the cursor to the page's last row;
-      // tie rows cut off at the boundary are recovered by the next run's
-      // overlap re-poll.
-      if (orders.length >= WC_PAGE_SIZE && lastMs === firstMs) {
-        tiePage += 1
-      } else {
-        modifiedAfter = new Date(lastMs).toISOString()
-        tiePage = 1
-      }
 
       if (summary.fetched >= MAX_ORDERS_PER_RUN) {
         log.warn('order cap reached; remaining orders resume next run', {
@@ -553,30 +1215,62 @@ export async function syncWooCommerceOrders(
         break
       }
     }
+
+    // A successful empty page proves the moving WooCommerce window was fully
+    // scanned. Advancing to the run start rotates quiet stores in the cron;
+    // the 24h overlap still re-polls updates that landed during the run. Do
+    // not apply this watermark after any incomplete refund or ingest work.
+    if (windowExhausted && failureFloorMs === Number.POSITIVE_INFINITY) {
+      const watermarkMs = runStartMs
+      if (watermarkMs > prevCursorMs) {
+        const cursorIso = new Date(watermarkMs).toISOString()
+        await completeWooScan(supabase, connection, cursorIso, summary, deadlineMs)
+        connection.last_order_synced_at = cursorIso
+        prevCursorMs = watermarkMs
+      }
+    }
   } catch (err) {
     if (isRevokedCredentialsError(err)) {
       // The key was deleted or demoted in wp-admin: flip the connection so
       // the UI offers a reconnect instead of the cron retrying forever.
+      const query = supabase.rpc('revoke_commerce_connection_for_sync', {
+        p_provider: 'woocommerce',
+        p_connection_id: connection.id,
+        p_claim_token: claimToken,
+        p_error_message: 'Butiken avvisade API-nyckeln. Anslut butiken igen.',
+        p_disconnected_at: new Date().toISOString(),
+      })
+      const { data, error } = await awaitDurableCommerceOperation(
+        query,
+        deadlineMs,
+        'persist WooCommerce credential revocation',
+        'credential_revocation',
+        summary,
+      )
+      if (error || data !== true) {
+        throw new CommerceSyncPersistenceError(
+          `Failed to persist WooCommerce credential revocation${error ? `: ${error.message}` : ': exact active lease was not matched'}`,
+          'credential_revocation',
+          summary,
+        )
+      }
       summary.revoked = true
-      await supabase
-        .from('woocommerce_connections')
-        .update({
-          status: 'revoked',
-          error_message: 'Butiken avvisade API-nyckeln. Anslut butiken igen.',
-          // The store already rejected these; keeping decryptable dead
-          // credentials would be pure data retention (same as /disconnect).
-          consumer_key_encrypted: null,
-          consumer_secret_encrypted: null,
-          disconnected_at: new Date().toISOString(),
-        })
-        .eq('id', connection.id)
-        .eq('status', 'active')
       log.warn('credentials revoked upstream; connection flipped to revoked', {
         connectionId: connection.id,
       })
       return summary
     }
-    throw err
+    if (
+      err instanceof CommerceSyncPersistenceError ||
+      err instanceof CommerceSyncProviderError
+    ) {
+      throw err
+    }
+    throw new CommerceSyncProviderError(
+      err instanceof Error ? err.message : String(err),
+      summary,
+      { cause: err },
+    )
   }
 
   if (summary.skippedLocked > 0) {

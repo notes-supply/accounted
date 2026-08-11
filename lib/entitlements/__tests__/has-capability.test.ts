@@ -195,6 +195,58 @@ describe('getCompanyIdsWithCapability', () => {
       getCompanyIdsWithCapability(supabase, [directCompanyId], CAPABILITY.bank_sync),
     ).rejects.toThrow('Failed to resolve capability company scopes: connection reset')
   })
+
+  it('bounds a never-settling bulk query by its wall-clock deadline and aborts the client query', async () => {
+    vi.useFakeTimers()
+    const aborted = vi.fn()
+    const query = {
+      select: () => query,
+      eq: () => query,
+      in: () => query,
+      abortSignal: (signal: AbortSignal) => {
+        signal.addEventListener('abort', aborted, { once: true })
+        return new Promise(() => undefined)
+      },
+      then: () => undefined,
+    }
+    const supabase = { from: () => query } as unknown as SupabaseClient
+    const promise = getCompanyIdsWithCapability(
+      supabase,
+      [directCompanyId],
+      CAPABILITY.bank_sync,
+      { deadlineMs: Date.now() + 20 },
+    )
+    const rejection = expect(promise).rejects.toThrow('Capability resolution deadline reached')
+
+    try {
+      await vi.advanceTimersByTimeAsync(21)
+      await rejection
+      expect(aborted).toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('honors a caller AbortSignal without changing grant semantics', async () => {
+    const controller = new AbortController()
+    const query = {
+      select: () => query,
+      eq: () => query,
+      in: () => query,
+      abortSignal: () => new Promise(() => undefined),
+      then: () => undefined,
+    }
+    const supabase = { from: () => query } as unknown as SupabaseClient
+    const promise = getCompanyIdsWithCapability(
+      supabase,
+      [directCompanyId],
+      CAPABILITY.bank_sync,
+      { signal: controller.signal },
+    )
+
+    controller.abort()
+    await expect(promise).rejects.toThrow('Capability resolution aborted')
+  })
 })
 
 describe('requireCapability', () => {
