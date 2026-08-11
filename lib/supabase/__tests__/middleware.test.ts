@@ -12,6 +12,7 @@ import { NextRequest } from 'next/server'
 const state = vi.hoisted(() => ({
   user: null as null | { id: string; app_metadata?: Record<string, unknown> },
   sessionId: 'session-1' as string | null,
+  authEventAt: Math.floor(Date.now() / 1000) as number | null,
   authError: null as unknown,
   aal: null as null | { currentLevel: string; nextLevel: string },
   factors: null as null | { totp: Array<{ id: string; status: string }> },
@@ -37,7 +38,14 @@ vi.mock('@supabase/ssr', () => ({
         error: state.authError,
       })),
       getClaims: vi.fn(async () => ({
-        data: { claims: state.sessionId ? { session_id: state.sessionId } : {} },
+        data: {
+          claims: {
+            ...(state.sessionId ? { session_id: state.sessionId } : {}),
+            ...(state.authEventAt === null
+              ? {}
+              : { amr: [{ method: 'password', timestamp: state.authEventAt }] }),
+          },
+        },
       })),
       signOut: state.signOut,
       mfa: {
@@ -96,6 +104,7 @@ describe('updateSession redirect destinations', () => {
     vi.clearAllMocks()
     state.user = null
     state.sessionId = 'session-1'
+    state.authEventAt = Math.floor(Date.now() / 1000)
     state.authError = null
     state.aal = null
     state.factors = null
@@ -169,9 +178,32 @@ describe('updateSession redirect destinations', () => {
       await expect(verifySessionTimeoutState(encoded)).resolves.toMatchObject({
         userId: 'user-1',
         sessionId: 'session-1',
+        startedAt: state.authEventAt! * 1000,
+        lastActivityAt: state.authEventAt! * 1000,
         method: 'bankid',
       })
       expect(response.cookies.get('gnubok-auth-method')?.value).toBe('')
+    })
+
+    it('does not renew an existing session when only the timeout cookie is missing', async () => {
+      state.authEventAt = Math.floor(Date.now() / 1000) - 120
+
+      const response = await run('/settings/tax')
+
+      expect(response.status).toBe(307)
+      expect(new URL(locationOf(response)!).searchParams.get('reason')).toBe('absolute')
+      expect(state.signOut).toHaveBeenCalledWith({ scope: 'local' })
+      expect(response.cookies.get(SESSION_TIMEOUT_COOKIE)).toBeUndefined()
+    })
+
+    it('fails closed when a missing timeout cookie has no signed auth event', async () => {
+      state.authEventAt = null
+
+      const response = await run('/settings/tax')
+
+      expect(response.status).toBe(307)
+      expect(new URL(locationOf(response)!).searchParams.get('reason')).toBe('absolute')
+      expect(state.signOut).toHaveBeenCalledWith({ scope: 'local' })
     })
 
     it('rejects a tampered cookie and revokes only the current session', async () => {

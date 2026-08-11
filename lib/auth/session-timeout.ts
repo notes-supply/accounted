@@ -27,6 +27,26 @@ export interface SessionTimeoutState {
   method: SessionAuthMethod
 }
 
+/** Earliest signed Supabase authentication event, in milliseconds. */
+export function sessionStartedAtFromClaims(claims: unknown): number | null {
+  if (!claims || typeof claims !== 'object') return null
+  const amr = (claims as { amr?: unknown }).amr
+  if (!Array.isArray(amr)) return null
+
+  const timestamps = amr.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object') return []
+    const timestamp = (entry as { timestamp?: unknown }).timestamp
+    if (typeof timestamp !== 'number' || !Number.isSafeInteger(timestamp) || timestamp <= 0) {
+      return []
+    }
+    return [timestamp]
+  })
+  if (timestamps.length === 0) return null
+
+  const startedAt = Math.min(...timestamps) * 1000
+  return Number.isSafeInteger(startedAt) ? startedAt : null
+}
+
 type Environment = Record<string, string | undefined>
 
 function parseDuration(value: string | undefined, fallback: number): number {

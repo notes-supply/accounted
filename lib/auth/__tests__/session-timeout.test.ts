@@ -4,6 +4,7 @@ import {
   createSessionTimeoutState,
   evaluateSessionTimeout,
   getSessionTimeoutConfig,
+  sessionStartedAtFromClaims,
   sessionStateMatchesUser,
   signSessionTimeoutState,
   verifySessionTimeoutState,
@@ -66,6 +67,24 @@ describe('session timeout configuration', () => {
       idleTimeoutMs: 30 * 60 * 1000,
       absoluteTimeoutMs: 12 * 60 * 60 * 1000,
     })
+  })
+})
+
+describe('Supabase session evidence', () => {
+  it('uses the earliest valid signed authentication event', () => {
+    expect(sessionStartedAtFromClaims({
+      amr: [
+        { method: 'totp', timestamp: 1_720_000_300 },
+        { method: 'password', timestamp: 1_720_000_000 },
+        { method: 'ignored', timestamp: '1720000000' },
+      ],
+    })).toBe(1_720_000_000_000)
+  })
+
+  it('rejects missing or malformed authentication evidence', () => {
+    expect(sessionStartedAtFromClaims(null)).toBeNull()
+    expect(sessionStartedAtFromClaims({ amr: [] })).toBeNull()
+    expect(sessionStartedAtFromClaims({ amr: [{ timestamp: -1 }] })).toBeNull()
   })
 })
 

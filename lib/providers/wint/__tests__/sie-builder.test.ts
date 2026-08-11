@@ -154,6 +154,34 @@ describe('buildWintSieFile', () => {
     expect(payment?.description).toBe('Inbetalning "1007"');
   });
 
+  it('preserves literal backslashes in text and dimension fields', () => {
+    const voucherText = String.raw`Archive C:\Temp`;
+    const transactionText = String.raw`Receipt C:\incoming\invoice.pdf`;
+    const objectNo = String.raw`P\01`;
+    const objectName = String.raw`Project C:\work`;
+    const content = buildWintSieFile({
+      ...BASE_OPTIONS,
+      vouchers: [voucher({
+        text: voucherText,
+        transactions: [
+          {
+            accountNumber: '3010',
+            amount: -100,
+            text: transactionText,
+            dimensions: [{ type: 'Project', shortName: objectNo, name: objectName }],
+          },
+          { accountNumber: '1510', amount: 100 },
+        ],
+      })],
+    });
+
+    const parsed = parseSIEFile(content);
+    expect(parsed.vouchers[0]?.description).toBe(voucherText);
+    expect(parsed.vouchers[0]?.lines[0]?.description).toBe(transactionText);
+    expect(parsed.vouchers[0]?.lines[0]?.dimensions).toEqual({ '6': objectNo });
+    expect(parsed.dimensionValues).toContainEqual({ sieDimNo: 6, code: objectNo, name: objectName });
+  });
+
   it('emits declared #KONTO for every referenced account and orders vouchers per series', () => {
     const content = buildWintSieFile({
       ...BASE_OPTIONS,

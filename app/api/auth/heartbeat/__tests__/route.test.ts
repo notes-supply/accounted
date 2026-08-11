@@ -107,24 +107,17 @@ describe('session heartbeat route', () => {
     expect(expired.headers.get('x-session-timeout-reason')).toBe('absolute')
   })
 
-  it('initializes fresh state for a missing or mismatched cookie like middleware', async () => {
+  it('fails closed for a missing or session-mismatched cookie', async () => {
     const missing = await GET()
-    expect(missing.status).toBe(200)
-    const initialized = missing.cookies.get(SESSION_TIMEOUT_COOKIE)?.value
-    expect(initialized).toBeTruthy()
-    await expect(verifySessionTimeoutState(initialized)).resolves.toMatchObject({
-      userId: 'user-1',
-      sessionId: 'session-1',
-    })
+    expect(missing.status).toBe(401)
+    expect(missing.headers.get('x-session-timeout-reason')).toBe('absolute')
+    expect(missing.cookies.get(SESSION_TIMEOUT_COOKIE)).toBeUndefined()
 
     await setState({ sessionId: 'another-session' })
     const mismatch = await GET()
-    expect(mismatch.status).toBe(200)
-    const reminted = mismatch.cookies.get(SESSION_TIMEOUT_COOKIE)?.value
-    expect(reminted).toBeTruthy()
-    await expect(verifySessionTimeoutState(reminted)).resolves.toMatchObject({
-      sessionId: 'session-1',
-    })
+    expect(mismatch.status).toBe(401)
+    expect(mismatch.headers.get('x-session-timeout-reason')).toBe('absolute')
+    expect(mismatch.cookies.get(SESSION_TIMEOUT_COOKIE)).toBeUndefined()
   })
 
   it('passes through the existing authentication error', async () => {

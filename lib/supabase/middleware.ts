@@ -11,6 +11,7 @@ import {
   evaluateSessionTimeout,
   getSessionTimeoutConfig,
   sessionStateMatchesUser,
+  sessionStartedAtFromClaims,
   sessionTimeoutClearCookieOptions,
   sessionTimeoutCookieOptions,
   signSessionTimeoutState,
@@ -90,7 +91,7 @@ export async function updateSession(request: NextRequest) {
     !apiRequestSkipsSessionTimeout(pathname, hasAuthorizationHeader)
   ) {
     const encodedState = request.cookies.get(SESSION_TIMEOUT_COOKIE)?.value
-    const sessionId = await getSupabaseSessionId(supabase)
+    const sessionEvidence = await getSupabaseSessionEvidence(supabase)
     const verifiedState = await verifySessionTimeoutState(encodedState)
 
     if (encodedState && !verifiedState) {
@@ -105,7 +106,7 @@ export async function updateSession(request: NextRequest) {
 
     if (
       !verifiedState ||
-      !sessionStateMatchesUser(verifiedState, user.id, sessionId)
+      !sessionStateMatchesUser(verifiedState, user.id, sessionEvidence.sessionId)
     ) {
       const hintedMethod = request.cookies.get(
         SESSION_AUTH_METHOD_HINT_COOKIE,
@@ -113,11 +114,36 @@ export async function updateSession(request: NextRequest) {
       const method = isSessionAuthMethod(hintedMethod)
         ? hintedMethod
         : 'password'
+
+      // The timeout cookie is intentionally independent from Supabase's auth
+      // cookies, so its absence cannot mean "start now": a caller could delete
+      // only this cookie forever. Reconstruct the original boundary from the
+      // earliest signed AMR event, which survives access-token refresh.
+      if (sessionEvidence.startedAt === null) {
+        await signOutTimedOutSession(supabase)
+        return sessionTimeoutResponse(
+          request,
+          supabaseResponse,
+          'absolute',
+          method,
+        )
+      }
       const state = createSessionTimeoutState({
         userId: user.id,
-        sessionId,
+        sessionId: sessionEvidence.sessionId,
         method,
+        now: sessionEvidence.startedAt,
       })
+      const timeoutReason = evaluateSessionTimeout(state, timeoutConfig)
+      if (timeoutReason) {
+        await signOutTimedOutSession(supabase)
+        return sessionTimeoutResponse(
+          request,
+          supabaseResponse,
+          timeoutReason,
+          method,
+        )
+      }
       const signedState = await signSessionTimeoutState(state)
 
       if (signedState) {
@@ -388,19 +414,30 @@ export async function updateSession(request: NextRequest) {
   return supabaseResponse
 }
 
-async function getSupabaseSessionId(
+interface SupabaseSessionEvidence {
+  sessionId: string | null
+  startedAt: number | null
+}
+
+async function getSupabaseSessionEvidence(
   supabase: ReturnType<typeof createServerClient>,
-): Promise<string | null> {
-  if (typeof supabase.auth.getClaims !== 'function') return null
+): Promise<SupabaseSessionEvidence> {
+  if (typeof supabase.auth.getClaims !== 'function') {
+    return { sessionId: null, startedAt: null }
+  }
 
   try {
     const { data } = await supabase.auth.getClaims()
-    return typeof data?.claims?.session_id === 'string'
-      ? data.claims.session_id
-      : null
+    const claims = data?.claims
+    return {
+      sessionId: typeof claims?.session_id === 'string'
+        ? claims.session_id
+        : null,
+      startedAt: sessionStartedAtFromClaims(claims),
+    }
   } catch (error) {
-    console.warn('[middleware] could not resolve Supabase session id', error)
-    return null
+    console.warn('[middleware] could not resolve Supabase session evidence', error)
+    return { sessionId: null, startedAt: null }
   }
 }
 
