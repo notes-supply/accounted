@@ -55,7 +55,7 @@ export async function generateARReconciliation(
       .from('invoices')
       .select('id, total, paid_amount, currency, exchange_rate')
       .eq('company_id', companyId)
-      .in('status', ['sent', 'overdue'])
+      .in('status', ['sent', 'overdue', 'partially_paid'])
       .order('id', { ascending: true })
       .range(from, to)
   )

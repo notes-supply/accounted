@@ -33,10 +33,10 @@
  * enskild_firma, so every row in the reports carries its BAS name instead of the
  * "Konto 6212" fallback.
  *
- * The entries deliberately carry NO voucher_number: the caller assigns those by
- * calling the next_voucher_number RPC once per entry, in array order, so the
- * sequence stays unbroken (BFNAR 2013:2). Lines carry no journal_entry_id for
- * the same reason.
+ * The entries deliberately carry NO voucher_number: the caller commits each
+ * balanced entry through the bookkeeping engine, whose atomic commit RPC assigns
+ * the number only after the lines exist. Lines therefore carry no
+ * journal_entry_id here either.
  */
 
 import { roundOre } from '@/lib/money'

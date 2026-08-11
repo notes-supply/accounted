@@ -45,6 +45,7 @@ import {
   processInboundMessage,
 } from '@/extensions/general/whatsapp-inbox/lib/process-inbound'
 import {
+  getOrCreateConversation,
   redactRawPayload,
   resolveAnswerTarget,
   resolveRecipient,
@@ -186,6 +187,24 @@ describe('company question is not one-shot when the send fails', () => {
 
     expect(asked).toBe(true)
     expect(mock.findCalls('whatsapp_conversations', 'update')).toHaveLength(1)
+  })
+})
+
+describe('conversation creation races', () => {
+  it('reloads the winning conversation after a concurrent unique insert', async () => {
+    const mock = createQueuedMockSupabase()
+    mock.enqueue({ data: null }) // initial lookup misses
+    mock.enqueue({ data: null, error: { code: '23505', message: 'duplicate key' } })
+    mock.enqueue({ data: makeConversation({ id: 'conv-winner' }) })
+
+    const conversation = await getOrCreateConversation(
+      mock.supabase as unknown as SupabaseClient,
+      'link-1',
+    )
+
+    expect(conversation?.id).toBe('conv-winner')
+    expect(mock.findCalls('whatsapp_conversations', 'insert')).toHaveLength(1)
+    expect(mock.findCalls('whatsapp_conversations', 'maybeSingle')).toHaveLength(3)
   })
 })
 

@@ -260,12 +260,26 @@ export async function runSweep(supabase: SupabaseClient): Promise<SweepSummary> 
 
   // ── 3. Question TTL (48h) ──────────────────────────────────
   try {
-    const { data } = await supabase
-      .from('whatsapp_conversations')
-      .select('*')
-      .neq('state', 'idle')
-      .limit(BATCH * 2)
-    for (const conversation of ((data ?? []) as WhatsAppConversation[])) {
+    const pageSize = BATCH * 2
+    const conversations: WhatsAppConversation[] = []
+    let afterId: string | null = null
+    while (true) {
+      let query = supabase
+        .from('whatsapp_conversations')
+        .select('*')
+        .neq('state', 'idle')
+        .order('id', { ascending: true })
+        .limit(pageSize)
+      if (afterId) query = query.gt('id', afterId)
+
+      const { data } = await query
+      const page = (data ?? []) as WhatsAppConversation[]
+      conversations.push(...page)
+      if (page.length < pageSize) break
+      afterId = page[page.length - 1].id
+    }
+
+    for (const conversation of conversations) {
       const context = getContext(conversation)
       const askedAt = context.pending_question?.asked_at
       const expired =

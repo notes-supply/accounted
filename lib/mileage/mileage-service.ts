@@ -222,21 +222,11 @@ export async function bookMileagePeriod(
     throw new Error('Milersättning bokförs per kalenderår: dela upp perioden per år')
   }
 
-  // Release orphaned claims from a crashed earlier booking (status booked,
-  // no verifikat, no salary run) so their trips become bookable again. The
-  // 5-minute age guard keeps a concurrent in-flight booking's claim safe.
-  const staleBefore = new Date(Date.now() - 5 * 60 * 1000).toISOString()
-  await supabase
-    .from('mileage_trips')
-    .update({ status: 'draft' })
-    .eq('company_id', companyId)
-    .eq('status', 'booked')
-    .is('journal_entry_id', null)
-    .is('salary_run_id', null)
-    .lt('updated_at', staleBefore)
-    .gte('trip_date', params.from)
-    .lte('trip_date', params.to)
-
+  // Booked rows without a journal link are intentionally not auto-released.
+  // They are ambiguous: a worker may have crashed before voucher creation, or
+  // the voucher may exist while the final trip-link write only partially landed.
+  // Resetting either case to draft can double-book an already posted expense;
+  // preserve the claim for explicit repair instead.
   const trips = await listTrips(supabase, companyId, {
     from: params.from,
     to: params.to,

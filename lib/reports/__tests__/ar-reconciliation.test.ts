@@ -73,6 +73,21 @@ describe('generateARReconciliation', () => {
     expect(result.is_reconciled).toBe(true)
   })
 
+  it('includes partially paid invoices in the open receivable population', async () => {
+    results = [{ data: [], error: null }, { data: [], error: null }]
+
+    await generateARReconciliation(supabase, 'company-1', 'period-1')
+
+    const statusFilters = calls.filter(
+      (call) => call.method === 'in' && call.args[0] === 'status',
+    )
+    expect(statusFilters.map((call) => call.args[1])).toContainEqual([
+      'sent',
+      'overdue',
+      'partially_paid',
+    ])
+  })
+
   it('detects difference when AR ledger does not match account 1510', async () => {
     results = [
       // 0: invoices

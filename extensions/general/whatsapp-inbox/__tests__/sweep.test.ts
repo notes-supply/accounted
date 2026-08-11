@@ -212,6 +212,53 @@ describe('runSweep', () => {
     expect(conversationPatch.context.company_options).toBeUndefined()
   })
 
+  it('keyset-pages past 50 non-expired conversations to reach an expired question', async () => {
+    const { supabase, enqueue, findCalls } = createQueuedMockSupabase()
+    const fresh = Array.from({ length: 50 }, (_, index) =>
+      expiredConversation({
+        id: `conv-${String(index).padStart(3, '0')}`,
+        context: {
+          pending_question: {
+            type: 'representation',
+            inbox_item_id: `item-fresh-${index}`,
+            asked_at: new Date().toISOString(),
+          },
+        },
+      }),
+    )
+
+    enqueue({ data: [] }) // stuck received
+    enqueue({ data: [] }) // stuck processing
+    enqueue({ data: [] }) // stale pending_ack
+    enqueue({ data: [] }) // unacked re-arm
+    enqueue({ data: fresh }) // full first TTL page, none expired
+    enqueue({ data: [expiredConversation({ id: 'conv-expired' })] }) // second TTL page
+    enqueue({
+      data: {
+        channel_context: {
+          channel: 'whatsapp',
+          pending_question: {
+            type: 'representation',
+            asked_at: new Date(Date.now() - 49 * HOURS).toISOString(),
+            status: 'open',
+          },
+        },
+      },
+    })
+    enqueue({ data: null }) // item context update
+    enqueue({ data: { company_id: 'company-1', correlation_id: null } })
+    enqueue({ data: null }) // conversation -> idle
+    enqueue({ data: [] }) // pin scan
+
+    const summary = await runSweep(supabase as unknown as SupabaseClient)
+
+    expect(summary.expiredQuestions).toBe(1)
+    expect(findCalls('whatsapp_conversations', 'gt')).toContainEqual([
+      'id',
+      'conv-049',
+    ])
+  })
+
   it('clears expired 8h company pins', async () => {
     const { supabase, enqueue, findCalls } = createQueuedMockSupabase()
     enqueue({ data: [] })

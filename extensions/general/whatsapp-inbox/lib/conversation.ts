@@ -89,12 +89,32 @@ export async function getOrCreateConversation(
     .eq('phone_link_id', phoneLinkId)
     .maybeSingle()
   if (existing) return existing as WhatsAppConversation
-  const { data: created } = await supabase
+  const { data: created, error: createError } = await supabase
     .from('whatsapp_conversations')
     .insert({ phone_link_id: phoneLinkId })
     .select('*')
     .maybeSingle()
-  return (created as WhatsAppConversation | null) ?? null
+  if (created) return created as WhatsAppConversation
+
+  if (createError?.code === '23505') {
+    // Another first-message webhook won the unique phone_link_id insert.
+    // Recover that row so this message is attached to the same conversation.
+    const { data: winner, error: reloadError } = await supabase
+      .from('whatsapp_conversations')
+      .select('*')
+      .eq('phone_link_id', phoneLinkId)
+      .maybeSingle()
+    if (reloadError) {
+      log.error('conversation uniqueness winner reload failed', reloadError, { phoneLinkId })
+      return null
+    }
+    return (winner as WhatsAppConversation | null) ?? null
+  }
+
+  if (createError) {
+    log.error('conversation creation failed', createError, { phoneLinkId })
+  }
+  return null
 }
 
 export async function loadConversation(

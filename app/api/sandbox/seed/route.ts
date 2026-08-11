@@ -10,6 +10,7 @@ import { ensureSandboxAgentProfile } from '@/lib/sandbox/ensure-agent'
 import { encryptPersonnummer } from '@/lib/salary/personnummer'
 import { getBASReference } from '@/lib/bookkeeping/bas-reference'
 import { markEntriesNoDocRequired } from '@/lib/bookkeeping/no-doc-required'
+import { createJournalEntry } from '@/lib/bookkeeping/engine'
 import { buildSandboxCustomers } from './customers'
 import { buildSandboxPendingOperations } from './pending-operations'
 import { buildSandboxArticles } from './articles'
@@ -489,78 +490,34 @@ export async function POST(request: Request) {
       accountMap,
     })
 
-    // One RPC per voucher: next_voucher_number is a counter table with a row
-    // lock (not MAX+1), so sequential calls are safe and gap-free. The two
-    // writes are batched rather than run per entry, which is what turns ~130
-    // round trips into ~45 for a seed that runs on every sandbox visit.
-    const historyVoucherNumbers: number[] = []
-    for (const historyEntry of ledgerHistory.entries) {
-      const { data: historyVoucherNumber, error: historyVoucherError } = await supabase.rpc(
-        'next_voucher_number',
+    // Use the bookkeeping engine for each history voucher. It inserts the
+    // balanced draft first, then assigns the voucher number and posts through
+    // commit_journal_entry in one database transaction. A failed commit therefore
+    // rolls the sequence increment back instead of leaving an unexplained gap.
+    const historyEntryIds: string[] = []
+    for (const [index, historyEntry] of ledgerHistory.entries.entries()) {
+      const entry = await createJournalEntry(
+        supabase,
+        companyId,
+        userId,
         {
-          p_company_id: companyId,
-          p_fiscal_period_id: fiscalPeriod.id,
-          p_series: historyEntry.voucher_series,
+          fiscal_period_id: historyEntry.fiscal_period_id,
+          voucher_series: historyEntry.voucher_series,
+          entry_date: historyEntry.entry_date,
+          description: historyEntry.description,
+          source_type: 'manual',
+          lines: ledgerHistory.linesByEntryIndex[index].map((line) => ({
+            account_number: line.account_number,
+            debit_amount: line.debit_amount,
+            credit_amount: line.credit_amount,
+            line_description: line.line_description,
+            dimensions: line.dimensions,
+          })),
         },
+        'sandbox_seed',
       )
-      if (historyVoucherError) throw historyVoucherError
-      historyVoucherNumbers.push(historyVoucherNumber as number)
+      historyEntryIds.push(entry.id)
     }
-
-    // Inserted as draft and posted after the lines land: PostgREST autocommits
-    // each request, and check_balance_on_posted_insert (migration
-    // 20260806130000) rejects a posted header whose transaction carries no
-    // lines. The draft-to-posted UPDATE below fires check_balance_on_post
-    // against the finished verifikat instead.
-    //
-    // committed_at note: this route runs under the requester's authenticated
-    // client, and set_committed_at() (migration 20260806160000) preserves a
-    // preset committed_at only for trusted roles, so any backdated
-    // committed_at supplied here is overwritten with now() at posting. That
-    // is deliberate: an end-user role must never control the audit timestamp,
-    // and sandbox companies are disposable.
-    const { data: insertedHistoryEntries, error: historyEntryError } = await supabase
-      .from('journal_entries')
-      .insert(
-        ledgerHistory.entries.map((historyEntry, index) => ({
-          ...historyEntry,
-          voucher_number: historyVoucherNumbers[index],
-          status: 'draft',
-        })),
-      )
-      .select('id, voucher_number')
-    if (historyEntryError) throw historyEntryError
-
-    // Match on voucher_number, not on array position: PostgREST does not
-    // promise the returned rows come back in insertion order, and
-    // (company_id, fiscal_period_id, voucher_series, voucher_number) is unique.
-    const historyIdByVoucher = new Map(
-      (insertedHistoryEntries ?? []).map(row => [row.voucher_number as number, row.id as string]),
-    )
-
-    const historyEntryIds = historyVoucherNumbers.map(voucherNumber => {
-      const entryId = historyIdByVoucher.get(voucherNumber)
-      if (!entryId) {
-        throw new Error(`Sandbox seed: ledger history voucher ${voucherNumber} was not inserted`)
-      }
-      return entryId
-    })
-
-    const { error: historyLinesError } = await supabase
-      .from('journal_entry_lines')
-      .insert(
-        ledgerHistory.linesByEntryIndex.flatMap((lines, index) =>
-          lines.map(line => ({ ...line, journal_entry_id: historyEntryIds[index] })),
-        ),
-      )
-    if (historyLinesError) throw historyLinesError
-
-    const { error: historyPostError } = await supabase
-      .from('journal_entries')
-      .update({ status: 'posted' })
-      .in('id', historyEntryIds)
-      .eq('company_id', companyId)
-    if (historyPostError) throw historyPostError
 
     // The history is the company's books from before it arrived in Accounted:
     // its kvitton live in the previous system's binder, not here. Left

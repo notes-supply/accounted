@@ -292,14 +292,18 @@ describe('bookMileagePeriod', () => {
 
   it('returns NO_TRIPS when the period has no drafts', async () => {
     vi.mocked(fetchAllRows).mockResolvedValue([])
+    const supabase = stampSupabase([])
     const result = await bookMileagePeriod(
-      stampSupabase([]) as never,
+      supabase as never,
       'company-1',
       'user-1',
       params
     )
     expect(result).toEqual({ ok: false, code: 'NO_TRIPS' })
     expect(createJournalEntry).not.toHaveBeenCalled()
+    // Ambiguous booked/unlinked rows are not swept back to draft: they may
+    // already be represented by a posted voucher whose link write failed.
+    expect(supabase.chain.update).not.toHaveBeenCalled()
   })
 
   it('loses a concurrent race cleanly: partial claim reverts as CLAIM_LOST', async () => {
