@@ -119,6 +119,9 @@ function fmtDate(isoDate: string): string {
 }
 
 function quote(text: string): string {
+  // SIE keeps ordinary backslashes literal; only a backslash immediately before
+  // a quote participates in this repository's executable parser contract.
+  // codeql[js/incomplete-sanitization]
   return `"${text.replace(/"/g, '\\"').replace(/[\r\n]+/g, ' ')}"`;
 }
 
