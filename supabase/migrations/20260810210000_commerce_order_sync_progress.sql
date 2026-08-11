@@ -1118,7 +1118,7 @@ BEGIN
       AND current_user IN ('anon', 'authenticated') THEN
     FOREACH v_column IN ARRAY TG_ARGV LOOP
       v_value := pg_catalog.to_jsonb(NEW) -> v_column;
-      IF TG_OP = 'INSERT' AND CASE v_column
+      IF TG_OP = 'INSERT' AND (CASE v_column
           WHEN 'order_sync_priority_at' THEN
             v_value IS DISTINCT FROM pg_catalog.to_jsonb(
               '1970-01-01 00:00:00+00'::timestamptz
@@ -1135,7 +1135,7 @@ BEGIN
             v_value IS DISTINCT FROM pg_catalog.to_jsonb(false)
           ELSE
             v_value IS DISTINCT FROM 'null'::jsonb
-        END THEN
+        END) THEN
         RAISE EXCEPTION 'commerce order sync progress is service-managed'
           USING ERRCODE = '42501';
       ELSIF TG_OP = 'UPDATE' AND v_value
