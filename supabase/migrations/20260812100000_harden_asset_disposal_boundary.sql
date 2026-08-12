@@ -1,101 +1,9 @@
--- Atomic fixed-asset disposal.
+-- Harden fixed-asset disposal after the atomic disposal migration.
 --
--- A disposal voucher and the immutable asset-register update are one legal
--- event. This RPC calls commit_journal_entry for sequential voucher numbering,
--- records any disposal-date depreciation schedule, and marks the asset as
--- disposed in the same transaction.
-
-ALTER TABLE public.assets
-  ADD COLUMN IF NOT EXISTS disposal_type text,
-  ADD COLUMN IF NOT EXISTS disposal_journal_entry_id uuid,
-  ADD COLUMN IF NOT EXISTS jamkning_direction text,
-  ADD COLUMN IF NOT EXISTS jamkning_remaining_years integer,
-  ADD COLUMN IF NOT EXISTS jamkning_total_years integer,
-  ADD COLUMN IF NOT EXISTS jamkning_original_deduction_percent numeric(5, 2),
-  ADD COLUMN IF NOT EXISTS jamkning_new_deduction_percent numeric(5, 2);
-
--- All constrained columns are new and NULL for existing rows, so validation
--- can never fail. Add every constraint NOT VALID and validate separately:
--- an immediate FK validation takes SHARE ROW EXCLUSIVE on journal_entries (a
--- hot table) and each plain CHECK scans assets under a blocking lock, while
--- VALIDATE CONSTRAINT only needs SHARE UPDATE EXCLUSIVE and does not block
--- writes.
-ALTER TABLE public.assets
-  DROP CONSTRAINT IF EXISTS assets_disposal_journal_entry_id_fkey,
-  ADD CONSTRAINT assets_disposal_journal_entry_id_fkey
-    FOREIGN KEY (disposal_journal_entry_id)
-    REFERENCES public.journal_entries(id) ON DELETE RESTRICT
-    NOT VALID,
-  DROP CONSTRAINT IF EXISTS assets_disposal_type_check,
-  ADD CONSTRAINT assets_disposal_type_check CHECK (
-    disposal_type IS NULL OR disposal_type IN ('sale', 'scrap', 'business_transfer')
-  ) NOT VALID,
-  DROP CONSTRAINT IF EXISTS assets_jamkning_direction_check,
-  ADD CONSTRAINT assets_jamkning_direction_check CHECK (
-    jamkning_direction IS NULL OR jamkning_direction IN ('increase', 'decrease', 'none', 'transferred')
-  ) NOT VALID,
-  DROP CONSTRAINT IF EXISTS assets_jamkning_years_check,
-  ADD CONSTRAINT assets_jamkning_years_check CHECK (
-    (jamkning_remaining_years IS NULL OR jamkning_remaining_years >= 0)
-    AND (jamkning_total_years IS NULL OR jamkning_total_years IN (5, 10))
-    AND (
-      jamkning_remaining_years IS NULL
-      OR jamkning_total_years IS NULL
-      OR jamkning_remaining_years <= jamkning_total_years
-    )
-  ) NOT VALID,
-  DROP CONSTRAINT IF EXISTS assets_jamkning_percent_check,
-  ADD CONSTRAINT assets_jamkning_percent_check CHECK (
-    (jamkning_original_deduction_percent IS NULL OR jamkning_original_deduction_percent BETWEEN 0 AND 100)
-    AND (jamkning_new_deduction_percent IS NULL OR jamkning_new_deduction_percent BETWEEN 0 AND 100)
-  ) NOT VALID;
-
-ALTER TABLE public.assets VALIDATE CONSTRAINT assets_disposal_journal_entry_id_fkey;
-ALTER TABLE public.assets VALIDATE CONSTRAINT assets_disposal_type_check;
-ALTER TABLE public.assets VALIDATE CONSTRAINT assets_jamkning_direction_check;
-ALTER TABLE public.assets VALIDATE CONSTRAINT assets_jamkning_years_check;
-ALTER TABLE public.assets VALIDATE CONSTRAINT assets_jamkning_percent_check;
-
-CREATE OR REPLACE FUNCTION public.enforce_asset_post_disposal_immutability()
-RETURNS trigger
-LANGUAGE plpgsql
-SET search_path = ''
-AS $function$
-BEGIN
-  IF OLD.disposed_at IS NOT NULL THEN
-    IF NEW.category IS DISTINCT FROM OLD.category
-       OR NEW.acquisition_cost IS DISTINCT FROM OLD.acquisition_cost
-       OR NEW.salvage_value IS DISTINCT FROM OLD.salvage_value
-       OR NEW.useful_life_months IS DISTINCT FROM OLD.useful_life_months
-       OR NEW.depreciation_method IS DISTINCT FROM OLD.depreciation_method
-       OR NEW.restvarde_target IS DISTINCT FROM OLD.restvarde_target
-       OR NEW.bas_asset_account IS DISTINCT FROM OLD.bas_asset_account
-       OR NEW.bas_accumulated_account IS DISTINCT FROM OLD.bas_accumulated_account
-       OR NEW.bas_expense_account IS DISTINCT FROM OLD.bas_expense_account
-       OR NEW.acquisition_date IS DISTINCT FROM OLD.acquisition_date
-       OR NEW.k3_components IS DISTINCT FROM OLD.k3_components
-       OR NEW.disposed_at IS DISTINCT FROM OLD.disposed_at
-       OR NEW.disposed_proceeds IS DISTINCT FROM OLD.disposed_proceeds
-       OR NEW.disposed_proceeds_vat IS DISTINCT FROM OLD.disposed_proceeds_vat
-       OR NEW.disposed_vat_treatment IS DISTINCT FROM OLD.disposed_vat_treatment
-       OR NEW.disposal_type IS DISTINCT FROM OLD.disposal_type
-       OR NEW.disposal_journal_entry_id IS DISTINCT FROM OLD.disposal_journal_entry_id
-       OR NEW.jamkning_amount IS DISTINCT FROM OLD.jamkning_amount
-       OR NEW.jamkning_remaining_months IS DISTINCT FROM OLD.jamkning_remaining_months
-       OR NEW.jamkning_total_months IS DISTINCT FROM OLD.jamkning_total_months
-       OR NEW.jamkning_original_input_vat IS DISTINCT FROM OLD.jamkning_original_input_vat
-       OR NEW.jamkning_direction IS DISTINCT FROM OLD.jamkning_direction
-       OR NEW.jamkning_remaining_years IS DISTINCT FROM OLD.jamkning_remaining_years
-       OR NEW.jamkning_total_years IS DISTINCT FROM OLD.jamkning_total_years
-       OR NEW.jamkning_original_deduction_percent IS DISTINCT FROM OLD.jamkning_original_deduction_percent
-       OR NEW.jamkning_new_deduction_percent IS DISTINCT FROM OLD.jamkning_new_deduction_percent THEN
-      RAISE EXCEPTION 'Cannot modify financial or disposal attributes of a disposed asset (id=%)', OLD.id
-        USING ERRCODE = '23514';
-    END IF;
-  END IF;
-  RETURN NEW;
-END;
-$function$;
+-- The browser-authenticated route performs company/write authorization and
+-- builds the disposal draft through the shared planner. Only the server-side
+-- service client may cross this final atomic commit boundary, preventing an
+-- authenticated caller from substituting an unrelated balanced system draft.
 
 CREATE OR REPLACE FUNCTION public.commit_asset_disposal(
   p_company_id uuid,
@@ -125,6 +33,7 @@ SET search_path = ''
 AS $function$
 DECLARE
   v_asset_user_id uuid;
+  v_acquisition_cost numeric;
   v_entry_user_id uuid;
   v_schedule_id uuid;
   v_schedule_entry_id uuid;
@@ -169,8 +78,8 @@ BEGIN
       USING ERRCODE = '23514';
   END IF;
 
-  SELECT a.user_id
-    INTO v_asset_user_id
+  SELECT a.user_id, a.acquisition_cost
+    INTO v_asset_user_id, v_acquisition_cost
     FROM public.assets a
    WHERE a.id = p_asset_id
      AND a.company_id = p_company_id
@@ -238,8 +147,10 @@ BEGIN
       RAISE EXCEPTION 'Valid disposal draft not found: %', p_entry_id
         USING ERRCODE = 'P0002';
     END IF;
-  ELSIF abs(coalesce(p_current_depreciation, 0)) > 0.005 THEN
-    RAISE EXCEPTION 'Current depreciation requires a disposal voucher'
+  ELSIF abs(coalesce(v_acquisition_cost, 0)) > 0.005
+     OR abs(coalesce(p_disposed_proceeds, 0)) > 0.005
+     OR abs(coalesce(p_current_depreciation, 0)) > 0.005 THEN
+    RAISE EXCEPTION 'A financially material asset disposal requires a disposal voucher'
       USING ERRCODE = '23514';
   END IF;
 
@@ -328,12 +239,12 @@ $function$;
 REVOKE ALL ON FUNCTION public.commit_asset_disposal(
   uuid, uuid, uuid, uuid, text, date, numeric, numeric, text, numeric,
   numeric, text, integer, integer, numeric, numeric, numeric, text, text
-) FROM PUBLIC, anon;
+) FROM PUBLIC, anon, authenticated;
 
 GRANT EXECUTE ON FUNCTION public.commit_asset_disposal(
   uuid, uuid, uuid, uuid, text, date, numeric, numeric, text, numeric,
   numeric, text, integer, integer, numeric, numeric, numeric, text, text
-) TO authenticated;
+) TO service_role;
 
 COMMENT ON FUNCTION public.commit_asset_disposal(
   uuid, uuid, uuid, uuid, text, date, numeric, numeric, text, numeric,

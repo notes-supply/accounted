@@ -268,6 +268,14 @@ const BOOKKEEPING: Record<string, StructuredErrorEntry> = {
     message_en: 'Bookkeeping database operation failed.',
     retryable: true,
   },
+  POST_COMMIT_READBACK_FAILED: {
+    httpStatus: 500,
+    message_sv:
+      'Verifikationen kan redan vara bokförd, men resultatet kunde inte läsas tillbaka. Försök inte igen innan verifikationen har kontrollerats.',
+    message_en:
+      'The journal entry may already be posted, but its result could not be read back. Do not retry before checking the supplied journal entry and voucher identifiers.',
+    retryable: false,
+  },
   MEANINGLESS_CORRECTION: {
     httpStatus: 400,
     message_sv: 'Rättelsen motsvarar ingen ekonomisk händelse: det finns inget att rätta.',

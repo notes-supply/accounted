@@ -4,6 +4,38 @@ import { getPool } from '@/tests/pg/setup'
 import { seedCompany } from '@/tests/pg/fixtures'
 
 describe('commit_asset_disposal (pg-real)', () => {
+  it('is executable only by the service role', async () => {
+    const signature =
+      'public.commit_asset_disposal(uuid,uuid,uuid,uuid,text,date,numeric,numeric,text,numeric,numeric,text,integer,integer,numeric,numeric,numeric,text,text)'
+    const { rows } = await getPool().query<{
+      public_exec: boolean
+      anon_exec: boolean
+      authenticated_exec: boolean
+      service_exec: boolean
+    }>(
+      `SELECT
+         EXISTS (
+           SELECT 1
+             FROM pg_proc function_row
+             CROSS JOIN LATERAL aclexplode(function_row.proacl) privilege
+            WHERE function_row.oid = $1::regprocedure
+              AND privilege.grantee = 0
+              AND privilege.privilege_type = 'EXECUTE'
+         ) AS public_exec,
+         has_function_privilege('anon', $1, 'EXECUTE') AS anon_exec,
+         has_function_privilege('authenticated', $1, 'EXECUTE') AS authenticated_exec,
+         has_function_privilege('service_role', $1, 'EXECUTE') AS service_exec`,
+      [signature],
+    )
+
+    expect(rows[0]).toEqual({
+      public_exec: false,
+      anon_exec: false,
+      authenticated_exec: false,
+      service_exec: true,
+    })
+  })
+
   async function insertAsset(userId: string, companyId: string): Promise<string> {
     const assetId = randomUUID()
     await getPool().query(

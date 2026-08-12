@@ -3,6 +3,7 @@ import { NextResponse } from 'next/server'
 import { createMockRequest, createQueuedMockSupabase, parseJsonResponse } from '@/tests/helpers'
 
 const { supabase, reset } = createQueuedMockSupabase()
+const disposalClient = { rpc: vi.fn() }
 const requireAuthMock = vi.fn()
 const requireWriteMock = vi.fn()
 
@@ -18,6 +19,9 @@ vi.mock('@/lib/auth/require-write', () => ({
 }))
 vi.mock('@/lib/bokslut/assets/asset-service', () => ({
   disposeAsset: vi.fn(),
+}))
+vi.mock('@/lib/supabase/server', () => ({
+  createServiceClient: () => disposalClient,
 }))
 
 import { disposeAsset } from '@/lib/bokslut/assets/asset-service'
@@ -103,6 +107,7 @@ describe('POST /api/assets/[id]/dispose', () => {
     expect(body.data.gain_or_loss).toBe(10_000)
     expect(mockDisposeAsset).toHaveBeenCalledWith(
       supabase,
+      disposalClient,
       'company-1',
       'user-1',
       'asset-1',
