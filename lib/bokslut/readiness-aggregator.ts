@@ -226,8 +226,8 @@ export async function buildBokslutReadinessReport(
 
   if (accountingMethod === 'accrual') {
     const [arResult, apResult] = await Promise.allSettled([
-      generateARReconciliation(supabase, companyId, fiscalPeriodId),
-      generateAPReconciliation(supabase, companyId, fiscalPeriodId),
+      generateARReconciliation(supabase, companyId, fiscalPeriodId, period.period_end),
+      generateAPReconciliation(supabase, companyId, fiscalPeriodId, period.period_end),
     ])
     // A failed tie-out degrades to "no reminder" (these are advisory), but a
     // silently swallowed failure is indistinguishable from "reconciled" in

@@ -5,9 +5,18 @@ vi.mock('@/lib/bookkeeping/engine', () => ({
   reverseEntry: vi.fn(),
 }))
 
+vi.mock('@/lib/supabase/fetch-all', () => ({
+  fetchAllRows: vi.fn(),
+}))
+
+vi.mock('@/lib/invoices/payment-totals', () => ({
+  fetchPaymentTotalsByParent: vi.fn(),
+}))
+
 import {
   buildCutoffLines,
   buildCutoffNote,
+  collectKontantmetodCutoff,
   distributeOre,
   postKontantmetodCutoff,
   nextDay,
@@ -18,6 +27,8 @@ import {
 import type { CutoffPayable, CutoffReceivable } from '../kontantmetod-cutoff'
 import { roundOre } from '@/lib/money'
 import { createJournalEntry, reverseEntry } from '@/lib/bookkeeping/engine'
+import { fetchAllRows } from '@/lib/supabase/fetch-all'
+import { fetchPaymentTotalsByParent } from '@/lib/invoices/payment-totals'
 
 const sum = (lines: Array<{ debit_amount: number; credit_amount: number }>) => ({
   debit: roundOre(lines.reduce((s, l) => s + l.debit_amount, 0)),
@@ -40,6 +51,44 @@ const payable = (over: Partial<CutoffPayable> = {}): CutoffPayable => ({
   vat: 250,
   netByAccount: [{ account: '5410', amount: 1000 }],
   ...over,
+})
+
+describe('collectKontantmetodCutoff', () => {
+  it('scales foreign-currency outstanding amounts in SEK without mixing units', async () => {
+    vi.mocked(fetchAllRows)
+      .mockResolvedValueOnce([
+        {
+          id: 'inv-eur',
+          invoice_number: 'F-EUR',
+          total: 1000,
+          total_sek: 11500,
+          vat_amount: 200,
+          vat_amount_sek: 2300,
+          vat_treatment: 'standard_25',
+          credited_invoice_id: null,
+          document_type: 'invoice',
+        },
+      ])
+      .mockResolvedValueOnce([])
+    vi.mocked(fetchPaymentTotalsByParent)
+      .mockResolvedValueOnce(new Map([['inv-eur', 500]]))
+      .mockResolvedValueOnce(new Map())
+
+    const result = await collectKontantmetodCutoff(
+      {} as never,
+      'co-1',
+      '2025-01-01',
+      '2025-12-31',
+    )
+
+    expect(result.receivables).toEqual([
+      expect.objectContaining({
+        id: 'inv-eur',
+        outstanding: 5750,
+        vat: 1150,
+      }),
+    ])
+  })
 })
 
 describe('distributeOre', () => {

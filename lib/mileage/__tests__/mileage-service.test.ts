@@ -178,6 +178,12 @@ describe('pushMileageToSalaryRun', () => {
       await pushMileageToSalaryRun(bookedRun as never, 'company-1', params)
     ).toEqual({ ok: false, code: 'RUN_NOT_EDITABLE' })
 
+    const reviewRun = salarySupabase({ run: { id: 'run-1', status: 'review' } })
+    expect(
+      await pushMileageToSalaryRun(reviewRun as never, 'company-1', params)
+    ).toEqual({ ok: false, code: 'RUN_NOT_EDITABLE' })
+    expect(reviewRun.rpc).not.toHaveBeenCalled()
+
     const noSre = salarySupabase({ run: { id: 'run-1', status: 'draft' }, sre: null })
     expect(
       await pushMileageToSalaryRun(noSre as never, 'company-1', params)

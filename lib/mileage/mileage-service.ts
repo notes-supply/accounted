@@ -382,7 +382,7 @@ export type PushToSalaryRunResult =
     }
 
 /**
- * Push the period's draft trips into a draft/review salary run as
+ * Push the period's draft trips into a draft salary run as
  * mileage_taxfree line items (kostnadsersättning: not taxable, no avgifter,
  * not semesterlönegrundande). The salary run's own booking flow then carries
  * the amounts into the verifikat and AGI.
@@ -405,7 +405,7 @@ export async function pushMileageToSalaryRun(
     .eq('company_id', companyId)
     .single()
   if (!run) return { ok: false, code: 'RUN_NOT_FOUND' }
-  if (run.status !== 'draft' && run.status !== 'review') {
+  if (run.status !== 'draft') {
     return { ok: false, code: 'RUN_NOT_EDITABLE' }
   }
 

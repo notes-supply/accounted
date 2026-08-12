@@ -43,6 +43,8 @@ import { getRevenueAccount } from '@/lib/bookkeeping/invoice-entries'
 import { createJournalEntry, reverseEntry } from '@/lib/bookkeeping/engine'
 import { createLogger } from '@/lib/logger'
 import { ORE_TOLERANCE, roundOre } from '@/lib/money'
+import { fetchAllRows } from '@/lib/supabase/fetch-all'
+import { fetchPaymentTotalsByParent } from '@/lib/invoices/payment-totals'
 
 const log = createLogger('kontantmetod-cutoff')
 
@@ -379,58 +381,52 @@ export async function collectKontantmetodCutoff(
   periodStart: string,
   periodEnd: string,
 ): Promise<CutoffCollection> {
-  const [invoicesResult, supplierResult] = await Promise.all([
-    supabase
-      .from('invoices')
-      .select('id, invoice_number, invoice_date, status, total, total_sek, vat_amount, vat_amount_sek, vat_treatment, credited_invoice_id, document_type')
-      .eq('company_id', companyId)
-      .lte('invoice_date', periodEnd)
-      .in('status', ['sent', 'overdue', 'partially_paid', 'paid']),
-    supabase
-      .from('supplier_invoices')
-      .select('id, supplier_invoice_number, invoice_date, status, total, total_sek, vat_amount, vat_amount_sek, reverse_charge, is_credit_note, items:supplier_invoice_items(account_number, line_total)')
-      .eq('company_id', companyId)
-      .lte('invoice_date', periodEnd)
-      .in('status', ['registered', 'approved', 'partially_paid', 'paid']),
+  const [invoices, supplierInvoices] = await Promise.all([
+    fetchAllRows<Record<string, unknown>>(({ from, to }) =>
+      supabase
+        .from('invoices')
+        .select('id, invoice_number, invoice_date, status, total, total_sek, vat_amount, vat_amount_sek, vat_treatment, credited_invoice_id, document_type')
+        .eq('company_id', companyId)
+        .lte('invoice_date', periodEnd)
+        .in('status', ['sent', 'overdue', 'partially_paid', 'paid'])
+        .order('id', { ascending: true })
+        .range(from, to),
+    ),
+    fetchAllRows<Record<string, unknown>>(({ from, to }) =>
+      supabase
+        .from('supplier_invoices')
+        .select('id, supplier_invoice_number, invoice_date, status, total, total_sek, vat_amount, vat_amount_sek, reverse_charge, is_credit_note, items:supplier_invoice_items(account_number, line_total)')
+        .eq('company_id', companyId)
+        .lte('invoice_date', periodEnd)
+        .in('status', ['registered', 'approved', 'partially_paid', 'paid'])
+        .order('id', { ascending: true })
+        .range(from, to),
+    ),
   ])
-
-  const invoices = (invoicesResult.data ?? []) as Array<Record<string, unknown>>
-  const supplierInvoices = (supplierResult.data ?? []) as Array<Record<string, unknown>>
 
   const invoiceIds = invoices.map((row) => row.id as string)
   const supplierIds = supplierInvoices.map((row) => row.id as string)
 
   // Payments ON OR BEFORE period end reduce the outstanding balance; later
   // ones must not.
-  const [invoicePayments, supplierPayments] = await Promise.all([
-    invoiceIds.length > 0
-      ? supabase
-          .from('invoice_payments')
-          .select('invoice_id, amount, payment_date')
-          .eq('company_id', companyId)
-          .lte('payment_date', periodEnd)
-          .in('invoice_id', invoiceIds)
-      : Promise.resolve({ data: [] as Array<Record<string, unknown>> }),
-    supplierIds.length > 0
-      ? supabase
-          .from('supplier_invoice_payments')
-          .select('supplier_invoice_id, amount, payment_date')
-          .eq('company_id', companyId)
-          .lte('payment_date', periodEnd)
-          .in('supplier_invoice_id', supplierIds)
-      : Promise.resolve({ data: [] as Array<Record<string, unknown>> }),
+  const [paidByInvoice, paidBySupplierInvoice] = await Promise.all([
+    fetchPaymentTotalsByParent({
+      supabase,
+      table: 'invoice_payments',
+      parentColumn: 'invoice_id',
+      companyId,
+      parentIds: invoiceIds,
+      throughDate: periodEnd,
+    }),
+    fetchPaymentTotalsByParent({
+      supabase,
+      table: 'supplier_invoice_payments',
+      parentColumn: 'supplier_invoice_id',
+      companyId,
+      parentIds: supplierIds,
+      throughDate: periodEnd,
+    }),
   ])
-
-  const paidByInvoice = new Map<string, number>()
-  for (const row of (invoicePayments.data ?? []) as Array<Record<string, unknown>>) {
-    const id = row.invoice_id as string
-    paidByInvoice.set(id, (paidByInvoice.get(id) ?? 0) + Number(row.amount ?? 0))
-  }
-  const paidBySupplierInvoice = new Map<string, number>()
-  for (const row of (supplierPayments.data ?? []) as Array<Record<string, unknown>>) {
-    const id = row.supplier_invoice_id as string
-    paidBySupplierInvoice.set(id, (paidBySupplierInvoice.get(id) ?? 0) + Number(row.amount ?? 0))
-  }
 
   const receivables: CutoffReceivable[] = []
   const unknownVatTreatment: string[] = []
@@ -442,10 +438,13 @@ export async function collectKontantmetodCutoff(
     const documentType = row.document_type as string | null
     if (documentType && documentType !== 'invoice') continue
 
-    const total = Number(row.total_sek ?? row.total ?? 0)
-    const vat = Number(row.vat_amount_sek ?? row.vat_amount ?? 0)
+    const invoiceTotal = Number(row.total ?? 0)
+    const totalSek = Number(row.total_sek ?? row.total ?? 0)
+    const vatSek = Number(row.vat_amount_sek ?? row.vat_amount ?? 0)
     const paid = paidByInvoice.get(row.id as string) ?? 0
-    const outstanding = roundOre(total - paid)
+    const outstandingInInvoiceCurrency = roundOre(invoiceTotal - paid)
+    const ratio = invoiceTotal === 0 ? 0 : outstandingInInvoiceCurrency / invoiceTotal
+    const outstanding = roundOre(totalSek * ratio)
     if (Math.abs(outstanding) < ORE_TOLERANCE) continue
 
     // Never guess the treatment. Defaulting a 12 %/6 %/undantagen invoice to
@@ -461,8 +460,7 @@ export async function collectKontantmetodCutoff(
 
     // Scale the moms share to the part still outstanding: a half-paid invoice
     // carries half its moms into the cut-off.
-    const ratio = total === 0 ? 0 : outstanding / total
-    const scaledVat = roundOre(vat * ratio)
+    const scaledVat = roundOre(vatSek * ratio)
 
     // Moms on a treatment that cannot carry Swedish output moms is a real
     // invoicing error. Surface it instead of quietly folding it into revenue:
@@ -482,19 +480,21 @@ export async function collectKontantmetodCutoff(
 
   const payables: CutoffPayable[] = []
   for (const row of supplierInvoices) {
-    const total = Number(row.total_sek ?? row.total ?? 0)
-    const vat = Number(row.vat_amount_sek ?? row.vat_amount ?? 0)
+    const invoiceTotal = Number(row.total ?? 0)
+    const totalSek = Number(row.total_sek ?? row.total ?? 0)
+    const vatSek = Number(row.vat_amount_sek ?? row.vat_amount ?? 0)
     const paid = paidBySupplierInvoice.get(row.id as string) ?? 0
-    const outstanding = roundOre(total - paid)
+    const outstandingInInvoiceCurrency = roundOre(invoiceTotal - paid)
+    const ratio = invoiceTotal === 0 ? 0 : outstandingInInvoiceCurrency / invoiceTotal
+    const outstanding = roundOre(totalSek * ratio)
     if (Math.abs(outstanding) < ORE_TOLERANCE) continue
 
-    const ratio = total === 0 ? 0 : outstanding / total
     const items = (row.items ?? []) as Array<Record<string, unknown>>
     payables.push({
       id: row.id as string,
       reference: (row.supplier_invoice_number as string) ?? '',
       outstanding,
-      vat: roundOre(vat * ratio),
+      vat: roundOre(vatSek * ratio),
       reverseCharge: Boolean(row.reverse_charge),
       netByAccount: items
         .filter((item) => item.account_number)

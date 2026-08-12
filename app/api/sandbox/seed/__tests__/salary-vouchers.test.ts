@@ -1,5 +1,11 @@
-import { describe, it, expect } from 'vitest'
-import { buildSandboxSalaryVouchers } from '../salary-vouchers'
+import { describe, it, expect, vi } from 'vitest'
+
+vi.mock('@/lib/bookkeeping/engine', () => ({
+  createJournalEntry: vi.fn(),
+}))
+
+import { createJournalEntry } from '@/lib/bookkeeping/engine'
+import { buildSandboxSalaryVouchers, postSandboxSalaryVouchers } from '../salary-vouchers'
 
 const BASE = {
   userId: 'user-1',
@@ -117,5 +123,40 @@ describe('buildSandboxSalaryVouchers', () => {
       totalNet: 0.2,
     })
     expect(salary.lines[0].debit_amount).toBe(0.3)
+  })
+})
+
+describe('postSandboxSalaryVouchers', () => {
+  it('commits every salary voucher through the bookkeeping engine', async () => {
+    const vouchers = buildSandboxSalaryVouchers({ ...BASE, ...TOTALS })
+    vi.mocked(createJournalEntry)
+      .mockResolvedValueOnce({ id: 'salary-entry' } as never)
+      .mockResolvedValueOnce({ id: 'avgifter-entry' } as never)
+      .mockResolvedValueOnce({ id: 'vacation-entry' } as never)
+
+    const links = await postSandboxSalaryVouchers(
+      {} as never,
+      'company-1',
+      'user-1',
+      vouchers,
+    )
+
+    expect(createJournalEntry).toHaveBeenCalledTimes(3)
+    expect(createJournalEntry).toHaveBeenNthCalledWith(
+      1,
+      expect.anything(),
+      'company-1',
+      'user-1',
+      expect.objectContaining({
+        source_type: 'salary_payment',
+        source_id: 'run-1',
+        lines: vouchers[0].lines,
+      }),
+    )
+    expect(links).toEqual({
+      salary_entry_id: 'salary-entry',
+      avgifter_entry_id: 'avgifter-entry',
+      vacation_entry_id: 'vacation-entry',
+    })
   })
 })

@@ -341,7 +341,18 @@ describe('buildBokslutReadinessReport', () => {
     expect(ap?.href).toBe('/reports/supplier-ledger')
     // Warnings never flip readiness.
     expect(report.ready).toBe(true)
-    expect(vi.mocked(generateARReconciliation)).toHaveBeenCalledWith(supabase, 'co-1', 'fp-1')
+    expect(vi.mocked(generateARReconciliation)).toHaveBeenCalledWith(
+      supabase,
+      'co-1',
+      'fp-1',
+      '2025-12-31',
+    )
+    expect(vi.mocked(generateAPReconciliation)).toHaveBeenCalledWith(
+      supabase,
+      'co-1',
+      'fp-1',
+      '2025-12-31',
+    )
   })
 
   it('skips the AR/AP tie-outs entirely for kontantmetoden companies', async () => {

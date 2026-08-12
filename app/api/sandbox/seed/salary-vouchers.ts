@@ -3,18 +3,18 @@
  *
  * A run in status 'booked' that produced no verifikat would be a lie: in the
  * real product `bookPaidSalaryRun` posts 2-4 entries through the bookkeeping
- * engine before it advances the status. The sandbox seed cannot call that path
- * (it goes through the engine, which emits events, and the seed deliberately
- * inserts journal rows directly), so this module mirrors the account structure
- * of `createSalaryRunEntries` in lib/salary/salary-entries.ts instead.
+ * engine before it advances the status. This module mirrors the account
+ * structure of `createSalaryRunEntries` in lib/salary/salary-entries.ts; the
+ * caller commits each result through the same bookkeeping engine boundary.
  *
  * Accounts come from SALARY_ACCOUNTS (lib/salary/account-mapping.ts), not from
  * literals here, so a future BAS remap moves the seed with the engine.
  *
- * Pure builders, in the same style as ./customers.ts and ./pending-operations.ts:
- * the caller assigns voucher numbers and journal_entry_id foreign keys.
+ * Pure builders, in the same style as ./customers.ts and ./pending-operations.ts.
  */
 
+import type { SupabaseClient } from '@supabase/supabase-js'
+import { createJournalEntry } from '@/lib/bookkeeping/engine'
 import { SALARY_ACCOUNTS } from '@/lib/salary/account-mapping'
 
 /** Money rounding, per the project rule: never toFixed(). */
@@ -244,4 +244,29 @@ export function buildSandboxSalaryVouchers(input: SalaryVoucherInput): SalaryVou
   }
 
   return vouchers
+}
+
+/** Commit salary vouchers through the engine and return their salary-run links. */
+export async function postSandboxSalaryVouchers(
+  supabase: SupabaseClient,
+  companyId: string,
+  userId: string,
+  vouchers: SalaryVoucher[],
+): Promise<Record<string, string>> {
+  const runEntryLinks: Record<string, string> = {}
+
+  for (const voucher of vouchers) {
+    const salaryEntry = await createJournalEntry(supabase, companyId, userId, {
+      fiscal_period_id: voucher.entry.fiscal_period_id,
+      voucher_series: voucher.entry.voucher_series,
+      entry_date: voucher.entry.entry_date,
+      description: voucher.entry.description,
+      source_type: voucher.entry.source_type,
+      source_id: voucher.entry.source_id,
+      lines: voucher.lines,
+    })
+    runEntryLinks[voucher.runColumn] = salaryEntry.id
+  }
+
+  return runEntryLinks
 }

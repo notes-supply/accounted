@@ -2,6 +2,8 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 import { resolveSekAmount } from '@/lib/bookkeeping/currency-utils'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import { fetchEntryLines, type EntryLinesQuery } from '@/lib/bookkeeping/entry-lines'
+import { fetchPaymentTotalsByParent } from '@/lib/invoices/payment-totals'
+import { fetchPeriodLinkedRows } from '@/lib/reports/period-linked-rows'
 
 export interface ARReconciliationResult {
   ar_ledger_total: number
@@ -37,28 +39,50 @@ export interface ARReconciliationResult {
 export async function generateARReconciliation(
   supabase: SupabaseClient,
   companyId: string,
-  periodId: string
+  periodId: string,
+  asOfDate?: string,
 ): Promise<ARReconciliationResult> {
 
   // total/paid_amount are stored in invoice currency; account 1510 is in SEK
   // (booked at invoice-date rate), so convert each row before summing.
   // Paginated: a company with >1000 open invoices would otherwise be silently
   // truncated, manufacturing a phantom reconciliation gap.
-  const invoices = await fetchAllRows<{
+  type InvoiceRow = {
     id: string
     total: number | null
     paid_amount: number | null
     currency: string | null
     exchange_rate: number | null
-  }>(({ from, to }) =>
-    supabase
-      .from('invoices')
-      .select('id, total, paid_amount, currency, exchange_rate')
-      .eq('company_id', companyId)
-      .in('status', ['sent', 'overdue', 'partially_paid'])
-      .order('id', { ascending: true })
-      .range(from, to)
-  )
+  }
+  const invoices = asOfDate
+    ? await fetchPeriodLinkedRows<InvoiceRow>({
+        supabase,
+        table: 'invoices',
+        select: 'id, total, paid_amount, currency, exchange_rate',
+        entryLinkColumn: 'journal_entry_id',
+        companyId,
+        throughDate: asOfDate,
+      })
+    : await fetchAllRows<InvoiceRow>(({ from, to }) =>
+        supabase
+          .from('invoices')
+          .select('id, total, paid_amount, currency, exchange_rate')
+          .eq('company_id', companyId)
+          .in('status', ['sent', 'overdue', 'partially_paid'])
+          .order('id', { ascending: true })
+          .range(from, to),
+      )
+
+  const paidByInvoice = asOfDate
+    ? await fetchPaymentTotalsByParent({
+        supabase,
+        table: 'invoice_payments',
+        parentColumn: 'invoice_id',
+        companyId,
+        parentIds: invoices.map((invoice) => invoice.id),
+        throughDate: asOfDate,
+      })
+    : null
 
   let unconvertedFxCount = 0
   const arLedgerTotal = (invoices || [])
@@ -71,7 +95,8 @@ export async function generateARReconciliation(
         unconvertedFxCount += 1
         return sum
       }
-      const outstanding = (Number(inv.total) || 0) - (Number(inv.paid_amount) || 0)
+      const paid = paidByInvoice?.get(inv.id) ?? (Number(inv.paid_amount) || 0)
+      const outstanding = (Number(inv.total) || 0) - paid
       const sek = resolveSekAmount(outstanding, null, inv.currency, inv.exchange_rate)
       return Math.round((sum + sek) * 100) / 100
     }, 0)

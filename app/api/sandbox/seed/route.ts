@@ -30,6 +30,7 @@ import {
 } from './salary'
 import {
   buildSandboxSalaryVouchers,
+  postSandboxSalaryVouchers,
   SANDBOX_SALARY_ACCOUNT_NUMBERS,
 } from './salary-vouchers'
 
@@ -1109,9 +1110,7 @@ export async function POST(request: Request) {
 
     // 21. Verifikat for the BOOKED run. A run in status 'booked' that posted
     // nothing would be a lie: the real path (bookPaidSalaryRun) always writes
-    // these through the engine before advancing the status. The seed inserts
-    // journal rows directly to avoid event emission, so ./salary-vouchers
-    // mirrors the engine's account structure instead.
+    // these through the engine before advancing the status.
     const bookedPeriod = resolveSandboxSalaryPeriods(today).booked
     const salaryVouchers = buildSandboxSalaryVouchers({
       userId,
@@ -1132,52 +1131,12 @@ export async function POST(request: Request) {
       totalVacationAvgifter: SANDBOX_TOTAL_VACATION_ACCRUAL_AVGIFTER,
     })
 
-    const runEntryLinks: Record<string, string> = {}
-    for (const voucher of salaryVouchers) {
-      const { data: salaryVoucherNumber, error: salaryVoucherError } = await supabase.rpc(
-        'next_voucher_number',
-        {
-          p_company_id: companyId,
-          p_fiscal_period_id: fiscalPeriod.id,
-          p_series: voucher.entry.voucher_series,
-        },
-      )
-      // A posted verifikat with no voucher number is a hole in the
-      // verifikationsserie (BFNAR 2013:2), so a failed counter read has to stop
-      // the seed rather than insert one.
-      if (salaryVoucherError) throw salaryVoucherError
-      if (salaryVoucherNumber == null) {
-        throw new Error('Sandbox seed: next_voucher_number returned no number for a salary voucher')
-      }
-
-      const { data: insertedSalaryEntry, error: salaryEntryError } = await supabase
-        .from('journal_entries')
-        // Draft until the lines exist; see the ledger-history comment above.
-        .insert({ ...voucher.entry, voucher_number: salaryVoucherNumber, status: 'draft' })
-        .select('id')
-        .single()
-      if (salaryEntryError) throw salaryEntryError
-
-      const { error: salaryEntryLinesError } = await supabase
-        .from('journal_entry_lines')
-        .insert(
-          voucher.lines.map(line => ({
-            ...line,
-            account_id: accountMap[line.account_number] ?? null,
-            journal_entry_id: insertedSalaryEntry.id,
-          })),
-        )
-      if (salaryEntryLinesError) throw salaryEntryLinesError
-
-      runEntryLinks[voucher.runColumn] = insertedSalaryEntry.id
-    }
-
-    const { error: salaryPostError } = await supabase
-      .from('journal_entries')
-      .update({ status: 'posted' })
-      .in('id', Object.values(runEntryLinks))
-      .eq('company_id', companyId)
-    if (salaryPostError) throw salaryPostError
+    const runEntryLinks = await postSandboxSalaryVouchers(
+      supabase,
+      companyId,
+      userId,
+      salaryVouchers,
+    )
 
     const { error: linkRunError } = await supabase
       .from('salary_runs')
