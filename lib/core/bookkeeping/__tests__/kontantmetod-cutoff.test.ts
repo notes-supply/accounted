@@ -70,6 +70,7 @@ describe('collectKontantmetodCutoff', () => {
         },
       ])
       .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
     vi.mocked(fetchPaymentTotalsByParent)
       .mockResolvedValueOnce(new Map([['inv-eur', 500]]))
       .mockResolvedValueOnce(new Map())
@@ -88,6 +89,188 @@ describe('collectKontantmetodCutoff', () => {
         vat: 1150,
       }),
     ])
+  })
+
+  it('preserves mixed VAT rates and frozen revenue accounts in the cut-off', async () => {
+    vi.mocked(fetchAllRows)
+      .mockResolvedValueOnce([
+        {
+          id: 'inv-mixed',
+          invoice_number: 'F-MIX',
+          total: 2370,
+          total_sek: 2370,
+          vat_amount: 370,
+          vat_amount_sek: 370,
+          vat_treatment: 'standard_25',
+          journal_entry_id: null,
+          credited_invoice_id: null,
+          document_type: 'invoice',
+          items: [
+            { sort_order: 0, line_total: 1000, vat_rate: 25, vat_amount: 250, revenue_account: '3041' },
+            { sort_order: 1, line_total: 1000, vat_rate: 12, vat_amount: 120, revenue_account: null },
+          ],
+        },
+      ])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+    vi.mocked(fetchPaymentTotalsByParent)
+      .mockResolvedValueOnce(new Map())
+      .mockResolvedValueOnce(new Map())
+
+    const result = await collectKontantmetodCutoff(
+      {} as never,
+      'co-1',
+      '2025-01-01',
+      '2025-12-31',
+    )
+    const { receivableLines } = buildCutoffLines(result.receivables, [])
+
+    expect(receivableLines.find((line) => line.account_number === '3041')?.credit_amount).toBe(1000)
+    expect(receivableLines.find((line) => line.account_number === '3002')?.credit_amount).toBe(1000)
+    expect(receivableLines.find((line) => line.account_number === '2618')?.credit_amount).toBe(250)
+    expect(receivableLines.find((line) => line.account_number === '2628')?.credit_amount).toBe(120)
+    expect(sum(receivableLines)).toEqual({ debit: 2370, credit: 2370 })
+  })
+
+  it('nets an unbooked credit note with its original before building fixed-side lines', async () => {
+    const originalItems = [
+      { sort_order: 0, line_total: 1000, vat_rate: 25, vat_amount: 250, revenue_account: '3041' },
+    ]
+    vi.mocked(fetchAllRows)
+      .mockResolvedValueOnce([
+        {
+          id: 'inv-original',
+          invoice_number: 'F-1',
+          status: 'credited',
+          total: 1250,
+          total_sek: 1250,
+          vat_amount: 250,
+          vat_amount_sek: 250,
+          vat_treatment: 'standard_25',
+          journal_entry_id: null,
+          credited_invoice_id: null,
+          document_type: 'invoice',
+          items: originalItems,
+        },
+        {
+          id: 'inv-credit',
+          invoice_number: 'KR-F-1',
+          status: 'sent',
+          total: -1250,
+          total_sek: -1250,
+          vat_amount: -250,
+          vat_amount_sek: -250,
+          vat_treatment: 'standard_25',
+          journal_entry_id: null,
+          credited_invoice_id: 'inv-original',
+          document_type: 'invoice',
+          items: [
+            { sort_order: 0, line_total: -1000, vat_rate: 25, vat_amount: -250, revenue_account: null },
+          ],
+        },
+      ])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+    vi.mocked(fetchPaymentTotalsByParent)
+      .mockResolvedValueOnce(new Map())
+      .mockResolvedValueOnce(new Map())
+
+    const result = await collectKontantmetodCutoff(
+      {} as never,
+      'co-1',
+      '2025-01-01',
+      '2025-12-31',
+    )
+
+    expect(result.receivables).toHaveLength(2)
+    expect(buildCutoffLines(result.receivables, []).receivableLines).toEqual([])
+  })
+
+  it('excludes a credit note already represented by a posted source voucher', async () => {
+    vi.mocked(fetchAllRows)
+      .mockResolvedValueOnce([
+        {
+          id: 'inv-original',
+          invoice_number: 'F-1',
+          status: 'credited',
+          total: 1250,
+          total_sek: 1250,
+          vat_amount: 250,
+          vat_amount_sek: 250,
+          vat_treatment: 'standard_25',
+          journal_entry_id: null,
+          credited_invoice_id: null,
+          document_type: 'invoice',
+          items: [{ sort_order: 0, line_total: 1000, vat_rate: 25, vat_amount: 250 }],
+        },
+        {
+          id: 'inv-credit',
+          invoice_number: 'KR-F-1',
+          status: 'sent',
+          total: -1250,
+          total_sek: -1250,
+          vat_amount: -250,
+          vat_amount_sek: -250,
+          vat_treatment: 'standard_25',
+          journal_entry_id: null,
+          credited_invoice_id: 'inv-original',
+          document_type: 'invoice',
+          items: [{ sort_order: 0, line_total: -1000, vat_rate: 25, vat_amount: -250 }],
+        },
+      ])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ source_id: 'inv-credit' }])
+    vi.mocked(fetchPaymentTotalsByParent)
+      .mockResolvedValueOnce(new Map())
+      .mockResolvedValueOnce(new Map())
+
+    const result = await collectKontantmetodCutoff(
+      {} as never,
+      'co-1',
+      '2025-01-01',
+      '2025-12-31',
+    )
+
+    expect(result.receivables.map((row) => row.id)).toEqual(['inv-original'])
+    expect(buildCutoffLines(result.receivables, []).receivableTotal).toBe(1250)
+  })
+
+  it('keeps a credit note in a historical cutoff when its source voucher is later', async () => {
+    vi.mocked(fetchAllRows)
+      .mockResolvedValueOnce([
+        {
+          id: 'inv-credit',
+          invoice_number: 'KR-F-1',
+          status: 'sent',
+          total: -1250,
+          total_sek: -1250,
+          vat_amount: -250,
+          vat_amount_sek: -250,
+          vat_treatment: 'standard_25',
+          credited_invoice_id: 'inv-original',
+          document_type: 'invoice',
+          items: [{ sort_order: 0, line_total: -1000, vat_rate: 25, vat_amount: -250 }],
+        },
+      ])
+      .mockResolvedValueOnce([])
+      // The date-bounded journal query returns nothing. A current row pointer
+      // must not erase the historical credit balance.
+      .mockResolvedValueOnce([])
+    vi.mocked(fetchPaymentTotalsByParent)
+      .mockResolvedValueOnce(new Map())
+      .mockResolvedValueOnce(new Map())
+
+    const result = await collectKontantmetodCutoff(
+      {} as never,
+      'co-1',
+      '2025-01-01',
+      '2025-12-31',
+    )
+
+    expect(result.receivables.map((row) => row.id)).toEqual(['inv-credit'])
+    const { receivableLines } = buildCutoffLines(result.receivables, [])
+    expect(receivableLines.every((line) => line.debit_amount >= 0 && line.credit_amount >= 0)).toBe(true)
+    expect(sum(receivableLines)).toEqual({ debit: 1250, credit: 1250 })
   })
 })
 
@@ -194,6 +377,20 @@ describe('buildCutoffLines: fordringar', () => {
   it('emits nothing when there is nothing outstanding', () => {
     expect(buildCutoffLines([], []).receivableLines).toEqual([])
     expect(buildCutoffLines([receivable({ outstanding: 0, vat: 0 })], []).receivableLines).toEqual([])
+  })
+
+  it('normalizes a net credit position to positive opposite-side lines', () => {
+    const { receivableLines } = buildCutoffLines([
+      receivable({ outstanding: -1250, vat: -250 }),
+    ], [])
+
+    expect(receivableLines).toEqual(expect.arrayContaining([
+      expect.objectContaining({ account_number: '1510', debit_amount: 0, credit_amount: 1250 }),
+      expect.objectContaining({ account_number: '3001', debit_amount: 1000, credit_amount: 0 }),
+      expect.objectContaining({ account_number: '2618', debit_amount: 250, credit_amount: 0 }),
+    ]))
+    expect(receivableLines.every((line) => line.debit_amount >= 0 && line.credit_amount >= 0)).toBe(true)
+    expect(sum(receivableLines)).toEqual({ debit: 1250, credit: 1250 })
   })
 })
 
