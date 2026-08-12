@@ -116,7 +116,7 @@ BEGIN
         USING ERRCODE = 'P0001';
     END IF;
     IF NEW.salary_run_id IS NOT NULL OR NEW.salary_line_item_id IS NOT NULL THEN
-      RAISE EXCEPTION 'Reverting a mileage trip to draft must clear payroll links.'
+      RAISE EXCEPTION 'Reverting a mileage trip to draft must clear salary_run_id and salary_line_item_id payroll links.'
         USING ERRCODE = 'P0001';
     END IF;
     RETURN NEW;
