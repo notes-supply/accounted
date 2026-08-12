@@ -219,7 +219,7 @@ describe('deletePayslipLine', () => {
   it('deletes a line in a draft run', async () => {
     mock.enqueue({ data: { id: RUN_ID, status: 'draft' } })
     mock.enqueue({ data: EXISTING_LINE })
-    mock.enqueue({ data: null })
+    mock.enqueue({ data: true })
 
     const result = await deletePayslipLine(supabase, {
       companyId: COMPANY_ID,

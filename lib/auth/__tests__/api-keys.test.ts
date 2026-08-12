@@ -36,6 +36,14 @@ describe('generateApiKey', () => {
     expect(key.startsWith('gnubok_sk_')).toBe(true)
   })
 
+  it('uses exactly 32 CSPRNG bytes encoded as unpadded base64url', () => {
+    const { key } = generateApiKey()
+    const encoded = key.slice('gnubok_sk_'.length)
+
+    expect(encoded).toMatch(/^[A-Za-z0-9_-]{43}$/)
+    expect(Buffer.from(encoded, 'base64url')).toHaveLength(32)
+  })
+
   it('returns 64-char hex SHA-256 hash', () => {
     const { hash } = generateApiKey()
     expect(hash).toMatch(/^[0-9a-f]{64}$/)
@@ -73,6 +81,7 @@ describe('hashApiKey', () => {
     const hash1 = hashApiKey('gnubok_sk_deterministic')
     const hash2 = hashApiKey('gnubok_sk_deterministic')
     expect(hash1).toBe(hash2)
+    expect(hash1).toBe('3e95d9cd3cd5aa0c30c9b65f52f6cffed2fb03b6ad3e2cedb0928008de13bd39')
   })
 
   it('produces different hashes for different inputs', () => {

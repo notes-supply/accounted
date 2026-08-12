@@ -103,6 +103,14 @@
   --duration-slow: 500ms;
 }
 
+/* While the assistant panel's width handle is being dragged, the page margin
+   must track the cursor 1:1: the page panel's 300ms margin transition would
+   trail the drag and leave a gap. AgentSheet sets the attribute for the
+   duration of the drag only. */
+:root[data-agent-resizing] #main-content {
+  transition: none !important;
+}
+
 .dark {
   color-scheme: dark;
 
@@ -154,6 +162,157 @@
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
   --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.35);
   --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+
+/* Color palettes are independent of appearance mode. next-themes continues
+   to own the .dark class while data-palette replaces only semantic chrome
+   tokens. Preview swatches share these rules so their colors cannot drift. */
+:root[data-palette="neutral"],
+[data-palette-preview="neutral"] {
+  --background: 0 0% 100%;
+  --primary: 0 0% 9%;
+  --secondary: 40 11% 89%;
+  --border: 45 5% 85%;
+}
+
+.dark[data-palette="neutral"],
+.dark [data-palette-preview="neutral"] {
+  --background: 0 0% 7%;
+  --primary: 0 0% 87%;
+  --secondary: 0 0% 14%;
+  --border: 45 4% 18%;
+}
+
+:root[data-palette="indigo"],
+[data-palette-preview="indigo"] {
+  --background: 228 42% 98%;
+  --foreground: 229 30% 14%;
+  --frame: 228 52% 94%;
+  --card: 0 0% 100%;
+  --card-foreground: 229 30% 14%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 229 30% 14%;
+  --primary: 231 48% 34%;
+  --primary-foreground: 225 40% 98%;
+  --secondary: 229 42% 89%;
+  --secondary-foreground: 229 30% 14%;
+  --muted: 228 36% 93%;
+  --muted-foreground: 229 20% 38%;
+  --accent: 228 36% 93%;
+  --accent-foreground: 229 30% 14%;
+  --border: 229 24% 78%;
+  --input: 229 24% 78%;
+  --ring: 231 48% 34%;
+}
+
+.dark[data-palette="indigo"],
+.dark [data-palette-preview="indigo"] {
+  --background: 231 28% 7%;
+  --foreground: 228 22% 89%;
+  --frame: 232 34% 4%;
+  --card: 231 24% 11%;
+  --card-foreground: 228 22% 89%;
+  --popover: 231 24% 11%;
+  --popover-foreground: 228 22% 89%;
+  --primary: 228 58% 74%;
+  --primary-foreground: 231 25% 10%;
+  --secondary: 231 28% 16%;
+  --secondary-foreground: 228 22% 89%;
+  --muted: 230 23% 18%;
+  --muted-foreground: 228 16% 64%;
+  --accent: 230 23% 18%;
+  --accent-foreground: 228 22% 89%;
+  --border: 231 20% 26%;
+  --input: 231 20% 26%;
+  --ring: 228 58% 74%;
+}
+
+:root[data-palette="forest"],
+[data-palette-preview="forest"] {
+  --background: 145 25% 98%;
+  --foreground: 150 24% 12%;
+  --frame: 140 38% 93%;
+  --card: 0 0% 100%;
+  --card-foreground: 150 24% 12%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 150 24% 12%;
+  --primary: 151 42% 28%;
+  --primary-foreground: 140 30% 98%;
+  --secondary: 140 30% 87%;
+  --secondary-foreground: 150 24% 12%;
+  --muted: 140 24% 92%;
+  --muted-foreground: 148 18% 34%;
+  --accent: 140 24% 92%;
+  --accent-foreground: 150 24% 12%;
+  --border: 142 20% 76%;
+  --input: 142 20% 76%;
+  --ring: 151 42% 28%;
+}
+
+.dark[data-palette="forest"],
+.dark [data-palette-preview="forest"] {
+  --background: 150 22% 6%;
+  --foreground: 140 15% 88%;
+  --frame: 150 28% 4%;
+  --card: 150 19% 10%;
+  --card-foreground: 140 15% 88%;
+  --popover: 150 19% 10%;
+  --popover-foreground: 140 15% 88%;
+  --primary: 145 38% 66%;
+  --primary-foreground: 150 18% 8%;
+  --secondary: 150 22% 16%;
+  --secondary-foreground: 140 15% 88%;
+  --muted: 150 20% 18%;
+  --muted-foreground: 143 14% 62%;
+  --accent: 150 20% 18%;
+  --accent-foreground: 140 15% 88%;
+  --border: 150 17% 26%;
+  --input: 150 17% 26%;
+  --ring: 145 38% 66%;
+}
+
+:root[data-palette="sand"],
+[data-palette-preview="sand"] {
+  --background: 42 52% 97%;
+  --foreground: 28 23% 13%;
+  --frame: 39 56% 91%;
+  --card: 42 45% 98%;
+  --card-foreground: 28 23% 13%;
+  --popover: 42 45% 98%;
+  --popover-foreground: 28 23% 13%;
+  --primary: 24 36% 30%;
+  --primary-foreground: 42 35% 98%;
+  --secondary: 38 42% 85%;
+  --secondary-foreground: 28 23% 13%;
+  --muted: 40 38% 90%;
+  --muted-foreground: 28 18% 34%;
+  --accent: 40 38% 90%;
+  --accent-foreground: 28 23% 13%;
+  --border: 36 28% 74%;
+  --input: 36 28% 74%;
+  --ring: 24 36% 30%;
+}
+
+.dark[data-palette="sand"],
+.dark [data-palette-preview="sand"] {
+  --background: 28 22% 7%;
+  --foreground: 39 20% 88%;
+  --frame: 25 26% 4%;
+  --card: 29 20% 10%;
+  --card-foreground: 39 20% 88%;
+  --popover: 29 20% 10%;
+  --popover-foreground: 39 20% 88%;
+  --primary: 35 44% 66%;
+  --primary-foreground: 28 18% 9%;
+  --secondary: 30 25% 16%;
+  --secondary-foreground: 39 20% 88%;
+  --muted: 30 22% 18%;
+  --muted-foreground: 34 15% 63%;
+  --accent: 30 22% 18%;
+  --accent-foreground: 39 20% 88%;
+  --border: 31 18% 26%;
+  --input: 31 18% 26%;
+  --ring: 35 44% 66%;
 }
 
 @theme inline {
@@ -418,6 +577,18 @@ body {
 
 .animate-scale-in {
   animation: scaleIn var(--duration-base) var(--ease-out);
+}
+
+/* Chrome/Safari autofill repaints the field in a browser-chosen blue/yellow
+   that ignores the theme. Painting an inset shadow in the input's own surface
+   color over it keeps autofilled fields inside the achromatic palette; the
+   text and caret colors follow the foreground token. */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus {
+  -webkit-box-shadow: 0 0 0 1000px hsl(var(--card)) inset;
+  -webkit-text-fill-color: hsl(var(--foreground));
+  caret-color: hsl(var(--foreground));
 }
 
 /* Soft focus states */

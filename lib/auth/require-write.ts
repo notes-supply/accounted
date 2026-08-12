@@ -27,6 +27,40 @@ type WritePermissionResult =
   | { ok: true }
   | { ok: false; response: NextResponse }
 
+const WRITABLE_COMPANY_ROLES = new Set<CompanyRole>([
+  'owner',
+  'admin',
+  'member',
+])
+
+/**
+ * Checks write permission for one already-resolved company.
+ *
+ * This deliberately does not resolve the active company again. Dispatchers
+ * that already hold a company context must authorize that exact id so a
+ * concurrent active-company change cannot make the role check target a
+ * different tenant. Query failures and unknown roles fail closed.
+ */
+export async function canWriteCompany(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+): Promise<boolean> {
+  try {
+    const { data: membership, error } = await supabase
+      .from('company_members')
+      .select('role')
+      .eq('company_id', companyId)
+      .eq('user_id', userId)
+      .maybeSingle()
+
+    if (error || !membership) return false
+    return WRITABLE_COMPANY_ROLES.has(membership.role as CompanyRole)
+  } catch {
+    return false
+  }
+}
+
 export async function requireWritePermission(
   supabase: SupabaseClient,
   userId: string,
@@ -43,14 +77,7 @@ export async function requireWritePermission(
     }
   }
 
-  const { data: membership } = await supabase
-    .from('company_members')
-    .select('role')
-    .eq('company_id', companyId)
-    .eq('user_id', userId)
-    .maybeSingle()
-
-  if (!membership || membership.role === 'viewer') {
+  if (!(await canWriteCompany(supabase, userId, companyId))) {
     return {
       ok: false,
       response: NextResponse.json(

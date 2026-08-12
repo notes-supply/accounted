@@ -2,6 +2,8 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 import { resolveSekAmount } from '@/lib/bookkeeping/currency-utils'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import { fetchEntryLines, type EntryLinesQuery } from '@/lib/bookkeeping/entry-lines'
+import { fetchPaymentTotalsByParent } from '@/lib/invoices/payment-totals'
+import { fetchPeriodLinkedRows } from '@/lib/reports/period-linked-rows'
 
 export interface ReconciliationResult {
   supplier_ledger_total: number
@@ -30,27 +32,50 @@ export interface ReconciliationResult {
 export async function generateReconciliation(
   supabase: SupabaseClient,
   companyId: string,
-  periodId: string
+  periodId: string,
+  asOfDate?: string,
 ): Promise<ReconciliationResult> {
 
   // remaining_amount is stored in invoice currency; account 2440 is in SEK
   // (booked at invoice-date rate), so convert each row before summing.
   // Paginated: a company with >1000 open supplier invoices would otherwise be
   // silently truncated, manufacturing a phantom reconciliation gap.
-  const invoices = await fetchAllRows<{
+  type SupplierInvoiceRow = {
     id: string
     remaining_amount: number | null
+    total: number | null
     currency: string | null
     exchange_rate: number | null
-  }>(({ from, to }) =>
-    supabase
-      .from('supplier_invoices')
-      .select('id, remaining_amount, currency, exchange_rate')
-      .eq('company_id', companyId)
-      .in('status', ['registered', 'approved', 'partially_paid', 'overdue'])
-      .order('id', { ascending: true })
-      .range(from, to)
-  )
+  }
+  const invoices = asOfDate
+    ? await fetchPeriodLinkedRows<SupplierInvoiceRow>({
+        supabase,
+        table: 'supplier_invoices',
+        select: 'id, total, remaining_amount, currency, exchange_rate',
+        entryLinkColumn: 'registration_journal_entry_id',
+        companyId,
+        throughDate: asOfDate,
+      })
+    : await fetchAllRows<SupplierInvoiceRow>(({ from, to }) =>
+        supabase
+          .from('supplier_invoices')
+          .select('id, total, remaining_amount, currency, exchange_rate')
+          .eq('company_id', companyId)
+          .in('status', ['registered', 'approved', 'partially_paid', 'overdue'])
+          .order('id', { ascending: true })
+          .range(from, to),
+      )
+
+  const paidByInvoice = asOfDate
+    ? await fetchPaymentTotalsByParent({
+        supabase,
+        table: 'supplier_invoice_payments',
+        parentColumn: 'supplier_invoice_id',
+        companyId,
+        parentIds: invoices.map((invoice) => invoice.id),
+        throughDate: asOfDate,
+      })
+    : null
 
   let unconvertedFxCount = 0
   const supplierLedgerTotal = (invoices || [])
@@ -64,7 +89,9 @@ export async function generateReconciliation(
         return sum
       }
       const sek = resolveSekAmount(
-        Number(inv.remaining_amount) || 0,
+        asOfDate
+          ? (Number(inv.total) || 0) - (paidByInvoice?.get(inv.id) ?? 0)
+          : Number(inv.remaining_amount) || 0,
         null,
         inv.currency,
         inv.exchange_rate

@@ -281,9 +281,12 @@ describe('gnubok_vat_declaration_submit', () => {
       fiscalPeriodId,
       resolvedPeriodStart: '2025-04-01',
       resolvedPeriodEnd: '2026-03-31',
+      fiscalPeriodStart: '2025-04-01',
+      fiscalPeriodEnd: '2026-03-31',
     })
     mockSkvRequest.mockResolvedValue({ ok: true, status: 200, json: async () => ({ status: 'OK' }) })
     const { supabase, enqueue, findCall } = createQueuedMockSupabase()
+    enqueue({ data: { vat_liability_start_date: '2025-04-01' }, error: null })
     enqueue({ data: null })
     enqueue({ data: null })
     enqueue({ data: { id: 'op-1' }, error: null })
@@ -305,7 +308,22 @@ describe('gnubok_vat_declaration_submit', () => {
     expect(result.next.args).toMatchObject({ fiscal_period_id: fiscalPeriodId })
 
     expect(findCall('pending_operations', 'insert')?.[0]).toMatchObject({
-      params: { fiscal_period_id: fiscalPeriodId },
+      params: {
+        fiscal_period_id: fiscalPeriodId,
+        fiscal_period_start: '2025-04-01',
+        fiscal_period_end: '2026-03-31',
+        resolved_period_start: '2025-04-01',
+        resolved_period_end: '2026-03-31',
+        vat_liability_start_date: '2025-04-01',
+      },
+      preview_data: {
+        fiscal_period_id: fiscalPeriodId,
+        fiscal_period_start: '2025-04-01',
+        fiscal_period_end: '2026-03-31',
+        resolved_period_start: '2025-04-01',
+        resolved_period_end: '2026-03-31',
+        vat_liability_start_date: '2025-04-01',
+      },
     })
   })
 
@@ -316,12 +334,15 @@ describe('gnubok_vat_declaration_submit', () => {
       redovisningsperiod: '202603',
       momsuppgift: { summaMoms: 100 },
       fiscalPeriodId,
-      resolvedPeriodStart: '2025-10-01',
+      resolvedPeriodStart: '2025-07-01',
       resolvedPeriodEnd: '2026-03-31',
+      fiscalPeriodStart: '2025-07-01',
+      fiscalPeriodEnd: '2026-03-31',
       declaration: { rutor: {} },
     })
     mockSkvRequest.mockResolvedValue({ ok: true, status: 200, json: async () => ({ status: 'OK' }) })
     const { supabase, enqueue, findCall } = createQueuedMockSupabase()
+    enqueue({ data: { vat_liability_start_date: null }, error: null })
     enqueue({ data: null })
     enqueue({ data: null })
     enqueue({ data: { id: 'op-2' }, error: null })
@@ -338,12 +359,94 @@ describe('gnubok_vat_declaration_submit', () => {
     expect(findCall('pending_operations', 'insert')?.[0]).toMatchObject({
       params: {
         fiscal_period_id: fiscalPeriodId,
-        resolved_period_start: '2025-10-01',
+        fiscal_period_start: '2025-07-01',
+        fiscal_period_end: '2026-03-31',
+        resolved_period_start: '2025-07-01',
         resolved_period_end: '2026-03-31',
+        vat_liability_start_date: null,
+      },
+      preview_data: {
+        fiscal_period_id: fiscalPeriodId,
+        fiscal_period_start: '2025-07-01',
+        fiscal_period_end: '2026-03-31',
+        resolved_period_start: '2025-07-01',
+        resolved_period_end: '2026-03-31',
+        vat_liability_start_date: null,
       },
     })
-    expect(result.preview).toMatchObject({ fiscal_period_id: fiscalPeriodId })
+    expect(result.preview).toMatchObject({
+      fiscal_period_id: fiscalPeriodId,
+      fiscal_period_start: '2025-07-01',
+      fiscal_period_end: '2026-03-31',
+      resolved_period_start: '2025-07-01',
+      resolved_period_end: '2026-03-31',
+      vat_liability_start_date: null,
+    })
     expect(result.next.args).toMatchObject({ fiscal_period_id: fiscalPeriodId })
+  })
+
+  it.each([
+    { label: 'missing row', read: { data: null, error: null } },
+    { label: 'missing property', read: { data: {}, error: null } },
+    {
+      label: 'malformed date',
+      read: { data: { vat_liability_start_date: '2025-02-30' }, error: null },
+    },
+  ])('fails annual staging when liability evidence is $label', async ({ read }) => {
+    mockBuildMomsuppgift.mockResolvedValue({
+      redovisare: '165560000000',
+      redovisningsperiod: '202603',
+      momsuppgift: { summaMoms: 100 },
+      fiscalPeriodId: '22222222-2222-4222-8222-222222222222',
+      resolvedPeriodStart: '2025-07-01',
+      resolvedPeriodEnd: '2026-03-31',
+      fiscalPeriodStart: '2025-07-01',
+      fiscalPeriodEnd: '2026-03-31',
+      declaration: { rutor: {} },
+    })
+    const { supabase, enqueue, findCall } = createQueuedMockSupabase()
+    enqueue(read)
+
+    await expect(vatSubmit.execute({
+      period_type: 'yearly',
+      year: 2026,
+      period: 1,
+    }, 'company-1', 'user-1', supabase as never, { type: 'api_key' }))
+      .rejects.toThrow(/liability start/i)
+
+    expect(mockSkvRequest).not.toHaveBeenCalled()
+    expect(findCall('pending_operations', 'insert')).toBeUndefined()
+  })
+
+  it.each([
+    { label: 'missing', fiscal: {} },
+    { label: 'one-sided', fiscal: { fiscalPeriodStart: '2025-07-01' } },
+    {
+      label: 'malformed',
+      fiscal: { fiscalPeriodStart: '2025-02-30', fiscalPeriodEnd: '2026-03-31' },
+    },
+  ])('fails annual staging before SKV or persistence when original fiscal evidence is $label', async ({ fiscal }) => {
+    mockBuildMomsuppgift.mockResolvedValue({
+      redovisare: '165560000000',
+      redovisningsperiod: '202603',
+      momsuppgift: { summaMoms: 100 },
+      fiscalPeriodId: '22222222-2222-4222-8222-222222222222',
+      resolvedPeriodStart: '2025-10-01',
+      resolvedPeriodEnd: '2026-03-31',
+      declaration: { rutor: {} },
+      ...fiscal,
+    })
+    const { supabase, findCall } = createQueuedMockSupabase()
+
+    await expect(vatSubmit.execute({
+      period_type: 'yearly',
+      year: 2026,
+      period: 1,
+    }, 'company-1', 'user-1', supabase as never, { type: 'api_key' }))
+      .rejects.toThrow(/period bounds|fiscal period/i)
+
+    expect(mockSkvRequest).not.toHaveBeenCalled()
+    expect(findCall('pending_operations', 'insert')).toBeUndefined()
   })
 
   it('does not stage when an omitted annual id is ambiguous within the end year', async () => {

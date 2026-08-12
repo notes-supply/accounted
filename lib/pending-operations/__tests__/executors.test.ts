@@ -11,6 +11,7 @@ import {
   makeCustomer,
   makeInvoice,
   makeFiscalPeriod,
+  makeSupplierInvoice,
 } from '@/tests/helpers'
 import type { PendingOperation } from '@/types'
 
@@ -66,6 +67,17 @@ vi.mock('@/lib/bookkeeping/invoice-entries', async () => {
   }
 })
 
+vi.mock('@/lib/bookkeeping/supplier-invoice-entries', async () => {
+  const actual =
+    await vi.importActual<typeof import('@/lib/bookkeeping/supplier-invoice-entries')>(
+      '@/lib/bookkeeping/supplier-invoice-entries'
+    )
+  return {
+    ...actual,
+    createSupplierCreditNoteEntry: vi.fn(),
+  }
+})
+
 vi.mock('@/lib/transactions/categorize-core', async () => {
   const actual =
     await vi.importActual<typeof import('@/lib/transactions/categorize-core')>(
@@ -112,6 +124,7 @@ import {
   bulkBookMatchedInboxItems,
   categorizeMatchedTransaction,
 } from '@/lib/transactions/categorize-core'
+import { createSupplierCreditNoteEntry } from '@/lib/bookkeeping/supplier-invoice-entries'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
 
 function makePendingOp(overrides: Partial<PendingOperation>): PendingOperation {
@@ -853,6 +866,76 @@ describe('commitPendingOperation: credit_invoice', () => {
   })
 })
 
+// ─── credit_supplier_invoice ────────────────────────────────────────
+
+describe('commitPendingOperation: credit_supplier_invoice', () => {
+  it('normalizes copied storage and reverses with the untouched original items', async () => {
+    const originalItems = [
+      {
+        sort_order: 0,
+        description: 'Office supplies',
+        quantity: 1,
+        unit: 'st',
+        unit_price: 1000,
+        line_total: 1000,
+        account_number: '5410',
+        vat_code: null,
+        vat_rate: 25,
+        vat_amount: 250,
+        dimensions: {},
+      },
+    ]
+    const original = {
+      ...makeSupplierInvoice({ id: 'supplier-invoice-1', status: 'registered' }),
+      supplier: { name: 'Office Depot AB', supplier_type: 'swedish_business' },
+      items: originalItems,
+    }
+    const creditNote = makeSupplierInvoice({
+      id: 'supplier-credit-1',
+      is_credit_note: true,
+      credited_invoice_id: original.id,
+    })
+    const { supabase, enqueueMany, findCall } = createQueuedMockSupabase()
+    enqueueMany([
+      { data: { id: 'op-1' }, error: null },
+      { data: original, error: null },
+      { data: 2, error: null },
+      { data: creditNote, error: null },
+      { data: null, error: null },
+      { data: { accounting_method: 'accrual' }, error: null },
+      { data: null, error: null },
+      { data: null, error: null },
+      { data: null, error: null },
+    ])
+    vi.mocked(createSupplierCreditNoteEntry).mockResolvedValueOnce({ id: 'je-1' } as never)
+
+    const op = makePendingOp({
+      operation_type: 'credit_supplier_invoice',
+      params: { supplier_invoice_id: original.id },
+    })
+    const result = await commitPendingOperation(
+      supabase as never,
+      'user-1',
+      'company-1',
+      op,
+    )
+
+    expect(result.status).toBe('committed')
+    const insertArgs = findCall('supplier_invoice_items', 'insert')
+    const insertedItems = insertArgs?.[0] as Array<{ vat_rate: number }>
+    expect(insertedItems[0]?.vat_rate).toBe(0.25)
+    expect(createSupplierCreditNoteEntry).toHaveBeenCalledWith(
+      supabase,
+      'company-1',
+      'user-1',
+      creditNote,
+      originalItems,
+      'swedish_business',
+      'Office Depot AB',
+    )
+  })
+})
+
 // ─── attach_document_to_transaction ─────────────────────────────────
 
 describe('commitPendingOperation: attach_document_to_transaction', () => {
@@ -1296,6 +1379,12 @@ describe('commitPendingOperation: bulk_book_inbox_items partial settlement failu
       params: {
         item_ids: ['11111111-1111-4111-8111-111111111111'],
         category: 'expense_software',
+        expected_settlements: [{
+          item_id: '11111111-1111-4111-8111-111111111111',
+          transaction_id: '22222222-2222-4222-8222-222222222222',
+          cash_account_id: null,
+          settlement_account: '1930',
+        }],
       },
     })
 
@@ -1343,6 +1432,12 @@ describe('commitPendingOperation: bulk_book_inbox_items partial settlement failu
       params: {
         item_ids: ['11111111-1111-4111-8111-111111111111'],
         category: 'expense_software',
+        expected_settlements: [{
+          item_id: '11111111-1111-4111-8111-111111111111',
+          transaction_id: '22222222-2222-4222-8222-222222222222',
+          cash_account_id: '33333333-3333-4333-8333-333333333333',
+          settlement_account: '1931',
+        }],
       },
     })
 
@@ -1361,5 +1456,85 @@ describe('commitPendingOperation: bulk_book_inbox_items partial settlement failu
       status: 'committing',
       result_data: { commit_in_progress: { partial_failure_possible: true } },
     })
+    expect(bulkBookMatchedInboxItems).toHaveBeenCalledWith(
+      supabase,
+      'user-1',
+      'company-1',
+      expect.objectContaining({
+        expected_settlements: [{
+          item_id: '11111111-1111-4111-8111-111111111111',
+          transaction_id: '22222222-2222-4222-8222-222222222222',
+          cash_account_id: '33333333-3333-4333-8333-333333333333',
+          settlement_account: '1931',
+        }],
+      }),
+    )
+  })
+
+  it.each([
+    { name: 'missing evidence', expectedSettlements: undefined },
+    {
+      name: 'one-sided evidence',
+      expectedSettlements: [{
+        item_id: '11111111-1111-4111-8111-111111111111',
+        transaction_id: '22222222-2222-4222-8222-222222222222',
+        cash_account_id: null,
+      }],
+    },
+    {
+      name: 'malformed evidence',
+      expectedSettlements: [{
+        item_id: '11111111-1111-4111-8111-111111111111',
+        transaction_id: 'not-a-uuid',
+        cash_account_id: null,
+        settlement_account: 'bank',
+      }],
+    },
+    {
+      name: 'non-canonical null-account evidence',
+      expectedSettlements: [{
+        item_id: '11111111-1111-4111-8111-111111111111',
+        transaction_id: '22222222-2222-4222-8222-222222222222',
+        cash_account_id: null,
+        settlement_account: '1931',
+      }],
+    },
+    {
+      name: 'evidence for a different item',
+      expectedSettlements: [{
+        item_id: '44444444-4444-4444-8444-444444444444',
+        transaction_id: '22222222-2222-4222-8222-222222222222',
+        cash_account_id: null,
+        settlement_account: '1930',
+      }],
+    },
+  ])('fails closed before bulk execution for $name', async ({ expectedSettlements }) => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null })
+    enqueue({ data: null, error: null })
+    const op = makePendingOp({
+      operation_type: 'bulk_book_inbox_items',
+      params: {
+        item_ids: ['11111111-1111-4111-8111-111111111111'],
+        category: 'expense_software',
+        ...(expectedSettlements === undefined
+          ? {}
+          : { expected_settlements: expectedSettlements }),
+      },
+    })
+
+    const result = await commitPendingOperation(
+      supabase as never,
+      'user-1',
+      'company-1',
+      op,
+    )
+
+    expect(result).toMatchObject({
+      status: 'rejected',
+      http_status: 409,
+    })
+    expect(result.error).toMatch(/ursprung för avräkningskontona/)
+    expect(bulkBookMatchedInboxItems).not.toHaveBeenCalled()
   })
 })

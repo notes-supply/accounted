@@ -34,6 +34,9 @@ import {
   type RequestOptions as HttpsRequestOptions,
 } from 'node:https'
 import type { ClientRequest, IncomingMessage } from 'node:http'
+import { X509Certificate } from 'node:crypto'
+import { isIP } from 'node:net'
+import { checkServerIdentity as checkServerIdentityDefault } from 'node:tls'
 import { validateWebhookUrl as validateWebhookUrlDefault } from './url-guard'
 
 export type PinnedFetchResult =
@@ -47,7 +50,8 @@ export type PinnedFetchResult =
     }
   | { kind: 'unsafe_url'; reason: string; detail: string; pinnedAddress: null }
   | { kind: 'redirect_blocked'; status: number; detail: string; pinnedAddress: string }
-  | { kind: 'timeout'; detail: string; pinnedAddress: string }
+  | { kind: 'response_too_large'; detail: string; pinnedAddress: string }
+  | { kind: 'timeout'; detail: string; pinnedAddress: string | null }
   | { kind: 'transport_error'; detail: string; pinnedAddress: string | null }
 
 export interface PinnedFetchInit {
@@ -57,6 +61,8 @@ export interface PinnedFetchInit {
   timeoutMs: number
   /** Max bytes captured from response body: receivers returning long error pages get truncated. */
   maxResponseBytes: number
+  /** Reject instead of returning a truncated body. Defaults to false for webhook compatibility. */
+  rejectOversizeResponse?: boolean
 }
 
 export interface PinnedFetchDeps {
@@ -69,6 +75,37 @@ export interface PinnedFetchDeps {
   ) => ClientRequest
 }
 
+function ipCertificateIdentityError(
+  hostname: string,
+  detail: string,
+  cause?: unknown,
+): Error {
+  const error = new Error(
+    `IP certificate identity verification failed for ${hostname}: ${detail}`,
+    cause === undefined ? undefined : { cause },
+  ) as Error & { code: string; reason: string; host: string }
+  error.code = 'ERR_TLS_CERT_ALTNAME_INVALID'
+  error.reason = detail
+  error.host = hostname
+  return error
+}
+
+function checkIpServerIdentity(
+  hostname: string,
+  cert: Parameters<typeof checkServerIdentityDefault>[1],
+): Error | undefined {
+  try {
+    const x509 = new X509Certificate(cert.raw)
+    if (x509.checkIP(hostname) !== undefined) return undefined
+    return ipCertificateIdentityError(
+      hostname,
+      'certificate does not contain an exact matching IP subject alternative name',
+    )
+  } catch (error) {
+    return ipCertificateIdentityError(hostname, 'certificate could not be parsed', error)
+  }
+}
+
 export async function pinnedHttpsFetch(
   rawUrl: string,
   init: PinnedFetchInit,
@@ -76,6 +113,7 @@ export async function pinnedHttpsFetch(
 ): Promise<PinnedFetchResult> {
   const validateUrl = deps.validateUrl ?? validateWebhookUrlDefault
   const httpsRequest = deps.httpsRequest ?? httpsRequestDefault
+  const deadlineAt = Date.now() + init.timeoutMs
 
   let parsed: URL
   try {
@@ -89,7 +127,41 @@ export async function pinnedHttpsFetch(
     }
   }
 
-  const validation = await validateUrl(rawUrl)
+  type ValidationOutcome =
+    | { kind: 'completed'; value: Awaited<ReturnType<typeof validateUrl>> }
+    | { kind: 'failed'; error: unknown }
+    | { kind: 'timeout' }
+  const validationOutcome = await new Promise<ValidationOutcome>((resolve) => {
+    let completed = false
+    const finish = (outcome: ValidationOutcome) => {
+      if (completed) return
+      completed = true
+      clearTimeout(timer)
+      resolve(outcome)
+    }
+    const remaining = Math.max(0, deadlineAt - Date.now())
+    const timer = setTimeout(() => finish({ kind: 'timeout' }), remaining)
+    Promise.resolve()
+      .then(() => validateUrl(rawUrl))
+      .then(
+        (value) => finish({ kind: 'completed', value }),
+        (error) => finish({ kind: 'failed', error }),
+      )
+  })
+  if (validationOutcome.kind === 'timeout') {
+    return {
+      kind: 'timeout',
+      detail: `URL validation exceeded ${init.timeoutMs} ms wall-clock`,
+      pinnedAddress: null,
+    }
+  }
+  if (validationOutcome.kind === 'failed') {
+    const detail = validationOutcome.error instanceof Error
+      ? validationOutcome.error.message
+      : String(validationOutcome.error)
+    return { kind: 'transport_error', detail, pinnedAddress: null }
+  }
+  const validation = validationOutcome.value
   if (!validation.ok) {
     return {
       kind: 'unsafe_url',
@@ -102,7 +174,10 @@ export async function pinnedHttpsFetch(
   // Pick the first vetted address. validateWebhookUrl rejects the whole
   // set when ANY entry is unsafe, so the first is safe by construction.
   // Deterministic choice keeps log output stable across retries.
-  const pinnedAddress = validation.resolvedAddresses[0]
+  const rawPinnedAddress = validation.resolvedAddresses[0]
+  const pinnedAddress = rawPinnedAddress?.startsWith('[') && rawPinnedAddress.endsWith(']')
+    ? rawPinnedAddress.slice(1, -1)
+    : rawPinnedAddress
   if (!pinnedAddress) {
     // Defensive: validateWebhookUrl returns ok only when there's at least
     // one address, but a future refactor could regress this and we want
@@ -115,6 +190,18 @@ export async function pinnedHttpsFetch(
   }
 
   const port = parsed.port ? Number(parsed.port) : 443
+  const urlHostname = parsed.hostname.startsWith('[') && parsed.hostname.endsWith(']')
+    ? parsed.hostname.slice(1, -1)
+    : parsed.hostname
+  const literalHostname = isIP(urlHostname) !== 0
+  const remainingRequestMs = Math.max(0, deadlineAt - Date.now())
+  if (remainingRequestMs === 0) {
+    return {
+      kind: 'timeout',
+      detail: `Request exceeded ${init.timeoutMs} ms wall-clock during URL validation`,
+      pinnedAddress,
+    }
+  }
 
   return new Promise<PinnedFetchResult>((resolve) => {
     let settled = false
@@ -137,18 +224,14 @@ export async function pinnedHttpsFetch(
       port,
       path: parsed.pathname + parsed.search,
       method: init.method,
-      // SNI carries the original hostname so the receiver's TLS cert
-      // (which is issued for the hostname, not the IP) validates.
-      //
-      // Cert-vs-hostname verification: Node's default checkServerIdentity
-      // matches the cert's SAN/CN against `servername` (or `host` when
-      // servername is unset). Because `servername` is set to the original
-      // hostname, the IP substitution above does NOT weaken the hostname-
-      // verification step: a forged endpoint at the pinned IP presenting
-      // a valid cert for a DIFFERENT hostname would fail the handshake.
-      // No explicit checkServerIdentity override is needed; relying on
-      // the default is the documented contract.
-      servername: parsed.hostname,
+      // DNS names keep their original SNI. IP literals omit SNI because TLS
+      // servername values cannot be bracketed IPv6 or an IP address.
+      ...(!literalHostname ? { servername: urlHostname } : {}),
+      // Pin certificate verification to the original normalized URL identity.
+      // DNS names verify their DNS SAN/CN; IP literals verify an exact IP SAN.
+      checkServerIdentity: (_hostname, cert) => literalHostname
+        ? checkIpServerIdentity(urlHostname, cert)
+        : checkServerIdentityDefault(urlHostname, cert),
       headers: {
         ...init.headers,
         // Lowercase 'host': Node's https.request would synthesise one
@@ -185,6 +268,50 @@ export async function pinnedHttpsFetch(
         })
       }
 
+      const contentLength = Number(res.headers['content-length'])
+      let oversizeDetected = false
+      let requestDestroyed = false
+      let responseDestroyed = false
+      const destroyRequestOnce = () => {
+        if (requestDestroyed) return
+        requestDestroyed = true
+        req.destroy()
+      }
+      const destroyResponseOnce = () => {
+        if (responseDestroyed) return
+        responseDestroyed = true
+        res.destroy()
+      }
+      const rejectOversize = () => {
+        if (oversizeDetected) return
+        oversizeDetected = true
+        if (absoluteTimer) clearTimeout(absoluteTimer)
+        settle({
+          kind: 'response_too_large',
+          detail: `Response exceeded ${init.maxResponseBytes} bytes.`,
+          pinnedAddress,
+        })
+        // Settle and mark the terminal condition before destruction because
+        // either stream may synchronously emit error/aborted/close.
+        destroyResponseOnce()
+        destroyRequestOnce()
+      }
+      // Register before the Content-Length fast path destroys the response.
+      // Some stream implementations emit an error synchronously from destroy.
+      res.on('error', (err) => {
+        if (oversizeDetected) return
+        if (absoluteTimer) clearTimeout(absoluteTimer)
+        settle({ kind: 'transport_error', detail: err.message, pinnedAddress })
+      })
+      if (
+        init.rejectOversizeResponse &&
+        Number.isFinite(contentLength) &&
+        contentLength > init.maxResponseBytes
+      ) {
+        rejectOversize()
+        return
+      }
+
       const chunks: Buffer[] = []
       let total = 0
       let truncated = false
@@ -196,8 +323,12 @@ export async function pinnedHttpsFetch(
           if (remaining > 0) chunks.push(chunk.subarray(0, remaining))
           total = init.maxResponseBytes
           truncated = true
-          // Destroy the stream: no point pulling the rest over the wire.
-          res.destroy()
+          if (init.rejectOversizeResponse) {
+            rejectOversize()
+          } else {
+            // Destroy the stream: no point pulling the rest over the wire.
+            destroyResponseOnce()
+          }
         } else {
           chunks.push(chunk)
           total += chunk.length
@@ -206,6 +337,7 @@ export async function pinnedHttpsFetch(
 
       const finalize = () => {
         if (absoluteTimer) clearTimeout(absoluteTimer)
+        if (oversizeDetected) return
         const headers: Record<string, string> = {}
         for (const [k, v] of Object.entries(res.headers)) {
           if (typeof v === 'string') headers[k] = v
@@ -234,37 +366,36 @@ export async function pinnedHttpsFetch(
       }
       res.once('end', finalizeOnce)
       res.once('close', finalizeOnce)
-      res.on('error', (err) => {
-        if (absoluteTimer) clearTimeout(absoluteTimer)
-        settle({ kind: 'transport_error', detail: err.message, pinnedAddress })
-      })
     })
 
     // Two-layer timeout: socket-idle timeout via Node's built-in, plus a
     // wall-clock absolute timeout. node:https `timeout` is idle-only and
     // wouldn't fire if a slow receiver dribbles bytes; the absolute timer
     // is the hard cap.
-    req.setTimeout(init.timeoutMs)
+    req.setTimeout(remainingRequestMs)
     req.on('timeout', () => {
+      if (settled) return
       req.destroy()
       if (absoluteTimer) clearTimeout(absoluteTimer)
       settle({
         kind: 'timeout',
-        detail: `Socket idle for ${init.timeoutMs} ms`,
+        detail: `Socket idle for ${remainingRequestMs} ms`,
         pinnedAddress,
       })
     })
 
     absoluteTimer = setTimeout(() => {
+      if (settled) return
       req.destroy()
       settle({
         kind: 'timeout',
         detail: `Request exceeded ${init.timeoutMs} ms wall-clock`,
         pinnedAddress,
       })
-    }, init.timeoutMs)
+    }, remainingRequestMs)
 
     req.on('error', (err) => {
+      if (settled) return
       if (absoluteTimer) clearTimeout(absoluteTimer)
       settle({ kind: 'transport_error', detail: err.message, pinnedAddress })
     })

@@ -23,11 +23,10 @@ import {
   proposeAteforing,
 } from '@/lib/bokslut/reserves/periodiseringsfond-service'
 import { proposeOveravskrivningar } from '@/lib/bokslut/reserves/overavskrivningar-service'
+import { calculateOveravskrivningar } from '@/lib/bokslut/reserves/overavskrivningar-calculator'
 import { generateIncomeStatement } from '@/lib/reports/income-statement'
-import {
-  buildDispositionsProposal,
-  buildLatentTaxProposal,
-} from '@/lib/bokslut/dispositions-proposal-builder'
+import { roundOre } from '@/lib/money'
+import { buildDispositionsProposal } from '@/lib/bokslut/dispositions-proposal-builder'
 import type { ProposedDisposition } from '@/lib/bokslut/types'
 import type { JournalEntry } from '@/types'
 
@@ -53,9 +52,6 @@ const DISPOSITION_ORDER: Record<string, number> = {
   sarskild_loneskatt: 2,
   periodiseringsfond_avsattning: 3,
   bolagsskatt: 4,
-  // K3 only: posts last because it depends on the closing 21xx balance,
-  // which only stabilises once avsättning / återföring have been applied.
-  uppskjuten_skatt: 5,
 }
 
 // ============================================================
@@ -172,11 +168,6 @@ const ItemSchema = z.discriminatedUnion('kind', [
       .enum(['machinery_equipment', 'building', 'immaterial', 'group'])
       .optional(),
   }),
-  // K3 only: uppskjuten skatt provision. Server recomputes the amount from
-  // current 2240 + 21xx state so the client cannot override it.
-  z.object({
-    kind: z.literal('uppskjuten_skatt'),
-  }),
 ])
 
 const PostBodySchema = z.object({
@@ -243,6 +234,13 @@ export const POST = withRouteContext(
 
       return NextResponse.json({ data: { created } })
     } catch (err) {
+      if (err instanceof OveravskrivningarConflictError) {
+        return errorResponseFromCode('CONFLICT', opLog, {
+          requestId,
+          messageSv: err.message,
+          messageEn: err.messageEn,
+        })
+      }
       if (err instanceof TaxProvisionConflictError) {
         return errorResponseFromCode('CONFLICT', opLog, {
           requestId,
@@ -292,6 +290,16 @@ class TaxProvisionConflictError extends Error {
     readonly expectedAmount: number,
   ) {
     super('Booked corporate tax differs from the current calculation')
+  }
+}
+
+class OveravskrivningarConflictError extends Error {
+  constructor(
+    message: string,
+    readonly messageEn: string,
+  ) {
+    super(message)
+    this.name = 'OveravskrivningarConflictError'
   }
 }
 
@@ -442,20 +450,43 @@ async function computeProposal(
       if (result.proposals.length === 0) return null
       return mergeAteforingProposals(result.proposals)
     }
-    case 'overavskrivningar':
-      return proposeOveravskrivningar({
-        additionalAmount: item.additionalAmount,
-        category: item.category,
-      })
-    case 'uppskjuten_skatt':
-      // Server-only: recompute from current TB (which already reflects any
-      // 21xx postings that committed earlier in this batch). The client
-      // sends no amount: the calculator owns the K3 split.
-      return buildLatentTaxProposal({
+    case 'overavskrivningar': {
+      if (item.category && item.category !== 'machinery_equipment') {
+        throw new OveravskrivningarConflictError(
+          'Den automatiska beräkningen omfattar endast maskiner och inventarier enligt IL 18 kap.',
+          'The automatic calculation only covers machinery and equipment under Chapter 18 of the Income Tax Act.',
+        )
+      }
+      const calculation = await calculateOveravskrivningar({
         supabase,
         companyId,
-        fiscalPeriodId,
+        fiscalPeriod: period,
       })
+      if (calculation.status === 'blocked') {
+        throw new OveravskrivningarConflictError(
+          calculation.warning ?? 'Överavskrivningen kan inte beräknas säkert.',
+          'The excess depreciation cannot be calculated safely.',
+        )
+      }
+      if (!calculation.proposal) return null
+
+      const requested = roundOre(item.additionalAmount)
+      const maximum = calculation.proposal.signedAmount ?? calculation.proposal.amount
+      const invalidIncrease = maximum > 0 && (requested <= 0 || requested > maximum)
+      const invalidRelease = maximum < 0 && requested !== maximum
+      if (invalidIncrease || invalidRelease) {
+        throw new OveravskrivningarConflictError(
+          'Beloppet är inte längre giltigt. Ladda om bokslutet och använd den aktuella beräkningen.',
+          'The amount is no longer valid. Reload the year-end flow and use the current calculation.',
+        )
+      }
+
+      return proposeOveravskrivningar({
+        additionalAmount: requested,
+        category: 'machinery_equipment',
+        computation: calculation.proposal.computation,
+      })
+    }
   }
 }
 

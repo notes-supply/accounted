@@ -34,6 +34,10 @@ vi.mock('@/lib/auth/mfa', () => ({
   hasValidAssuranceLevel: vi.fn(() => true),
 }))
 
+vi.mock('@/lib/auth/require-write', () => ({
+  canWriteCompany: vi.fn(),
+}))
+
 // Drive the paywall gate directly. Keep the module's real exports (the resolver
 // path reads keys.ts, not this module) and only stub requireCapability so a test
 // can force "blocked" / "allowed" without seeding capability_grants rows.
@@ -52,13 +56,15 @@ vi.mock('@/lib/extensions/sectors', async (importOriginal) => ({
 
 import { createClient } from '@/lib/supabase/server'
 import { shouldEnforceMfa } from '@/lib/auth/mfa'
+import { canWriteCompany } from '@/lib/auth/require-write'
 import { requireCapability } from '@/lib/entitlements/has-capability'
 import { requiredCapabilityForExtensionId } from '@/lib/extensions/sectors'
 import { extensionRegistry } from '@/lib/extensions/registry'
-import { GET, POST } from '../route'
+import { DELETE, GET, PATCH, POST, PUT } from '../route'
 
 const mockCreateClient = vi.mocked(createClient)
 const mockShouldEnforceMfa = vi.mocked(shouldEnforceMfa)
+const mockCanWriteCompany = vi.mocked(canWriteCompany)
 const mockRequireCapability = vi.mocked(requireCapability)
 const mockRequiredCapabilityForExtensionId = vi.mocked(requiredCapabilityForExtensionId)
 
@@ -72,6 +78,7 @@ describe('Extension Catch-All Route', () => {
     // clearAllMocks doesn't reset implementations: re-assert the default so the
     // AAL2 test's mockReturnValue(true) can't leak into later cases.
     mockShouldEnforceMfa.mockReturnValue(false)
+    mockCanWriteCompany.mockResolvedValue(true)
     // Default: capability present (allowed). Gated-extension tests override this.
     mockRequireCapability.mockResolvedValue(null)
     // Default: extension requires no capability, so the gate is a no-op and
@@ -210,9 +217,10 @@ describe('Extension Catch-All Route', () => {
     expect(handler).toHaveBeenCalledWith(request, expect.objectContaining({
       extensionId: 'test-ext',
     }))
+    expect(mockCanWriteCompany).not.toHaveBeenCalled()
   })
 
-  it('dispatches POST requests correctly', async () => {
+  it('dispatches a company-context mutation for a writable member', async () => {
     const handler = vi.fn().mockResolvedValue(
       NextResponse.json({ ok: true })
     )
@@ -240,6 +248,131 @@ describe('Extension Catch-All Route', () => {
 
     expect(status).toBe(200)
     expect(handler).toHaveBeenCalled()
+    expect(mockCanWriteCompany).toHaveBeenCalledWith(
+      expect.anything(),
+      'user-1',
+      'company-1',
+    )
+  })
+
+  it.each([
+    ['POST', POST],
+    ['PUT', PUT],
+    ['PATCH', PATCH],
+    ['DELETE', DELETE],
+  ] as const)(
+    'denies a viewer %s mutation before the company-context handler runs',
+    async (method, dispatcher) => {
+      const handler = vi.fn()
+      extensionRegistry.register({
+        id: 'test-ext',
+        name: 'Test',
+        version: '1.0.0',
+        apiRoutes: [{ method, path: '/data', handler }],
+      })
+
+      const { supabase } = createQueuedMockSupabase()
+      supabase.auth.getUser.mockResolvedValue({
+        data: { user: { id: 'user-1' } },
+        error: null,
+      })
+      mockCreateClient.mockResolvedValue(supabase as never)
+      mockCanWriteCompany.mockResolvedValue(false)
+
+      const request = createMockRequest('/api/extensions/ext/test-ext/data', {
+        method,
+      })
+      const response = await dispatcher(
+        request,
+        createPathParams(['test-ext', 'data']),
+      )
+      const { status, body } = await parseJsonResponse<{
+        error: { code: string; requestId?: string }
+      }>(response)
+
+      expect(status).toBe(403)
+      expect(body.error.code).toBe('FORBIDDEN')
+      expect(body.error.requestId).toMatch(/^req_/)
+      expect(mockCanWriteCompany).toHaveBeenCalledWith(
+        supabase,
+        'user-1',
+        'company-1',
+      )
+      expect(handler).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each([
+    { method: 'POST', dispatcher: POST, routeSegments: ['oauth', 'start'] },
+    { method: 'POST', dispatcher: POST, routeSegments: ['connections', 'backfill'] },
+    { method: 'DELETE', dispatcher: DELETE, routeSegments: ['connections'] },
+  ] as const)(
+    'denies a viewer mail $method mutation before the mail handler runs',
+    async ({ method, dispatcher, routeSegments }) => {
+      const path = `/${routeSegments.join('/')}`
+      const handler = vi.fn()
+      extensionRegistry.register({
+        id: 'mail',
+        name: 'Mail',
+        version: '1.0.0',
+        apiRoutes: [{ method, path, handler }],
+      })
+
+      const { supabase } = createQueuedMockSupabase()
+      supabase.auth.getUser.mockResolvedValue({
+        data: { user: { id: 'user-1' } },
+        error: null,
+      })
+      mockCreateClient.mockResolvedValue(supabase as never)
+      mockCanWriteCompany.mockResolvedValue(false)
+
+      const request = createMockRequest(`/api/extensions/ext/mail${path}`, { method })
+      const response = await dispatcher(
+        request,
+        createPathParams(['mail', ...routeSegments]),
+      )
+
+      expect(response.status).toBe(403)
+      expect(mockCanWriteCompany).toHaveBeenCalledWith(supabase, 'user-1', 'company-1')
+      expect(handler).not.toHaveBeenCalled()
+    },
+  )
+
+  it('does not apply the company write-role gate to authenticated routes without company context', async () => {
+    const handler = vi.fn().mockResolvedValue(NextResponse.json({ ok: true }))
+    extensionRegistry.register({
+      id: 'test-ext',
+      name: 'Test',
+      version: '1.0.0',
+      apiRoutes: [
+        {
+          method: 'POST',
+          path: '/lookup',
+          handler,
+          skipCompanyContext: true,
+        },
+      ],
+    })
+
+    const { supabase } = createQueuedMockSupabase()
+    supabase.auth.getUser.mockResolvedValue({
+      data: { user: { id: 'user-1' } },
+      error: null,
+    })
+    mockCreateClient.mockResolvedValue(supabase as never)
+    mockCanWriteCompany.mockResolvedValue(false)
+
+    const request = createMockRequest('/api/extensions/ext/test-ext/lookup', {
+      method: 'POST',
+    })
+    const response = await POST(
+      request,
+      createPathParams(['test-ext', 'lookup']),
+    )
+
+    expect(response.status).toBe(200)
+    expect(handler).toHaveBeenCalled()
+    expect(mockCanWriteCompany).not.toHaveBeenCalled()
   })
 
   // Paywall: the dispatcher gates every company-context route of an extension
@@ -325,5 +458,6 @@ describe('Extension Catch-All Route', () => {
     expect(response.status).toBe(200)
     expect(handler).toHaveBeenCalled()
     expect(mockRequireCapability).not.toHaveBeenCalled()
+    expect(mockCanWriteCompany).not.toHaveBeenCalled()
   })
 })

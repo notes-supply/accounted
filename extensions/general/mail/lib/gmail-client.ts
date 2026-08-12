@@ -1,0 +1,252 @@
+/**
+ * The thin slice of the Gmail API the hunt needs: search, read headers, fetch
+ * an attachment. Nothing here writes, because the granted scope cannot.
+ */
+import type { MailCandidate } from '@/lib/mail-search/service'
+
+const API = 'https://gmail.googleapis.com/gmail/v1/users/me'
+
+/**
+ * Deadline on every Gmail call.
+ *
+ * Mailboxes are searched with Promise.all, so one stalled request would hold
+ * the whole company's hunt open until the platform killed the run. A timeout
+ * turns that into one mailbox missing from tonight's sweep.
+ */
+export const GMAIL_TIMEOUT_MS = 15_000
+
+/** Hits to consider per mailbox per purchase. */
+export const MAX_RESULTS = 8
+
+interface GmailHeader {
+  name: string
+  value: string
+}
+
+interface GmailPart {
+  filename?: string
+  mimeType?: string
+  body?: { attachmentId?: string; size?: number; data?: string }
+  headers?: GmailHeader[]
+  parts?: GmailPart[]
+}
+
+/** Longest body worth carrying: a receipt states its total near the top. */
+const MAX_BODY_CHARS = 2500
+
+/**
+ * The readable text of a mail.
+ *
+ * Already on the wire (format=full is required to see the parts tree at all),
+ * so this costs nothing extra, and it is where the two facts a forwarded
+ * receipt hides live: the original sender and the original date, both written
+ * into the "Vidarebefordrat meddelande" header that Gmail's 200-character
+ * snippet cuts off.
+ */
+function collectBodyText(part: GmailPart | undefined, out: string[]): void {
+  if (!part) return
+  const type = part.mimeType ?? ''
+  if ((type === 'text/plain' || type === 'text/html') && part.body?.data) {
+    out.push(Buffer.from(part.body.data, 'base64url').toString('utf8'))
+  }
+  for (const child of part.parts ?? []) collectBodyText(child, out)
+}
+
+function readableBody(msg: GmailMessage): string {
+  const chunks: string[] = []
+  collectBodyText(msg.payload, chunks)
+  return chunks
+    .join('\n')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;|&zwnj;|&#847;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, MAX_BODY_CHARS)
+}
+
+interface GmailMessage {
+  id: string
+  internalDate?: string
+  snippet?: string
+  payload?: {
+    headers?: GmailHeader[]
+    filename?: string
+    mimeType?: string
+    body?: { attachmentId?: string; size?: number }
+    parts?: GmailPart[]
+  }
+}
+
+function header(msg: GmailMessage, name: string): string | null {
+  const found = msg.payload?.headers?.find((h) => h.name.toLowerCase() === name.toLowerCase())
+  return found?.value ?? null
+}
+
+function partHeader(part: GmailPart, name: string): string | null {
+  const normalizedName = name.trim().toLowerCase()
+  const found = part.headers?.find((h) => h.name.trim().toLowerCase() === normalizedName)
+  return found?.value ?? null
+}
+
+function dispositionKind(part: GmailPart): string {
+  const raw = partHeader(part, 'Content-Disposition')
+  if (!raw) return ''
+  return raw.split(';', 1)[0].trim().toLowerCase()
+}
+
+function supportedAttachmentKind(part: GmailPart): 'pdf' | 'image' | null {
+  const mimeType = (part.mimeType ?? '').split(';', 1)[0].trim().toLowerCase()
+  if (mimeType === 'application/pdf') return 'pdf'
+  if (mimeType === 'image/jpeg' || mimeType === 'image/png' || mimeType === 'image/webp') {
+    return 'image'
+  }
+  if (mimeType !== 'application/octet-stream') return null
+  if (/\.pdf$/i.test(part.filename ?? '')) return 'pdf'
+  if (/\.(?:jpe?g|png|webp)$/i.test(part.filename ?? '')) return 'image'
+  return null
+}
+
+/** Attachments anywhere in the MIME tree, excluding every explicit inline part. */
+function collectAttachments(
+  part: GmailPart | undefined,
+  out: Array<{ id: string; filename: string }>,
+): void {
+  if (!part) return
+  const id = part.body?.attachmentId
+  const named = part.filename && part.filename.length > 0
+  const disposition = dispositionKind(part)
+  const attachmentKind = supportedAttachmentKind(part)
+  const isExplicitAttachment = disposition === 'attachment'
+  const isExplicitInline = disposition === 'inline'
+  // An explicit inline disposition is authoritative for every MIME type.
+  // Images are additionally fail-closed when the disposition is absent.
+  const isDocument = named && attachmentKind !== null && !isExplicitInline &&
+    (attachmentKind === 'pdf' || isExplicitAttachment)
+  if (id && isDocument) out.push({ id, filename: part.filename as string })
+  for (const child of part.parts ?? []) collectAttachments(child, out)
+}
+
+function requestSignal(signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(GMAIL_TIMEOUT_MS)
+  return signal ? AbortSignal.any([signal, timeout]) : timeout
+}
+
+async function gmailFetch<T>(accessToken: string, path: string, signal?: AbortSignal): Promise<T> {
+  const response = await fetch(`${API}${path}`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    signal: requestSignal(signal),
+  })
+  if (!response.ok) {
+    const text = await response.text().catch(() => '')
+    throw new Error(`Gmail ${response.status}: ${text.slice(0, 200)}`)
+  }
+  return (await response.json()) as T
+}
+
+export async function searchMessageIds(
+  accessToken: string,
+  query: string,
+  maxResults: number = MAX_RESULTS,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const params = new URLSearchParams({ q: query, maxResults: String(maxResults) })
+  const data = await gmailFetch<{ messages?: Array<{ id: string }> }>(
+    accessToken,
+    `/messages?${params.toString()}`,
+    signal,
+  )
+  return (data.messages ?? []).map((m) => m.id)
+}
+
+/**
+ * Subject, sender, date and which parts are attachments.
+ *
+ * `format=full` rather than `format=metadata`: metadata returns headers only
+ * and omits `payload.parts` entirely, so every message came back looking like
+ * it had no attachments and the hunt could never file anything. Gmail offers no
+ * format that returns the MIME structure without the body, so the body does
+ * come down the wire here. Message body text is not persisted. Selected
+ * attachment bytes may be persisted before a human reviews the proposal.
+ */
+export async function getMessageSummary(
+  accessToken: string,
+  messageId: string,
+  connectionId: string,
+  mailbox: string,
+  signal?: AbortSignal,
+): Promise<MailCandidate> {
+  const msg = await gmailFetch<GmailMessage>(
+    accessToken,
+    `/messages/${messageId}?format=full`,
+    signal,
+  )
+  const attachments: Array<{ id: string; filename: string }> = []
+  collectAttachments(msg.payload, attachments)
+
+  return {
+    connectionId,
+    mailbox,
+    provider: 'gmail',
+    messageId: msg.id,
+    subject: header(msg, 'Subject'),
+    from: header(msg, 'From'),
+    receivedAt: msg.internalDate
+      ? new Date(Number(msg.internalDate)).toISOString()
+      : header(msg, 'Date'),
+    // A receipt with no attachment is usually the mail body itself; the caller
+    // decides whether to render it.
+    attachmentIds: attachments.map((a) => a.id),
+    attachmentNames: attachments.map((a) => a.filename),
+    snippet: msg.snippet ?? null,
+    bodyText: readableBody(msg),
+    bodyIsReceipt: attachments.length === 0,
+  }
+}
+
+export async function fetchAttachmentBytes(
+  accessToken: string,
+  messageId: string,
+  attachmentId: string,
+  signal?: AbortSignal,
+): Promise<Buffer | null> {
+  const data = await gmailFetch<{ data?: string; size?: number }>(
+    accessToken,
+    `/messages/${messageId}/attachments/${attachmentId}`,
+    signal,
+  )
+  if (!data.data) return null
+  return Buffer.from(data.data, 'base64url')
+}
+
+/**
+ * Filename and MIME type live on the message, not on the attachment response,
+ * so they are read back from the parts tree.
+ */
+export async function describeAttachment(
+  accessToken: string,
+  messageId: string,
+  attachmentId: string,
+  signal?: AbortSignal,
+): Promise<{ filename: string; mimeType: string } | null> {
+  const msg = await gmailFetch<GmailMessage>(
+    accessToken,
+    `/messages/${messageId}?format=full`,
+    signal,
+  )
+  let found: { filename: string; mimeType: string } | null = null
+  const walk = (part: GmailPart | undefined): void => {
+    if (!part || found) return
+    if (part.body?.attachmentId === attachmentId) {
+      found = {
+        filename: part.filename || 'underlag.pdf',
+        mimeType: part.mimeType || 'application/octet-stream',
+      }
+      return
+    }
+    for (const child of part.parts ?? []) walk(child)
+  }
+  walk(msg.payload)
+  return found
+}

@@ -131,5 +131,55 @@ export const EXTENSION_DEFINITIONS: Record<string, ExtensionDefinition[]> = {
           "hasOwnData": true,
           "subscriptionNotice": "Denna integration kräver ett eget Stripe-konto. Stripes transaktionsavgifter tillkommer enligt ditt avtal med Stripe."
     },
+    {
+          "slug": "whatsapp-inbox",
+          "name": "WhatsApp-inkorg",
+          "sector": "general",
+          "category": "import",
+          "icon": "MessageCircle",
+          "dataPattern": "both",
+          "description": "Skicka kvitton som foto eller PDF till Accounteds WhatsApp-nummer: de landar i Underlag med avlästa fält",
+          "longDescription": "Koppla ditt mobilnummer med en engångskod och skicka sedan kvitton direkt i WhatsApp. Varje kvitto laddas upp till dokumentarkivet, fält som belopp och datum läses av med AI, och du får en bekräftelse i chatten. Bokföringen sker som vanligt i appen.",
+          "readsCoreTables": [
+                "company_members",
+                "document_attachments",
+                "invoice_inbox_items"
+          ],
+          "hasOwnData": true
+    },
+    {
+          "slug": "woocommerce",
+          "name": "WooCommerce",
+          "sector": "general",
+          "category": "import",
+          "icon": "ShoppingCart",
+          "dataPattern": "manual",
+          "description": "Hämta betalda ordrar och återbetalningar från din WooCommerce-butik till transaktionsinkorgen",
+          "longDescription": "Anslut din WooCommerce-butik så hämtas betalda ordrar och återbetalningar automatiskt varje natt till transaktionsinkorgen, som ett bankflöde för butiken. Inget bokförs automatiskt: du bokför raderna själv precis som vanliga banktransaktioner.",
+          "hasOwnData": true
+    },
+    {
+          "slug": "shopify",
+          "name": "Shopify",
+          "sector": "general",
+          "category": "import",
+          "icon": "ShoppingBag",
+          "dataPattern": "manual",
+          "description": "Hämta betalda ordrar och återbetalningar från din Shopify-butik till transaktionsinkorgen",
+          "longDescription": "Anslut din Shopify-butik så hämtas betalda ordrar och återbetalningar automatiskt varje natt till transaktionsinkorgen, som ett bankflöde för butiken. Inget bokförs automatiskt: du bokför raderna själv precis som vanliga banktransaktioner.",
+          "hasOwnData": true
+    },
+    {
+          "slug": "mail",
+          "name": "Brevlådor",
+          "sector": "general",
+          "category": "operations",
+          "icon": "Mail",
+          "dataPattern": "manual",
+          "description": "Automatisk kvittojakt i brevlådor är avstängd i förhandsversionen",
+          "longDescription": "Automatisk sökning efter kvitton i brevlådor, nya kopplingar och historisk sökning är inte tillgängliga i produktion. Befintliga kopplingar kan fortfarande visas och kopplas från, vilket raderar sparade OAuth-behörighetsuppgifter. Tidigare härledda dokument, inkorgsposter och affärsposter ligger kvar enligt produktens lagrings- och raderingskontroller.",
+          "hasOwnData": true,
+          "subscriptionNotice": "Förhandsfunktionen är avstängd. Begär inte nya brevlådebehörigheter. Befintliga kopplingar kan visas och kopplas från."
+    },
   ],
 }

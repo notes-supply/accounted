@@ -25,7 +25,7 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { signPayload } from './signing'
-import { pinnedHttpsFetch, type PinnedFetchResult } from './pinned-fetch'
+import { pinnedHttpsFetch } from './pinned-fetch'
 import { createLogger } from '@/lib/logger'
 
 const log = createLogger('webhooks/dispatcher')
@@ -766,6 +766,7 @@ async function attemptDelivery(args: {
       }
     case 'timeout':
     case 'transport_error':
+    case 'response_too_large':
       return {
         kind: 'failed',
         attempts,

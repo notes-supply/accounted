@@ -216,16 +216,19 @@ export async function removeEmployeeFromRun(
     return { ok: true, data: { deleted: true, employee_id: args.employeeId } }
   }
 
-  // Cascades to salary_line_items via ON DELETE CASCADE.
-  const { error } = await supabase
-    .from('salary_run_employees')
-    .delete()
-    .eq('salary_run_id', args.salaryRunId)
-    .eq('employee_id', args.employeeId)
-    .eq('company_id', args.companyId)
+  const { data: deleted, error } = await supabase.rpc(
+    'delete_salary_draft_object_with_mileage_release',
+    {
+      p_company_id: args.companyId,
+      p_salary_run_id: args.salaryRunId,
+      p_kind: 'employee',
+      p_target_id: (sre as { id: string }).id,
+    },
+  )
 
   if (error) {
     return { ok: false, code: 'INTERNAL_ERROR', details: { message: error.message } }
   }
+  if (!deleted) return { ok: false, code: 'SALARY_RUN_EMPLOYEE_NOT_FOUND' }
   return { ok: true, data: { deleted: true, employee_id: args.employeeId } }
 }

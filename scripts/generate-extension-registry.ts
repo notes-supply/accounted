@@ -8,6 +8,7 @@
  *
  * Usage:
  *   npx tsx scripts/generate-extension-registry.ts          # Generate files
+ *   npx tsx scripts/generate-extension-registry.ts --check  # Fail on drift
  *   npx tsx scripts/generate-extension-registry.ts --list    # List available extensions
  */
 
@@ -17,7 +18,9 @@ import { fileURLToPath } from 'url'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
-const ROOT = path.resolve(__dirname, '..')
+const ROOT = process.env.EXTENSION_REGISTRY_ROOT
+  ? path.resolve(process.env.EXTENSION_REGISTRY_ROOT)
+  : path.resolve(__dirname, '..')
 const CONFIG_PATH = path.join(ROOT, 'extensions.config.json')
 const EXTENSIONS_DIR = path.join(ROOT, 'extensions')
 const OUTPUT_DIR = path.join(ROOT, 'lib', 'extensions', '_generated')
@@ -245,7 +248,7 @@ function main(): void {
     return
   }
 
-  // Normal mode: generate registry files
+  // Normal mode: generate or verify registry files
   const config = loadConfig()
 
   // Validate enabled IDs
@@ -259,26 +262,33 @@ function main(): void {
 
   const enabledManifests = config.extensions.map(id => allManifests.get(id)!)
 
-  // Ensure output directory exists
-  fs.mkdirSync(OUTPUT_DIR, { recursive: true })
+  const outputs = new Map<string, string>([
+    ['extension-list.ts', generateExtensionList(enabledManifests)],
+    ['workspace-map.tsx', generateWorkspaceMap(enabledManifests)],
+    ['sector-definitions.ts', generateSectorDefinitions(enabledManifests)],
+    ['enabled-extensions.ts', generateEnabledExtensions(enabledManifests)],
+  ])
 
-  // Generate files
-  fs.writeFileSync(
-    path.join(OUTPUT_DIR, 'extension-list.ts'),
-    generateExtensionList(enabledManifests),
-  )
-  fs.writeFileSync(
-    path.join(OUTPUT_DIR, 'workspace-map.tsx'),
-    generateWorkspaceMap(enabledManifests),
-  )
-  fs.writeFileSync(
-    path.join(OUTPUT_DIR, 'sector-definitions.ts'),
-    generateSectorDefinitions(enabledManifests),
-  )
-  fs.writeFileSync(
-    path.join(OUTPUT_DIR, 'enabled-extensions.ts'),
-    generateEnabledExtensions(enabledManifests),
-  )
+  if (args.includes('--check')) {
+    const drifted = [...outputs].filter(([name, expected]) => {
+      const outputPath = path.join(OUTPUT_DIR, name)
+      return !fs.existsSync(outputPath) || fs.readFileSync(outputPath, 'utf8') !== expected
+    })
+    if (drifted.length > 0) {
+      console.error('ERROR: Generated extension registry is out of date:')
+      for (const [name] of drifted) console.error(`  lib/extensions/_generated/${name}`)
+      console.error('Run `npm run setup:extensions` and stage the generated files.')
+      process.exitCode = 1
+      return
+    }
+    console.log('Extension registry is in sync')
+    return
+  }
+
+  fs.mkdirSync(OUTPUT_DIR, { recursive: true })
+  for (const [name, content] of outputs) {
+    fs.writeFileSync(path.join(OUTPUT_DIR, name), content)
+  }
 
   // Summary
   const enabledNames = enabledManifests.map(m => m.id)

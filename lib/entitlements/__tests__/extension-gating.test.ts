@@ -12,6 +12,10 @@ describe('requiredCapabilityForExtension', () => {
     expect(requiredCapabilityForExtension('general', 'invoice-inbox')).toBe(CAPABILITY.ai)
   })
 
+  it('does not blanket-gate mailbox inspection and credential revocation', () => {
+    expect(requiredCapabilityForExtension('general', 'mail')).toBeUndefined()
+  })
+
   it('returns undefined for extensions that stay open', () => {
     expect(requiredCapabilityForExtension('general', 'enable-banking')).toBeUndefined()
     expect(requiredCapabilityForExtension('general', 'tic')).toBeUndefined()
@@ -20,5 +24,6 @@ describe('requiredCapabilityForExtension', () => {
 
   it('keys the map by `${sector}/${slug}` so page and nav resolve identically', () => {
     expect(EXTENSION_REQUIRED_CAPABILITY['general/invoice-inbox']).toBe(CAPABILITY.ai)
+    expect(EXTENSION_REQUIRED_CAPABILITY['general/mail']).toBeUndefined()
   })
 })

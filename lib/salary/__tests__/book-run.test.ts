@@ -41,6 +41,7 @@ const makeRun = (overrides: Record<string, unknown> = {}) => ({
   total_net: 23000,
   total_avgifter: 9426,
   total_vacation_accrual: 0,
+  calculation_params: { slpRate: 0.2426 },
   ...overrides,
 })
 
@@ -165,6 +166,33 @@ describe('advanceAndBookSalaryRun', () => {
       expect.objectContaining({ type: 'salary_run.booked' }),
     )
   })
+
+  it('books a mileage-only payout instead of treating it as nollkörning', async () => {
+    const { supabase, enqueueMany } = createQueuedMockSupabase()
+    enqueueMany([
+      {
+        data: makeRun({
+          status: 'paid',
+          total_gross: 0,
+          total_tax: 0,
+          total_net: 250,
+          total_avgifter: 0,
+        }),
+      },
+      {
+        data: [
+          makeSre({ gross_salary: 0, tax_withheld: 0, net_salary: 250, avgifter_amount: 0 }),
+        ],
+      },
+      { data: { id: 'run-1', status: 'booked' } },
+    ])
+
+    const result = await advanceAndBookSalaryRun(supabase as never, ARGS)
+
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.data.nollkorning).toBe(false)
+    expect(createSalaryRunEntries).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('bookPaidSalaryRun', () => {
@@ -194,5 +222,11 @@ describe('bookPaidSalaryRun', () => {
     expect(result.ok).toBe(true)
     if (result.ok) expect(result.data.entryIds).toEqual(['je-1', 'je-2'])
     expect(createSalaryRunEntries).toHaveBeenCalledTimes(1)
+    expect(createSalaryRunEntries).toHaveBeenCalledWith(
+      expect.anything(),
+      'company-1',
+      'user-1',
+      expect.objectContaining({ calculation_params: { slpRate: 0.2426 } }),
+    )
   })
 })

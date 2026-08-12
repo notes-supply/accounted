@@ -629,6 +629,9 @@ describe('CreateCustomerSchema', () => {
     const result = CreateCustomerSchema.safeParse(validCustomer({
       email: 'billing@acme.se',
       phone: '+46701234567',
+      contact_person: 'Anna Andersson',
+      invoice_email_cc_addresses: ['finance@acme.se'],
+      invoice_email_bcc_addresses: ['archive@acme.se'],
       address_line1: 'Storgatan 1',
       address_line2: 'Box 123',
       postal_code: '111 22',
@@ -680,6 +683,20 @@ describe('CreateCustomerSchema', () => {
 
   it('rejects non-integer payment terms', () => {
     const result = CreateCustomerSchema.safeParse(validCustomer({ default_payment_terms: 30.5 }))
+    expect(result.success).toBe(false)
+  })
+
+  it('rejects more than 19 customer invoice copy recipients across CC and BCC', () => {
+    const result = CreateCustomerSchema.safeParse(validCustomer({
+      invoice_email_cc_addresses: Array.from(
+        { length: 10 },
+        (_, index) => `copy-${index}@example.test`,
+      ),
+      invoice_email_bcc_addresses: Array.from(
+        { length: 10 },
+        (_, index) => `archive-${index}@example.test`,
+      ),
+    }))
     expect(result.success).toBe(false)
   })
 })
@@ -2173,6 +2190,13 @@ describe('UpdateCustomerSchema', () => {
     const result = UpdateCustomerSchema.safeParse({ customer_type: 'government' })
     expect(result.success).toBe(false)
   })
+
+  it('rejects an invalid customer invoice copy address', () => {
+    const result = UpdateCustomerSchema.safeParse({
+      invoice_email_cc_addresses: ['not-an-email'],
+    })
+    expect(result.success).toBe(false)
+  })
 })
 
 describe('UpdateSupplierSchema', () => {
@@ -2742,5 +2766,34 @@ describe('CreateRecurringScheduleSchema send_hour', () => {
   it('rejects an out-of-range send_hour', () => {
     expect(CreateRecurringScheduleSchema.safeParse({ ...base, send_hour: 24 }).success).toBe(false)
     expect(CreateRecurringScheduleSchema.safeParse({ ...base, send_hour: -1 }).success).toBe(false)
+  })
+})
+
+describe('CreateRecurringScheduleSchema interval_months', () => {
+  const base = {
+    customer_id: '550e8400-e29b-41d4-a716-446655440000',
+    name: 'Retainer',
+    day_of_month: 15,
+    items: [{ description: 'Service', quantity: 1, unit_price: 1000 }],
+  }
+
+  it('defaults interval_months to 1 (monthly) when omitted', () => {
+    const result = CreateRecurringScheduleSchema.safeParse(base)
+    expect(result.success).toBe(true)
+    if (result.success) expect(result.data.interval_months).toBe(1)
+  })
+
+  it('accepts quarterly, half-yearly and yearly intervals', () => {
+    for (const interval of [3, 6, 12]) {
+      const result = CreateRecurringScheduleSchema.safeParse({ ...base, interval_months: interval })
+      expect(result.success).toBe(true)
+      if (result.success) expect(result.data.interval_months).toBe(interval)
+    }
+  })
+
+  it('rejects out-of-range or fractional intervals', () => {
+    expect(CreateRecurringScheduleSchema.safeParse({ ...base, interval_months: 0 }).success).toBe(false)
+    expect(CreateRecurringScheduleSchema.safeParse({ ...base, interval_months: 13 }).success).toBe(false)
+    expect(CreateRecurringScheduleSchema.safeParse({ ...base, interval_months: 1.5 }).success).toBe(false)
   })
 })

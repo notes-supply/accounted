@@ -165,6 +165,20 @@ describe('POST /api/transactions/[id]/categorize', () => {
     original_pointer_cleared: true,
   }
 
+  function attachedTransaction(
+    transaction: ReturnType<typeof makeTransaction>,
+    category = 'expense_software',
+    isBusiness = true,
+  ) {
+    return {
+      ...transaction,
+      company_id: 'company-1',
+      category,
+      is_business: isBusiness,
+      journal_entry_id: 'je-1',
+    }
+  }
+
   beforeEach(() => {
     vi.clearAllMocks()
     reset()
@@ -297,6 +311,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
       'attach_transaction_categorization',
       expect.anything(),
     )
+    expect(mockUpsertCounterpartyTemplate).not.toHaveBeenCalled()
   })
 
   it('does not mutate documents or inbox state when atomic attachment conflicts', async () => {
@@ -394,6 +409,17 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: [{ id: 'period-1' }], error: null })
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
     enqueue({ data: true, error: null })
+    const authoritative = {
+      ...tx,
+      company_id: 'company-1',
+      category: 'expense_software',
+      is_business: true,
+      journal_entry_id: 'je-1',
+      cash_account_id: 'cash-revolut-sek',
+    }
+    enqueue({ data: authoritative, error: null })
+
+    const emitSpy = vi.spyOn(eventBus, 'emit')
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
@@ -428,6 +454,56 @@ describe('POST /api/transactions/[id]/categorize', () => {
         p_journal_entry_id: 'je-1',
       }),
     )
+    expect(mockUpsertCounterpartyTemplate).toHaveBeenCalledWith(
+      mockSupabase,
+      'company-1',
+      authoritative,
+      expect.objectContaining({
+        debit_account: expect.any(String),
+        credit_account: '1931',
+      }),
+      'user_approved',
+    )
+    expect(emitSpy).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transaction.categorized',
+      payload: expect.objectContaining({ transaction: authoritative }),
+    }))
+  })
+
+  it('fails closed, compensates, and emits no transaction event when attachment readback is missing', async () => {
+    const tx = makeTransaction({
+      id: 'tx-1',
+      amount: -500,
+      journal_entry_id: null,
+      cash_account_id: 'cash-revolut-sek',
+    })
+    mockResolveSettlementAccount.mockResolvedValueOnce('1931')
+    enqueue({ data: tx, error: null })
+    enqueue({ data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 }, error: null })
+    enqueue({ data: [{ id: 'period-1' }], error: null })
+    mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
+    enqueue({ data: true, error: null })
+    enqueue({ data: null, error: null })
+    enqueue({ data: compensationSuccess, error: null })
+    const emitSpy = vi.spyOn(eventBus, 'emit')
+
+    const response = await POST(
+      createMockRequest('/api/transactions/tx-1/categorize', {
+        method: 'POST',
+        body: { is_business: true, category: 'expense_software' },
+      }),
+      createMockRouteParams({ id: 'tx-1' }),
+    )
+
+    expect(response.status).toBe(500)
+    expect(emitSpy).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'transaction.categorized' }),
+    )
+    expect(mockSupabase.rpc).toHaveBeenCalledWith(
+      'compensate_transaction_categorization',
+      expect.objectContaining({ p_original_journal_entry_id: 'je-1' }),
+    )
+    expect(mockUpsertCounterpartyTemplate).not.toHaveBeenCalled()
   })
 
   it('surfaces the posted id when CAS-race storno fails', async () => {
@@ -451,6 +527,8 @@ describe('POST /api/transactions/[id]/categorize', () => {
     expect(status).toBe(409)
     expect(body.error.code).toBe('TX_CATEGORIZE_RACE')
     expect(body.error.details).toEqual({
+      failed_partial: true,
+      compensation_verified: false,
       partial_posted_ids: { journal_entry_id: 'je-1' },
     })
     expect(mockSupabase.from).not.toHaveBeenCalledWith('voucher_gap_explanations')
@@ -779,6 +857,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
 
     // Update transaction (CAS guard: returns matched row)
     enqueue({ data: true, error: null })
+    enqueue({ data: attachedTransaction(tx), error: null })
 
     const emitSpy = vi.spyOn(eventBus, 'emit')
 
@@ -830,6 +909,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: [{ id: 'period-1' }], error: null }) // fiscal period check
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
     enqueue({ data: true, error: null }) // atomic attachment matched
+    enqueue({ data: attachedTransaction(tx), error: null })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
@@ -889,6 +969,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: [{ id: 'period-1' }], error: null }) // fiscal period check
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
     enqueue({ data: true, error: null }) // atomic attachment matched
+    enqueue({ data: attachedTransaction(tx), error: null })
     // Inbox propagation: one matched item with a document
     enqueue({ data: [{ id: 'inbox-1', document_id: 'doc-1' }], error: null })
     enqueue({ data: null, error: null }) // document_attachments update
@@ -923,6 +1004,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: [{ id: 'period-1' }], error: null })
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
     enqueue({ data: true, error: null }) // atomic attachment
+    enqueue({ data: attachedTransaction(tx), error: null })
     enqueue({ data: [], error: null }) // inbox propagation: no matched items
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
@@ -1174,6 +1256,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
     // Transaction update
     enqueue({ data: true, error: null })
+    enqueue({ data: attachedTransaction(tx), error: null })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
@@ -1217,6 +1300,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
     // Transaction update
     enqueue({ data: true, error: null })
+    enqueue({ data: attachedTransaction(tx), error: null })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
@@ -1259,7 +1343,8 @@ describe('POST /api/transactions/[id]/categorize', () => {
   })
 
   it('EUR transaction: a 1 000 SEK supplier invoice is not suggested for a 1 000 EUR payment', async () => {
-    enqueue({ data: eurExpenseTx(), error: null })
+    const tx = eurExpenseTx()
+    enqueue({ data: tx, error: null })
     enqueue({ data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null })
 
     mockBuildMappingResultFromCategory.mockReturnValue({
@@ -1276,6 +1361,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: [{ id: 'period-1' }], error: null })
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
     enqueue({ data: true, error: null })
+    enqueue({ data: attachedTransaction(tx), error: null })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
@@ -1323,7 +1409,8 @@ describe('POST /api/transactions/[id]/categorize', () => {
   })
 
   it('EUR transaction without a rate: kronor invoices are excluded, never compared raw', async () => {
-    enqueue({ data: eurExpenseTx({ exchange_rate: null }), error: null })
+    const tx = eurExpenseTx({ exchange_rate: null })
+    enqueue({ data: tx, error: null })
     enqueue({ data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null })
 
     mockBuildMappingResultFromCategory.mockReturnValue({
@@ -1338,6 +1425,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: [{ id: 'period-1' }], error: null })
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
     enqueue({ data: true, error: null })
+    enqueue({ data: attachedTransaction(tx), error: null })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
@@ -1431,6 +1519,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: [{ id: 'period-1' }], error: null })
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
     enqueue({ data: true, error: null })
+    enqueue({ data: attachedTransaction(tx, 'income_services'), error: null })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
@@ -1582,6 +1671,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
     // Transaction update
     enqueue({ data: true, error: null })
+    enqueue({ data: attachedTransaction(tx, 'income_services'), error: null })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
@@ -1639,6 +1729,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
     mockSaveUserMappingRule.mockResolvedValue(undefined)
     enqueue({ data: true, error: null }) // atomic attachment matched
+    enqueue({ data: attachedTransaction(tx), error: null })
 
     mockDetectDup.mockResolvedValue({
       transaction_id: SIBLING_UUID,
@@ -1695,6 +1786,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
 
     // Update transaction (CAS guard: returns matched row)
     enqueue({ data: true, error: null })
+    enqueue({ data: attachedTransaction(tx, 'private', false), error: null })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',

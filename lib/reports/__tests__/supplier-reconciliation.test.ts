@@ -1,5 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
+vi.mock('@/lib/invoices/payment-totals', () => ({
+  fetchPaymentTotalsByParent: vi.fn(),
+}))
+
+vi.mock('@/lib/reports/period-linked-rows', () => ({
+  fetchPeriodLinkedRows: vi.fn(),
+}))
+
 // ============================================================
 // Mock: sequential result queue
 // ============================================================
@@ -10,7 +18,7 @@ let calls: Array<{ method: string; args: unknown[] }>
 
 function makeBuilder() {
   const b: Record<string, unknown> = {}
-  for (const m of ['select', 'eq', 'in', 'order', 'range']) {
+  for (const m of ['select', 'eq', 'in', 'lte', 'not', 'order', 'range']) {
     b[m] = vi.fn().mockImplementation((...args: unknown[]) => {
       calls.push({ method: m, args })
       return b
@@ -29,6 +37,8 @@ function makeClient() {
 }
 
 import { generateReconciliation } from '../supplier-reconciliation'
+import { fetchPaymentTotalsByParent } from '@/lib/invoices/payment-totals'
+import { fetchPeriodLinkedRows } from '@/lib/reports/period-linked-rows'
 
 let supabase: ReturnType<typeof makeClient>
 
@@ -38,6 +48,8 @@ beforeEach(() => {
   results = []
   calls = []
   supabase = makeClient()
+  vi.mocked(fetchPaymentTotalsByParent).mockResolvedValue(new Map())
+  vi.mocked(fetchPeriodLinkedRows).mockResolvedValue([])
 })
 
 describe('generateReconciliation', () => {
@@ -71,6 +83,37 @@ describe('generateReconciliation', () => {
     expect(result.account_2440_balance).toBe(8000)
     expect(result.difference).toBe(0)
     expect(result.is_reconciled).toBe(true)
+  })
+
+  it('reconstructs the payable at period end instead of using current remaining_amount', async () => {
+    results = [
+      { data: [{ id: 'entry-1' }], error: null },
+      { data: [{ debit_amount: 0, credit_amount: 1000, journal_entry_id: 'entry-1' }], error: null },
+    ]
+    vi.mocked(fetchPeriodLinkedRows).mockResolvedValue([
+      { id: 'si-1', total: 1000, remaining_amount: 0, currency: 'SEK', exchange_rate: null },
+    ] as never)
+    vi.mocked(fetchPaymentTotalsByParent).mockResolvedValue(new Map([['si-1', 0]]))
+
+    const result = await generateReconciliation(
+      supabase,
+      'company-1',
+      'period-1',
+      '2025-12-31',
+    )
+
+    expect(result.supplier_ledger_total).toBe(1000)
+    expect(result.is_reconciled).toBe(true)
+    expect(vi.mocked(fetchPaymentTotalsByParent)).toHaveBeenCalledWith(
+      expect.objectContaining({ throughDate: '2025-12-31', parentIds: ['si-1'] }),
+    )
+    expect(vi.mocked(fetchPeriodLinkedRows)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        table: 'supplier_invoices',
+        entryLinkColumn: 'registration_journal_entry_id',
+        throughDate: '2025-12-31',
+      }),
+    )
   })
 
   it('paginates the 2440 ledger query: sums >1000 lines instead of truncating at 1000', async () => {

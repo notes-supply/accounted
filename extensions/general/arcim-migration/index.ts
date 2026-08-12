@@ -81,6 +81,17 @@ function translateOAuthError(error: string, description: string | null): string 
  * The override exists so dev environments can route through a single
  * registered URI instead of registering every ngrok URL on the OAuth client.
  */
+/**
+ * WINT ships dark until the connection is verified against a live WINT
+ * account (its API is spec-derived, not sandbox-verified) and the relationship
+ * question is settled. Flipping WINT_MIGRATION_ENABLED=true is the launch
+ * switch; the rest of the provider is fully wired.
+ */
+function enabledProviders(): typeof ARCIM_PROVIDERS {
+  if (process.env.WINT_MIGRATION_ENABLED === 'true') return ARCIM_PROVIDERS
+  return ARCIM_PROVIDERS.filter(p => p.id !== 'wint')
+}
+
 function resolveArcimCallbackUrl(provider: ArcimProvider | ProviderName): string {
   const providerRedirectEnv =
     provider === 'visma'
@@ -119,6 +130,27 @@ async function buildArcimOAuthUrl(consentId: string, provider: ArcimProvider): P
 }
 
 /**
+ * Map a failed /migrate run to its structured error response. Shared by the
+ * JSON path (returned as-is) and the NDJSON path (body re-sent as the
+ * terminal `error` event, since the stream's 200 status is already
+ * committed). Consent missing or owned by another company: same 404 either way.
+ */
+function migrateFailureResponse(error: unknown, consentId: string): NextResponse {
+  if (error instanceof ConsentNotFoundError) {
+    return errorResponseFromCode('PROVIDER_CONSENT_NOT_FOUND', moduleLog, {
+      details: { consentId },
+    })
+  }
+  const classified = classifyProviderError(error)
+  return errorResponseFromCode(classified ?? 'PROVIDER_MIGRATE_FAILED', moduleLog, {
+    details: {
+      reason: error instanceof Error ? error.message : 'unknown',
+      classified: classified ?? 'unclassified',
+    },
+  })
+}
+
+/**
  * Provider Migration extension
  *
  * Migrates bookkeeping data from external Swedish accounting systems
@@ -140,7 +172,7 @@ export const arcimMigrationExtension: Extension = {
       method: 'GET',
       path: '/providers',
       handler: async () => {
-        return NextResponse.json({ providers: ARCIM_PROVIDERS })
+        return NextResponse.json({ providers: enabledProviders() })
       },
     },
 
@@ -234,7 +266,7 @@ export const arcimMigrationExtension: Extension = {
           })
         }
 
-        const providerInfo = ARCIM_PROVIDERS.find(p => p.id === provider)
+        const providerInfo = enabledProviders().find(p => p.id === provider)
         if (!providerInfo) {
           return errorResponseFromCode('PROVIDER_INVALID', moduleLog, {
             details: { provider },
@@ -407,8 +439,10 @@ export const arcimMigrationExtension: Extension = {
         }
 
         // Briox needs the account ID (the /token clientid param) alongside
-        // the application token; Bokio/BL need their company GUID.
-        if ((provider === 'bokio' || provider === 'bjornlunden' || provider === 'briox') && !providerCompanyId) {
+        // the application token; Bokio/BL need their company GUID. WINT
+        // reuses the field for the login mail (paired with the password in
+        // apiToken; both are exchanged for tokens and never stored).
+        if ((provider === 'bokio' || provider === 'bjornlunden' || provider === 'briox' || provider === 'wint') && !providerCompanyId) {
           return errorResponseFromCode('PROVIDER_COMPANY_ID_REQUIRED', moduleLog, {
             details: { provider },
           })
@@ -627,6 +661,16 @@ export const arcimMigrationExtension: Extension = {
             const companyInfo = await fetchCompanyInfoDirect(provider, resolved.accessToken, resolved.providerCompanyId)
             mapped = companyInfo ? mapCompanyInfo(companyInfo) : null
           } catch (err) {
+            // A missing integration license / inactive API module dooms every
+            // later call in the wizard too: fail the preview with the typed
+            // code (via the outer catch) so the user reads the remediation at
+            // connect time, not after a silently empty migration. Other
+            // failures stay soft: the preview is still useful without company
+            // info (e.g. SIE-over-API can work with narrower scopes).
+            const classified = classifyProviderError(err)
+            if (classified === 'PROVIDER_API_MODULE_INACTIVE' || classified === 'PROVIDER_LICENSE_MISSING') {
+              throw err
+            }
             log.info('Company info fetch failed:', err instanceof Error ? err.message : String(err))
           }
 
@@ -1070,7 +1114,7 @@ export const arcimMigrationExtension: Extension = {
 
           log.info(`Starting migration for user ${user.id} from ${consent.provider}`)
 
-          const results = await executeMigration({
+          const migrationOptions = {
             consentId,
             companyId,
             userId: user.id,
@@ -1081,7 +1125,64 @@ export const arcimMigrationExtension: Extension = {
             importSalesInvoices,
             importSupplierInvoices,
             reconcileVouchers,
-          })
+          }
+
+          // Streaming mode (the migration wizard opts in via Accept): one
+          // NDJSON line per orchestrator progress event, then a terminal
+          // `done` or `error` line. Errors after the stream opens cannot
+          // change the HTTP status, so the terminal `error` line carries the
+          // same structured envelope the JSON path answers with. Callers
+          // without the Accept header keep the original JSON contract.
+          if ((request.headers.get('accept') ?? '').includes('application/x-ndjson')) {
+            const encoder = new TextEncoder()
+            const stream = new ReadableStream<Uint8Array>({
+              async start(controller) {
+                const send = (event: Record<string, unknown>) => {
+                  try {
+                    controller.enqueue(encoder.encode(JSON.stringify(event) + '\n'))
+                  } catch {
+                    // Reader cancelled (tab closed, navigation). The migration
+                    // keeps running server-side; we just stop narrating.
+                  }
+                }
+                try {
+                  const results = await executeMigration({
+                    ...migrationOptions,
+                    onProgress: (p) => send({
+                      kind: 'progress',
+                      status: p.status,
+                      currentStep: p.currentStep,
+                      progress: p.progress,
+                    }),
+                  })
+                  log.info('Migration completed:', results)
+                  // Mark consent as fully accepted now that data has been imported
+                  await acceptConsent(consentId)
+                  send({ kind: 'done', success: true, results })
+                } catch (error) {
+                  log.error('arcim migration failed', error as Error)
+                  const envelope = await migrateFailureResponse(error, consentId).json()
+                  send({ kind: 'error', ...envelope })
+                } finally {
+                  try {
+                    controller.close()
+                  } catch {
+                    // Already closed because the reader cancelled; close()
+                    // would otherwise reject start() as an unhandled rejection.
+                  }
+                }
+              },
+            })
+            return new Response(stream, {
+              headers: {
+                'Content-Type': 'application/x-ndjson; charset=utf-8',
+                'Cache-Control': 'no-store',
+                'X-Accel-Buffering': 'no',
+              },
+            })
+          }
+
+          const results = await executeMigration(migrationOptions)
 
           log.info('Migration completed:', results)
 
@@ -1091,19 +1192,7 @@ export const arcimMigrationExtension: Extension = {
           return NextResponse.json({ success: true, results })
         } catch (error) {
           log.error('arcim migration failed', error as Error)
-          // Consent missing or owned by another company: same 404 either way.
-          if (error instanceof ConsentNotFoundError) {
-            return errorResponseFromCode('PROVIDER_CONSENT_NOT_FOUND', moduleLog, {
-              details: { consentId },
-            })
-          }
-          const classified = classifyProviderError(error)
-          return errorResponseFromCode(classified ?? 'PROVIDER_MIGRATE_FAILED', moduleLog, {
-            details: {
-              reason: error instanceof Error ? error.message : 'unknown',
-              classified: classified ?? 'unclassified',
-            },
-          })
+          return migrateFailureResponse(error, consentId)
         }
       },
     },

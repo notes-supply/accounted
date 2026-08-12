@@ -1,4 +1,5 @@
 import { requireAuth } from '@/lib/auth/require-auth'
+import { canWriteCompany } from '@/lib/auth/require-write'
 import { NextResponse } from 'next/server'
 import { ensureInitialized } from '@/lib/init'
 import { extensionRegistry } from '@/lib/extensions/registry'
@@ -7,9 +8,11 @@ import { requireCompanyId } from '@/lib/company/context'
 import { requireCapability } from '@/lib/entitlements/has-capability'
 import { requiredCapabilityForExtensionId } from '@/lib/extensions/sectors'
 import { createLogger } from '@/lib/logger'
+import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import type { ApiRouteDefinition } from '@/lib/extensions/types'
 
 const dispatcherLog = createLogger('extension-dispatcher')
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 
 function generateRequestId(): string {
   return `req_${crypto.randomUUID()}`
@@ -295,8 +298,36 @@ async function handleRequest(
     }
   }
 
+  // Authenticated routes with company context inherit the same viewer boundary
+  // as core mutating routes. Check the exact company resolved above instead of
+  // resolving the active company a second time: the latter could authorize a
+  // different tenant if the active-company preference changes mid-request.
+  if (MUTATING_METHODS.has(method)) {
+    const canWrite = await canWriteCompany(supabase, user.id, companyId)
+    if (!canWrite) {
+      return decorateResponse(
+        errorResponseFromCode('FORBIDDEN', log, {
+          requestId,
+          reason: 'extension company mutation requires a writable role',
+        }),
+        requestId,
+      )
+    }
+  }
+
   // Build context and dispatch
-  const ctx = createExtensionContext(supabase, user.id, companyId, extensionId, requestId)
+  const ctx = createExtensionContext(
+    supabase,
+    user.id,
+    companyId,
+    extensionId,
+    requestId,
+    {
+      requestStartedAtMs: start,
+      workStartDeadlineMs: start + 180_000,
+      cleanupDeadlineMs: start + 285_000,
+    },
+  )
   const response = await matchedRoute.handler(handlerRequest, ctx)
   log.info('extension call completed', {
     durationMs: Date.now() - start,

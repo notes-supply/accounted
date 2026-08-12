@@ -124,7 +124,7 @@ describe('DELETE /api/salary/runs/[id]/lines/[lineId]', () => {
       { data: { id: 'run-1', status: 'draft' } }, // salary_runs lookup
       // Run-membership verification added by the shared service.
       { data: { id: 'line-1', amount: 50, salary_run_employee: { salary_run_id: 'run-1' } } },
-      { data: null }, // delete (error null)
+      { data: true }, // atomic mileage release + delete
     ])
     const response = await DELETE(
       createMockRequest('/api/salary/runs/run-1/lines/line-1', { method: 'DELETE' }),

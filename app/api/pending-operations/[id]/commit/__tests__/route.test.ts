@@ -139,6 +139,16 @@ describe('POST /api/pending-operations/:id/commit', () => {
         { data: settings },                           // fetch company settings
         { data: [{ id: 'fp-1' }] },                  // fiscal period check
         { data: true, error: null },                  // atomic settlement attachment
+        {
+          data: {
+            ...tx,
+            category: 'expense_office',
+            is_business: true,
+            journal_entry_id: 'je-1',
+            cash_account_id: null,
+          },
+          error: null,
+        },                                            // authoritative attachment readback
         { data: null, error: null },                  // upsert counterparty template
         { data: null, error: null },                  // update pending op status
       ])

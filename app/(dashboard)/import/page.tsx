@@ -20,7 +20,7 @@ import {
 } from '@/components/ui/dialog'
 import { useToast } from '@/components/ui/use-toast'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
-import { ArrowLeft, CreditCard, Landmark, Loader2, ChevronRight, Download, AlertTriangle } from 'lucide-react'
+import { ArrowLeft, CreditCard, Landmark, Loader2, ChevronRight, Download, AlertTriangle, ShoppingBag, ShoppingCart } from 'lucide-react'
 import { cn, formatDate } from '@/lib/utils'
 import { createClient } from '@/lib/supabase/client'
 import { useCompany, useCapability } from '@/contexts/CompanyContext'
@@ -61,6 +61,11 @@ import type {
   ImportResult,
   ParseIssue,
 } from '@/lib/import/types'
+import type { TheaterModel } from '@/lib/import/theater-model'
+
+/** Above this size the client-side theater parse is skipped (main-thread
+ *  parse of very large SIE files would jank the animation it exists for). */
+const THEATER_MAX_FILE_BYTES = 8 * 1024 * 1024
 import type { BASAccount } from '@/types'
 import { ENABLED_EXTENSION_IDS } from '@/lib/extensions/_generated/enabled-extensions'
 import dynamic from 'next/dynamic'
@@ -441,6 +446,7 @@ function SIEImportWizard() {
   const [preview, setPreview] = useState<ImportPreview | null>(null)
   const [issues, setIssues] = useState<ParseIssue[]>([])
   const [importResult, setImportResult] = useState<ImportResult | null>(null)
+  const [theaterModel, setTheaterModel] = useState<TheaterModel | null>(null)
   const [, setSieAccounts] = useState<{ number: string; name: string }[]>([])
   const [isCreatingAccounts, setIsCreatingAccounts] = useState(false)
 
@@ -708,6 +714,23 @@ function SIEImportWizard() {
     setIsLoading(true)
     setError(null)
 
+    // Import theater: parse the file client-side (the parser is browser-clean)
+    // so the graph can build itself while the server writes. Best-effort with
+    // a size cap: any failure just leaves the plain spinner takeover.
+    if (file.size <= THEATER_MAX_FILE_BYTES) {
+      void (async () => {
+        try {
+          const [{ parseSIEFile, detectEncoding, decodeBuffer }, { buildTheaterModel }] =
+            await Promise.all([import('@/lib/import/sie-parser'), import('@/lib/import/theater-model')])
+          const buffer = await file.arrayBuffer()
+          const parsed = parseSIEFile(decodeBuffer(buffer, detectEncoding(buffer)))
+          setTheaterModel(buildTheaterModel(parsed))
+        } catch {
+          // Theater is a nicety; the import itself is unaffected.
+        }
+      })()
+    }
+
     try {
       const formData = new FormData()
       formData.append('file', file)
@@ -773,7 +796,7 @@ function SIEImportWizard() {
     setStep('upload'); setFile(null); setParsed(null); setMappings([])
     setPreview(null); setIssues([]); setImportResult(null); setError(null); setErrorType(undefined)
     setValidationErrors([]); setValidationWarnings([]); setDuplicateImportId(null)
-    setSieAccounts([]); setIsCreatingAccounts(false)
+    setSieAccounts([]); setIsCreatingAccounts(false); setTheaterModel(null)
   }
 
   return (
@@ -811,9 +834,13 @@ function SIEImportWizard() {
       )}
       {step === 'review' && preview && (
         <ImportReviewStep preview={preview} mappings={mappings}
-          onExecute={handleExecuteImport} onBack={goBack} isLoading={isLoading} />
+          onExecute={handleExecuteImport} onBack={goBack} isLoading={isLoading}
+          theaterModel={theaterModel} />
       )}
-      {step === 'result' && importResult && <ImportResultStep result={importResult} onNewImport={handleNewImport} onUndo={handleUndo} />}
+      {step === 'result' && importResult && (
+        <ImportResultStep result={importResult} onNewImport={handleNewImport} onUndo={handleUndo}
+          preview={preview} theaterModel={theaterModel} />
+      )}
     </div>
   )
 }
@@ -1955,15 +1982,23 @@ const BankingPanel = getSettingsPanel('enable-banking')
 // PSD2 bank connection above.
 const StripePanel = getSettingsPanel('stripe')
 
+// And for the WooCommerce order feed: the store's paid orders and refunds are
+// an import source in the same category as the Stripe feed above.
+const WooCommercePanel = getSettingsPanel('woocommerce')
+
+// And for the Shopify order feed: same category as the WooCommerce feed above.
+const ShopifyPanel = getSettingsPanel('shopify')
+
 // ============================================================
 // Import Page with Selection Cards
 // ============================================================
 
-type ImportMode = null | 'psd2' | 'stripe' | 'bank' | 'sie' | 'csv_data' | 'migration'
+type ImportMode = null | 'psd2' | 'stripe' | 'woocommerce' | 'shopify' | 'bank' | 'sie' | 'csv_data' | 'migration'
 
 export default function ImportPage() {
   const { isSandbox } = useCompany()
   const [mode, setMode] = useState<ImportMode>(null)
+  const [initialProvider, setInitialProvider] = useState<string | null>(null)
   const [view, setView] = useState<'import' | 'export'>('import')
   const [sieDialogOpen, setSieDialogOpen] = useState(false)
   const [cloudOpen, setCloudOpen] = useState(false)
@@ -1991,7 +2026,7 @@ export default function ImportPage() {
     // Manual file-import modes (bank file, CSV/Excel, SIE) stay reachable.
     const allowedModes = isSandbox
       ? ['bank', 'sie', 'csv_data']
-      : ['psd2', 'stripe', 'bank', 'sie', 'csv_data', 'migration']
+      : ['psd2', 'stripe', 'woocommerce', 'shopify', 'bank', 'sie', 'csv_data', 'migration']
     if (!isSandbox && searchParams.get('migration')) {
       setMode('migration')
     } else {
@@ -1999,6 +2034,12 @@ export default function ImportPage() {
       if (modeParam && allowedModes.includes(modeParam)) {
         setMode(modeParam as ImportMode)
       }
+      // Deep link from the onboarding branch question: preselect the old
+      // system so the wizard can jump straight to its connect step. Cleared
+      // for every other mode so a stale preselect can't survive re-entry.
+      setInitialProvider(
+        modeParam === 'migration' && !isSandbox ? searchParams.get('provider') : null
+      )
     }
     const viewParam = searchParams.get('view')
     if (viewParam === 'export' || viewParam === 'import') {
@@ -2037,6 +2078,11 @@ export default function ImportPage() {
   const hasStripeExtension = ENABLED_EXTENSION_IDS.has('stripe')
   // Stripe is enabled everywhere (hosted + self-hosted); only the sandbox blocks it.
   const stripeDisabled = isSandbox
+  const hasWooCommerceExtension = ENABLED_EXTENSION_IDS.has('woocommerce')
+  // Same doctrine as Stripe: external credentials never leave the sandbox.
+  const woocommerceDisabled = isSandbox
+  const hasShopifyExtension = ENABLED_EXTENSION_IDS.has('shopify')
+  const shopifyDisabled = isSandbox
 
   return (
     <div className="space-y-8">
@@ -2108,6 +2154,24 @@ export default function ImportPage() {
                     onClick={() => setMode('stripe')}
                   />
                 )}
+                {hasWooCommerceExtension && (
+                  <ImportRow
+                    title={t('woocommerce_title')}
+                    sub={t('woocommerce_description')}
+                    chips={<LogoChip src="/logos/woocommerce.svg" name="WooCommerce" />}
+                    disabled={woocommerceDisabled}
+                    onClick={() => setMode('woocommerce')}
+                  />
+                )}
+                {hasShopifyExtension && (
+                  <ImportRow
+                    title={t('shopify_title')}
+                    sub={t('shopify_description')}
+                    chips={<LogoChip src="/logos/shopify.svg" name="Shopify" />}
+                    disabled={shopifyDisabled}
+                    onClick={() => setMode('shopify')}
+                  />
+                )}
                 {hasMigrationExtension && (
                   <ImportRow
                     title={t('migration_title')}
@@ -2119,6 +2183,7 @@ export default function ImportPage() {
                         <LogoChip src="/logos/bokio.png" name="Bokio" />
                         <LogoChip src="/logos/bjornlunden.png" name="Björn Lundén" />
                         <LogoChip src="/logos/Briox_logo.png" name="Briox" />
+                        <LogoChip src="/logos/wint.svg" name="WINT" />
                       </>
                     }
                     disabled={isSandbox}
@@ -2219,7 +2284,17 @@ export default function ImportPage() {
       )}
 
       {mode !== null && (
-        <Button variant="ghost" size="sm" onClick={() => setMode(null)}>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => {
+            setMode(null)
+            // Mode is client state (not URL-synced), so the deep-linked
+            // preselect must be cleared here too or a re-entered migration
+            // mode would auto-jump again.
+            setInitialProvider(null)
+          }}
+        >
           <ArrowLeft className="mr-2 h-4 w-4" />
           {t('back_to_choices')}
         </Button>
@@ -2259,10 +2334,42 @@ export default function ImportPage() {
           </Card>
         )
       )}
+      {mode === 'woocommerce' && (
+        hasWooCommerceExtension && WooCommercePanel ? (
+          <WooCommercePanel />
+        ) : (
+          <Card>
+            <CardContent className="flex flex-col items-center justify-center py-12 text-center">
+              <ShoppingCart className="mb-4 h-10 w-10 text-muted-foreground/40" />
+              <p className="mb-1 font-medium">{t('woocommerce_not_enabled_title')}</p>
+              <p className="max-w-md text-sm text-muted-foreground">
+                {t('woocommerce_not_enabled_description')}
+              </p>
+            </CardContent>
+          </Card>
+        )
+      )}
+      {mode === 'shopify' && (
+        hasShopifyExtension && ShopifyPanel ? (
+          <ShopifyPanel />
+        ) : (
+          <Card>
+            <CardContent className="flex flex-col items-center justify-center py-12 text-center">
+              <ShoppingBag className="mb-4 h-10 w-10 text-muted-foreground/40" />
+              <p className="mb-1 font-medium">{t('shopify_not_enabled_title')}</p>
+              <p className="max-w-md text-sm text-muted-foreground">
+                {t('shopify_not_enabled_description')}
+              </p>
+            </CardContent>
+          </Card>
+        )
+      )}
       {mode === 'bank' && <BankFileImportWizard />}
       {mode === 'sie' && <SIEImportWizard />}
       {mode === 'csv_data' && <CSVDataImportWizard />}
-      {mode === 'migration' && <MigrationWizard userId={userId} />}
+      {mode === 'migration' && (
+        <MigrationWizard userId={userId} initialProvider={initialProvider ?? undefined} />
+      )}
     </div>
   )
 }

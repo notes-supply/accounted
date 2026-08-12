@@ -40,6 +40,7 @@ import {
   NoOpenPeriodForDateError,
   TargetPeriodClosedError,
   TargetPeriodLockedError,
+  PostCommitReadbackError,
   isBookkeepingError,
 } from '../bookkeeping/errors'
 
@@ -453,6 +454,16 @@ function extractBookkeepingDetails(err: unknown): { code: string; details?: unkn
   }
   if (err instanceof TargetPeriodLockedError) {
     return { code: err.code, details: { date: err.date, lockDate: err.lockDate } }
+  }
+  if (err instanceof PostCommitReadbackError) {
+    return {
+      code: err.code,
+      details: {
+        journal_entry_id: err.journalEntryId,
+        voucher_number: err.voucherNumber,
+        cause: err.cause,
+      },
+    }
   }
   if (err instanceof BookkeepingDatabaseError) {
     return { code: err.code, details: { operation: err.operation } }

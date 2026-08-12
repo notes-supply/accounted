@@ -108,7 +108,7 @@ describe('DELETE /api/salary/runs/[id]', () => {
 
     enqueueMany([
       { data: { id: 'run-1', status: 'draft' } }, // salary_runs lookup
-      { data: null },                              // salary_runs delete (cascade handles children)
+      { data: true },                              // atomic mileage release + run delete
     ])
 
     const request = createMockRequest('/api/salary/runs/run-1', { method: 'DELETE' })

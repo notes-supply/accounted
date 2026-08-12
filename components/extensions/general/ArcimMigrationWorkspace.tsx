@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useCallback, useEffect } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Progress } from '@/components/ui/progress'
@@ -40,18 +40,21 @@ import {
 } from 'lucide-react'
 import type { WorkspaceComponentProps } from '@/lib/extensions/workspace-registry'
 
-type ArcimProvider = 'fortnox' | 'visma' | 'briox' | 'bokio' | 'bjornlunden'
+type ArcimProvider = 'fortnox' | 'visma' | 'briox' | 'bokio' | 'bjornlunden' | 'wint'
 
 // `sieViaApi`: the provider serves its general ledger as SIE over the API:
 // no manual SIE upload needed. Deliberately duplicated from
 // extensions/general/arcim-migration/types.ts (core code must not import from
 // @/extensions/: CI enforces it). Keep both lists in sync.
+// WINT is env-gated server-side (WINT_MIGRATION_ENABLED): the wizard renders
+// whatever GET /providers returns, so no client-side gate is needed here.
 const ARCIM_PROVIDERS: { id: ArcimProvider; name: string; authType: 'oauth' | 'token'; sieViaApi: boolean }[] = [
   { id: 'fortnox', name: 'Fortnox', authType: 'oauth', sieViaApi: true },
   { id: 'visma', name: 'Visma', authType: 'oauth', sieViaApi: false },
   { id: 'bokio', name: 'Bokio', authType: 'token', sieViaApi: false },
   { id: 'bjornlunden', name: 'Björn Lundén', authType: 'token', sieViaApi: true },
   { id: 'briox', name: 'Briox', authType: 'token', sieViaApi: true },
+  { id: 'wint', name: 'WINT', authType: 'token', sieViaApi: true },
 ]
 
 /**
@@ -68,6 +71,100 @@ function apiErrorMessage(data: unknown, fallback: string): string {
     if (typeof message === 'string' && message) return message
   }
   return fallback
+}
+
+/**
+ * Marks an error whose message is already user-facing Swedish (server
+ * envelopes, ImportResult.errors). The catch blocks must show these
+ * verbatim: routing them through getErrorMessage would test them against
+ * its Swedish-pattern heuristic and swallow any miss into the generic
+ * "Något gick fel. Försök igen.", hiding the real reason the migration
+ * stopped.
+ */
+class UserFacingError extends Error {}
+
+/**
+ * Build the throwable for a failed API response: an extracted server
+ * message passes through to the UI verbatim, while the technical fallback
+ * (e.g. "HTTP 500") stays a plain Error so getErrorMessage maps it to a
+ * friendly message.
+ */
+function apiError(data: unknown, fallback: string): Error {
+  const extracted = apiErrorMessage(data, '')
+  return extracted ? new UserFacingError(extracted) : new Error(fallback)
+}
+
+/** Resolve the message a catch block should display. */
+function displayError(err: unknown, nonErrorFallback?: string): string {
+  if (err instanceof UserFacingError) return err.message
+  if (!(err instanceof Error) && nonErrorFallback) return nonErrorFallback
+  return getUserErrorMessage(err)
+}
+
+/**
+ * Read the /migrate NDJSON stream: one JSON object per line. `progress`
+ * events carry the orchestrator's real step labels and anchors; the stream
+ * ends with a terminal `done` line (results) or `error` line (the same
+ * structured envelope the JSON path answers with, thrown here so the catch
+ * block shows it verbatim).
+ */
+async function consumeMigrationStream(
+  body: ReadableStream<Uint8Array>,
+  onProgress: (currentStep: string | undefined, progress: number) => void,
+): Promise<MigrationResults> {
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let results: MigrationResults | undefined
+
+  const handleLine = (line: string) => {
+    if (!line.trim()) return
+    let event: {
+      kind?: string
+      currentStep?: string
+      progress?: number
+      results?: MigrationResults
+    }
+    try {
+      event = JSON.parse(line)
+    } catch {
+      return // torn line from an intermediary flush; terminal lines are whole
+    }
+    if (event.kind === 'progress' && typeof event.progress === 'number') {
+      onProgress(
+        typeof event.currentStep === 'string' && event.currentStep ? event.currentStep : undefined,
+        event.progress,
+      )
+    } else if (event.kind === 'done') {
+      results = event.results ?? {}
+    } else if (event.kind === 'error') {
+      throw apiError(event, 'Migreringen misslyckades.')
+    }
+  }
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
+      for (const line of lines) handleLine(line)
+    }
+    buffer += decoder.decode()
+    if (buffer) handleLine(buffer)
+  } finally {
+    reader.releaseLock()
+  }
+
+  if (!results) {
+    // The connection dropped before the terminal line. The migration keeps
+    // running server-side, so a blind retry could double-import.
+    throw new UserFacingError(
+      'Anslutningen bröts innan migreringen bekräftades. Ladda om sidan och kontrollera om kunder och fakturor redan har importerats innan du försöker igen.'
+    )
+  }
+  return results
 }
 
 /** Pull the structured error `code` from an envelope, if present. */
@@ -87,14 +184,23 @@ interface SkipReasons {
   noMatch?: number
 }
 
+interface MigrationStepError {
+  step: 'companyInfo' | 'customers' | 'suppliers' | 'salesInvoices' | 'supplierInvoices' | 'reconciliation'
+  code: string | null
+  message: string
+}
+
 interface MigrationResults {
   companyInfo?: { imported: boolean }
-  customers?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons }
-  suppliers?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons }
-  salesInvoices?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons }
-  supplierInvoices?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons }
+  customers?: { total: number; imported: number; updated?: number; skipped: number; skipReasons?: SkipReasons; errorSample?: string }
+  suppliers?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons; errorSample?: string }
+  salesInvoices?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons; errorSample?: string }
+  supplierInvoices?: { total: number; imported: number; skipped: number; skipReasons?: SkipReasons; errorSample?: string }
+  stepErrors?: MigrationStepError[]
 }
 import AccountMappingStep from '@/components/import/AccountMappingStep'
+import ArcimMigrationTheater from '@/components/extensions/general/ArcimMigrationTheater'
+import type { TheaterModel } from '@/lib/import/theater-model'
 import type { AccountMapping, ImportResult, ParsedSIEFile } from '@/lib/import/types'
 import type { BASAccount } from '@/types'
 
@@ -225,7 +331,10 @@ interface ConnectionStatus {
   }
 }
 
-const COMING_SOON_PROVIDERS = new Set<ArcimProvider>([])
+// WINT shows as a disabled "Kommer snart" card until the integration is
+// verified against a live WINT account. Launch = remove it here AND set
+// WINT_MIGRATION_ENABLED=true (the server-side /connect gate).
+const COMING_SOON_PROVIDERS = new Set<ArcimProvider>(['wint'])
 
 const PROVIDER_LOGOS: Record<ArcimProvider, string> = {
   fortnox: '/logos/fortnox.svg',
@@ -233,6 +342,7 @@ const PROVIDER_LOGOS: Record<ArcimProvider, string> = {
   bokio: '/logos/bokio.png',
   bjornlunden: '/logos/bjornlunden.png',
   briox: '/logos/Briox_logo.png',
+  wint: '/logos/wint.svg',
 }
 
 function ProviderStep({
@@ -263,7 +373,7 @@ function ProviderStep({
           <div className="min-w-0 flex-1">
             <p className="text-sm font-medium">SIE-import krävs först</p>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              Bokio och Visma hämtar endast kunder, leverantörer och fakturor via API:et. Bokföringsdata (kontoplan, verifikationer och balanser) måste importeras via SIE-fil först. Gäller inte Fortnox, Briox och Björn Lundén: där hämtar vi SIE direkt via API:et.
+              Bokio och Visma hämtar endast kunder, leverantörer och fakturor via API:et. Bokföringsdata (kontoplan, verifikationer och balanser) måste importeras via SIE-fil först. Gäller inte Fortnox, Briox, Björn Lundén och WINT: där hämtar vi bokföringen direkt via API:et.
             </p>
             <Link
               href="/import?mode=sie"
@@ -472,24 +582,34 @@ function ConnectStep({
 
   // BL uses server-side client credentials: only needs company ID, no API key
   const isClientCredentials = provider === 'bjornlunden'
+  // WINT has no API keys: the "token" is the user's WINT login (e-post +
+  // lösenord), exchanged server-side for ett tokenpar; lösenordet sparas aldrig.
+  const isWintLogin = provider === 'wint'
   const needsApiToken = !isClientCredentials
-  // Briox: the account ID is the `clientid` half of the token exchange
-  const needsCompanyId = provider === 'bokio' || provider === 'bjornlunden' || provider === 'briox'
+  // Briox: the account ID is the `clientid` half of the token exchange;
+  // WINT reuses the same field for the login e-mail.
+  const needsCompanyId = provider === 'bokio' || provider === 'bjornlunden' || provider === 'briox' || provider === 'wint'
   const companyIdLabel = provider === 'briox'
     ? 'Konto-ID'
     : provider === 'bjornlunden'
       ? 'Företagsnyckel (User-Key)'
-      : 'Företags-ID'
+      : provider === 'wint'
+        ? 'E-postadress'
+        : 'Företags-ID'
 
   const tokenDescription = isClientCredentials
     ? `Ange din företagsnyckel (User-Key) från Björn Lundén. ${branding.appName.toLowerCase()} ansluter automatiskt via sin integrationspartner-åtkomst.`
-    : provider === 'briox'
-      ? `Ange ditt konto-ID och din applikationstoken från Briox för att ge ${branding.appName.toLowerCase()} tillgång att läsa din bokföringsdata.`
-      : `Ange din API-nyckel från ${providerName} för att ge ${branding.appName.toLowerCase()} tillgång att läsa din bokföringsdata.`
+    : isWintLogin
+      ? `Logga in med dina WINT-uppgifter för att ge ${branding.appName.toLowerCase()} tillgång att läsa din bokföringsdata. Lösenordet används en gång för att skapa anslutningen och sparas aldrig.`
+      : provider === 'briox'
+        ? `Ange ditt konto-ID och din applikationstoken från Briox för att ge ${branding.appName.toLowerCase()} tillgång att läsa din bokföringsdata.`
+        : `Ange din API-nyckel från ${providerName} för att ge ${branding.appName.toLowerCase()} tillgång att läsa din bokföringsdata.`
 
   const tokenHelpText = isClientCredentials
     ? `Företagsnyckeln (User-Key) är ett GUID som du hittar i Lundify under Integrationer → kugghjulet vid integrationen, eller i aktiveringsmejlet från Björn Lundén.`
-    : provider === 'bokio'
+    : isWintLogin
+      ? `Använd samma e-postadress och lösenord som när du loggar in på app.wint.se. Kräver ditt WINT-konto BankID-inloggning kan anslutningen inte skapas ännu: be i så fall WINT om en SIE-fil och importera den manuellt.`
+      : provider === 'bokio'
       ? `Du hittar din API-nyckel i ${providerName} under Inställningar \u2192 Integrationer \u2192 API. Ditt företags-ID är det GUID som syns i URL:en när du är inloggad, t.ex. https://app.bokio.se/ditt-företags-id/settings-r/private-integrations.`
       : provider === 'briox'
         ? `Skapa din applikationstoken i Briox under Admin \u2192 Anv\u00e4ndare \u2192 kugghjulet vid din anv\u00e4ndare \u2192 Applikationstoken. Ditt konto-ID \u00e4r det l\u00e5nga numret inom parentes bredvid f\u00f6retagsnamnet under "Ditt konto" i menyn till h\u00f6ger.`
@@ -581,38 +701,50 @@ function ConnectStep({
               <p className="text-sm text-muted-foreground">
                 {tokenHelpText}
               </p>
-              <div className="space-y-3">
+              {/* WINT is a login form: e-mail reads above password (CSS order;
+                  the button keeps its place). Other token providers keep
+                  token-first order. */}
+              <div className={cn('space-y-3', isWintLogin && 'flex flex-col gap-3 space-y-0')}>
                 {needsApiToken && (
-                  <div>
+                  <div className={cn(isWintLogin && 'order-2')}>
                     <label htmlFor="apiToken" className="text-sm font-medium">
-                      {provider === 'briox' ? 'Applikationstoken' : 'API-nyckel'}
+                      {provider === 'briox' ? 'Applikationstoken' : isWintLogin ? 'Lösenord' : 'API-nyckel'}
                     </label>
                     <Input
                       id="apiToken"
                       name="apiToken_nocomplete"
                       type="password"
                       autoComplete="new-password"
-                      placeholder={provider === 'briox' ? 'Klistra in din applikationstoken' : 'Klistra in din API-nyckel'}
+                      placeholder={
+                        provider === 'briox'
+                          ? 'Klistra in din applikationstoken'
+                          : isWintLogin
+                            ? 'Ditt lösenord hos WINT'
+                            : 'Klistra in din API-nyckel'
+                      }
                       value={apiToken}
                       onChange={(e) => setApiToken(e.target.value)}
                     />
                   </div>
                 )}
                 {needsCompanyId && (
-                  <div>
+                  <div className={cn(isWintLogin && 'order-1')}>
                     <label htmlFor="companyId" className="text-sm font-medium">
                       {companyIdLabel}
                     </label>
                     <Input
                       id="companyId"
                       name="companyId_nocomplete"
+                      type={isWintLogin ? 'email' : 'text'}
                       autoComplete="new-password"
                       placeholder={
                         isClientCredentials
                           ? 'Företagsnyckel, t.ex. 1f0e2d3c-4b5a-...'
                           : provider === 'briox'
                             ? 'Det långa numret inom parentes, t.ex. 35649125'
-                            : 'GUID från URL:en, t.ex. 14ccad83-67f6-49bd-...'
+                            : isWintLogin
+                              ? 'namn@foretaget.se'
+                              : 'GUID från URL:en, t.ex. 14ccad83-67f6-49bd-...'
                       }
                       value={companyId}
                       onChange={(e) => setCompanyId(e.target.value)}
@@ -620,7 +752,7 @@ function ConnectStep({
                   </div>
                 )}
                 <Button
-                  className="min-h-11"
+                  className={cn('min-h-11', isWintLogin && 'order-3')}
                   onClick={() => onTokenSubmit(apiToken, companyId)}
                   disabled={!canSubmit}
                 >
@@ -1497,16 +1629,22 @@ function ResultStep({
   // Check if anything meaningful was imported via entities
   // Company info is always re-fetched (upsert) so it doesn't count as "new"
   const entityImported = results && (
-    (results.customers && (results.customers.imported > 0 || results.customers.skipped > 0)) ||
+    (results.customers && (results.customers.imported > 0 || (results.customers.updated ?? 0) > 0 || results.customers.skipped > 0)) ||
     (results.suppliers && (results.suppliers.imported > 0 || results.suppliers.skipped > 0)) ||
     (results.salesInvoices && (results.salesInvoices.imported > 0 || results.salesInvoices.skipped > 0)) ||
     (results.supplierInvoices && (results.supplierInvoices.imported > 0 || results.supplierInvoices.skipped > 0))
   )
-  const nothingNew = sieResults.length === 0 && !entityImported
+
+  // Steps that failed against the provider API. An empty sync with failed
+  // steps must never present as "Allt är uppdaterat": that reading sent a
+  // real subscription problem to the bug tracker as a sync bug.
+  const stepErrors = results?.stepErrors ?? []
+  const apiFailed = stepErrors.length > 0
+  const nothingNew = sieResults.length === 0 && !entityImported && !apiFailed
 
   // Overall status
   const overallIcon = anySieFailed ? 'error' as const :
-    (!allSieSucceeded || totalErrors > 0) ? 'warning' as const : 'success' as const
+    (apiFailed || !allSieSucceeded || totalErrors > 0) ? 'warning' as const : 'success' as const
 
   return (
     <div className="space-y-4">
@@ -1516,7 +1654,7 @@ function ResultStep({
           <CardTitle className="flex items-center gap-2">
             <StatusIcon status={nothingNew ? 'success' : overallIcon} />
             {nothingNew ? 'Allt är uppdaterat' :
-             anySieFailed ? 'Migrering delvis genomförd' :
+             (anySieFailed || apiFailed) ? 'Migrering delvis genomförd' :
              !allSieSucceeded ? 'Migrering klar med anmärkningar' :
              'Migrering klar'}
           </CardTitle>
@@ -1541,6 +1679,23 @@ function ResultStep({
         </CardHeader>
       </Card>
 
+      {/* ── Steps that failed against the provider API ── */}
+      {stepErrors.length > 0 && (
+        <div className="space-y-2">
+          {groupStepErrors(stepErrors).map((group, i) => (
+            <div key={i} className="flex gap-3 rounded-lg border border-destructive/20 bg-destructive/10 p-4">
+              <AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-destructive" />
+              <div>
+                <p className="text-sm font-medium text-destructive">
+                  Kunde inte hämta: {group.steps.map((s) => STEP_ERROR_LABELS[s]).join(', ')}
+                </p>
+                <p className="mt-1 text-sm text-muted-foreground">{group.message}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* ── Per-fiscal-year SIE breakdown ── */}
       {sieResults.length > 0 && (
         <div className="space-y-2">
@@ -1559,7 +1714,7 @@ function ResultStep({
       {/* ── API import results (company info, customers, etc.) ── */}
       {results && (() => {
         const hasCompanyInfo = results.companyInfo?.imported
-        const hasCustomers = results.customers && (results.customers.imported > 0 || results.customers.skipped > 0)
+        const hasCustomers = results.customers && (results.customers.imported > 0 || (results.customers.updated ?? 0) > 0 || results.customers.skipped > 0)
         const hasSuppliers = results.suppliers && (results.suppliers.imported > 0 || results.suppliers.skipped > 0)
         const hasSalesInvoices = results.salesInvoices && (results.salesInvoices.imported > 0 || results.salesInvoices.skipped > 0)
         const hasSupplierInvoices = results.supplierInvoices && (results.supplierInvoices.imported > 0 || results.supplierInvoices.skipped > 0)
@@ -1586,36 +1741,38 @@ function ResultStep({
                 <EntityResultRow
                   icon={<Users className="h-4 w-4" />}
                   label="Kunder"
-                  status="success"
-                  statusText={`${results.customers!.imported} importerade`}
-                  detail={results.customers!.skipped > 0 ? formatSkipReasons(results.customers!.skipReasons, 'customer') ?? `${results.customers!.skipped} hoppades över` : undefined}
+                  status={entityRowStatus(results.customers!.imported, results.customers!.skipReasons)}
+                  statusText={results.customers!.updated
+                    ? `${results.customers!.imported} importerade, ${results.customers!.updated} kompletterade`
+                    : `${results.customers!.imported} importerade`}
+                  detail={results.customers!.skipped > 0 ? formatSkipReasons(results.customers!.skipReasons, 'customer', results.customers!.errorSample) ?? `${results.customers!.skipped} hoppades över` : undefined}
                 />
               )}
               {hasSuppliers && (
                 <EntityResultRow
                   icon={<Truck className="h-4 w-4" />}
                   label="Leverantörer"
-                  status="success"
+                  status={entityRowStatus(results.suppliers!.imported, results.suppliers!.skipReasons)}
                   statusText={`${results.suppliers!.imported} importerade`}
-                  detail={results.suppliers!.skipped > 0 ? formatSkipReasons(results.suppliers!.skipReasons, 'supplier') ?? `${results.suppliers!.skipped} hoppades över` : undefined}
+                  detail={results.suppliers!.skipped > 0 ? formatSkipReasons(results.suppliers!.skipReasons, 'supplier', results.suppliers!.errorSample) ?? `${results.suppliers!.skipped} hoppades över` : undefined}
                 />
               )}
               {hasSalesInvoices && (
                 <EntityResultRow
                   icon={<FileText className="h-4 w-4" />}
                   label="Kundfakturor"
-                  status="success"
+                  status={entityRowStatus(results.salesInvoices!.imported, results.salesInvoices!.skipReasons)}
                   statusText={`${results.salesInvoices!.imported} importerade`}
-                  detail={results.salesInvoices!.skipped > 0 ? formatSkipReasons(results.salesInvoices!.skipReasons, 'invoice') ?? `${results.salesInvoices!.skipped} hoppades över` : undefined}
+                  detail={results.salesInvoices!.skipped > 0 ? formatSkipReasons(results.salesInvoices!.skipReasons, 'invoice', results.salesInvoices!.errorSample) ?? `${results.salesInvoices!.skipped} hoppades över` : undefined}
                 />
               )}
               {hasSupplierInvoices && (
                 <EntityResultRow
                   icon={<FileText className="h-4 w-4" />}
                   label="Leverantörsfakturor"
-                  status="success"
+                  status={entityRowStatus(results.supplierInvoices!.imported, results.supplierInvoices!.skipReasons)}
                   statusText={`${results.supplierInvoices!.imported} importerade`}
-                  detail={results.supplierInvoices!.skipped > 0 ? formatSkipReasons(results.supplierInvoices!.skipReasons, 'invoice') ?? `${results.supplierInvoices!.skipped} hoppades över` : undefined}
+                  detail={results.supplierInvoices!.skipped > 0 ? formatSkipReasons(results.supplierInvoices!.skipReasons, 'invoice', results.supplierInvoices!.errorSample) ?? `${results.supplierInvoices!.skipped} hoppades över` : undefined}
                 />
               )}
             </div>
@@ -1683,7 +1840,34 @@ function ResultStep({
   )
 }
 
-function formatSkipReasons(reasons?: SkipReasons, entityType?: 'customer' | 'supplier' | 'invoice'): string | undefined {
+const STEP_ERROR_LABELS: Record<MigrationStepError['step'], string> = {
+  companyInfo: 'Företagsinformation',
+  customers: 'Kunder',
+  suppliers: 'Leverantörer',
+  salesInvoices: 'Kundfakturor',
+  supplierInvoices: 'Leverantörsfakturor',
+  reconciliation: 'Avstämning av betalningar',
+}
+
+/**
+ * Group step errors that share the same message (a provider outage hits every
+ * step identically) so the result shows one card per cause, not one per step.
+ */
+function groupStepErrors(errors: MigrationStepError[]): { message: string; steps: MigrationStepError['step'][] }[] {
+  const groups = new Map<string, MigrationStepError['step'][]>()
+  for (const e of errors) {
+    const steps = groups.get(e.message) ?? []
+    steps.push(e.step)
+    groups.set(e.message, steps)
+  }
+  return [...groups.entries()].map(([message, steps]) => ({ message, steps }))
+}
+
+function formatSkipReasons(
+  reasons?: SkipReasons,
+  entityType?: 'customer' | 'supplier' | 'invoice',
+  errorSample?: string,
+): string | undefined {
   if (!reasons) return undefined
   const parts: string[] = []
   if (reasons.duplicate) parts.push(`${reasons.duplicate} fanns redan`)
@@ -1692,8 +1876,19 @@ function formatSkipReasons(reasons?: SkipReasons, entityType?: 'customer' | 'sup
     const matchLabel = entityType === 'invoice' ? 'utan matchning' : 'utan matchning'
     parts.push(`${reasons.noMatch} ${matchLabel}`)
   }
-  if (reasons.failed) parts.push(`${reasons.failed} misslyckades`)
+  if (reasons.failed) {
+    parts.push(
+      errorSample
+        ? `${reasons.failed} misslyckades: ${errorSample.slice(0, 140)}`
+        : `${reasons.failed} misslyckades`
+    )
+  }
   return parts.length > 0 ? parts.join(', ') : undefined
+}
+
+/** A step that failed everything it tried is an error, not a green checkmark. */
+function entityRowStatus(imported: number, reasons?: SkipReasons): 'success' | 'error' {
+  return imported === 0 && (reasons?.failed ?? 0) > 0 ? 'error' : 'success'
 }
 
 /** Simple row for non-SIE entity results (customers, invoices, etc.) */
@@ -1706,7 +1901,7 @@ function EntityResultRow({
 }: {
   icon: React.ReactNode
   label: string
-  status: 'success' | 'skipped'
+  status: 'success' | 'skipped' | 'error'
   statusText: string
   detail?: string
 }) {
@@ -1718,14 +1913,20 @@ function EntityResultRow({
         <p className="text-sm text-muted-foreground">{statusText}</p>
         {detail && <p className="text-sm text-muted-foreground/70">{detail}</p>}
       </div>
-      <StatusIcon status={status === 'success' ? 'success' : 'warning'} />
+      <StatusIcon status={status === 'skipped' ? 'warning' : status} />
     </div>
   )
 }
 
 // ── Main wizard ─────────────────────────────────────────────────
 
-export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps) {
+export default function ArcimMigrationWorkspace({
+  initialProvider,
+}: WorkspaceComponentProps & {
+  /** Deep-linked old system (onboarding branch question): jump straight to
+   *  its connect step instead of showing the provider list. */
+  initialProvider?: string
+}) {
   const { toast } = useToast()
 
   const [step, setStep] = useState<WizardStep>('provider')
@@ -1768,6 +1969,9 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
   const [migrationProgress, setMigrationProgress] = useState(0)
   const [migrationResults, setMigrationResults] = useState<MigrationResults | null>(null)
   const [sieImportResults, setSieImportResults] = useState<ImportResult[]>([])
+  // Knowledge-graph theater for the migrating step, built from the already
+  // client-held parsed SIE. Null falls back to the plain progress card.
+  const [theaterModel, setTheaterModel] = useState<TheaterModel | null>(null)
 
   // Wizard progress: only user-interactive steps
   const userSteps = STEPS.filter(s => {
@@ -1819,13 +2023,19 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
         const data = await res.json().catch(() => ({}))
         // A dead connection (expired/revoked refresh token) is recoverable in
         // place: flag it so the UI offers "Återanslut" instead of a dead end.
-        // A missing Fortnox integration license shows the same CTA but keeps the
-        // SIE fallback, because re-auth loops until the license is re-ordered.
+        // A missing Fortnox integration license or an inactive Visma API
+        // module shows the same CTA but keeps the SIE fallback, because
+        // re-auth loops until the customer fixes the subscription (re-orders
+        // the license / activates the API module).
         const code = apiErrorCode(data)
-        if (code === 'PROVIDER_AUTH_EXPIRED' || code === 'PROVIDER_LICENSE_MISSING') {
+        if (
+          code === 'PROVIDER_AUTH_EXPIRED' ||
+          code === 'PROVIDER_LICENSE_MISSING' ||
+          code === 'PROVIDER_API_MODULE_INACTIVE'
+        ) {
           setAuthExpired(true)
         }
-        if (code === 'PROVIDER_LICENSE_MISSING') {
+        if (code === 'PROVIDER_LICENSE_MISSING' || code === 'PROVIDER_API_MODULE_INACTIVE') {
           setLicenseMissing(true)
         }
         throw new Error(apiErrorMessage(data, `HTTP ${res.status}`))
@@ -2055,6 +2265,22 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // Deep-linked provider preselect (onboarding branch question). Only when
+  // this mount is not an OAuth return (that flow owns the wizard state), and
+  // only for providers whose SIE comes via API: visma/bokio must first see
+  // the provider list with its "SIE krävs först" gate, which depends on
+  // async connection status.
+  const preselectedRef = useRef(false)
+  useEffect(() => {
+    if (preselectedRef.current || !initialProvider) return
+    if (new URL(window.location.href).searchParams.get('migration')) return
+    const provider = ARCIM_PROVIDERS.find((p) => p.id === initialProvider)
+    if (!provider || COMING_SOON_PROVIDERS.has(provider.id) || !provider.sieViaApi) return
+    preselectedRef.current = true
+    void handleSelectProvider(provider.id)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialProvider])
+
   // Listen for postMessage from OAuth popup
   useEffect(() => {
     function handleMessage(event: MessageEvent) {
@@ -2092,11 +2318,11 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
         const validationErrors = data?.error === 'validation' ? data.validation?.errors : undefined
         if (Array.isArray(validationErrors)) {
           setErrorDetails(validationErrors.filter((e): e is string => typeof e === 'string'))
-          throw new Error(
+          throw new UserFacingError(
             'Bokföringsdatan hos leverantören klarade inte valideringen. Felen nedan måste rättas i källsystemet innan importen kan fortsätta.'
           )
         }
-        throw new Error(apiErrorMessage(data, `HTTP ${res.status}`))
+        throw apiError(data, `HTTP ${res.status}`)
       }
 
       const data = await res.json()
@@ -2112,7 +2338,7 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
         setStep('options')
       }
     } catch (err) {
-      setError(err instanceof Error ? getUserErrorMessage(err) : 'Kunde inte hämta SIE-data')
+      setError(displayError(err, 'Kunde inte hämta SIE-data'))
     } finally {
       setIsLoading(false)
     }
@@ -2155,6 +2381,19 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
     setMigrationProgress(5)
     setError(null)
 
+    // Build the theater from the parsed SIE the client already holds.
+    // Best-effort: any failure just leaves the plain progress card.
+    if (sieData?.parsed) {
+      try {
+        const { buildTheaterModel } = await import('@/lib/import/theater-model')
+        setTheaterModel(buildTheaterModel(sieData.parsed))
+      } catch {
+        setTheaterModel(null)
+      }
+    } else {
+      setTheaterModel(null)
+    }
+
     try {
       // ── Phase 1: SIE import ──────────────────────────────────
       if (migrationOptions.importSIEData && sieData && sieData.rawContent.length > 0) {
@@ -2194,7 +2433,7 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
 
           if (!res.ok) {
             const data = await res.json().catch(() => ({}))
-            throw new Error(apiErrorMessage(data, `SIE import HTTP ${res.status}`))
+            throw apiError(data, `SIE import HTTP ${res.status}`)
           }
 
           const result = await res.json() as ImportResult
@@ -2205,7 +2444,7 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
           // to /migrate would hit its SIE-guard, whose "SIE måste importeras
           // först" message masks the real error.
           if (!result.success) {
-            throw new Error(result.errors.length > 0
+            throw new UserFacingError(result.errors.length > 0
               ? result.errors.join('\n')
               : 'SIE-importen misslyckades utan felmeddelande.')
           }
@@ -2219,13 +2458,14 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
         migrationOptions.importSalesInvoices ||
         migrationOptions.importSupplierInvoices
 
+      let hadStepErrors = false
       if (hasApiImport) {
         setMigrationStep('Importerar kunder, leverantörer och fakturor...')
         setMigrationProgress(55)
 
         const res = await fetch('/api/extensions/ext/arcim-migration/migrate', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
           body: JSON.stringify({
             consentId,
             importCompanyInfo: migrationOptions.importCompanyInfo,
@@ -2238,11 +2478,26 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
 
         if (!res.ok) {
           const data = await res.json().catch(() => ({}))
-          throw new Error(apiErrorMessage(data, `HTTP ${res.status}`))
+          throw apiError(data, `HTTP ${res.status}`)
         }
 
-        const data = await res.json()
-        setMigrationResults(data.results)
+        const contentType = res.headers.get('content-type') ?? ''
+        let results: MigrationResults | undefined
+        if (contentType.includes('application/x-ndjson') && res.body) {
+          results = await consumeMigrationStream(res.body, (currentStep, progress) => {
+            if (currentStep) setMigrationStep(currentStep)
+            // The orchestrator reports 0-100 on its own scale; the wizard bar
+            // reserves 55-100 for the entity phase (SIE holds 10-50).
+            setMigrationProgress(55 + Math.round(progress * 0.45))
+          })
+        } else {
+          // Pre-stream server (or a proxy that stripped the stream): the
+          // original single-JSON contract.
+          const data = await res.json()
+          results = data.results as MigrationResults | undefined
+        }
+        setMigrationResults(results ?? null)
+        hadStepErrors = (results?.stepErrors?.length ?? 0) > 0
       }
 
       // Mark consent as fully accepted now that import is complete
@@ -2257,13 +2512,20 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
       setMigrationProgress(100)
       setStep('result')
 
-      toast({
-        title: 'Migrering klar',
-        description: 'Din bokföringsdata har importerats.',
-      })
+      if (hadStepErrors) {
+        toast({
+          title: 'Migrering delvis genomförd',
+          description: 'Vissa delar kunde inte hämtas från leverantören. Se detaljerna i resultatet.',
+          variant: 'destructive',
+        })
+      } else {
+        toast({
+          title: 'Migrering klar',
+          description: 'Din bokföringsdata har importerats.',
+        })
+      }
     } catch (err) {
-      const msg = getUserErrorMessage(err)
-      setError(msg)
+      setError(displayError(err))
       setStep('result')
     }
   }, [consentId, migrationOptions, sieData, toast])
@@ -2280,6 +2542,7 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
     setMigrationOptions(DEFAULT_OPTIONS)
     setMigrationResults(null)
     setSieImportResults([])
+    setTheaterModel(null)
     setError(null)
     // Refresh status so provider step shows updated import history
     fetchStatus()
@@ -2383,7 +2646,15 @@ export default function ArcimMigrationWorkspace(_props: WorkspaceComponentProps)
       )}
 
       {step === 'migrating' && (
-        <MigratingStep currentStep={migrationStep} progress={migrationProgress} />
+        theaterModel ? (
+          <ArcimMigrationTheater
+            model={theaterModel}
+            currentStep={migrationStep}
+            progress={migrationProgress}
+          />
+        ) : (
+          <MigratingStep currentStep={migrationStep} progress={migrationProgress} />
+        )
       )}
 
       {step === 'result' && (

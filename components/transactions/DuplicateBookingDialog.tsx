@@ -11,6 +11,7 @@ import { getErrorMessage, type ErrorLocale } from '@/lib/errors/get-error-messag
 import { resolveAccount } from '@/lib/cash-accounts/resolve-account'
 import type { CashAccount } from '@/types'
 import type { BookedDuplicateCandidate } from '@/lib/transactions/booking-duplicate-detection'
+import { duplicateBookingVoucherHref } from './duplicate-booking-href'
 
 /** The bank transaction being booked, as much as the caller knows about it.
  *  Enables the "Matcha mot verifikatet" action for ledger-only candidates. */
@@ -223,7 +224,7 @@ export default function DuplicateBookingDialog({
             {candidate && (
               <Button asChild variant="ghost" size="sm" className="text-muted-foreground sm:mr-auto">
                 <a
-                  href={`/bookkeeping/${candidate.journal_entry_id}`}
+                  href={duplicateBookingVoucherHref(candidate.journal_entry_id)}
                   target="_blank"
                   rel="noopener noreferrer"
                 >

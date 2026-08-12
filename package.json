@@ -5,6 +5,7 @@
   "license": "AGPL-3.0-or-later",
   "scripts": {
     "setup:extensions": "npx tsx scripts/generate-extension-registry.ts",
+    "extensions:check": "npx tsx scripts/generate-extension-registry.ts --check",
     "skills:generate": "npx tsx scripts/generate-skill-bodies.ts",
     "skills:check": "npx tsx scripts/generate-skill-bodies.ts --check",
     "crontabs:generate": "npx tsx scripts/generate-crontabs.ts",
@@ -19,6 +20,8 @@
     "start": "next start",
     "lint": "eslint",
     "check:guards": "node scripts/checks/no-new-antipatterns.mjs",
+    "validate:packs": "npx tsx scripts/validate-packs.ts",
+    "validate:registry": "npx tsx scripts/validate-registry.ts",
     "check:lint": "node scripts/checks/no-new-lint-errors.mjs",
     "test": "vitest run --project unit --project mfa-config",
     "test:pg": "vitest run --project pg-real"
@@ -52,6 +55,7 @@
     "framer-motion": "^12.42.2",
     "fuse.js": "^7.4.2",
     "ics": "^3.12.0",
+    "js-yaml": "4.1.1",
     "jszip": "^3.10.1",
     "lucide-react": "^1.24.0",
     "mailparser": "^3.9.14",
@@ -81,6 +85,7 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "@types/js-yaml": "4.0.9",
     "@types/mailparser": "^3.4.6",
     "@types/node": "^20",
     "@types/pg": "^8.20.0",

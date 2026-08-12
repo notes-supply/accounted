@@ -12,6 +12,7 @@ import { fetchExchangeRate } from '@/lib/currency/riksbanken'
 import { logMatchEvent } from '@/lib/invoices/match-log'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import { contentBucketKey, descriptionsBridge, normalizeImportedDescription, shiftIsoDate } from '@/lib/transactions/external-id'
+import { classifyTransactionMethod } from '@/lib/transactions/transaction-method'
 import { isImportedTransaction } from '@/lib/transactions/origin'
 import { createLogger } from '@/lib/logger'
 import type { Transaction, RawTransaction, IngestResult, IngestOptions, SupplierInvoice, Currency, ExchangeRate } from '@/types'
@@ -268,6 +269,41 @@ export async function ingestTransactions(
   // scope-drift, we validate on real fleet data first.
   const dateDriftShadow = process.env.DEDUP_DATE_DRIFT_MODE !== 'off'
 
+  // Resolve the cash account this batch settled on before any other work that
+  // can write. Every row in one ingest call shares a settlement account:
+  // enable-banking calls this per account and CSV import passes the account the
+  // user picked. A caller-supplied account is a binding instruction, not a
+  // hint: fail closed unless the company-scoped row proves the exact ledger
+  // account. Persisting NULL would reopen the legacy 1930 fallback later.
+  // We never auto-create a cash account here; that would race
+  // upsertFromPsd2's seed-promotion logic in lib/cash-accounts/service.ts.
+  let cashAccountId: string | null = null
+  if (options?.settlementAccount != null) {
+    const { data: ca, error: cashAccountError } = await supabase
+      .from('cash_accounts')
+      .select('id, company_id, ledger_account')
+      .eq('company_id', companyId)
+      .eq('ledger_account', options.settlementAccount)
+      .maybeSingle()
+    const evidence = ca as {
+      id?: unknown
+      company_id?: unknown
+      ledger_account?: unknown
+    } | null
+    if (
+      cashAccountError ||
+      typeof evidence?.id !== 'string' ||
+      evidence.id.length === 0 ||
+      evidence.company_id !== companyId ||
+      evidence.ledger_account !== options.settlementAccount
+    ) {
+      throw new Error(
+        `Settlement account ${options.settlementAccount} could not be resolved exactly for this company`,
+      )
+    }
+    cashAccountId = evidence.id
+  }
+
   // Pre-fetch existing transactions for content-based dedup (date+amount+
   // description prefix, plus the cross-channel mirror below). Booked rows catch
   // cross-source duplicates after they've been booked; unbooked import-feed rows
@@ -409,27 +445,6 @@ export async function ingestTransactions(
     data?.forEach(r => existingExternalIds.add(r.external_id))
   }
 
-  // Resolve the cash account this batch settled on, once. Every row in one
-  // ingest call shares a settlement account: enable-banking calls this per
-  // account (settlementAccount = account.ledger_account), CSV import passes the
-  // single account the user picked. cash_accounts.ledger_account is unique per
-  // company, so this is a single-row lookup. Tolerate a miss: the row stays
-  // unbound (cash_account_id NULL) and reconciliation falls back to currency.
-  // We never auto-create a cash account here; that would race upsertFromPsd2's
-  // seed-promotion logic in lib/cash-accounts/service.ts.
-  let cashAccountId: string | null = null
-  let settlementProvenanceVerified = true
-  if (options?.settlementAccount) {
-    const { data: ca, error: cashAccountError } = await supabase
-      .from('cash_accounts')
-      .select('id')
-      .eq('company_id', companyId)
-      .eq('ledger_account', options.settlementAccount)
-      .maybeSingle()
-    cashAccountId = (ca?.id as string | undefined) ?? null
-    settlementProvenanceVerified = !cashAccountError && cashAccountId !== null
-  }
-
   // ── Shadow-mode same-feed scope-drift precompute (measure only) ──────────
   // Two per-(date, öre) bucket counts that, when EQUAL and non-zero, mark a
   // bucket as a probable scope-drift mirror:
@@ -538,10 +553,34 @@ export async function ingestTransactions(
     // Normalize the source title once. Guarantees a non-empty, Swedish-first
     // label for every import path (PSD2 sync + all bank-file CSV/CAMT parsers
     // funnel into raw.description): catching both empty/whitespace titles and
-    // the legacy English 'Unknown' sentinel. This normalized value is stored as
-    // both description and original_description below; it's what the user sees
-    // and edits, and what the content-dedup key is built from.
+    // the legacy English 'Unknown' sentinel. This normalized FULL value is what
+    // the content-dedup key is built from and what original_description stores;
+    // the row's working title (description column) is the classifier's
+    // displayTitle: the same string with the trailing channel phrase
+    // ("Överföring via internet", "Kortköp/uttag", ...) stripped. A stripped
+    // title is a PREFIX of the full string, so the prefix-containment dedup
+    // bridge is unaffected.
     const description = normalizeImportedDescription(raw.description)
+    // Classification is a FEED-row concept: a user-created row (manual UI,
+    // MCP, or a source-less caller without a bank connection) carries a
+    // user-authored title, not bank channel vocabulary; classifying or
+    // stripping it would corrupt meaning ("Egen insättning" is a title, not a
+    // deposit label). Same predicate as isImportedTransaction(): a live
+    // bank_connection_id marks a feed row even when import_source is unset.
+    // Mirrors the scope of the 20260808090100 backfill.
+    const isUserCreatedSource = !isImportedTransaction({
+      bank_connection_id: raw.bank_connection_id ?? null,
+      import_source: raw.import_source ?? null,
+    })
+    const { method: transactionMethod, displayTitle } = isUserCreatedSource
+      ? { method: null, displayTitle: description }
+      : classifyTransactionMethod({
+          description,
+          bankTransactionCode: raw.bank_transaction_code ?? null,
+          proprietaryBankTransactionCode: raw.proprietary_bank_transaction_code ?? null,
+          mccCode: raw.mcc_code ?? null,
+          explicitMethod: raw.transaction_method ?? null,
+        })
 
     // 1. Check for duplicates via external_id (batch pre-fetched)
     if (existingExternalIds.has(raw.external_id)) {
@@ -869,11 +908,17 @@ export async function ingestTransactions(
         cash_account_id: cashAccountId,
         external_id: raw.external_id,
         date: raw.date,
-        description: description,
-        // Immutable bank/PSD2 original: captured once, never overwritten by a
-        // title edit. Equals description at insert; they diverge only if the
-        // user later edits the title.
+        // Working title: the source description with the trailing channel
+        // phrase stripped (classifyTransactionMethod). Falls back to the full
+        // string when no phrase matched or stripping would empty it.
+        description: displayTitle,
+        // Immutable bank/PSD2 original: the FULL source string, captured once,
+        // never overwritten by a title edit or the phrase strip. Dedup-bridge
+        // source and the "restore original" value.
         original_description: description,
+        transaction_method: transactionMethod,
+        bank_transaction_code: raw.bank_transaction_code || null,
+        proprietary_bank_transaction_code: raw.proprietary_bank_transaction_code || null,
         amount: raw.amount,
         currency: raw.currency,
         amount_sek: amountSek,
@@ -1015,14 +1060,6 @@ export async function ingestTransactions(
         )
 
         if (mappingResult.confidence >= 0.8 && !mappingResult.requires_review) {
-          if (!settlementProvenanceVerified) {
-            ;(result.auto_categorization_failures ??= []).push({
-              transaction_id: newTransaction.id,
-              code: 'SETTLEMENT_PROVENANCE_UNAVAILABLE',
-            })
-            continue
-          }
-
           const autoCategory = mappingResult.default_private ? 'private' : 'uncategorized'
           const autoIsBusiness = !mappingResult.default_private
           const journalEntry = await createTransactionJournalEntry(
@@ -1049,6 +1086,7 @@ export async function ingestTransactions(
                 isBusiness: autoIsBusiness,
                 category: autoCategory,
                 journalEntryId: journalEntry.id,
+                requireVerifiedTransaction: true,
               },
               log,
             )
@@ -1066,10 +1104,19 @@ export async function ingestTransactions(
               continue
             }
 
+            const verifiedTransaction = attachment.verifiedTransaction
+            if (!verifiedTransaction) {
+              ;(result.auto_categorization_failures ??= []).push({
+                transaction_id: newTransaction.id,
+                code: 'ATTACHMENT_DATABASE_ERROR',
+              })
+              continue
+            }
+
             // Upsert counterparty template (auto-learned, lower confidence)
             try {
               await upsertCounterpartyTemplate(
-                supabase, companyId, newTransaction as Transaction,
+                supabase, companyId, verifiedTransaction,
                 mappingResult, 'auto_learned'
               )
             } catch {

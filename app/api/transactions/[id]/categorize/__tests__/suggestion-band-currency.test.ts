@@ -347,8 +347,23 @@ describe('POST /api/transactions/[id]/categorize: suggestion band units', () => 
             journal_entry_id: null,
           }),
         },
-        // The post-suggestion status update.
-        { data: [{ id: 'tx-1' }] },
+        // Authoritative post-attachment transaction readback.
+        {
+          data: makeTransaction({
+            id: 'tx-1',
+            company_id: 'company-1',
+            amount: -1000,
+            currency: 'EUR',
+            amount_sek: null,
+            exchange_rate: null,
+            merchant_name: 'Leverantör AB',
+            reference: null,
+            cash_account_id: null,
+            journal_entry_id: 'je-1',
+            category: 'expense_software',
+            is_business: true,
+          }),
+        },
       ],
       company_settings: [settingsPage],
       suppliers: [{ data: [{ id: 'sup-1' }] }],

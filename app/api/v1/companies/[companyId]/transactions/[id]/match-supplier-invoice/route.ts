@@ -17,6 +17,7 @@ import {
   createSupplierInvoiceCashEntry,
 } from '@/lib/bookkeeping/supplier-invoice-entries'
 import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
+import { cashPartialBlockReason } from '@/lib/bookkeeping/booking-mode'
 import { reverseEntry, createJournalEntry, findFiscalPeriod } from '@/lib/bookkeeping/engine'
 import { AccountsNotInChartError } from '@/lib/bookkeeping/errors'
 import { findUnresolvableAccounts } from '@/lib/bookkeeping/account-validation'
@@ -24,6 +25,7 @@ import { anchorSupplierInvoiceDocument } from '@/lib/core/documents/supplier-inv
 import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { logMatchEvent } from '@/lib/invoices/match-log'
 import { clearSettledInvoiceSuggestions } from '@/lib/invoices/clear-settled-invoice-suggestions'
+import { paidAtFromDate } from '@/lib/invoices/paid-at'
 import { eventBus } from '@/lib/events/bus'
 import type { SupplierInvoice, SupplierInvoiceItem, Transaction } from '@/types'
 
@@ -266,8 +268,6 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       }
     }
 
-    const now = new Date().toISOString()
-
     const { data: settings } = await ctx.supabase
       .from('company_settings')
       .select('accounting_method')
@@ -301,6 +301,26 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
           exchangeRateDifference,
           invoiceCurrency: invoice.currency,
           transactionCurrency: transaction.currency,
+        },
+      })
+    }
+
+    // Same-currency partials and part-paid completions are equally unbookable
+    // under kontantmetoden (createSupplierInvoiceCashEntry books the FULL
+    // invoice, so a partial bank amount would over-book the expense): reject
+    // them too, not only the FX case above. Mirrors the dashboard route.
+    const cashBlock = cashPartialBlockReason({
+      invoiceAlreadyBooked: siAlreadyBooked,
+      accountingMethod,
+      priorPaidAmount: (invoice as { paid_amount?: number | null }).paid_amount,
+      paysRemainingInFull: fullSettlement,
+    })
+    if (cashBlock) {
+      return v1ErrorResponseFromCode('SI_CASH_PARTIAL_UNSUPPORTED', txLog, {
+        requestId: ctx.requestId,
+        details: {
+          reason: cashBlock,
+          remaining_amount: invoice.remaining_amount,
         },
       })
     }
@@ -407,6 +427,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       Math.round((invoice.paid_amount + paymentAmountInvoiceCurrency) * 100) / 100
     const isFullyPaid = newRemaining <= 0
     const newStatus = isFullyPaid ? 'paid' : 'partially_paid'
+    const paidAt = isFullyPaid ? paidAtFromDate(transaction.date) : null
 
     const { data: updatedRows, error: updateInvErr } = await ctx.supabase
       .from('supplier_invoices')
@@ -414,7 +435,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
         status: newStatus,
         remaining_amount: newRemaining,
         paid_amount: newPaidAmount,
-        paid_at: isFullyPaid ? now : null,
+        paid_at: paidAt,
         payment_journal_entry_id: journalEntryId,
         transaction_id: txId,
       })
@@ -538,8 +559,22 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       eventBus.emit({
         type: 'supplier_invoice.match_confirmed',
         payload: {
-          supplierInvoice: invoice as SupplierInvoice,
-          transaction: transaction as Transaction,
+          supplierInvoice: {
+            ...invoice,
+            status: newStatus,
+            remaining_amount: newRemaining,
+            paid_amount: newPaidAmount,
+            paid_at: paidAt,
+            payment_journal_entry_id: journalEntryId,
+            transaction_id: txId,
+          } as SupplierInvoice,
+          transaction: {
+            ...transaction,
+            supplier_invoice_id,
+            potential_supplier_invoice_id: null,
+            journal_entry_id: journalEntryId,
+            is_business: true,
+          } as Transaction,
           userId: ctx.userId,
           companyId: ctx.companyId!,
         },

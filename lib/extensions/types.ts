@@ -198,6 +198,12 @@ export interface ExtensionContext {
    * support staff can grep stdout logs by it.
    */
   requestId?: string
+  /** Route-relative timing envelope supplied by the extension dispatcher. */
+  requestStartedAtMs?: number
+  /** No provider operation may begin at or after this instant. */
+  workStartDeadlineMs?: number
+  /** Durable claim cleanup must finish before this instant. */
+  cleanupDeadlineMs?: number
   supabase: SupabaseClient
   emit(event: CoreEvent): Promise<void>
   settings: ExtensionSettings

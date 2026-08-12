@@ -3,11 +3,11 @@ import { z } from 'zod'
 import { ensureInitialized } from '@/lib/init'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { buildMappingResultFromCategory, getCategoryAccountMapping } from '@/lib/bookkeeping/category-mapping'
-import { buildTransactionEntryLines } from '@/lib/bookkeeping/transaction-entries'
+import { applySettlementAccount } from '@/lib/bookkeeping/mapping-engine'
 import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
+import { buildTransactionEntryLines } from '@/lib/bookkeeping/transaction-entries'
 import { loadCategorizationCompanySettings } from '@/lib/bookkeeping/company-settings'
 import { getVatRate } from '@/lib/bookkeeping/vat-entries'
-import { createLogger } from '@/lib/logger'
 import type { Transaction, TransactionCategory, VatTreatment } from '@/types'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
@@ -23,7 +23,6 @@ import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-m
 // invoice line items before send) they extend this dispatcher.
 
 ensureInitialized()
-const log = createLogger('api/pending-operations/edit')
 
 const CATEGORIES = [
   'income_services', 'income_products', 'income_other',
@@ -53,7 +52,7 @@ const PatchSchema = z
 
 export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
   'pending_operation.update',
-  async (request, { supabase, companyId }, { params }) => {
+  async (request, { supabase, companyId, log }, { params }) => {
     const { id } = await params
 
     let body: z.infer<typeof PatchSchema>
@@ -174,6 +173,7 @@ export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
         { status: 400 },
       )
     }
+    mapping = applySettlementAccount(mapping, settlementAccount, (tx as Transaction).amount)
 
     if (!mapping.debit_account || !mapping.credit_account) {
       return NextResponse.json(

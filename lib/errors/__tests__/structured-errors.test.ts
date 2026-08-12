@@ -10,6 +10,7 @@ import {
   AccountsNotInChartError,
   EntryDateOutsideFiscalPeriodError,
   JournalEntryNotBalancedError,
+  PostCommitReadbackError,
 } from '@/lib/bookkeeping/errors'
 
 const noopLogger = {
@@ -71,6 +72,20 @@ describe('errorResponse', () => {
     const body = await readEnvelope(res)
     expect(body.error.code).toBe('ACCOUNTS_NOT_IN_CHART')
     expect(body.error.details).toMatchObject({ account_numbers: ['1930', '2641'] })
+  })
+
+  it('preserves committed journal identity after a readback failure', async () => {
+    const err = new PostCommitReadbackError('entry-1', 42, 'connection reset')
+    const res = errorResponse(err, noopLogger, { requestId: 'req_post_commit' })
+    const body = await readEnvelope(res)
+
+    expect(res.status).toBe(500)
+    expect(body.error.code).toBe('POST_COMMIT_READBACK_FAILED')
+    expect(body.error.details).toEqual({
+      journal_entry_id: 'entry-1',
+      voucher_number: 42,
+      cause: 'connection reset',
+    })
   })
 
   it('maps ZodError to VALIDATION_ERROR with field issues', async () => {

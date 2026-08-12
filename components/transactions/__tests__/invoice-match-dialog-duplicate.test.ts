@@ -65,6 +65,15 @@ describe('InvoiceMatchDialog duplicate-candidate rendering', () => {
 })
 
 describe('DuplicateBookingDialog rateless-sibling warning', () => {
+  it('builds the voucher link through the encoded path helper', () => {
+    expect(BOOKING_DIALOG_SRC).toContain(
+      'duplicateBookingVoucherHref(candidate.journal_entry_id)',
+    )
+    expect(BOOKING_DIALOG_SRC).not.toContain(
+      'href={`/bookkeeping/${candidate.journal_entry_id}`}',
+    )
+  })
+
   it('gates the currency-naming warning on candidate.currency being present', () => {
     // t('dialog_duplicate_sek_unavailable', { currency }) interpolates the
     // currency into the sentence; an empty string renders broken Swedish, so

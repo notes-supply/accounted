@@ -10,7 +10,11 @@ import { detectBookingDuplicate } from '@/lib/transactions/booking-duplicate-det
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { appendProcessingHistory } from '@/lib/processing-history/append'
-import type { Transaction } from '@/types'
+import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
+import {
+  attachCategorizedTransaction,
+  compensatePostCommitReadbackFailure,
+} from '@/lib/transactions/settlement-attachment'
 
 ensureInitialized()
 
@@ -42,6 +46,8 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
         { status: 409 }
       )
     }
+
+    let duplicateDismissalHistory: Parameters<typeof appendProcessingHistory>[0] | null = null
 
     // Booking-time duplicate guard: if another transaction with the same
     // date+amount+account is already booked, booking this one would double-count
@@ -99,35 +105,31 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
         // bookkeeping act that must leave a durable, queryable record; a warn in
         // the application log is ephemeral and does not satisfy the requirement.
         // Best-effort: a logging failure must never block a legitimate booking.
-        try {
-          await appendProcessingHistory({
-            companyId,
-            correlationId: id,
-            aggregateType: 'BankTransaction',
-            aggregateId: id,
-            eventType: 'BankTransactionDuplicateDismissed',
-            payload: {
-              transaction_id: id,
-              dismissed_transaction_id: candidate.transaction_id,
-              dismissed_journal_entry_id: candidate.journal_entry_id,
-              // Null when the candidate's SEK value could not be established
-              // (a rateless foreign sibling); the foreign figures below then
-              // carry the durable record instead of a fabricated kr amount.
-              amount_ore: candidate.amount != null ? Math.round(candidate.amount * 100) : null,
-              dismissed_currency: candidate.currency,
-              dismissed_amount_in_currency: candidate.amount_in_currency,
-              entry_date: candidate.entry_date,
-              // Whether the user dismissed a confirmed same-amount twin or a
-              // candidate whose amounts could never be compared (BFNAR 2013:2
-              // kap 8: the behandlingshistorik has to say which).
-              amount_verified: candidate.amount_verified,
-              unverified_reason: candidate.unverified_reason,
-            },
-            actor: { type: 'user', id: user.id },
-            occurredAt: new Date(),
-          })
-        } catch (logErr) {
-          dupLog.error('failed to append duplicate-dismissal behandlingshistorik', logErr as Error)
+        duplicateDismissalHistory = {
+          companyId,
+          correlationId: id,
+          aggregateType: 'BankTransaction',
+          aggregateId: id,
+          eventType: 'BankTransactionDuplicateDismissed',
+          payload: {
+            transaction_id: id,
+            dismissed_transaction_id: candidate.transaction_id,
+            dismissed_journal_entry_id: candidate.journal_entry_id,
+            // Null when the candidate's SEK value could not be established
+            // (a rateless foreign sibling); the foreign figures below then
+            // carry the durable record instead of a fabricated kr amount.
+            amount_ore: candidate.amount != null ? Math.round(candidate.amount * 100) : null,
+            dismissed_currency: candidate.currency,
+            dismissed_amount_in_currency: candidate.amount_in_currency,
+            entry_date: candidate.entry_date,
+            // Whether the user dismissed a confirmed same-amount twin or a
+            // candidate whose amounts could never be compared (BFNAR 2013:2
+            // kap 8: the behandlingshistorik has to say which).
+            amount_verified: candidate.amount_verified,
+            unverified_reason: candidate.unverified_reason,
+          },
+          actor: { type: 'user', id: user.id },
+          occurredAt: new Date(),
         }
       }
     } catch (err) {
@@ -141,6 +143,23 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
       dupLog.warn('booking-time duplicate detection failed (continuing)', err as Error)
     }
 
+    let settlementAccount: string
+    try {
+      settlementAccount = await resolveSettlementAccount(
+        supabase,
+        companyId,
+        transaction.cash_account_id ?? null,
+        log,
+      )
+    } catch (err) {
+      const typed = bookkeepingErrorResponse(err)
+      if (typed) return typed
+      log.error('failed to resolve settlement account on book', err as Error)
+      return errorResponseFromCode('BOOKKEEPING_DATABASE_ERROR', log, {
+        details: { operation: 'resolve_settlement_account' },
+      })
+    }
+
     // Create journal entry via the engine
     let journalEntry
     try {
@@ -150,9 +169,32 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
         description,
         source_type: 'bank_transaction',
         source_id: id,
+        categorization_category: 'uncategorized',
+        categorization_is_business: true,
         lines,
       })
     } catch (err) {
+      const postCommitFailure = await compensatePostCommitReadbackFailure(
+        supabase,
+        { companyId, userId: user.id, transactionId: id, error: err },
+        log,
+      )
+      if (postCommitFailure.handled) {
+        return errorResponseFromCode('BOOKKEEPING_DATABASE_ERROR', log, {
+          details: {
+            operation: 'commit_entry.readback',
+            journal_entry_id: postCommitFailure.journalEntryId,
+            voucher_number: postCommitFailure.voucherNumber,
+            compensation_verified: postCommitFailure.compensationVerified,
+            ...(!postCommitFailure.compensationVerified
+              ? { failed_partial: true }
+              : {}),
+            ...(postCommitFailure.partialPostedIds
+              ? { partial_posted_ids: postCommitFailure.partialPostedIds }
+              : {}),
+          },
+        })
+      }
       const typed = bookkeepingErrorResponse(err)
       if (typed) return typed
       // Untyped errors map to Swedish via getErrorMessage: the raw message is
@@ -164,21 +206,56 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
       )
     }
 
-    // Link transaction to the journal entry
-    const { error: updateError } = await supabase
-      .from('transactions')
-      .update({
-        journal_entry_id: journalEntry.id,
-        is_business: true,
+    const attachment = await attachCategorizedTransaction(
+      supabase,
+      {
+        companyId,
+        userId: user.id,
+        transactionId: id,
+        expectedJournalEntryId: transaction.journal_entry_id ?? null,
+        expectedCashAccountId: transaction.cash_account_id ?? null,
+        expectedSettlementAccount: settlementAccount,
+        isBusiness: true,
         category: 'uncategorized',
-      })
-      .eq('id', id)
+        journalEntryId: journalEntry.id,
+        requireVerifiedTransaction: true,
+      },
+      log,
+    )
 
-    if (updateError) {
-      return NextResponse.json(
-        { error: 'Failed to update transaction' },
-        { status: 500 }
-      )
+    if (!attachment.ok) {
+      const details = attachment.partialPostedIds
+        ? {
+            failed_partial: true,
+            compensation_verified: false,
+            partial_posted_ids: attachment.partialPostedIds,
+          }
+        : undefined
+      if (attachment.reason === 'database_error') {
+        log.error('failed to attach booked transaction', attachment.error)
+        return errorResponseFromCode('BOOKKEEPING_DATABASE_ERROR', log, {
+          details: {
+            operation: 'attach_transaction_categorization',
+            ...(details ?? {}),
+          },
+        })
+      }
+      return errorResponseFromCode('TX_CATEGORIZE_RACE', log, { details })
+    }
+
+    const verifiedTransaction = attachment.verifiedTransaction
+    if (!verifiedTransaction) {
+      return errorResponseFromCode('BOOKKEEPING_DATABASE_ERROR', log, {
+        details: { operation: 'attach_transaction_categorization.readback' },
+      })
+    }
+
+    if (duplicateDismissalHistory) {
+      try {
+        await appendProcessingHistory(duplicateDismissalHistory)
+      } catch (logErr) {
+        dupLog.error('failed to append duplicate-dismissal behandlingshistorik', logErr as Error)
+      }
     }
 
     // Emit event (non-blocking)
@@ -186,7 +263,7 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
       await eventBus.emit({
         type: 'transaction.categorized',
         payload: {
-          transaction: transaction as Transaction,
+          transaction: verifiedTransaction,
           account: lines[0]?.account_number || '',
           taxCode: '',
           userId: user.id,

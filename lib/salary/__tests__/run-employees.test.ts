@@ -166,7 +166,7 @@ describe('removeEmployeeFromRun', () => {
   it('removes an attached employee from a draft run', async () => {
     mock.enqueue({ data: { id: RUN_ID, status: 'draft' } })
     mock.enqueue({ data: { id: SRE_ID } })
-    mock.enqueue({ data: null }) // delete
+    mock.enqueue({ data: true }) // atomic mileage release + delete
 
     const result = await removeEmployeeFromRun(supabase, {
       companyId: COMPANY_ID,

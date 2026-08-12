@@ -145,6 +145,11 @@ export function createExtensionContext(
   companyId: string,
   extensionId: string,
   requestId?: string,
+  timing?: {
+    requestStartedAtMs: number
+    workStartDeadlineMs: number
+    cleanupDeadlineMs: number
+  },
 ): ExtensionContext {
   const logBindings: Record<string, unknown> = { userId, companyId, extensionId }
   if (requestId) logBindings.requestId = requestId
@@ -154,6 +159,7 @@ export function createExtensionContext(
     companyId,
     extensionId,
     requestId,
+    ...timing,
     supabase,
     emit: (event: CoreEvent) => eventBus.emit(event),
     settings: createSettings(supabase, userId, companyId, extensionId),

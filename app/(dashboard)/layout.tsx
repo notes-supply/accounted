@@ -9,6 +9,7 @@ import { AgentSheetProvider } from '@/components/agent/AgentSheetProvider'
 import AgentTrigger from '@/components/agent/AgentTrigger'
 import LazyCommandPalette from '@/components/common/LazyCommandPalette'
 import { SettingsHotkey } from '@/components/settings/SettingsHotkey'
+import { SessionTimeoutController } from '@/components/auth/SessionTimeoutController'
 import { SandboxBanner } from '@/components/dashboard/SandboxBanner'
 import { getExtensionNavItems } from '@/lib/extensions/sectors'
 import { CompanyProvider } from '@/contexts/CompanyContext'
@@ -108,6 +109,7 @@ export default async function DashboardLayout({
           trialEndsAt: null,
         }}
       >
+        <SessionTimeoutController />
         <AgentSheetProvider>
           <CompanyTabSync />
           <div className="min-h-screen bg-frame md:flex md:flex-col">
@@ -205,6 +207,7 @@ export default async function DashboardLayout({
 
     return (
       <CompanyProvider value={companyContextValue}>
+        <SessionTimeoutController />
         <AgentSheetProvider>
           <CompanyTabSync />
           <div className="min-h-screen bg-frame md:flex md:flex-col">
@@ -284,12 +287,16 @@ export default async function DashboardLayout({
 
   return (
     <CompanyProvider value={companyContextValue}>
+      <SessionTimeoutController />
       <AgentSheetProvider
         identity={{
           displayName: agentProfileIdentity?.display_name ?? null,
           avatarId: agentProfileIdentity?.avatar_id ?? null,
           isVerified: Boolean(agentProfileIdentity?.verified_at),
         }}
+        // Server-seeded panel geometry (docked width / floating rect / mode)
+        // so the assistant opens at the user's persisted size without a jump.
+        initialPanelPrefs={uiState.agent_panel}
       >
         <CompanyTabSync />
         <div
@@ -299,6 +306,7 @@ export default async function DashboardLayout({
         >
           {/* Skip to content link for keyboard/screen reader users */}
           <a
+            data-ph-unmask
             href="#main-content"
             className="sr-only focus:not-sr-only focus:fixed focus:top-4 focus:left-4 focus:z-[100] focus:px-4 focus:py-2 focus:bg-primary focus:text-primary-foreground focus:rounded-lg focus:text-sm focus:font-medium"
           >

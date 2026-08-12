@@ -554,6 +554,7 @@ async function categorizeOne(
       isBusiness: is_business,
       category: finalCategory,
       journalEntryId,
+      requireVerifiedTransaction: true,
     },
     log,
   )
@@ -586,11 +587,24 @@ async function categorizeOne(
     }
   }
 
+  const verifiedTransaction = attachment.verifiedTransaction
+  if (!verifiedTransaction) {
+    return {
+      ok: false,
+      request_index: index,
+      transaction_id: transactionId,
+      error: {
+        code: 'BOOKKEEPING_DATABASE_ERROR',
+        message: 'Post-attachment transaction state could not be verified.',
+      },
+    }
+  }
+
   try {
     await eventBus.emit({
       type: 'transaction.categorized',
       payload: {
-        transaction: transaction as Transaction,
+        transaction: verifiedTransaction,
         account: mappingResult.debit_account,
         taxCode: mappingResult.vat_lines[0]?.account_number || '',
         userId,

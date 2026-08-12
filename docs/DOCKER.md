@@ -67,6 +67,67 @@ curl http://localhost:3000/api/health
 
 ---
 
+## Synology DSM and Xpenology
+
+Use a **Container Manager Project**, not the single-container wizard. The
+project path is the working directory for every relative path in the Compose
+file. Create that directory first and put all of these files in it before
+deploying the project:
+
+```text
+docker-compose.yml
+.env
+docker/
+  cron.Dockerfile
+  crontab.self-hosted
+```
+
+Uploading only `docker-compose.yml` is not enough: the cron service is built
+from `docker/cron.Dockerfile` and bind-mounts
+`docker/crontab.self-hosted`. Keep `.env` readable only by the administrator
+and Container Manager because it contains the Supabase service-role key.
+
+Container Manager ships its own Compose build, and supported keys vary by DSM
+release. Accounted's base Compose file avoids the optional `cpus` and
+`healthcheck.start_interval` keys for compatibility. Set a CPU limit through
+Container Manager's resource controls or a local override if needed. When
+updating an existing deployment that relied on the previous two-CPU cap,
+reapply that limit in the host controls before restarting the project.
+
+If you run Docker Compose 2.20.2 or newer against Docker Engine 25.0 or newer,
+the optional resource overlay restores the previous two-CPU cap and faster
+startup health checks while keeping the base file compatible. Download the
+overlay from the same Accounted tag or full commit as the base Compose file:
+
+```bash
+ACCOUNTED_REF=replace-with-the-same-tag-or-full-commit
+curl -fsSLo docker-compose.resources.yml \
+  "https://raw.githubusercontent.com/erp-mafia/accounted/${ACCOUNTED_REF}/docker-compose.resources.yml"
+docker compose -f docker-compose.yml -f docker-compose.resources.yml up -d
+```
+
+Compose only applies the files named in each invocation. Keep the resource
+overlay in every later `up` command, after any other overlay. For example:
+
+```bash
+# HTTPS with Caddy
+docker compose -f docker-compose.yml -f docker-compose.caddy.yml -f docker-compose.resources.yml up -d
+
+# Local image build
+docker compose -f docker-compose.yml -f docker-compose.build.yml -f docker-compose.resources.yml up --build -d
+```
+
+Do not use this overlay if Container Manager rejects either key or the Docker
+Engine is older than 25.0. The memory and PID limits remain active in the base
+file either way.
+
+Accounted itself does not use PostgreSQL port 5432 and does not need a database
+data folder when connected to Supabase Cloud. If Supabase is also running on
+the NAS, follow the [fully self-hosted notes](SELF-HOSTING.md#synology-dsm-and-xpenology-notes)
+for its separate project, bind mounts, ports, and JWKS configuration.
+
+---
+
 ## Enable HTTPS (recommended)
 
 Ship a Caddy reverse proxy alongside the app: it auto-provisions Let's Encrypt certificates and renews them forever.
@@ -107,12 +168,50 @@ If you already have nginx / a managed load balancer / Cloudflare in front, skip 
 
 The self-hosted image ships with all extensions enabled (except Enable Banking, which requires private PSD2 credentials). Each extension activates when you provide its env vars: without them, the app works normally and the feature is simply unavailable.
 
-### AI Features (ai-categorization, ai-chat, receipt-ocr, invoice-inbox)
+### AI Features (document-extraction, invoice-inbox, AI assistant)
+
+All AI runs Claude via AWS Bedrock; provide AWS credentials with Bedrock model access to Claude:
 
 ```env
-ANTHROPIC_API_KEY=sk-ant-...
-OPENAI_API_KEY=sk-...
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=eu-north-1
 ```
+
+`ANTHROPIC_API_KEY` and `OPENAI_API_KEY` from earlier versions are no longer used (plain-key support is tracked in [#1406](https://github.com/erp-mafia/accounted/issues/1406)). See [SELF-HOSTING.md](./SELF-HOSTING.md#ai-features) for optional model overrides.
+
+### Gmail Receipt Search
+
+Create a dedicated Google OAuth client, register
+`https://your-domain.com/api/extensions/ext/mail/oauth/callback`, and configure:
+
+```env
+GOOGLE_MAIL_CLIENT_ID=your-google-oauth-client-id
+GOOGLE_MAIL_CLIENT_SECRET=replace-with-google-oauth-client-secret
+MAIL_TOKEN_ENCRYPTION_KEY=<64 hex characters from openssl rand -hex 32>
+RECEIPT_HUNT_COMPANY_IDS=comma-separated-company-uuids
+RECEIPT_HUNT_MODEL_ID=eu.anthropic.claude-sonnet-5
+RECEIPT_HUNT_MIN_CONFIDENCE=0.7
+RECEIPT_HUNT_MAX_RECEIPTS=25
+RECEIPT_HUNT_MAX_MAILS=40
+```
+
+The receipt and mail limits must be plain positive integers. Their hard maxima
+are 100 across all connected mailboxes in one company hunt. The company
+allowlist accepts at most 25 unique entries.
+
+Production requires the dedicated mail-token key. Only development can fall
+back to a key derived from `SUPABASE_SERVICE_ROLE_KEY`. The volume defaults are
+25 stored receipts and 40 model-processed messages across all connected
+mailboxes in one company hunt.
+
+Candidate email and attachments are downloaded, and their metadata, body,
+names, and content may be processed by the configured external AI or model
+provider. Selected attachments and derived records may be stored before human
+review. Rejected or unreviewed material can remain under the product's normal
+retention and deletion controls. Disconnecting deletes OAuth credentials and
+stops future access, but does not automatically erase imported records. This is
+disclosed in the mailbox connection UI.
 
 ### Email (invoice sending, reminders)
 

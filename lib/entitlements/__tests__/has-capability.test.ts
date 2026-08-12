@@ -4,6 +4,7 @@ import {
   hasCapability,
   requireCapability,
   capabilityBlockedResponse,
+  getCompanyIdsWithCapability,
   getCompanyEntitlements,
 } from '../has-capability'
 import { CAPABILITY, PAID_CAPABILITIES } from '../keys'
@@ -131,6 +132,120 @@ describe('hasCapability', () => {
       capability_grants: { data: null, error: { message: 'boom' } },
     })
     expect(await hasCapability(supabase, '11111111-1111-4111-8111-111111111111', CAPABILITY.ai)).toBe(false)
+  })
+})
+
+describe('getCompanyIdsWithCapability', () => {
+  const directCompanyId = '11111111-1111-4111-8111-111111111111'
+  const firmCompanyId = '22222222-2222-4222-8222-222222222222'
+  const expiredCompanyId = '33333333-3333-4333-8333-333333333333'
+  const disabledCompanyId = '44444444-4444-4444-8444-444444444444'
+  const teamId = '55555555-5555-4555-8555-555555555555'
+
+  it('resolves direct and firm grants before excluding expired and disabled companies', async () => {
+    const supabase = makeSupabase({
+      companies: {
+        data: [
+          { id: directCompanyId, team_id: null },
+          { id: firmCompanyId, team_id: teamId },
+          { id: expiredCompanyId, team_id: null },
+          { id: disabledCompanyId, team_id: null },
+        ],
+      },
+      capability_grants: {
+        data: [
+          { company_id: directCompanyId, team_id: null, expires_at: null },
+          { company_id: null, team_id: teamId, expires_at: iso(60_000) },
+          { company_id: expiredCompanyId, team_id: null, expires_at: iso(-60_000) },
+          { company_id: disabledCompanyId, team_id: null, expires_at: null },
+        ],
+      },
+      company_capability_config: { data: [{ company_id: disabledCompanyId }] },
+    })
+
+    const result = await getCompanyIdsWithCapability(
+      supabase,
+      [directCompanyId, firmCompanyId, expiredCompanyId, disabledCompanyId],
+      CAPABILITY.bank_sync,
+    )
+
+    expect([...result].sort()).toEqual([directCompanyId, firmCompanyId].sort())
+  })
+
+  it('returns every valid requested company when the paywall is bypassed', async () => {
+    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'true')
+    const supabase = makeSupabase({})
+
+    const result = await getCompanyIdsWithCapability(
+      supabase,
+      [directCompanyId, directCompanyId, 'not-a-uuid'],
+      CAPABILITY.skatteverket,
+    )
+
+    expect([...result]).toEqual([directCompanyId])
+  })
+
+  it('throws on a database error so a cron run cannot silently skip every payer', async () => {
+    const supabase = makeSupabase({
+      companies: { data: null, error: { message: 'connection reset' } },
+      company_capability_config: { data: [] },
+    })
+
+    await expect(
+      getCompanyIdsWithCapability(supabase, [directCompanyId], CAPABILITY.bank_sync),
+    ).rejects.toThrow('Failed to resolve capability company scopes: connection reset')
+  })
+
+  it('bounds a never-settling bulk query by its wall-clock deadline and aborts the client query', async () => {
+    vi.useFakeTimers()
+    const aborted = vi.fn()
+    const query = {
+      select: () => query,
+      eq: () => query,
+      in: () => query,
+      abortSignal: (signal: AbortSignal) => {
+        signal.addEventListener('abort', aborted, { once: true })
+        return new Promise(() => undefined)
+      },
+      then: () => undefined,
+    }
+    const supabase = { from: () => query } as unknown as SupabaseClient
+    const promise = getCompanyIdsWithCapability(
+      supabase,
+      [directCompanyId],
+      CAPABILITY.bank_sync,
+      { deadlineMs: Date.now() + 20 },
+    )
+    const rejection = expect(promise).rejects.toThrow('Capability resolution deadline reached')
+
+    try {
+      await vi.advanceTimersByTimeAsync(21)
+      await rejection
+      expect(aborted).toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('honors a caller AbortSignal without changing grant semantics', async () => {
+    const controller = new AbortController()
+    const query = {
+      select: () => query,
+      eq: () => query,
+      in: () => query,
+      abortSignal: () => new Promise(() => undefined),
+      then: () => undefined,
+    }
+    const supabase = { from: () => query } as unknown as SupabaseClient
+    const promise = getCompanyIdsWithCapability(
+      supabase,
+      [directCompanyId],
+      CAPABILITY.bank_sync,
+      { signal: controller.signal },
+    )
+
+    controller.abort()
+    await expect(promise).rejects.toThrow('Capability resolution aborted')
   })
 })
 

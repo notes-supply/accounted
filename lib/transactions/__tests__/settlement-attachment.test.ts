@@ -79,6 +79,24 @@ function rpcSupabase(
   }
 }
 
+function readbackSupabase(
+  readback: { data: unknown; error: unknown },
+  compensation?: { data: unknown; error: unknown },
+) {
+  const supabase = compensation
+    ? rpcSupabase({ data: true, error: null }, compensation)
+    : { rpc: vi.fn().mockResolvedValueOnce({ data: true, error: null }) }
+  const chain: object = new Proxy({}, {
+    get(_target, prop) {
+      if (prop === 'then') {
+        return (resolve: (value: unknown) => void) => resolve(readback)
+      }
+      return () => chain
+    },
+  })
+  return { ...supabase, from: vi.fn(() => chain) }
+}
+
 const baseParams: CategorizationAttachmentParams = {
   companyId: 'company-1',
   userId: 'user-1',
@@ -153,6 +171,169 @@ describe('attachCategorizedTransaction', () => {
       },
     )
     expect(reverseEntryMock).not.toHaveBeenCalled()
+  })
+
+  it('returns the exact authoritative post-attachment transaction when verification is required', async () => {
+    const verifiedTransaction = {
+      id: 'tx-1',
+      company_id: 'company-1',
+      category: 'expense_bank_fees',
+      is_business: true,
+      journal_entry_id: 'je-1',
+      cash_account_id: 'cash-1',
+    }
+    const supabase = readbackSupabase({ data: verifiedTransaction, error: null })
+
+    const result = await attachCategorizedTransaction(
+      supabase as never,
+      { ...baseParams, requireVerifiedTransaction: true },
+      log as never,
+    )
+
+    expect(result).toEqual({ ok: true, verifiedTransaction })
+    expect(compensateTransactionCategorizationMock).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { label: 'missing row', readback: { data: null, error: null }, reason: 'database_error' },
+    {
+      label: 'ambiguous row',
+      readback: { data: null, error: { message: 'JSON object requested, multiple rows returned' } },
+      reason: 'database_error',
+    },
+    {
+      label: 'wrong tenant',
+      readback: {
+        data: {
+          id: 'tx-1', company_id: 'company-2', category: 'expense_bank_fees', is_business: true,
+          journal_entry_id: 'je-1', cash_account_id: 'cash-1',
+        },
+        error: null,
+      },
+      reason: 'conflict',
+    },
+    {
+      label: 'wrong transaction id',
+      readback: {
+        data: {
+          id: 'tx-2', company_id: 'company-1', category: 'expense_bank_fees', is_business: true,
+          journal_entry_id: 'je-1', cash_account_id: 'cash-1',
+        },
+        error: null,
+      },
+      reason: 'conflict',
+    },
+    {
+      label: 'stale category',
+      readback: {
+        data: {
+          id: 'tx-1', company_id: 'company-1', category: 'expense_office', is_business: true,
+          journal_entry_id: 'je-1', cash_account_id: 'cash-1',
+        },
+        error: null,
+      },
+      reason: 'conflict',
+    },
+    {
+      label: 'stale business flag',
+      readback: {
+        data: {
+          id: 'tx-1', company_id: 'company-1', category: 'expense_bank_fees', is_business: false,
+          journal_entry_id: 'je-1', cash_account_id: 'cash-1',
+        },
+        error: null,
+      },
+      reason: 'conflict',
+    },
+    {
+      label: 'wrong journal entry',
+      readback: {
+        data: {
+          id: 'tx-1', company_id: 'company-1', category: 'expense_bank_fees', is_business: true,
+          journal_entry_id: 'je-other', cash_account_id: 'cash-1',
+        },
+        error: null,
+      },
+      reason: 'conflict',
+    },
+    {
+      label: 'wrong cash account',
+      readback: {
+        data: {
+          id: 'tx-1', company_id: 'company-1', category: 'expense_bank_fees', is_business: true,
+          journal_entry_id: 'je-1', cash_account_id: 'cash-other',
+        },
+        error: null,
+      },
+      reason: 'conflict',
+    },
+  ])('fails closed and compensates on $label verified readback', async ({ readback, reason }) => {
+    const supabase = readbackSupabase(readback)
+
+    const result = await attachCategorizedTransaction(
+      supabase as never,
+      { ...baseParams, requireVerifiedTransaction: true },
+      log as never,
+    )
+
+    expect(result).toMatchObject({ ok: false, reason })
+    expect(compensateTransactionCategorizationMock).toHaveBeenCalledWith(
+      supabase,
+      {
+        companyId: 'company-1',
+        userId: 'user-1',
+        transactionId: 'tx-1',
+        originalJournalEntryId: 'je-1',
+      },
+    )
+  })
+
+  it('fails closed and compensates when verified readback throws', async () => {
+    const supabase = {
+      ...rpcSupabase({ data: true, error: null }),
+      from: vi.fn(() => { throw new TypeError('readback transport failed') }),
+    }
+
+    const result = await attachCategorizedTransaction(
+      supabase as never,
+      { ...baseParams, requireVerifiedTransaction: true },
+      log as never,
+    )
+
+    expect(result).toMatchObject({ ok: false, reason: 'database_error' })
+    expect(compensateTransactionCategorizationMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('preserves original and reversal ids when verified readback compensation is unverifiable', async () => {
+    compensateTransactionCategorizationMock.mockResolvedValueOnce({
+      compensationVerified: false,
+      partialPostedIds: {
+        journal_entry_id: 'je-1',
+        reversal_journal_entry_id: 'je-storno-1',
+        reversal_journal_entry_2_id: 'je-storno-2',
+      },
+      error: new BookkeepingDatabaseError(
+        'verify_transaction_compensation',
+        'ambiguous reversals',
+      ),
+    })
+    const supabase = readbackSupabase({ data: null, error: null })
+
+    const result = await attachCategorizedTransaction(
+      supabase as never,
+      { ...baseParams, requireVerifiedTransaction: true },
+      log as never,
+    )
+
+    expect(result).toMatchObject({
+      ok: false,
+      reason: 'database_error',
+      partialPostedIds: {
+        journal_entry_id: 'je-1',
+        reversal_journal_entry_id: 'je-storno-1',
+        reversal_journal_entry_2_id: 'je-storno-2',
+      },
+    })
   })
 
   it('uses the atomic categorization compensation RPC after a clean attachment mismatch', async () => {

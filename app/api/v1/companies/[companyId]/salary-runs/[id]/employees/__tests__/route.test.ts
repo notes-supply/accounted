@@ -46,7 +46,10 @@ interface TableResp {
   error?: unknown
 }
 
-function makeFlexibleSupabase(byTable: Record<string, TableResp | TableResp[]>) {
+function makeFlexibleSupabase(
+  byTable: Record<string, TableResp | TableResp[]>,
+  rpcResult: TableResp = { data: null, error: null },
+) {
   const queues = new Map<string, TableResp[]>()
   for (const [t, val] of Object.entries(byTable)) {
     queues.set(t, Array.isArray(val) ? [...val] : [val])
@@ -66,7 +69,10 @@ function makeFlexibleSupabase(byTable: Record<string, TableResp | TableResp[]>) 
     }
     return new Proxy({}, handler)
   }
-  return { from: vi.fn((table: string) => buildChain(table)) }
+  return {
+    from: vi.fn((table: string) => buildChain(table)),
+    rpc: vi.fn().mockResolvedValue(rpcResult),
+  }
 }
 
 const COMPANY_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
@@ -507,15 +513,15 @@ describe('DELETE /api/v1/companies/:companyId/salary-runs/:id/employees/:employe
 
   it('removes an attached employee (204)', async () => {
     mockServiceClient.mockReturnValue(
-      makeFlexibleSupabase({
-        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
-        salary_runs: { data: { id: RUN_ID, status: 'draft' }, error: null },
-        salary_run_employees: [
-          { data: { id: SRE_ID }, error: null },
-          { data: null, error: null },
-        ],
-        idempotency_keys: { data: null, error: null },
-      }),
+      makeFlexibleSupabase(
+        {
+          company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+          salary_runs: { data: { id: RUN_ID, status: 'draft' }, error: null },
+          salary_run_employees: { data: { id: SRE_ID }, error: null },
+          idempotency_keys: { data: null, error: null },
+        },
+        { data: true, error: null },
+      ),
     )
 
     const res = await removeEmployee(

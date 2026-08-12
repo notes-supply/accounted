@@ -165,6 +165,20 @@ const INV_ID = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
 const SI_ID = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
 const JE_ID = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
 
+function verifiedCategorizedTransaction(cashAccountId: string | null = null) {
+  return {
+    data: {
+      id: TX_ID,
+      company_id: COMPANY_ID,
+      category: 'expense_office',
+      is_business: true,
+      journal_entry_id: 'je-fresh',
+      cash_account_id: cashAccountId,
+    },
+    error: null,
+  }
+}
+
 function makeRequest(url: string, body: unknown): Request {
   return new Request(url, {
     method: 'POST',
@@ -209,7 +223,7 @@ describe('POST :id/categorize', () => {
             },
             error: null,
           },
-          { data: [{ id: TX_ID }], error: null }, // CAS update select
+          verifiedCategorizedTransaction(),
         ],
         company_settings: {
           data: { entity_type: 'enskild_firma' },
@@ -390,7 +404,7 @@ describe('POST :id/categorize', () => {
             },
             error: null,
           },
-          { data: [{ id: TX_ID }], error: null }, // CAS update select
+          verifiedCategorizedTransaction('ca-1940'),
         ],
         company_settings: { data: { entity_type: 'enskild_firma' }, error: null },
         cash_accounts: { data: { ledger_account: '1940' }, error: null },
@@ -431,7 +445,7 @@ describe('POST :id/categorize', () => {
             },
             error: null,
           },
-          { data: [{ id: TX_ID }], error: null },
+          verifiedCategorizedTransaction(),
         ],
         company_settings: { data: { entity_type: 'enskild_firma' }, error: null },
       }),
