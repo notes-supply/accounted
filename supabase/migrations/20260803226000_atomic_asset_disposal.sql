@@ -125,6 +125,7 @@ SET search_path = ''
 AS $function$
 DECLARE
   v_asset_user_id uuid;
+  v_acquisition_cost numeric;
   v_entry_user_id uuid;
   v_schedule_id uuid;
   v_schedule_entry_id uuid;
@@ -169,8 +170,8 @@ BEGIN
       USING ERRCODE = '23514';
   END IF;
 
-  SELECT a.user_id
-    INTO v_asset_user_id
+  SELECT a.user_id, a.acquisition_cost
+    INTO v_asset_user_id, v_acquisition_cost
     FROM public.assets a
    WHERE a.id = p_asset_id
      AND a.company_id = p_company_id
@@ -238,8 +239,10 @@ BEGIN
       RAISE EXCEPTION 'Valid disposal draft not found: %', p_entry_id
         USING ERRCODE = 'P0002';
     END IF;
-  ELSIF abs(coalesce(p_current_depreciation, 0)) > 0.005 THEN
-    RAISE EXCEPTION 'Current depreciation requires a disposal voucher'
+  ELSIF abs(coalesce(v_acquisition_cost, 0)) > 0.005
+     OR abs(coalesce(p_disposed_proceeds, 0)) > 0.005
+     OR abs(coalesce(p_current_depreciation, 0)) > 0.005 THEN
+    RAISE EXCEPTION 'A financially material asset disposal requires a disposal voucher'
       USING ERRCODE = '23514';
   END IF;
 

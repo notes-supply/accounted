@@ -1,6 +1,17 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { validateBalance, getSwedishLocalDate, createDraftEntry, reverseEntry } from '../engine'
-import { BookkeepingDatabaseError, AccountsNotInChartError, CannotReverseStornoError } from '../errors'
+import {
+  validateBalance,
+  getSwedishLocalDate,
+  createDraftEntry,
+  reverseEntry,
+  commitAssetDisposal,
+} from '../engine'
+import {
+  BookkeepingDatabaseError,
+  AccountsNotInChartError,
+  CannotReverseStornoError,
+  PostCommitReadbackError,
+} from '../errors'
 import type { CreateJournalEntryLineInput, JournalEntryStatus } from '@/types'
 
 // Mock Supabase client for createDraftEntry/reverseEntry tests
@@ -104,6 +115,59 @@ describe('getSwedishLocalDate', () => {
     const date = getSwedishLocalDate()
     const parsed = new Date(date)
     expect(parsed.toString()).not.toBe('Invalid Date')
+  })
+})
+
+describe('commitAssetDisposal', () => {
+  it('surfaces the committed voucher identity when posted-entry readback fails', async () => {
+    const single = vi.fn().mockResolvedValue({
+      data: null,
+      error: { message: 'connection reset' },
+    })
+    const query = {
+      select: vi.fn().mockReturnThis(),
+      eq: vi.fn().mockReturnThis(),
+      single,
+    }
+    const supabase = {
+      rpc: vi.fn().mockResolvedValue({
+        data: [{ voucher_number: 42 }],
+        error: null,
+      }),
+      from: vi.fn().mockReturnValue(query),
+    }
+
+    const operation = commitAssetDisposal(
+      supabase as never,
+      'company-1',
+      'user-1',
+      'entry-1',
+      {
+        asset_id: 'asset-1',
+        fiscal_period_id: 'period-1',
+        disposal_type: 'sale',
+        disposed_at: '2026-06-30',
+        disposed_proceeds: 80_000,
+        proceeds_vat: 0,
+        vat_treatment: 'exempt',
+        current_depreciation: 0,
+        jamkning_amount: 0,
+        jamkning_direction: 'none',
+        jamkning_remaining_years: null,
+        jamkning_total_years: null,
+        jamkning_original_input_vat: null,
+        jamkning_original_deduction_percent: null,
+        jamkning_new_deduction_percent: null,
+      },
+    )
+
+    await expect(operation).rejects.toMatchObject({
+      name: 'PostCommitReadbackError',
+      journalEntryId: 'entry-1',
+      voucherNumber: 42,
+      cause: 'connection reset',
+    } satisfies Partial<PostCommitReadbackError>)
+    expect(single).toHaveBeenCalledTimes(2)
   })
 })
 

@@ -806,7 +806,7 @@ export async function commitAssetDisposal(
   input: CommitAssetDisposalInput,
 ): Promise<JournalEntry | null> {
   const actor = getActor()
-  const { error } = await supabase.rpc('commit_asset_disposal', {
+  const { data: rpcResult, error } = await supabase.rpc('commit_asset_disposal', {
     p_company_id: companyId,
     p_asset_id: input.asset_id,
     p_entry_id: entryId,
@@ -843,6 +843,16 @@ export async function commitAssetDisposal(
 
   if (!entryId) return null
 
+  const rpcRow = Array.isArray(rpcResult) ? rpcResult[0] : rpcResult
+  const rawVoucherNumber =
+    rpcRow && typeof rpcRow === 'object' && 'voucher_number' in rpcRow
+      ? (rpcRow as { voucher_number?: unknown }).voucher_number
+      : null
+  const voucherNumber =
+    typeof rawVoucherNumber === 'number' && Number.isFinite(rawVoucherNumber)
+      ? rawVoucherNumber
+      : null
+
   // The RPC has already committed the voucher and the register update at this
   // point. A transient reload failure must not masquerade as a failed
   // disposal, so retry once and log the divergence before surfacing it.
@@ -875,11 +885,10 @@ export async function commitAssetDisposal(
         journalEntryId: entryId,
       },
     )
-    throw new BookkeepingDatabaseError(
-      'fetch_asset_disposal_entry',
-      `disposal voucher is committed but could not be reloaded: ${
-        lastFetchError?.message ?? 'posted entry not found'
-      }`,
+    throw new PostCommitReadbackError(
+      entryId,
+      voucherNumber,
+      lastFetchError?.message ?? 'posted entry not found',
     )
   }
 

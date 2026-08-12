@@ -80,6 +80,29 @@ describe('commit_asset_disposal (pg-real)', () => {
     )
   }
 
+  it('requires a voucher for a financially material disposal', async () => {
+    const { userId, companyId, fiscalPeriodId } = await seedCompany()
+    const assetId = await insertAsset(userId, companyId)
+
+    await expect(
+      getPool().query(
+        `SELECT * FROM public.commit_asset_disposal(
+           $1::uuid, $2::uuid, NULL::uuid, $3::uuid, 'sale'::text,
+           '2026-06-30'::date, 80000::numeric, 0::numeric, 'exempt'::text,
+           0::numeric, 0::numeric, 'none'::text, 4::integer, 5::integer,
+           0::numeric, 0::numeric, 0::numeric, NULL::text, NULL::text
+         )`,
+        [companyId, assetId, fiscalPeriodId],
+      ),
+    ).rejects.toThrow(/requires a disposal voucher/)
+
+    const asset = await getPool().query(
+      `SELECT disposed_at, disposal_journal_entry_id FROM public.assets WHERE id = $1`,
+      [assetId],
+    )
+    expect(asset.rows[0]).toEqual({ disposed_at: null, disposal_journal_entry_id: null })
+  })
+
   it('posts the voucher, schedule, and register state in one transaction', async () => {
     const { userId, companyId, fiscalPeriodId } = await seedCompany()
     const assetId = await insertAsset(userId, companyId)
