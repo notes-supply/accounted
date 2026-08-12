@@ -243,18 +243,21 @@ export const DELETE = withRouteContext<{ params: Promise<{ id: string }> }>(
       )
     }
 
-    // salary_run_employees and their salary_line_items are removed via
-    // ON DELETE CASCADE. An agi_declarations row (never present on a draft)
-    // would block the delete via its RESTRICT FK, the safety net for the
-    // impossible case.
-    const { error } = await supabase
-      .from('salary_runs')
-      .delete()
-      .eq('id', id)
-      .eq('company_id', companyId)
+    const { data: deleted, error } = await supabase.rpc(
+      'delete_salary_draft_object_with_mileage_release',
+      {
+        p_company_id: companyId,
+        p_salary_run_id: id,
+        p_kind: 'run',
+        p_target_id: id,
+      },
+    )
 
     if (error) {
       return NextResponse.json({ error: getUserErrorMessage(error) }, { status: 500 })
+    }
+    if (!deleted) {
+      return NextResponse.json({ error: 'Lönekörning hittades inte' }, { status: 404 })
     }
 
     return NextResponse.json({ data: { id, deleted: true } })

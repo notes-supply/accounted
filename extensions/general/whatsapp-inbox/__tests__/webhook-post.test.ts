@@ -254,17 +254,16 @@ describe('POST /webhook', () => {
       enqueue({ data: { ok: true } }) // quota
       enqueue({
         data: {
-          id: 'code-1',
-          user_id: 'user-1',
-          expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
-          used_at: null,
+          ok: true,
+          link: {
+            id: 'link-9',
+            user_id: 'user-1',
+            wa_profile_name: 'Jakob',
+            phone_masked: '+46 70 *** ** 67',
+          },
+          conversation_id: 'conv-9',
         },
-      }) // code lookup
-      enqueue({ data: { id: 'code-1' } }) // code claim
-      enqueue({ data: null }) // revoke by phone hash
-      enqueue({ data: null }) // revoke by user
-      enqueue({ data: { id: 'link-9', user_id: 'user-1' } }) // link insert
-      enqueue({ data: { id: 'conv-9' } }) // conversation insert
+      }) // atomic code consume + link + conversation
       enqueue({ data: null }) // content-free code-message row
       enqueue({ data: [{ company_id: 'company-1' }] }) // memberships
       enqueue({ data: { name: 'Bolaget AB' } }) // company name
@@ -279,20 +278,19 @@ describe('POST /webhook', () => {
       )
       expect(response.status).toBe(200)
 
-      const [linkRow] = findCall('whatsapp_phone_links', 'insert') as [Record<string, unknown>]
-      expect(linkRow.user_id).toBe('user-1')
-      expect(linkRow.wa_profile_name).toBe('Jakob')
-      expect(linkRow.phone_masked).toBe('+46 70 *** ** 67')
+      expect(createClientMock.mock.results[0].value.rpc).toHaveBeenCalledWith(
+        'consume_whatsapp_code_and_create_link',
+        expect.objectContaining({
+          p_profile_name: 'Jakob',
+          p_phone_masked: '+46 70 *** ** 67',
+        }),
+      )
 
       // The code message row is persisted content-free (dedupe only).
       const [codeRow] = findCall('whatsapp_messages', 'insert') as [Record<string, unknown>]
       expect(codeRow.wamid).toBe('wamid.IN1')
       expect(codeRow.body_text).toBeUndefined()
       expect(codeRow.raw_payload).toBeUndefined()
-
-      // The code was claimed single-use.
-      const [claim] = findCall('whatsapp_link_codes', 'update') as [Record<string, unknown>]
-      expect(claim.used_at).toBeTruthy()
 
       expect(sendTextMock).toHaveBeenCalledTimes(1)
       const reply = sendTextMock.mock.calls[0][1]

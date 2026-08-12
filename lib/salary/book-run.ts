@@ -96,6 +96,7 @@ async function bookLoadedRun(
   const nothingToBook =
     Math.round(((run.total_gross as number) ?? 0) * 100) === 0 &&
     Math.round(((run.total_tax as number) ?? 0) * 100) === 0 &&
+    Math.round(((run.total_net as number) ?? 0) * 100) === 0 &&
     Math.round(((run.total_avgifter as number) ?? 0) * 100) === 0 &&
     Math.round(((run.total_vacation_accrual as number) ?? 0) * 100) === 0
 

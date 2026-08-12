@@ -325,6 +325,14 @@ export function calculateSalary(
     })
   }
 
+  // Tax-free mileage reimbursement is paid with the salary but is not gross
+  // salary, taxable income, or an employer-contribution basis.
+  const taxFreeMileage = r(
+    input.lineItems
+      .filter(li => li.itemType === 'mileage_taxfree')
+      .reduce((sum, li) => sum + Math.max(li.amount, 0), 0)
+  )
+
   // ─── Step 3: Subtract absence deductions ───
   const absenceItems = input.lineItems.filter(
     li => ['sick_karens', 'sick_day2_14', 'sick_day15_plus', 'vab', 'parental_leave', 'unpaid_leave', 'vacation'].includes(li.itemType)
@@ -465,11 +473,16 @@ export function calculateSalary(
   const netDeductionItems = input.lineItems.filter(li => li.isNetDeduction)
   const totalNetDeductions = r(Math.abs(netDeductionItems.reduce((sum, li) => sum + li.amount, 0)))
 
-  const netSalary = r(grossSalary - taxWithheld - totalNetDeductions)
+  const netSalary = r(grossSalary - taxWithheld - totalNetDeductions + taxFreeMileage)
   steps.push({
     label: 'Nettolön',
-    formula: 'bruttolön − skatt − nettoavdrag',
-    input: { gross: grossSalary, tax: taxWithheld, net_deductions: totalNetDeductions },
+    formula: 'bruttolön − skatt − nettoavdrag + skattefri milersättning',
+    input: {
+      gross: grossSalary,
+      tax: taxWithheld,
+      net_deductions: totalNetDeductions,
+      tax_free_mileage: taxFreeMileage,
+    },
     output: netSalary,
   })
 
@@ -590,11 +603,19 @@ export function calculateSalary(
     output: vacationAccrualAvgifter,
   })
 
-  const totalEmployerCost = r(grossSalary + avgifterAmount + vacationAccrual + vacationAccrualAvgifter)
+  const totalEmployerCost = r(
+    grossSalary + taxFreeMileage + avgifterAmount + vacationAccrual + vacationAccrualAvgifter
+  )
   steps.push({
     label: 'Total arbetsgivarkostnad',
-    formula: 'bruttolön + avgifter + semesteravsättning + avgifter på semester',
-    input: { gross: grossSalary, avgifter: avgifterAmount, vacation_accrual: vacationAccrual, vacation_avgifter: vacationAccrualAvgifter },
+    formula: 'bruttolön + skattefri milersättning + avgifter + semesteravsättning + avgifter på semester',
+    input: {
+      gross: grossSalary,
+      tax_free_mileage: taxFreeMileage,
+      avgifter: avgifterAmount,
+      vacation_accrual: vacationAccrual,
+      vacation_avgifter: vacationAccrualAvgifter,
+    },
     output: totalEmployerCost,
   })
 

@@ -221,6 +221,35 @@ describe('salary entries: net deductions', () => {
   })
 })
 
+describe('salary entries: tax-free mileage', () => {
+  it('debits mileage expense and credits the full reimbursement payout', async () => {
+    const run = makeRun([
+      makeEmployee({
+        gross_salary: 0,
+        tax_withheld: 0,
+        net_salary: 250,
+        avgifter_amount: 0,
+        line_items: [
+          {
+            item_type: 'mileage_taxfree',
+            amount: 250,
+            account_number: '7331',
+            is_net_deduction: false,
+            is_gross_deduction: false,
+          },
+        ],
+      }),
+    ])
+
+    await createSalaryRunEntries(makeSupabase(), 'company-1', 'user-1', run)
+    const salary = entryByDescription('Lön 2026-06')
+
+    expect(linesOn(salary, '7331')[0].debit_amount).toBe(250)
+    expect(linesOn(salary, '1930')[0].credit_amount).toBe(250)
+    assertBalanced(salary)
+  })
+})
+
 describe('salary entries: dimensions propagation (PR8)', () => {
   it('splits the salary expense per employee bag; tax and bank legs stay untagged', async () => {
     const run = makeRun([

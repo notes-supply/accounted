@@ -4323,6 +4323,7 @@ export interface MileageTrip {
   status: MileageTripStatus
   journal_entry_id: string | null
   salary_run_id: string | null
+  salary_line_item_id: string | null
   notes: string | null
   created_via: 'manual' | 'mcp' | 'import'
   created_at: string

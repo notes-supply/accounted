@@ -38,8 +38,7 @@ import { verifyMetaSignature, verifyChallengeToken } from './lib/webhook-verify'
 import { parseWebhookEnvelope, type ParsedInboundMessage } from './lib/webhook-parse'
 import { hashPhone } from './lib/phone-crypto'
 import {
-  consumeLinkCode,
-  createPhoneLink,
+  consumeLinkCodeAndCreatePhoneLink,
   LinkCodeRateLimitError,
   looksLikeLinkCode,
   lookupActiveLink,
@@ -145,8 +144,12 @@ async function handleUnknownSender(
   const copy = botCopy('sv')
 
   if (msg.type === 'text' && looksLikeLinkCode(msg.text)) {
-    const consumed = await consumeLinkCode(supabase, msg.text ?? '')
-    if (!consumed) {
+    const linked = await consumeLinkCodeAndCreatePhoneLink(supabase, {
+      rawText: msg.text ?? '',
+      phone: msg.from,
+      profileName: msg.profileName,
+    })
+    if (!linked) {
       await sendText(supabase, {
         to: msg.from,
         body: copy.m2BadCode(),
@@ -156,11 +159,7 @@ async function handleUnknownSender(
       return
     }
 
-    const { link, conversationId } = await createPhoneLink(supabase, {
-      userId: consumed.userId,
-      phone: msg.from,
-      profileName: msg.profileName,
-    })
+    const { link, conversationId, userId } = linked
 
     // Persist a content-free row for the code message so a Meta redelivery
     // of the same wamid dedupes instead of falling into the keyword path.
@@ -177,7 +176,7 @@ async function handleUnknownSender(
     const { data: memberships } = await supabase
       .from('company_members')
       .select('company_id')
-      .eq('user_id', consumed.userId)
+      .eq('user_id', userId)
     const companyIds = [...new Set((memberships ?? []).map((m) => m.company_id as string))]
 
     let companyName: string | null = null

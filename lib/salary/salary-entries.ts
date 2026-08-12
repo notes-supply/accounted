@@ -232,7 +232,12 @@ async function createSalaryEntry(
       if (BENEFIT_TYPES.includes(li.item_type)) continue // No cash flow for förmånsvärden
       const account = li.account_number || getLineItemAccount(li.item_type as never, emp.employment_type)
       addExpense(account, dimensions, li.amount)
-      lineItemTotal += li.amount
+      // Tax-free mileage is extra cash paid on top of gross salary. It gets
+      // its own expense debit but must not reduce the salary-account remainder
+      // used to reconcile the gross-pay portion.
+      if (li.item_type !== 'mileage_taxfree') {
+        lineItemTotal += li.amount
+      }
     }
 
     // Ensure the debit side always equals gross_salary (minus gross deductions,

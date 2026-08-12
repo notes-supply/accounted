@@ -268,14 +268,19 @@ export async function deletePayslipLine(
     return { ok: true, data: { deleted: true, salary_line_item_id: args.lineId } }
   }
 
-  const { error } = await supabase
-    .from('salary_line_items')
-    .delete()
-    .eq('id', args.lineId)
-    .eq('company_id', args.companyId)
+  const { data: deleted, error } = await supabase.rpc(
+    'delete_salary_draft_object_with_mileage_release',
+    {
+      p_company_id: args.companyId,
+      p_salary_run_id: args.salaryRunId,
+      p_kind: 'line',
+      p_target_id: args.lineId,
+    },
+  )
 
   if (error) {
     return { ok: false, code: 'INTERNAL_ERROR', details: { message: error.message } }
   }
+  if (!deleted) return { ok: false, code: 'SALARY_LINE_NOT_FOUND' }
   return { ok: true, data: { deleted: true, salary_line_item_id: args.lineId } }
 }

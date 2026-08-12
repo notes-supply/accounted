@@ -44,7 +44,10 @@ interface TableResp {
   error?: unknown
 }
 
-function makeFlexibleSupabase(byTable: Record<string, TableResp | TableResp[]>) {
+function makeFlexibleSupabase(
+  byTable: Record<string, TableResp | TableResp[]>,
+  rpcResult: TableResp = { data: null, error: null },
+) {
   const queues = new Map<string, TableResp[]>()
   for (const [t, val] of Object.entries(byTable)) {
     queues.set(t, Array.isArray(val) ? [...val] : [val])
@@ -71,6 +74,7 @@ function makeFlexibleSupabase(byTable: Record<string, TableResp | TableResp[]>) 
       tableCalls.push(table)
       return buildChain(table)
     }),
+    rpc: vi.fn().mockResolvedValue(rpcResult),
   }
 }
 
@@ -393,15 +397,18 @@ describe('PATCH /salary-runs/:id/lines/:lineId', () => {
 describe('DELETE /salary-runs/:id/lines/:lineId', () => {
   it('deletes a line and returns 204', async () => {
     mockServiceClient.mockReturnValue(
-      makeFlexibleSupabase({
-        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
-        salary_runs: { data: { id: RUN_ID, status: 'draft' }, error: null },
-        salary_line_items: [
-          { data: { ...SAMPLE_LINE, salary_run_employee: { salary_run_id: RUN_ID } }, error: null },
-          { data: null, error: null },
-        ],
-        idempotency_keys: { data: null, error: null },
-      }),
+      makeFlexibleSupabase(
+        {
+          company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+          salary_runs: { data: { id: RUN_ID, status: 'draft' }, error: null },
+          salary_line_items: {
+            data: { ...SAMPLE_LINE, salary_run_employee: { salary_run_id: RUN_ID } },
+            error: null,
+          },
+          idempotency_keys: { data: null, error: null },
+        },
+        { data: true, error: null },
+      ),
     )
 
     const res = await deleteLine(

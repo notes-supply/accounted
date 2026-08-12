@@ -53,6 +53,7 @@ function trip(overrides: Partial<MileageTrip>): MileageTrip {
     status: 'draft',
     journal_entry_id: null,
     salary_run_id: null,
+    salary_line_item_id: null,
     notes: null,
     created_via: 'manual',
     created_at: '2026-05-10T00:00:00Z',
@@ -146,20 +147,7 @@ describe('pushMileageToSalaryRun', () => {
   function salarySupabase(opts: {
     run?: { id: string; status: string } | null
     sre?: { id: string } | null
-    claimIds?: string[]
-    itemError?: { message: string } | null
   }) {
-    const insert = vi.fn(() => Promise.resolve({ error: opts.itemError ?? null }))
-    const tripChain: Record<string, unknown> = {}
-    for (const method of ['update', 'eq', 'in', 'is']) {
-      tripChain[method] = vi.fn(() => tripChain)
-    }
-    tripChain.select = vi.fn(() =>
-      Promise.resolve({ data: (opts.claimIds ?? []).map((id) => ({ id })), error: null })
-    )
-    tripChain.then = (resolve: (v: unknown) => unknown) =>
-      Promise.resolve({ data: null, error: null }).then(resolve)
-
     const singleChain = (row: unknown) => {
       const chain: Record<string, unknown> = {}
       for (const method of ['select', 'eq']) {
@@ -173,11 +161,9 @@ describe('pushMileageToSalaryRun', () => {
       from: vi.fn((table: string) => {
         if (table === 'salary_runs') return singleChain(opts.run ?? null)
         if (table === 'salary_run_employees') return singleChain(opts.sre ?? null)
-        if (table === 'salary_line_items') return { insert }
-        return tripChain
+        throw new Error(`unexpected table: ${table}`)
       }),
-      insert,
-      tripChain,
+      rpc: vi.fn().mockResolvedValue({ data: { ok: true }, error: null }),
     }
   }
 
@@ -206,25 +192,21 @@ describe('pushMileageToSalaryRun', () => {
     const supabase = salarySupabase({
       run: { id: 'run-1', status: 'draft' },
       sre: { id: 'sre-1' },
-      claimIds: ['t1'],
     })
+    supabase.rpc.mockResolvedValue({ data: { ok: true, trip_count: 1 }, error: null })
 
     const result = await pushMileageToSalaryRun(supabase as never, 'company-1', params)
     expect(result).toMatchObject({ ok: true, tripCount: 1, totalAmount: 250 })
-    const item = (supabase.insert.mock.calls[0] as unknown[][])[0][0]
-    expect(item).toMatchObject({
-      item_type: 'mileage_taxfree',
-      amount: 250,
-      is_taxable: false,
-      is_avgift_basis: false,
-      is_vacation_basis: false,
-      account_number: '7331',
-    })
-    // The claim ran before the insert (retry cannot double-pay).
-    const claimOrder = (supabase.tripChain.update as ReturnType<typeof vi.fn>).mock
-      .invocationCallOrder[0]
-    const insertOrder = supabase.insert.mock.invocationCallOrder[0]
-    expect(claimOrder).toBeLessThan(insertOrder)
+    expect(supabase.rpc).toHaveBeenCalledWith(
+      'claim_mileage_trips_for_salary_run',
+      expect.objectContaining({
+        p_company_id: 'company-1',
+        p_salary_run_id: 'run-1',
+        p_employee_id: 'emp-1',
+        p_trip_ids: ['t1'],
+        p_line_specs: [expect.objectContaining({ amount: 250, trip_ids: ['t1'] })],
+      }),
+    )
   })
 
   it('returns CLAIM_LOST and reverts when another booking claimed first', async () => {
@@ -236,32 +218,15 @@ describe('pushMileageToSalaryRun', () => {
     const supabase = salarySupabase({
       run: { id: 'run-1', status: 'draft' },
       sre: { id: 'sre-1' },
-      claimIds: ['t1'],
+    })
+    supabase.rpc.mockResolvedValue({
+      data: null,
+      error: { code: '40001', message: 'claim lost' },
     })
     const result = await pushMileageToSalaryRun(supabase as never, 'company-1', params)
     expect(result).toEqual({ ok: false, code: 'CLAIM_LOST' })
-    expect(supabase.insert).not.toHaveBeenCalled()
-    // The partial claim was reverted, not left dangling.
-    expect(supabase.tripChain.update).toHaveBeenCalledWith({
-      status: 'draft',
-      salary_run_id: null,
-    })
   })
 
-  it('reverts the claim when the line item insert fails', async () => {
-    vi.mocked(fetchAllRows).mockResolvedValue([trip({ id: 't1', employee_id: 'emp-1' })])
-    vi.mocked(loadPayrollConfig).mockResolvedValue(CONFIG)
-    const supabase = salarySupabase({
-      run: { id: 'run-1', status: 'draft' },
-      sre: { id: 'sre-1' },
-      claimIds: ['t1'],
-      itemError: { message: 'insert failed' },
-    })
-    await expect(
-      pushMileageToSalaryRun(supabase as never, 'company-1', params)
-    ).rejects.toThrow('insert failed')
-    expect(supabase.tripChain.update).toHaveBeenCalledWith({ status: 'draft', salary_run_id: null })
-  })
 })
 
 describe('bookMileagePeriod', () => {

@@ -434,55 +434,24 @@ export async function pushMileageToSalaryRun(
   const summaries = summarizeTrips(trips, config)
   const totalAmount = round2(summaries.reduce((sum, s) => sum + s.amount, 0))
 
-  // Claim the trips BEFORE inserting the salary lines: a retry after a
-  // partial failure would otherwise insert the mileage_taxfree items twice
-  // for the same trips (double pay). A lost claim reverts and reports.
-  const tripIds = trips.map((t) => t.id)
-  const { data: claimed, error: claimError } = await supabase
-    .from('mileage_trips')
-    .update({ status: 'booked', salary_run_id: params.runId })
-    .eq('company_id', companyId)
-    .eq('status', 'draft')
-    .in('id', tripIds)
-    .select('id')
+  const lineSpecs = summaries.map((s, index) => ({
+    description: `Milersättning ${VEHICLE_TYPE_LABELS[s.vehicle_type]} ${params.from} till ${params.to} (${s.trip_count} resor)`,
+    quantity: s.total_mil,
+    unit_price: s.rate_per_mil,
+    amount: s.amount,
+    sort_order: 100 + index,
+    trip_ids: trips.filter((trip) => trip.vehicle_type === s.vehicle_type).map((trip) => trip.id),
+  }))
+  const { error: claimError } = await supabase.rpc('claim_mileage_trips_for_salary_run', {
+    p_company_id: companyId,
+    p_salary_run_id: params.runId,
+    p_employee_id: params.employeeId,
+    p_trip_ids: trips.map((trip) => trip.id),
+    p_line_specs: lineSpecs,
+  })
   if (claimError) {
-    throw new Error(`Failed to claim mileage trips: ${claimError.message}`)
-  }
-  const claimedIds = (claimed ?? []).map((row) => row.id as string)
-  const revertClaim = async () => {
-    if (claimedIds.length === 0) return
-    await supabase
-      .from('mileage_trips')
-      .update({ status: 'draft', salary_run_id: null })
-      .eq('company_id', companyId)
-      .eq('status', 'booked')
-      .is('journal_entry_id', null)
-      .in('id', claimedIds)
-  }
-  if (claimedIds.length !== tripIds.length) {
-    await revertClaim()
-    return { ok: false, code: 'CLAIM_LOST' }
-  }
-
-  const { error: itemError } = await supabase.from('salary_line_items').insert(
-    summaries.map((s, index) => ({
-      salary_run_employee_id: sre.id,
-      company_id: companyId,
-      item_type: 'mileage_taxfree',
-      description: `Milersättning ${VEHICLE_TYPE_LABELS[s.vehicle_type]} ${params.from} till ${params.to} (${s.trip_count} resor)`,
-      quantity: s.total_mil,
-      unit_price: s.rate_per_mil,
-      amount: s.amount,
-      is_taxable: false,
-      is_avgift_basis: false,
-      is_vacation_basis: false,
-      account_number: MILEAGE_TAXFREE_ACCOUNT,
-      sort_order: 100 + index,
-    }))
-  )
-  if (itemError) {
-    await revertClaim()
-    throw new Error(`Failed to add mileage line items: ${itemError.message}`)
+    if (claimError.code === '40001') return { ok: false, code: 'CLAIM_LOST' }
+    throw new Error(`Failed to add mileage to salary run: ${claimError.message}`)
   }
 
   return { ok: true, tripCount: trips.length, totalAmount, summaries }

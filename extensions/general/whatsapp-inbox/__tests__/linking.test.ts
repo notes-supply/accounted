@@ -9,7 +9,7 @@ import {
   looksLikeLinkCode,
   hashLinkCode,
   mintLinkCode,
-  consumeLinkCode,
+  consumeLinkCodeAndCreatePhoneLink,
 } from '@/extensions/general/whatsapp-inbox/lib/linking'
 import type { SupabaseClient } from '@supabase/supabase-js'
 
@@ -141,74 +141,53 @@ describe('linking', () => {
     })
   })
 
-  describe('consumeLinkCode', () => {
-    const futureExpiry = () => new Date(Date.now() + 5 * 60 * 1000).toISOString()
-
-    it('consumes a valid unused code', async () => {
-      const { supabase, enqueue, findCall } = createQueuedMockSupabase()
-      enqueue({ data: { id: 'code-1', user_id: 'user-1', expires_at: futureExpiry(), used_at: null } })
-      enqueue({ data: { id: 'code-1' } })
-
-      const result = await consumeLinkCode(supabase as unknown as SupabaseClient, 'ac-7kp4qf')
-      expect(result).toEqual({ userId: 'user-1' })
-      const updateArgs = findCall('whatsapp_link_codes', 'update') as [Record<string, unknown>]
-      expect(updateArgs[0].used_at).toBeTruthy()
-    })
-
-    it('rejects an expired code', async () => {
-      const { supabase, enqueue, findCalls } = createQueuedMockSupabase()
-      enqueue({
-        data: {
-          id: 'code-1',
-          user_id: 'user-1',
-          expires_at: new Date(Date.now() - 1000).toISOString(),
-          used_at: null,
-        },
-      })
-
-      const result = await consumeLinkCode(supabase as unknown as SupabaseClient, 'AC-7KP4QF')
-      expect(result).toBeNull()
-      expect(findCalls('whatsapp_link_codes', 'update')).toHaveLength(0)
-    })
-
-    it('rejects an already-used code (single use)', async () => {
-      const { supabase, enqueue, findCalls } = createQueuedMockSupabase()
-      enqueue({
-        data: {
-          id: 'code-1',
-          user_id: 'user-1',
-          expires_at: futureExpiry(),
-          used_at: new Date().toISOString(),
-        },
-      })
-
-      const result = await consumeLinkCode(supabase as unknown as SupabaseClient, 'AC-7KP4QF')
-      expect(result).toBeNull()
-      expect(findCalls('whatsapp_link_codes', 'update')).toHaveLength(0)
-    })
-
-    it('loses the claim race gracefully', async () => {
+  describe('consumeLinkCodeAndCreatePhoneLink', () => {
+    it('delegates consumption and replacement to one atomic RPC', async () => {
       const { supabase, enqueue } = createQueuedMockSupabase()
-      enqueue({ data: { id: 'code-1', user_id: 'user-1', expires_at: futureExpiry(), used_at: null } })
-      enqueue({ data: null }) // guarded update matched no row: someone else won
+      enqueue({
+        data: {
+          ok: true,
+          link: { id: 'link-1', user_id: 'user-1' },
+          conversation_id: 'conversation-1',
+        },
+      })
 
-      const result = await consumeLinkCode(supabase as unknown as SupabaseClient, 'AC-7KP4QF')
-      expect(result).toBeNull()
+      const result = await consumeLinkCodeAndCreatePhoneLink(
+        supabase as unknown as SupabaseClient,
+        { rawText: 'ac-7kp4qf', phone: '+46701234567', profileName: 'Anna' },
+      )
+
+      expect(result).toMatchObject({
+        userId: 'user-1',
+        conversationId: 'conversation-1',
+        link: { id: 'link-1' },
+      })
+      expect(supabase.rpc).toHaveBeenCalledWith(
+        'consume_whatsapp_code_and_create_link',
+        expect.objectContaining({
+          p_code_hash: hashLinkCode('AC-7KP4QF'),
+          p_profile_name: 'Anna',
+        }),
+      )
     })
 
-    it('rejects unknown codes without touching anything', async () => {
-      const { supabase, enqueue, findCalls } = createQueuedMockSupabase()
-      enqueue({ data: null })
-      const result = await consumeLinkCode(supabase as unknown as SupabaseClient, 'AC-7KP4QF')
-      expect(result).toBeNull()
-      expect(findCalls('whatsapp_link_codes', 'update')).toHaveLength(0)
-    })
+    it('returns null for rejected codes and skips malformed text', async () => {
+      const { supabase, enqueue } = createQueuedMockSupabase()
+      enqueue({ data: { ok: false } })
 
-    it('short-circuits on non-code text without any DB call', async () => {
-      const { supabase, calls } = createQueuedMockSupabase()
-      const result = await consumeLinkCode(supabase as unknown as SupabaseClient, 'hej!')
-      expect(result).toBeNull()
-      expect(calls).toHaveLength(0)
+      await expect(
+        consumeLinkCodeAndCreatePhoneLink(
+          supabase as unknown as SupabaseClient,
+          { rawText: 'AC-7KP4QF', phone: '+46701234567' },
+        ),
+      ).resolves.toBeNull()
+      await expect(
+        consumeLinkCodeAndCreatePhoneLink(
+          supabase as unknown as SupabaseClient,
+          { rawText: 'hej!', phone: '+46701234567' },
+        ),
+      ).resolves.toBeNull()
+      expect(supabase.rpc).toHaveBeenCalledTimes(1)
     })
   })
 })

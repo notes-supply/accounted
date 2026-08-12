@@ -166,6 +166,33 @@ describe('advanceAndBookSalaryRun', () => {
       expect.objectContaining({ type: 'salary_run.booked' }),
     )
   })
+
+  it('books a mileage-only payout instead of treating it as nollkörning', async () => {
+    const { supabase, enqueueMany } = createQueuedMockSupabase()
+    enqueueMany([
+      {
+        data: makeRun({
+          status: 'paid',
+          total_gross: 0,
+          total_tax: 0,
+          total_net: 250,
+          total_avgifter: 0,
+        }),
+      },
+      {
+        data: [
+          makeSre({ gross_salary: 0, tax_withheld: 0, net_salary: 250, avgifter_amount: 0 }),
+        ],
+      },
+      { data: { id: 'run-1', status: 'booked' } },
+    ])
+
+    const result = await advanceAndBookSalaryRun(supabase as never, ARGS)
+
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.data.nollkorning).toBe(false)
+    expect(createSalaryRunEntries).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('bookPaidSalaryRun', () => {

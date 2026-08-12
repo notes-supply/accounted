@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import {
   calculateSalary,
   calculateKarensavdrag,
@@ -222,6 +222,38 @@ describe('calculateSalary', () => {
 
     expect(result.grossSalary).toBe(45000) // 40000 + 5000
     expect(result.taxWithheld).toBe(13500) // 30% of 45000
+  })
+
+  it('pays tax-free mileage without making it taxable salary or avgift basis', () => {
+    const result = calculateSalary(
+      makeBasicInput({
+        monthlySalary: 0,
+        vacationRule: 'none',
+        lineItems: [
+          {
+            itemType: 'mileage_taxfree',
+            amount: 250,
+            isTaxable: false,
+            isAvgiftBasis: false,
+            isVacationBasis: false,
+            isGrossDeduction: false,
+            isNetDeduction: false,
+          },
+        ],
+      }),
+      config2026,
+      emptyTaxRates,
+    )
+
+    expect(result).toMatchObject({
+      grossSalary: 0,
+      taxableIncome: 0,
+      taxWithheld: 0,
+      netSalary: 250,
+      avgifterBasis: 0,
+      avgifterAmount: 0,
+      totalEmployerCost: 250,
+    })
   })
 
   it('applies gross deductions before tax', () => {

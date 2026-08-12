@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { randomUUID } from 'node:crypto'
 import { insertPostedJournalEntry, seedCompany } from '@/tests/pg/fixtures'
 import { getPool, withUserContext } from '@/tests/pg/setup'
 
@@ -15,26 +16,56 @@ import { getPool, withUserContext } from '@/tests/pg/setup'
 async function insertTrip(params: {
   companyId: string
   userId: string
+  employeeId?: string | null
   status?: 'draft' | 'booked'
   odometerStart?: number | null
   odometerEnd?: number | null
 }): Promise<string> {
   const res = await getPool().query<{ id: string }>(
     `INSERT INTO public.mileage_trips
-       (company_id, user_id, trip_date, distance_km, from_location,
+       (company_id, user_id, employee_id, trip_date, distance_km, from_location,
         to_location, purpose, status, odometer_start, odometer_end)
-     VALUES ($1, $2, '2026-05-10', 32.3, 'Kontoret', 'Kunden', 'Kundbesök',
-             $3, $4, $5)
+     VALUES ($1, $2, $3, '2026-05-10', 32.3, 'Kontoret', 'Kunden', 'Kundbesök',
+             $4, $5, $6)
      RETURNING id`,
     [
       params.companyId,
       params.userId,
+      params.employeeId ?? null,
       params.status ?? 'draft',
       params.odometerStart ?? null,
       params.odometerEnd ?? null,
     ],
   )
   return res.rows[0].id
+}
+
+async function seedDraftSalaryClaim() {
+  const { userId, companyId } = await seedCompany()
+  const employeeId = randomUUID()
+  await getPool().query(
+    `INSERT INTO public.employees
+       (id, company_id, user_id, first_name, last_name, personnummer,
+        personnummer_last4, employment_start)
+     VALUES ($1, $2, $3, 'Mila', 'Testsson', 'enc-payload', '1234', '2026-01-01')`,
+    [employeeId, companyId, userId],
+  )
+  const run = await getPool().query<{ id: string }>(
+    `INSERT INTO public.salary_runs
+       (company_id, user_id, period_year, period_month, payment_date)
+     VALUES ($1, $2, 2026, 5, '2026-05-25') RETURNING id`,
+    [companyId, userId],
+  )
+  const runId = run.rows[0].id
+  const sre = await getPool().query<{ id: string }>(
+    `INSERT INTO public.salary_run_employees
+       (salary_run_id, employee_id, company_id, employment_degree,
+        monthly_salary, salary_type)
+     VALUES ($1, $2, $3, 100, 0, 'monthly') RETURNING id`,
+    [runId, employeeId, companyId],
+  )
+  const tripId = await insertTrip({ companyId, userId, employeeId })
+  return { userId, companyId, employeeId, runId, sreId: sre.rows[0].id, tripId }
 }
 
 describe('mileage_trips RLS', () => {
@@ -154,6 +185,133 @@ describe('mileage_trips booked immutability (20260807113215)', () => {
     await expect(
       getPool().query(`UPDATE public.mileage_trips SET status = 'draft' WHERE id = $1`, [tripId]),
     ).rejects.toThrow(/linked to a verifikat/)
+  })
+})
+
+describe('mileage salary-claim lifecycle (20260812090000)', () => {
+  async function claim(seed: Awaited<ReturnType<typeof seedDraftSalaryClaim>>) {
+    await withUserContext(
+      seed.userId,
+      (client) =>
+        client.query(
+          `SELECT public.claim_mileage_trips_for_salary_run(
+             $1::uuid, $2::uuid, $3::uuid, $4::uuid[], $5::jsonb
+           )`,
+          [
+            seed.companyId,
+            seed.runId,
+            seed.employeeId,
+            [seed.tripId],
+            JSON.stringify([
+              {
+                description: 'Milersättning egen bil',
+                quantity: 3.23,
+                unit_price: 25,
+                amount: 80.75,
+                sort_order: 300,
+                trip_ids: [seed.tripId],
+              },
+            ]),
+          ],
+        ),
+      { commit: true },
+    )
+  }
+
+  it('releases exact claims atomically for line and employee deletion', async () => {
+    for (const kind of ['line', 'employee'] as const) {
+      const seed = await seedDraftSalaryClaim()
+      await claim(seed)
+
+      const claimed = await getPool().query<{
+        status: string
+        salary_line_item_id: string | null
+      }>(
+        `SELECT status, salary_line_item_id
+         FROM public.mileage_trips WHERE id = $1`,
+        [seed.tripId],
+      )
+      const lineId = claimed.rows[0].salary_line_item_id
+      expect(claimed.rows[0].status).toBe('booked')
+      expect(lineId).toBeTruthy()
+
+      await expect(
+        getPool().query(`DELETE FROM public.salary_line_items WHERE id = $1`, [lineId]),
+      ).rejects.toThrow()
+
+      const targetId = kind === 'line' ? lineId : seed.sreId
+      await withUserContext(
+        seed.userId,
+        async (client) => {
+          const deleted = await client.query<{ deleted: boolean }>(
+            `SELECT public.delete_salary_draft_object_with_mileage_release(
+               $1::uuid, $2::uuid, $3::text, $4::uuid
+             ) AS deleted`,
+            [seed.companyId, seed.runId, kind, targetId],
+          )
+          expect(deleted.rows[0].deleted).toBe(true)
+        },
+        { commit: true },
+      )
+
+      const released = await getPool().query<{
+        status: string
+        salary_run_id: string | null
+        salary_line_item_id: string | null
+      }>(
+        `SELECT status, salary_run_id, salary_line_item_id
+         FROM public.mileage_trips WHERE id = $1`,
+        [seed.tripId],
+      )
+      expect(released.rows[0]).toEqual({
+        status: 'draft',
+        salary_run_id: null,
+        salary_line_item_id: null,
+      })
+    }
+  })
+
+  it('blocks ambiguous legacy partial deletion and lets whole-run deletion release it', async () => {
+    const seed = await seedDraftSalaryClaim()
+    await getPool().query(
+      `UPDATE public.mileage_trips
+       SET status = 'booked', salary_run_id = $2
+       WHERE id = $1`,
+      [seed.tripId, seed.runId],
+    )
+
+    await expect(
+      getPool().query(`DELETE FROM public.salary_run_employees WHERE id = $1`, [seed.sreId]),
+    ).rejects.toThrow(/atomic mileage-release command/)
+
+    await withUserContext(
+      seed.userId,
+      async (client) => {
+        const deleted = await client.query<{ deleted: boolean }>(
+          `SELECT public.delete_salary_draft_object_with_mileage_release(
+             $1::uuid, $2::uuid, 'run', $2::uuid
+           ) AS deleted`,
+          [seed.companyId, seed.runId],
+        )
+        expect(deleted.rows[0].deleted).toBe(true)
+      },
+      { commit: true },
+    )
+
+    const released = await getPool().query<{
+      status: string
+      salary_run_id: string | null
+      salary_line_item_id: string | null
+    }>(
+      `SELECT status, salary_run_id, salary_line_item_id
+       FROM public.mileage_trips WHERE id = $1`,
+      [seed.tripId],
+    )
+    expect(released.rows[0]).toEqual({
+      status: 'draft',
+      salary_run_id: null,
+      salary_line_item_id: null,
+    })
   })
 })
 

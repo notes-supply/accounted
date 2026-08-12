@@ -117,96 +117,50 @@ export async function mintLinkCode(
   return { code, expiresAt }
 }
 
-/**
- * Verify + consume a code from an inbound chat message. Returns the owning
- * user id, or null for unknown/expired/already-used codes. Single-use is
- * enforced by the guarded UPDATE (used_at IS NULL): a concurrent redelivery
- * loses the race and gets null.
- */
-export async function consumeLinkCode(
-  serviceClient: SupabaseClient,
-  rawText: string,
-): Promise<{ userId: string } | null> {
-  const code = normalizeLinkCode(rawText)
-  if (!code) return null
-
-  const { data: row } = await serviceClient
-    .from('whatsapp_link_codes')
-    .select('id, user_id, expires_at, used_at')
-    .eq('code_hash', hashLinkCode(code))
-    .maybeSingle()
-
-  if (!row || row.used_at) return null
-  if (new Date(row.expires_at).getTime() < Date.now()) return null
-
-  const { data: claimed } = await serviceClient
-    .from('whatsapp_link_codes')
-    .update({ used_at: new Date().toISOString() })
-    .eq('id', row.id)
-    .is('used_at', null)
-    .select('id')
-    .maybeSingle()
-
-  if (!claimed) return null
-  return { userId: row.user_id }
-}
-
 export interface CreatedPhoneLink {
   link: WhatsAppPhoneLink
   conversationId: string | null
 }
 
 /**
- * Bind a verified phone to a user: revoke whatever active links stand in the
- * way of the two partial-unique indexes (same phone bound elsewhere, or the
- * user re-linking from a new phone), then insert the link + its conversation
- * row. Revocation-not-deletion keeps the trail auditable.
+ * Consume a one-time code and replace conflicting phone links in one database
+ * transaction. A failed link or conversation insert leaves both the code and
+ * the previous active link untouched.
  */
-export async function createPhoneLink(
+export async function consumeLinkCodeAndCreatePhoneLink(
   serviceClient: SupabaseClient,
-  args: { userId: string; phone: string; profileName?: string | null },
-): Promise<CreatedPhoneLink> {
-  const phoneHash = hashPhone(args.phone)
-  const now = new Date().toISOString()
+  args: { rawText: string; phone: string; profileName?: string | null },
+): Promise<(CreatedPhoneLink & { userId: string }) | null> {
+  const code = normalizeLinkCode(args.rawText)
+  if (!code) return null
 
-  await serviceClient
-    .from('whatsapp_phone_links')
-    .update({ revoked_at: now })
-    .eq('phone_hash', phoneHash)
-    .is('revoked_at', null)
-  await serviceClient
-    .from('whatsapp_phone_links')
-    .update({ revoked_at: now })
-    .eq('user_id', args.userId)
-    .is('revoked_at', null)
+  const lastMessageAt = new Date().toISOString()
+  const { data, error } = await serviceClient.rpc(
+    'consume_whatsapp_code_and_create_link',
+    {
+      p_code_hash: hashLinkCode(code),
+      p_phone_hash: hashPhone(args.phone),
+      p_phone_enc: encryptPhone(args.phone),
+      p_phone_masked: maskPhone(args.phone),
+      p_profile_name: args.profileName ?? null,
+      p_last_message_at: lastMessageAt,
+      p_service_window_expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+    },
+  )
+  if (error) throw new Error(`Failed to create phone link: ${error.message}`)
 
-  const { data: link, error } = await serviceClient
-    .from('whatsapp_phone_links')
-    .insert({
-      user_id: args.userId,
-      phone_hash: phoneHash,
-      phone_enc: encryptPhone(args.phone),
-      phone_masked: maskPhone(args.phone),
-      wa_profile_name: args.profileName?.slice(0, 200) ?? null,
-      last_message_at: now,
-    })
-    .select('*')
-    .single()
-  if (error || !link) {
-    throw new Error(`Failed to create phone link: ${error?.message ?? 'no row returned'}`)
+  const result = data as {
+    ok?: boolean
+    link?: WhatsAppPhoneLink
+    conversation_id?: string
+  } | null
+  if (!result?.ok || !result.link) return null
+
+  return {
+    userId: result.link.user_id,
+    link: result.link,
+    conversationId: result.conversation_id ?? null,
   }
-
-  const { data: conversation } = await serviceClient
-    .from('whatsapp_conversations')
-    .insert({
-      phone_link_id: link.id,
-      last_inbound_at: now,
-      service_window_expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-    })
-    .select('id')
-    .maybeSingle()
-
-  return { link: link as WhatsAppPhoneLink, conversationId: conversation?.id ?? null }
 }
 
 /** Active (non-revoked) link for a phone hash, or null. */

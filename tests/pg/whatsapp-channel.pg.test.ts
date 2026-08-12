@@ -1,12 +1,13 @@
 import { randomUUID, createHash } from 'node:crypto'
 import { describe, it, expect, beforeAll } from 'vitest'
-import { getPool, withUserContext } from './setup'
+import { getPool, runAsServiceRole, withUserContext } from './setup'
 import { seedCompany, insertAuthUser } from './fixtures'
 
 // Migrations under test: 20260802090000 (phone links + link codes),
 // 20260802091000 (conversations + messages + sender quota RPC),
 // 20260802092000 (inbox source CHECK widening + channel_context),
-// 20260802210000 (acked_at combined-ack marker).
+// 20260802210000 (acked_at combined-ack marker), and 20260812090000
+// (atomic one-time-code consumption + phone-link replacement).
 
 function hash(value: string): string {
   return createHash('sha256').update(value).digest('hex')
@@ -137,6 +138,72 @@ describe('whatsapp_link_codes / conversations / messages are service-role only',
         expect(res.rows[0].n).toBe(0)
       }
     })
+  })
+})
+
+describe('atomic WhatsApp link replacement (20260812090000)', () => {
+  it('rolls back code consumption and revocation when replacement creation fails', async () => {
+    const userId = await insertAuthUser()
+    const oldLinkId = await insertPhoneLink({ userId })
+    const codeHash = hash(`code-${randomUUID()}`)
+    const phoneHash = hash(`phone-${randomUUID()}`)
+    await getPool().query(
+      `INSERT INTO public.whatsapp_link_codes (user_id, code_hash, expires_at)
+       VALUES ($1, $2, now() + interval '10 minutes')`,
+      [userId, codeHash],
+    )
+
+    await expect(
+      runAsServiceRole((client) =>
+        client.query(
+          `SELECT public.consume_whatsapp_code_and_create_link(
+             $1, $2, NULL::text, '+46 70 *** ** 67', 'Anna', now(), now() + interval '24 hours'
+           )`,
+          [codeHash, phoneHash],
+        ),
+      ),
+    ).rejects.toThrow(/phone_enc|null value/i)
+
+    const afterFailure = await getPool().query<{
+      used_at: Date | null
+      revoked_at: Date | null
+    }>(
+      `SELECT c.used_at, l.revoked_at
+       FROM public.whatsapp_link_codes AS c
+       JOIN public.whatsapp_phone_links AS l ON l.id = $2
+       WHERE c.code_hash = $1`,
+      [codeHash, oldLinkId],
+    )
+    expect(afterFailure.rows[0]).toEqual({ used_at: null, revoked_at: null })
+
+    const completed = await runAsServiceRole((client) =>
+      client.query<{ result: { ok: boolean; link: { id: string }; conversation_id: string } }>(
+        `SELECT public.consume_whatsapp_code_and_create_link(
+           $1, $2, 'encrypted-phone', '+46 70 *** ** 67', 'Anna', now(), now() + interval '24 hours'
+         ) AS result`,
+        [codeHash, phoneHash],
+      ),
+    )
+    expect(completed.rows[0].result.ok).toBe(true)
+    expect(completed.rows[0].result.link.id).toBeTruthy()
+    expect(completed.rows[0].result.conversation_id).toBeTruthy()
+
+    const finalState = await getPool().query<{
+      used: boolean
+      old_revoked: boolean
+      active_links: number
+    }>(
+      `SELECT
+         c.used_at IS NOT NULL AS used,
+         old.revoked_at IS NOT NULL AS old_revoked,
+         (SELECT count(*)::int FROM public.whatsapp_phone_links
+          WHERE user_id = c.user_id AND revoked_at IS NULL) AS active_links
+       FROM public.whatsapp_link_codes AS c
+       JOIN public.whatsapp_phone_links AS old ON old.id = $2
+       WHERE c.code_hash = $1`,
+      [codeHash, oldLinkId],
+    )
+    expect(finalState.rows[0]).toEqual({ used: true, old_revoked: true, active_links: 1 })
   })
 })
 
