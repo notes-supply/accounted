@@ -111,7 +111,12 @@ export function mapWintAccountForSie(raw: Record<string, unknown>): WintSieAccou
 }
 
 function fmtAmount(value: number): string {
-  return round2(value).toFixed(2);
+  const minorUnits = Math.round(value * 100);
+  const sign = minorUnits < 0 ? '-' : '';
+  const absoluteMinorUnits = Math.abs(minorUnits);
+  const majorUnits = Math.floor(absoluteMinorUnits / 100);
+  const remainder = String(absoluteMinorUnits % 100).padStart(2, '0');
+  return `${sign}${majorUnits}.${remainder}`;
 }
 
 function fmtDate(isoDate: string): string {

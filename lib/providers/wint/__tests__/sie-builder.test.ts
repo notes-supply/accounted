@@ -81,6 +81,22 @@ describe('buildWintSieFile', () => {
     }
   });
 
+  it('renders signed amounts from integer minor units', () => {
+    const content = buildWintSieFile({
+      ...BASE_OPTIONS,
+      vouchers: [voucher({
+        transactions: [
+          { accountNumber: '1930', amount: 10.05 },
+          { accountNumber: '3010', amount: -10.05 },
+        ],
+      })],
+      ibByAccount: new Map(),
+    });
+
+    expect(content).toContain('#TRANS 1930 {} 10.05');
+    expect(content).toContain('#TRANS 3010 {} -10.05');
+  });
+
   it('renders IB/UB for balance accounts and RES for result accounts', () => {
     const content = buildWintSieFile(BASE_OPTIONS);
 
