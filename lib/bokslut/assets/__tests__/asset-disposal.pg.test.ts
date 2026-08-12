@@ -6,7 +6,7 @@ import { seedCompany } from '@/tests/pg/fixtures'
 describe('commit_asset_disposal (pg-real)', () => {
   it('is executable only by the service role', async () => {
     const signature =
-      'public.commit_asset_disposal(uuid,uuid,uuid,uuid,text,date,numeric,numeric,text,numeric,numeric,text,integer,integer,numeric,numeric,numeric,text,text)'
+      'public.commit_asset_disposal(uuid,uuid,timestamptz,uuid,uuid,text,date,numeric,numeric,text,numeric,numeric,text,integer,integer,numeric,numeric,numeric,text,text)'
     const { rows } = await getPool().query<{
       public_exec: boolean
       anon_exec: boolean
@@ -93,17 +93,25 @@ describe('commit_asset_disposal (pg-real)', () => {
     fiscalPeriodId: string
     disposalType?: string
     currentDepreciation?: number
+    expectedAssetUpdatedAt?: string
   }) {
+    const assetVersion = args.expectedAssetUpdatedAt ?? (
+      await getPool().query<{ updated_at: string }>(
+        `SELECT updated_at::text FROM public.assets WHERE id = $1`,
+        [args.assetId],
+      )
+    ).rows[0].updated_at
     return getPool().query(
       `SELECT * FROM public.commit_asset_disposal(
-         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::text,
+         $1::uuid, $2::uuid, $3::timestamptz, $4::uuid, $5::uuid, $6::text,
          '2026-06-30'::date, 80000::numeric, 0::numeric, 'exempt'::text,
-         $6::numeric, 0::numeric, 'none'::text, 4::integer, 5::integer,
+         $7::numeric, 0::numeric, 'none'::text, 4::integer, 5::integer,
          0::numeric, 0::numeric, 0::numeric, NULL::text, NULL::text
        )`,
       [
         args.companyId,
         args.assetId,
+        assetVersion,
         args.entryId,
         args.fiscalPeriodId,
         args.disposalType ?? 'sale',
@@ -115,16 +123,22 @@ describe('commit_asset_disposal (pg-real)', () => {
   it('requires a voucher for a financially material disposal', async () => {
     const { userId, companyId, fiscalPeriodId } = await seedCompany()
     const assetId = await insertAsset(userId, companyId)
+    const assetVersion = (
+      await getPool().query<{ updated_at: string }>(
+        `SELECT updated_at::text FROM public.assets WHERE id = $1`,
+        [assetId],
+      )
+    ).rows[0].updated_at
 
     await expect(
       getPool().query(
         `SELECT * FROM public.commit_asset_disposal(
-           $1::uuid, $2::uuid, NULL::uuid, $3::uuid, 'sale'::text,
+           $1::uuid, $2::uuid, $3::timestamptz, NULL::uuid, $4::uuid, 'sale'::text,
            '2026-06-30'::date, 80000::numeric, 0::numeric, 'exempt'::text,
            0::numeric, 0::numeric, 'none'::text, 4::integer, 5::integer,
            0::numeric, 0::numeric, 0::numeric, NULL::text, NULL::text
          )`,
-        [companyId, assetId, fiscalPeriodId],
+        [companyId, assetId, assetVersion, fiscalPeriodId],
       ),
     ).rejects.toThrow(/requires a disposal voucher/)
 
@@ -181,6 +195,53 @@ describe('commit_asset_disposal (pg-real)', () => {
     await expect(
       getPool().query(`UPDATE public.assets SET notes = 'Audit note' WHERE id = $1`, [assetId]),
     ).resolves.toBeDefined()
+  })
+
+  it('rejects a stale asset version before posting the disposal voucher', async () => {
+    const { userId, companyId, fiscalPeriodId } = await seedCompany()
+    const assetId = await insertAsset(userId, companyId)
+    const originalVersion = (
+      await getPool().query<{ updated_at: string }>(
+        `SELECT updated_at::text FROM public.assets WHERE id = $1`,
+        [assetId],
+      )
+    ).rows[0].updated_at
+    const entryId = await insertDraft({
+      userId,
+      companyId,
+      fiscalPeriodId,
+      debitLines: [['1930', 80_000], ['7973', 20_000]],
+      creditLines: [['1220', 100_000]],
+    })
+
+    await getPool().query(
+      `UPDATE public.assets
+          SET acquisition_cost = 110000,
+              updated_at = updated_at + interval '1 second'
+        WHERE id = $1`,
+      [assetId],
+    )
+
+    await expect(
+      commit({
+        companyId,
+        assetId,
+        entryId,
+        fiscalPeriodId,
+        expectedAssetUpdatedAt: originalVersion,
+      }),
+    ).rejects.toThrow(/changed after disposal planning/)
+
+    const entry = await getPool().query(
+      `SELECT status, voucher_number FROM public.journal_entries WHERE id = $1`,
+      [entryId],
+    )
+    const asset = await getPool().query(
+      `SELECT disposed_at FROM public.assets WHERE id = $1`,
+      [assetId],
+    )
+    expect(entry.rows[0]).toMatchObject({ status: 'draft', voucher_number: 0 })
+    expect(asset.rows[0].disposed_at).toBeNull()
   })
 
   it('rolls the voucher commit back when the register update fails', async () => {

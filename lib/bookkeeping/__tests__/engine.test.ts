@@ -144,6 +144,7 @@ describe('commitAssetDisposal', () => {
       'entry-1',
       {
         asset_id: 'asset-1',
+        expected_asset_updated_at: '2026-06-01T12:00:00Z',
         fiscal_period_id: 'period-1',
         disposal_type: 'sale',
         disposed_at: '2026-06-30',
@@ -167,6 +168,13 @@ describe('commitAssetDisposal', () => {
       voucherNumber: 42,
       cause: 'connection reset',
     } satisfies Partial<PostCommitReadbackError>)
+    expect(supabase.rpc).toHaveBeenCalledWith(
+      'commit_asset_disposal',
+      expect.objectContaining({
+        p_asset_id: 'asset-1',
+        p_expected_asset_updated_at: '2026-06-01T12:00:00Z',
+      }),
+    )
     expect(single).toHaveBeenCalledTimes(2)
   })
 })

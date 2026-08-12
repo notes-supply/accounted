@@ -894,6 +894,7 @@ export async function disposeAsset(
       draft?.id ?? null,
       {
         asset_id: assetId,
+        expected_asset_updated_at: asset.updated_at,
         fiscal_period_id: input.fiscal_period_id,
         disposal_type: input.disposal_type,
         disposed_at: input.disposed_at,
