@@ -14,6 +14,7 @@ import {
 } from '../errors'
 import type { CreateJournalEntryLineInput, JournalEntryStatus } from '@/types'
 import { eventBus } from '@/lib/events'
+import { kickWebhookDispatch } from '@/lib/webhooks/dispatch-kick'
 
 const SUPPLIER_EVENT_PUBLICATION = {
   status: 'published',
@@ -45,6 +46,10 @@ function createMockChain(overrides: Record<string, unknown> = {}) {
 // Mock event bus
 vi.mock('@/lib/events', () => ({
   eventBus: { emit: vi.fn().mockResolvedValue([]) },
+}))
+
+vi.mock('@/lib/webhooks/dispatch-kick', () => ({
+  kickWebhookDispatch: vi.fn(),
 }))
 
 // Mock the on-demand BAS backfill, default: nothing seedable. Individual
@@ -829,6 +834,7 @@ describe('reverseEntry: storno guard', () => {
     }
 
     vi.mocked(eventBus.emit).mockClear()
+    vi.mocked(kickWebhookDispatch).mockClear()
     const result = await reverseEntry(
       supabase as never,
       'company-1',
@@ -845,6 +851,7 @@ describe('reverseEntry: storno guard', () => {
     })
     expect(inserts).toEqual([])
     expect(eventBus.emit).not.toHaveBeenCalled()
+    expect(kickWebhookDispatch).toHaveBeenCalledTimes(1)
   })
 
   it('does not recover an arbitrary allocation-less manual reversal', async () => {

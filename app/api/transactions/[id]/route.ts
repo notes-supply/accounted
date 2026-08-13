@@ -102,6 +102,20 @@ export async function DELETE(
     // message (match or ignore instead) rather than a bare 500.
     const code = (deleteError as { code?: string }).code
     const message = (deleteError as { message?: string }).message ?? ''
+    if (/supplier invoice payment allocation fields are immutable/i.test(message)) {
+      return NextResponse.json(
+        {
+          error: {
+            code: 'TRANSACTION_DELETE_RETAINED_SUPPLIER_PAYMENT',
+            message:
+              'Transaktionen ingår i bevarad historik för en leverantörsbetalning och kan inte raderas.',
+            message_en:
+              'The transaction is retained as part of supplier-payment history and cannot be deleted.',
+          },
+        },
+        { status: 409 }
+      )
+    }
     if (code === 'P0001' || /Audit log entries cannot be modified or deleted/i.test(message)) {
       return NextResponse.json(
         {

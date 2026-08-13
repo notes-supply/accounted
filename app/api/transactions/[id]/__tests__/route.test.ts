@@ -181,6 +181,26 @@ describe('DELETE /api/transactions/[id]', () => {
     expect(body.error.code).toBe('TRANSACTION_DELETE_HAS_AUDIT_TRAIL')
     expect(body.error.message).toMatch(/matchningshistorik|Bankavstämning/)
   })
+
+  it('returns a specific 409 when retained supplier-payment history blocks deletion', async () => {
+    const tx = makeTransaction({ journal_entry_id: null, bank_connection_id: null, import_source: 'manual' })
+    enqueue({ data: tx, error: null }) // fetch
+    enqueue({
+      data: null,
+      error: {
+        code: 'P0001',
+        message: 'supplier invoice payment allocation fields are immutable',
+      },
+    }) // retained allocation blocks ON DELETE SET NULL
+
+    const request = new Request('http://localhost/api/transactions/tx-1', { method: 'DELETE' })
+    const response = await DELETE(request, createMockRouteParams({ id: 'tx-1' }))
+    const { status, body } = await parseJsonResponse<{ error: { code: string; message: string } }>(response)
+
+    expect(status).toBe(409)
+    expect(body.error.code).toBe('TRANSACTION_DELETE_RETAINED_SUPPLIER_PAYMENT')
+    expect(body.error.message).toMatch(/bevarad historik/i)
+  })
 })
 
 describe('PATCH /api/transactions/[id] (edit title)', () => {
