@@ -4,12 +4,13 @@ import { withRouteContext } from '@/lib/api/with-route-context'
 import { validateBody } from '@/lib/api/validate'
 import { BookMileagePeriodSchema } from '@/lib/api/schemas'
 import { bookMileagePeriod } from '@/lib/mileage/mileage-service'
+import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 
 ensureInitialized()
 
 export const POST = withRouteContext(
   'mileage.book',
-  async (request, { supabase, companyId, user, log }) => {
+  async (request, { supabase, companyId, user, log, requestId }) => {
     const validation = await validateBody(request, BookMileagePeriodSchema)
     if (!validation.success) return validation.response
     const body = validation.data
@@ -54,14 +55,14 @@ export const POST = withRouteContext(
             releasedTripIds: result.releasedTripIds,
             detail: result.detail,
           })
-          return NextResponse.json(
-            {
-              error:
-                'Resorna kunde inte återställas efter en avbruten bokning. Försök inte igen innan körjournalen har kontrollerats.',
-              code: result.code,
-            },
-            { status: 500 }
-          )
+          return errorResponseFromCode(result.code, log, {
+            requestId,
+            status: 500,
+            messageSv:
+              'Resorna kunde inte återställas efter en avbruten bokning. Försök inte igen innan körjournalen har kontrollerats.',
+            messageEn:
+              'The trips could not be released after an aborted booking. Do not retry until the mileage log has been reviewed.',
+          })
         case 'POST_COMMIT_UNCERTAIN':
           log.error('mileage voucher outcome requires recovery', undefined, {
             operation: 'mileage.book',
@@ -70,16 +71,18 @@ export const POST = withRouteContext(
             entityId: result.journalEntryId,
             voucherNumber: result.voucherNumber,
           })
-          return NextResponse.json(
-            {
-              error:
-                'Verifikatet kan ha bokförts, men resultatet kunde inte bekräftas. Försök inte igen innan verifikatet och körjournalen har kontrollerats.',
-              code: result.code,
+          return errorResponseFromCode(result.code, log, {
+            requestId,
+            status: 500,
+            messageSv:
+              'Verifikatet kan ha bokförts, men resultatet kunde inte bekräftas. Försök inte igen innan verifikatet och körjournalen har kontrollerats.',
+            messageEn:
+              'The voucher may have been posted, but the outcome could not be confirmed. Do not retry until the voucher and mileage log have been reviewed.',
+            details: {
               journal_entry_id: result.journalEntryId,
               voucher_number: result.voucherNumber,
             },
-            { status: 500 }
-          )
+          })
         case 'STAMP_FAILED':
           log.error('mileage stamp failed after verifikat creation', undefined, {
             operation: 'mileage.book',
@@ -88,17 +91,19 @@ export const POST = withRouteContext(
             entityId: result.journalEntryId,
             voucherNumber: result.voucherNumber,
           })
-          return NextResponse.json(
-            {
-              error:
-                'Verifikatet skapades men alla resor kunde inte markeras som bokförda. Kontrollera körjournalen innan du bokför perioden igen.',
-              code: result.code,
+          return errorResponseFromCode(result.code, log, {
+            requestId,
+            status: 500,
+            messageSv:
+              'Verifikatet skapades men alla resor kunde inte markeras som bokförda. Kontrollera körjournalen innan du bokför perioden igen.',
+            messageEn:
+              'The voucher was created, but not every trip could be marked as posted. Review the mileage log before booking the period again.',
+            details: {
               journal_entry_id: result.journalEntryId,
               voucher_series: result.voucherSeries,
               voucher_number: result.voucherNumber,
             },
-            { status: 500 }
-          )
+          })
       }
       const unhandledResult: never = result
       throw new Error(`Unhandled mileage booking result: ${String(unhandledResult)}`)

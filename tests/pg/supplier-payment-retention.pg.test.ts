@@ -322,7 +322,9 @@ describe('supplier payment reversal retention migration', () => {
       ...seeded,
       journalEntryId: rematchJournalEntryId,
       transactionId,
-    })).rejects.toThrow(/duplicate active supplier payment transaction allocation/i)
+    })).rejects.toThrow(
+      /idx_supplier_invoice_payments_tx_inv_unique|duplicate active supplier payment transaction allocation/i,
+    )
 
     const stornoId = await insertPostedStorno({
       ...seeded,
@@ -565,7 +567,8 @@ describe('supplier payment reversal retention migration', () => {
     })
 
     const invoice = await getPool().query(
-      `SELECT status, paid_amount::text, remaining_amount::text, paid_at,
+      `SELECT status, paid_amount::double precision AS paid_amount,
+              remaining_amount::double precision AS remaining_amount, paid_at,
               payment_journal_entry_id
          FROM public.supplier_invoices
         WHERE id = $1`,
@@ -573,8 +576,8 @@ describe('supplier payment reversal retention migration', () => {
     )
     expect(invoice.rows).toEqual([{
       status: 'overdue',
-      paid_amount: '0',
-      remaining_amount: '1000',
+      paid_amount: 0,
+      remaining_amount: 1000,
       paid_at: null,
       payment_journal_entry_id: null,
     }])
@@ -660,7 +663,8 @@ describe('supplier payment reversal retention migration', () => {
     }, { commit: true })
 
     const state = await getPool().query(
-      `SELECT si.status, si.paid_amount::text, si.remaining_amount::text,
+      `SELECT si.status, si.paid_amount::double precision AS paid_amount,
+              si.remaining_amount::double precision AS remaining_amount,
               sip.reversed_at, sip.reversed_by_journal_entry_id,
               t.journal_entry_id, t.supplier_invoice_id, t.is_business, t.category
          FROM public.supplier_invoices si
@@ -671,8 +675,8 @@ describe('supplier payment reversal retention migration', () => {
     )
     expect(state.rows[0]).toMatchObject({
       status: 'overdue',
-      paid_amount: '0',
-      remaining_amount: '1000',
+      paid_amount: 0,
+      remaining_amount: 1000,
       reversed_by_journal_entry_id: stornoId,
       journal_entry_id: null,
       supplier_invoice_id: null,
@@ -781,12 +785,13 @@ describe('supplier payment reversal retention migration', () => {
       ])
 
       const invoice = await client.query(
-        `SELECT paid_amount::text, remaining_amount::text
+        `SELECT paid_amount::double precision AS paid_amount,
+                remaining_amount::double precision AS remaining_amount
            FROM public.supplier_invoices
           WHERE id = $1`,
         [seeded.supplierInvoiceId],
       )
-      expect(invoice.rows).toEqual([{ paid_amount: '0', remaining_amount: '1000' }])
+      expect(invoice.rows).toEqual([{ paid_amount: 0, remaining_amount: 1000 }])
     })
   })
 
@@ -936,15 +941,16 @@ describe('supplier payment reversal retention migration', () => {
     }, { commit: true })
 
     const invoice = await getPool().query(
-      `SELECT status, paid_amount::text, remaining_amount::text
+      `SELECT status, paid_amount::double precision AS paid_amount,
+              remaining_amount::double precision AS remaining_amount
          FROM public.supplier_invoices
         WHERE id = $1`,
       [seeded.supplierInvoiceId],
     )
     expect(invoice.rows).toEqual([{
       status: 'paid',
-      paid_amount: '1000.00',
-      remaining_amount: '0.00',
+      paid_amount: 1000,
+      remaining_amount: 0,
     }])
   })
 

@@ -737,7 +737,6 @@ async function fetchSupplierPaymentTotalsAtCutoff(
         .from('supplier_invoice_payments')
         .select('id, supplier_invoice_id, payment_date, amount, journal_entry_id')
         .eq('company_id', companyId)
-        .lte('payment_date', periodEnd)
         .in('supplier_invoice_id', chunk)
         .order('id', { ascending: true })
         .range(from, to),
@@ -777,8 +776,9 @@ async function fetchSupplierPaymentTotalsAtCutoff(
     // the journal helper returned null, so an unlinked row remains a documented
     // compatibility case. Every non-null link must resolve and prove a live
     // company-scoped ledger effect.
-    const countsAtCutoff = payment.journal_entry_id === null ||
-      hasLiveEffectAtCutoff(
+    const countsAtCutoff = payment.journal_entry_id === null
+      ? payment.payment_date <= periodEnd
+      : hasLiveEffectAtCutoff(
         linkedRoots.get(payment.journal_entry_id)!,
         lineage,
         periodEnd,

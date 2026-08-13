@@ -1007,6 +1007,57 @@ describe('collectKontantmetodCutoff: supplier credits', () => {
   })
 
   it.each([
+    {
+      label: 'source-linked',
+      sourceType: 'supplier_invoice_paid',
+      sourceId: 'si-original',
+      paymentVoucherRoot: true,
+    },
+    {
+      label: 'manual',
+      sourceType: 'manual',
+      sourceId: null,
+      paymentVoucherRoot: false,
+    },
+  ])('uses corrected journal lineage for a $label payment dated after cutoff', async ({
+    sourceType,
+    sourceId,
+    paymentVoucherRoot,
+  }) => {
+    const root = sourceJournalEntry('', {
+      id: 'je-payment-after-cutoff',
+      source_id: sourceId,
+      source_type: sourceType,
+      status: 'reversed',
+      entry_date: '2026-01-15',
+    })
+    mockSupplierLineage({
+      paymentRows: [{
+        id: 'payment-after-cutoff',
+        supplier_invoice_id: 'si-original',
+        payment_date: '2026-01-15',
+        amount: 500,
+        journal_entry_id: root.id,
+      }],
+      linkedRoots: [root],
+      paymentVoucherRoots: paymentVoucherRoot ? [root] : [],
+      lineageWaves: [{
+        corrections: [correctionEntry(root.id, '2025-12-31')],
+        reversals: [stornoEntry(root.id, root.entry_date)],
+      }],
+    })
+
+    const result = await collectKontantmetodCutoff(
+      {} as never,
+      'co-1',
+      '2025-01-01',
+      '2025-12-31',
+    )
+
+    expect(result.payables[0]?.outstanding).toBe(750)
+  })
+
+  it.each([
     { label: 'on cutoff', stornoDate: '2025-12-31', outstanding: 1250 },
     { label: 'after cutoff', stornoDate: '2026-01-15', outstanding: 750 },
   ])('handles a corrected payment child plainly reversed $label', async ({
@@ -1096,6 +1147,27 @@ describe('collectKontantmetodCutoff: supplier credits', () => {
     )
 
     expect(result.payables[0]?.outstanding).toBe(750)
+  })
+
+  it('excludes a future legacy payment with no journal lineage', async () => {
+    mockSupplierLineage({
+      paymentRows: [{
+        id: 'payment-legacy-future',
+        supplier_invoice_id: 'si-original',
+        payment_date: '2026-01-15',
+        amount: 500,
+        journal_entry_id: null,
+      }],
+    })
+
+    const result = await collectKontantmetodCutoff(
+      {} as never,
+      'co-1',
+      '2025-01-01',
+      '2025-12-31',
+    )
+
+    expect(result.payables[0]?.outstanding).toBe(1250)
   })
 
   it('keeps a supplier credit historically visible when its source voucher is later', async () => {

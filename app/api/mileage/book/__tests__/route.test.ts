@@ -121,7 +121,12 @@ describe('POST /api/mileage/book', () => {
     expect(res.status).toBe(500)
     const body = await res.json()
     expect(body).toMatchObject({
-      code: 'CLAIM_RELEASE_FAILED',
+      error: {
+        code: 'CLAIM_RELEASE_FAILED',
+        message: expect.any(String),
+        message_en: expect.any(String),
+        requestId: expect.any(String),
+      },
     })
     expect(body).not.toHaveProperty('claimed_trip_ids')
     expect(body).not.toHaveProperty('released_trip_ids')
@@ -140,9 +145,14 @@ describe('POST /api/mileage/book', () => {
 
     expect(res.status).toBe(500)
     expect(await res.json()).toMatchObject({
-      code: 'POST_COMMIT_UNCERTAIN',
-      journal_entry_id: 'je-uncertain',
-      voucher_number: 73,
+      error: {
+        code: 'POST_COMMIT_UNCERTAIN',
+        requestId: expect.any(String),
+        details: {
+          journal_entry_id: 'je-uncertain',
+          voucher_number: 73,
+        },
+      },
     })
   })
 
@@ -160,10 +170,15 @@ describe('POST /api/mileage/book', () => {
 
     expect(res.status).toBe(500)
     expect(await res.json()).toMatchObject({
-      code: 'STAMP_FAILED',
-      journal_entry_id: 'je-1',
-      voucher_series: 'A',
-      voucher_number: 42,
+      error: {
+        code: 'STAMP_FAILED',
+        requestId: expect.any(String),
+        details: {
+          journal_entry_id: 'je-1',
+          voucher_series: 'A',
+          voucher_number: 42,
+        },
+      },
     })
   })
 
