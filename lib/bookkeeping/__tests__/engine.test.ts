@@ -1031,6 +1031,17 @@ describe('reverseEntry: storno guard', () => {
     let jeCall = 0
     const jeResults = [
       { data: original, error: null },
+      {
+        data: {
+          id: 'entry-0',
+          company_id: 'company-1',
+          status: 'reversed',
+          source_type: 'invoice_created',
+          correction_of_id: null,
+          reversed_by_id: 'entry-0-storno',
+        },
+        error: null,
+      },
       { data: reversal, error: null },
       { data: null, error: null },
       { data: [{ id: 'entry-1' }], error: null },
@@ -1046,6 +1057,7 @@ describe('reverseEntry: storno guard', () => {
         return b
       })
       b.single = vi.fn().mockImplementation(async () => jeResults[jeCall++])
+      b.maybeSingle = vi.fn().mockImplementation(async () => jeResults[jeCall++])
       b.then = (resolve: (v: unknown) => void) => resolve(jeResults[jeCall++])
       return b
     }
@@ -1072,6 +1084,211 @@ describe('reverseEntry: storno guard', () => {
     expect(insertedEntry!.source_type).toBe('storno')
     expect(insertedEntry!.reverses_id).toBe('entry-1')
     expect(insertedEntry!.description).toBe('Makulering: Rättelse: Hyra november')
+  })
+
+  it('restores supplier state through the atomic RPC when cancelling a correction descendant', async () => {
+    const original = {
+      id: 'correction-1',
+      company_id: 'company-1',
+      status: 'posted',
+      fiscal_period_id: 'period-1',
+      voucher_series: 'A',
+      voucher_number: 4,
+      entry_date: '2026-06-03',
+      description: 'Rättelse: Leverantörsbetalning',
+      source_type: 'correction',
+      source_id: null,
+      correction_of_id: 'payment-root-1',
+      reversed_by_id: null,
+      lines: [
+        { account_number: '2440', debit_amount: 1000, credit_amount: 0 },
+        { account_number: '1930', debit_amount: 0, credit_amount: 1000 },
+      ],
+    }
+    const root = {
+      id: 'payment-root-1',
+      company_id: 'company-1',
+      status: 'reversed',
+      source_type: 'supplier_invoice_paid',
+      source_id: 'supplier-invoice-1',
+      correction_of_id: null,
+      reversed_by_id: 'root-storno-1',
+    }
+    const reversal = {
+      id: 'descendant-storno-1',
+      company_id: 'company-1',
+      status: 'posted',
+      source_type: 'storno',
+      reverses_id: original.id,
+      lines: [],
+    }
+    const journalResults = [
+      { data: original, error: null },
+      { data: root, error: null },
+      { data: reversal, error: null },
+      { data: null, error: null },
+      { data: [{ id: original.id }], error: null },
+      { data: reversal, error: null },
+    ]
+    let journalResult = 0
+    const transactionUpdates: unknown[] = []
+    const rpc = vi.fn()
+      .mockResolvedValueOnce({ data: 5, error: null })
+      .mockResolvedValueOnce({
+        data: {
+          ok: true,
+          status: 'applied',
+          allocation_count: 1,
+          invoice_count: 1,
+          transaction_count: 1,
+          event_publication: SUPPLIER_EVENT_PUBLICATION,
+        },
+        error: null,
+      })
+    const supabase = {
+      rpc,
+      from: vi.fn().mockImplementation((table: string) => {
+        if (table === 'journal_entries') {
+          const query = createMockChain()
+          query.single = vi.fn().mockImplementation(
+            async () => journalResults[journalResult++],
+          )
+          query.maybeSingle = vi.fn().mockImplementation(
+            async () => journalResults[journalResult++],
+          )
+          query.then = (resolve: (value: unknown) => void) =>
+            resolve(journalResults[journalResult++])
+          return query
+        }
+        if (table === 'chart_of_accounts') {
+          const query = createMockChain()
+          query.then = (resolve: (value: unknown) => void) => resolve({
+            data: [
+              { id: 'acc-2440', account_number: '2440' },
+              { id: 'acc-1930', account_number: '1930' },
+            ],
+            error: null,
+          })
+          return query
+        }
+        if (table === 'journal_entry_lines') {
+          return { insert: vi.fn().mockResolvedValue({ error: null }) }
+        }
+        if (table === 'transactions') {
+          const query = createMockChain()
+          query.update = vi.fn().mockImplementation((payload: unknown) => {
+            transactionUpdates.push(payload)
+            return query
+          })
+          query.then = (resolve: (value: unknown) => void) =>
+            resolve({ error: null })
+          return query
+        }
+        return createMockChain()
+      }),
+    }
+
+    vi.mocked(eventBus.emit).mockClear()
+    await expect(reverseEntry(
+      supabase as never,
+      'company-1',
+      'user-1',
+      original.id,
+    )).resolves.toEqual(reversal)
+
+    expect(rpc).toHaveBeenLastCalledWith('apply_supplier_payment_reversal', {
+      p_company_id: 'company-1',
+      p_original_journal_entry_id: original.id,
+      p_storno_journal_entry_id: reversal.id,
+    })
+    expect(transactionUpdates).toEqual([])
+    expect(eventBus.emit).not.toHaveBeenCalled()
+  })
+
+  it('resumes the exact correction-descendant cancellation without posting a second storno', async () => {
+    const original = {
+      id: 'correction-1',
+      company_id: 'company-1',
+      status: 'reversed',
+      reversed_by_id: 'descendant-storno-1',
+      source_type: 'correction',
+      source_id: null,
+      correction_of_id: 'payment-root-1',
+      lines: [],
+    }
+    const root = {
+      id: 'payment-root-1',
+      company_id: 'company-1',
+      status: 'reversed',
+      source_type: 'supplier_invoice_paid',
+      source_id: 'supplier-invoice-1',
+      correction_of_id: null,
+      reversed_by_id: 'root-storno-1',
+    }
+    const reversal = {
+      id: 'descendant-storno-1',
+      company_id: 'company-1',
+      status: 'posted',
+      source_type: 'storno',
+      reverses_id: original.id,
+      lines: [],
+    }
+    let journalQuery = 0
+    const inserts: unknown[] = []
+    const rpc = vi.fn().mockResolvedValue({
+      data: {
+        ok: true,
+        status: 'already_applied',
+        allocation_count: 1,
+        invoice_count: 1,
+        transaction_count: 0,
+        event_publication: {
+          ...SUPPLIER_EVENT_PUBLICATION,
+          status: 'already_published',
+        },
+      },
+      error: null,
+    })
+    const supabase = {
+      rpc,
+      from: vi.fn().mockImplementation((table: string) => {
+        if (table !== 'journal_entries') return createMockChain()
+        const queryIndex = journalQuery++
+        const query = createMockChain()
+        query.insert = vi.fn().mockImplementation((payload: unknown) => {
+          inserts.push(payload)
+          return query
+        })
+        query.single = vi.fn().mockResolvedValue({
+          data: queryIndex === 0 ? original : reversal,
+          error: null,
+        })
+        query.maybeSingle = vi.fn().mockResolvedValue({
+          data: root,
+          error: null,
+        })
+        query.then = (resolve: (value: unknown) => void) =>
+          resolve({ data: [], error: null })
+        return query
+      }),
+    }
+
+    vi.mocked(eventBus.emit).mockClear()
+    await expect(reverseEntry(
+      supabase as never,
+      'company-1',
+      'user-1',
+      original.id,
+    )).resolves.toEqual(reversal)
+
+    expect(rpc).toHaveBeenCalledTimes(1)
+    expect(rpc).toHaveBeenCalledWith('apply_supplier_payment_reversal', {
+      p_company_id: 'company-1',
+      p_original_journal_entry_id: original.id,
+      p_storno_journal_entry_id: reversal.id,
+    })
+    expect(inserts).toEqual([])
+    expect(eventBus.emit).not.toHaveBeenCalled()
   })
 })
 

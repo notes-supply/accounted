@@ -558,6 +558,12 @@ describe('supplier payment reversal retention migration', () => {
       expect(installed.lineage_definition).toContain(
         `v_max_rows constant integer := ${MAX_LINEAGE_ROWS}`,
       )
+      expect(installed.lineage_definition).toContain(
+        `entry.status = ANY (ARRAY['posted'::text, 'reversed'::text])`,
+      )
+      expect(installed.lineage_definition).toContain(
+        `child.status = ANY (ARRAY['posted'::text, 'reversed'::text])`,
+      )
       for (const guardDefinition of [
         installed.trigger_definition,
         installed.line_trigger_definition,
@@ -589,6 +595,12 @@ describe('supplier payment reversal retention migration', () => {
       )
       expect(installed.apply_definition).toContain('FOR UPDATE')
       expect(installed.apply_definition).toContain('ORDER BY correction.id')
+      expect(installed.apply_definition).toContain(
+        'supplier-payment-reversal:',
+      )
+      expect(installed.apply_definition).toContain(
+        'v_root_journal_entry_id',
+      )
       const correctionConstraint = await client.query<{ present: boolean }>(
         `SELECT to_regclass(
            'public.uq_journal_entries_committed_correction_child'
@@ -1195,6 +1207,361 @@ describe('supplier payment reversal retention migration', () => {
         category: 'expense_other',
       },
     })
+  })
+
+  it('cancels the live correction descendant only after draft siblings are cancelled', async () => {
+    const seeded = await seedPaymentVoucher()
+    const transactionId = await insertTransaction({
+      ...seeded,
+      amount: -seeded.total,
+      journalEntryId: seeded.journalEntryId,
+    })
+    const paymentId = await insertPayment({ ...seeded, transactionId })
+    await getPool().query(
+      `UPDATE public.supplier_invoices
+          SET paid_at = '2026-06-01T12:00:00Z',
+              payment_journal_entry_id = $1
+        WHERE id = $2`,
+      [seeded.journalEntryId, seeded.supplierInvoiceId],
+    )
+    await getPool().query(
+      `UPDATE public.transactions
+          SET supplier_invoice_id = $1,
+              is_business = true,
+              category = 'expense_other'
+        WHERE id = $2`,
+      [seeded.supplierInvoiceId, transactionId],
+    )
+
+    const rootStornoId = await insertPostedStorno({
+      ...seeded,
+      originalJournalEntryId: seeded.journalEntryId,
+      entryDate: '2026-06-01',
+    })
+    const correctionId = await insertPostedCorrection({
+      ...seeded,
+      originalJournalEntryId: seeded.journalEntryId,
+      entryDate: '2026-06-03',
+    })
+    const draftSiblingId = randomUUID()
+    await getPool().query(
+      `INSERT INTO public.journal_entries
+         (id, user_id, company_id, fiscal_period_id, voucher_number,
+          voucher_series, entry_date, description, source_type,
+          correction_of_id, status)
+       VALUES ($1, $2, $3, $4, 0, 'A', '2026-06-04',
+               'Cancelled correction construction artifact',
+               'correction', $5, 'draft')`,
+      [
+        draftSiblingId,
+        seeded.userId,
+        seeded.companyId,
+        seeded.fiscalPeriodId,
+        seeded.journalEntryId,
+      ],
+    )
+    const descendantStornoId = await insertPostedStorno({
+      ...seeded,
+      originalJournalEntryId: correctionId,
+      entryDate: '2026-06-03',
+    })
+
+    await withUserContext(seeded.userId, async (client) => {
+      await expect(withErrorSavepoint(
+        client,
+        () => applySupplierPaymentReversal(client, {
+          companyId: seeded.companyId,
+          originalJournalEntryId: correctionId,
+          stornoJournalEntryId: descendantStornoId,
+        }),
+      )).rejects.toMatchObject({
+        code: '55000',
+        message: 'supplier payment reversal blocked by live correction child',
+      })
+    })
+
+    const unchanged = await getPool().query(
+      `SELECT si.status,
+              si.paid_amount::double precision AS paid_amount,
+              si.remaining_amount::double precision AS remaining_amount,
+              si.payment_journal_entry_id,
+              sip.reversed_at,
+              sip.reversed_by_journal_entry_id,
+              t.journal_entry_id AS transaction_journal_entry_id
+         FROM public.supplier_invoices si
+         JOIN public.supplier_invoice_payments sip
+           ON sip.supplier_invoice_id = si.id
+         JOIN public.transactions t ON t.id = $3
+        WHERE si.id = $1 AND sip.id = $2`,
+      [seeded.supplierInvoiceId, paymentId, transactionId],
+    )
+    expect(unchanged.rows).toEqual([expect.objectContaining({
+      status: 'paid',
+      paid_amount: 1000,
+      remaining_amount: 0,
+      payment_journal_entry_id: seeded.journalEntryId,
+      reversed_at: null,
+      reversed_by_journal_entry_id: null,
+      transaction_journal_entry_id: seeded.journalEntryId,
+    })])
+
+    await getPool().query(
+      `UPDATE public.journal_entries
+          SET status = 'cancelled'
+        WHERE id = $1 AND status = 'draft'`,
+      [draftSiblingId],
+    )
+
+    await withUserContext(seeded.userId, async (client) => {
+      const first = await applySupplierPaymentReversal(client, {
+        companyId: seeded.companyId,
+        originalJournalEntryId: correctionId,
+        stornoJournalEntryId: descendantStornoId,
+      })
+      const retry = await applySupplierPaymentReversal(client, {
+        companyId: seeded.companyId,
+        originalJournalEntryId: correctionId,
+        stornoJournalEntryId: descendantStornoId,
+      })
+      expect(first).toMatchObject({
+        ok: true,
+        status: 'applied',
+        allocation_count: 1,
+        invoice_count: 1,
+        transaction_count: 1,
+        event_publication: {
+          status: 'published',
+          event_log_count: 2,
+        },
+      })
+      expect(retry).toMatchObject({
+        ok: true,
+        status: 'already_applied',
+        event_publication: {
+          status: 'already_published',
+          event_log_count: 2,
+        },
+      })
+
+      await expect(withErrorSavepoint(
+        client,
+        () => applySupplierPaymentReversal(client, {
+          companyId: seeded.companyId,
+          originalJournalEntryId: seeded.journalEntryId,
+          stornoJournalEntryId: rootStornoId,
+        }),
+      )).rejects.toMatchObject({
+        code: '55000',
+        message: 'supplier payment reversal blocked by live correction child',
+      })
+
+      const outboxIds = getEventOutboxIds(first)
+      const events = await client.query<{
+        event_type: string
+        data: Record<string, unknown>
+      }>(
+        `SELECT event_type, data
+           FROM public.event_log
+          WHERE outbox_event_id = ANY($1::uuid[])
+          ORDER BY event_type`,
+        [outboxIds],
+      )
+      expect(events.rows).toEqual([
+        expect.objectContaining({
+          event_type: 'journal_entry.committed',
+          data: { entry: expect.objectContaining({ id: descendantStornoId }) },
+        }),
+        expect.objectContaining({
+          event_type: 'journal_entry.reversed',
+          data: {
+            originalEntry: expect.objectContaining({ id: correctionId }),
+            reversalEntry: expect.objectContaining({ id: descendantStornoId }),
+          },
+        }),
+      ])
+    }, { commit: true })
+
+    const restored = await getPool().query(
+      `SELECT si.status,
+              si.paid_amount::double precision AS paid_amount,
+              si.remaining_amount::double precision AS remaining_amount,
+              si.paid_at,
+              si.payment_journal_entry_id,
+              sip.journal_entry_id AS allocation_journal_entry_id,
+              sip.reversed_at,
+              sip.reversed_by_journal_entry_id,
+              t.journal_entry_id AS transaction_journal_entry_id,
+              t.supplier_invoice_id AS transaction_supplier_invoice_id,
+              t.is_business,
+              t.category
+         FROM public.supplier_invoices si
+         JOIN public.supplier_invoice_payments sip
+           ON sip.supplier_invoice_id = si.id
+         JOIN public.transactions t ON t.id = $3
+        WHERE si.id = $1 AND sip.id = $2`,
+      [seeded.supplierInvoiceId, paymentId, transactionId],
+    )
+    expect(restored.rows).toEqual([expect.objectContaining({
+      status: 'overdue',
+      paid_amount: 0,
+      remaining_amount: 1000,
+      paid_at: null,
+      payment_journal_entry_id: null,
+      allocation_journal_entry_id: seeded.journalEntryId,
+      reversed_by_journal_entry_id: descendantStornoId,
+      transaction_journal_entry_id: null,
+      transaction_supplier_invoice_id: null,
+      is_business: null,
+      category: null,
+    })])
+    expect(restored.rows[0].reversed_at.toISOString()).toBe(
+      '2026-06-03T10:00:00.000Z',
+    )
+  })
+
+  it('rejects cross-company correction ancestry before touching the foreign root', async () => {
+    const foreign = await seedPaymentVoucher()
+    const paymentId = await insertPayment(foreign)
+    const own = await seedCompany()
+    const correctionId = await insertPostedCorrection({
+      ...own,
+      originalJournalEntryId: foreign.journalEntryId,
+      entryDate: '2026-06-03',
+    })
+    const descendantStornoId = await insertPostedStorno({
+      ...own,
+      originalJournalEntryId: correctionId,
+      entryDate: '2026-06-03',
+    })
+
+    await withUserContext(own.userId, async (client) => {
+      await expect(withErrorSavepoint(
+        client,
+        () => applySupplierPaymentReversal(client, {
+          companyId: own.companyId,
+          originalJournalEntryId: correctionId,
+          stornoJournalEntryId: descendantStornoId,
+        }),
+      )).rejects.toMatchObject({
+        code: '55000',
+        message: 'supplier payment correction ancestry is missing or cross-company',
+      })
+    })
+
+    const foreignState = await getPool().query(
+      `SELECT si.status,
+              si.paid_amount::double precision AS paid_amount,
+              si.remaining_amount::double precision AS remaining_amount,
+              sip.reversed_at,
+              sip.reversed_by_journal_entry_id
+         FROM public.supplier_invoices si
+         JOIN public.supplier_invoice_payments sip
+           ON sip.supplier_invoice_id = si.id
+        WHERE si.id = $1 AND sip.id = $2`,
+      [foreign.supplierInvoiceId, paymentId],
+    )
+    expect(foreignState.rows).toEqual([{
+      status: 'paid',
+      paid_amount: 1000,
+      remaining_amount: 0,
+      reversed_at: null,
+      reversed_by_journal_entry_id: null,
+    }])
+  })
+
+  it('serializes concurrent retries for one correction-descendant cancellation', async () => {
+    const seeded = await seedPaymentVoucher()
+    await insertPayment(seeded)
+    await getPool().query(
+      `UPDATE public.supplier_invoices
+          SET paid_at = '2026-06-01T12:00:00Z',
+              payment_journal_entry_id = $1
+        WHERE id = $2`,
+      [seeded.journalEntryId, seeded.supplierInvoiceId],
+    )
+    await insertPostedStorno({
+      ...seeded,
+      originalJournalEntryId: seeded.journalEntryId,
+      entryDate: '2026-06-01',
+    })
+    const correctionId = await insertPostedCorrection({
+      ...seeded,
+      originalJournalEntryId: seeded.journalEntryId,
+      entryDate: '2026-06-03',
+    })
+    const descendantStornoId = await insertPostedStorno({
+      ...seeded,
+      originalJournalEntryId: correctionId,
+      entryDate: '2026-06-03',
+    })
+
+    const firstClient = await getPool().connect()
+    const retryClient = await getPool().connect()
+    try {
+      for (const client of [firstClient, retryClient]) {
+        await client.query('BEGIN')
+        await client.query(
+          `SELECT set_config(
+             'request.jwt.claims',
+             '{"role":"service_role"}',
+             true
+           )`,
+        )
+        await client.query(
+          `SELECT set_config(
+             'request.jwt.claim.role',
+             'service_role',
+             true
+           )`,
+        )
+        await client.query('SET LOCAL ROLE service_role')
+      }
+
+      const first = await applySupplierPaymentReversal(firstClient, {
+        companyId: seeded.companyId,
+        originalJournalEntryId: correctionId,
+        stornoJournalEntryId: descendantStornoId,
+      })
+      const retryPromise = applySupplierPaymentReversal(retryClient, {
+        companyId: seeded.companyId,
+        originalJournalEntryId: correctionId,
+        stornoJournalEntryId: descendantStornoId,
+      })
+      await firstClient.query('COMMIT')
+      const retry = await retryPromise
+      await retryClient.query('COMMIT')
+
+      expect(first).toMatchObject({ ok: true, status: 'applied' })
+      expect(retry).toMatchObject({ ok: true, status: 'already_applied' })
+    } catch (error) {
+      await firstClient.query('ROLLBACK').catch(() => {})
+      await retryClient.query('ROLLBACK').catch(() => {})
+      throw error
+    } finally {
+      firstClient.release()
+      retryClient.release()
+    }
+
+    const state = await getPool().query(
+      `SELECT si.paid_amount::double precision AS paid_amount,
+              si.remaining_amount::double precision AS remaining_amount,
+              count(*)::integer AS allocation_count,
+              count(*) FILTER (
+                WHERE sip.reversed_by_journal_entry_id = $2
+              )::integer AS exact_reversal_count
+         FROM public.supplier_invoices si
+         JOIN public.supplier_invoice_payments sip
+           ON sip.supplier_invoice_id = si.id
+        WHERE si.id = $1
+        GROUP BY si.id`,
+      [seeded.supplierInvoiceId, descendantStornoId],
+    )
+    expect(state.rows).toEqual([{
+      paid_amount: 0,
+      remaining_amount: 1000,
+      allocation_count: 1,
+      exact_reversal_count: 1,
+    }])
   })
 
   it('reverses a sanctioned allocation-backed manual voucher exactly once', async () => {
@@ -2277,6 +2644,27 @@ describe('supplier payment reversal retention migration', () => {
       originalJournalEntryId: firstCorrectionId,
       entryDate: '2026-06-04',
     })
+    const draftArtifactId = randomUUID()
+    const cancelledArtifactId = randomUUID()
+    await getPool().query(
+      `INSERT INTO public.journal_entries
+         (id, user_id, company_id, fiscal_period_id, voucher_number,
+          voucher_series, entry_date, description, source_type,
+          correction_of_id, status)
+       VALUES
+         ($1, $3, $4, $5, 0, 'A', '2026-06-05',
+          'Draft correction artifact', 'correction', $6, 'draft'),
+         ($2, $3, $4, $5, 0, 'A', '2026-06-06',
+          'Cancelled correction artifact', 'correction', $6, 'cancelled')`,
+      [
+        draftArtifactId,
+        cancelledArtifactId,
+        tenant.userId,
+        tenant.companyId,
+        tenant.fiscalPeriodId,
+        secondCorrectionId,
+      ],
+    )
 
     await withUserContext(tenant.userId, async (client) => {
       const lineage = await getSupplierPaymentLineage(
@@ -2317,6 +2705,8 @@ describe('supplier payment reversal retention migration', () => {
         }),
       ]))
       expect(lineage.rows).toHaveLength(5)
+      expect(lineage.rows.map((row) => row.id)).not.toContain(draftArtifactId)
+      expect(lineage.rows.map((row) => row.id)).not.toContain(cancelledArtifactId)
     })
   })
 
@@ -2358,31 +2748,63 @@ describe('supplier payment reversal retention migration', () => {
     const tenant = await seedCompany()
     const cycleRootId = randomUUID()
     const cycleChildId = randomUUID()
-    await getPool().query(
-      `INSERT INTO public.journal_entries
-         (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-          entry_date, description, source_type, status)
-       VALUES ($1, $2, $3, $4, 0, 'A', '2026-06-01', 'Cycle root',
-               'supplier_invoice_paid', 'draft'),
-              ($5, $2, $3, $4, 0, 'A', '2026-06-02', 'Cycle child',
-               'correction', 'draft')`,
-      [
-        cycleRootId,
-        tenant.userId,
-        tenant.companyId,
-        tenant.fiscalPeriodId,
-        cycleChildId,
-      ],
-    )
-    await getPool().query(
-      `UPDATE public.journal_entries
-          SET correction_of_id = CASE
-            WHEN id = $1 THEN $2::uuid
-            ELSE $1::uuid
-          END
-        WHERE id IN ($1, $2)`,
-      [cycleRootId, cycleChildId],
-    )
+    const client = await getPool().connect()
+    try {
+      await client.query('BEGIN')
+      await client.query(
+        `INSERT INTO public.journal_entries
+           (id, user_id, company_id, fiscal_period_id, voucher_number,
+            voucher_series, entry_date, description, source_type, status)
+         VALUES ($1, $2, $3, $4, 0, 'A', '2026-06-01', 'Cycle root',
+                 'supplier_invoice_paid', 'draft'),
+                ($5, $2, $3, $4, 0, 'A', '2026-06-02', 'Cycle child',
+                 'correction', 'draft')`,
+        [
+          cycleRootId,
+          tenant.userId,
+          tenant.companyId,
+          tenant.fiscalPeriodId,
+          cycleChildId,
+        ],
+      )
+      await client.query(
+        `INSERT INTO public.journal_entry_lines
+           (journal_entry_id, account_number, debit_amount, credit_amount,
+            currency, sort_order)
+         VALUES
+           ($1, '2440', 1000, 0, 'SEK', 0),
+           ($1, '1930', 0, 1000, 'SEK', 1),
+           ($2, '2440', 1000, 0, 'SEK', 0),
+           ($2, '1930', 0, 1000, 'SEK', 1)`,
+        [cycleRootId, cycleChildId],
+      )
+      await client.query(
+        `UPDATE public.journal_entries
+            SET correction_of_id = CASE
+              WHEN id = $1 THEN $2::uuid
+              ELSE $1::uuid
+            END
+          WHERE id IN ($1, $2)`,
+        [cycleRootId, cycleChildId],
+      )
+      await client.query(
+        `UPDATE public.journal_entries
+            SET status = CASE
+              WHEN id = $1 THEN 'reversed'
+              ELSE 'posted'
+            END,
+                committed_at = '2026-06-02T10:00:00Z'
+          WHERE id IN ($1, $2)`,
+        [cycleRootId, cycleChildId],
+      )
+      await client.query('SET CONSTRAINTS check_balance_on_posted_insert IMMEDIATE')
+      await client.query('COMMIT')
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw error
+    } finally {
+      client.release()
+    }
 
     await withUserContext(tenant.userId, async (client) => {
       const cycle = await getSupplierPaymentLineage(
@@ -2409,45 +2831,58 @@ describe('supplier payment reversal retention migration', () => {
       { length: MAX_LINEAGE_DEPTH + 2 },
       () => randomUUID(),
     )
-    await getPool().query(
-      `WITH nodes AS (
-         SELECT node.id, node.ordinality
-         FROM unnest($1::uuid[]) WITH ORDINALITY AS node(id, ordinality)
-       )
-       INSERT INTO public.journal_entries (
-         id,
-         user_id,
-         company_id,
-         fiscal_period_id,
-         voucher_number,
-         voucher_series,
-         entry_date,
-         description,
-         source_type,
-         status,
-         correction_of_id
-       )
-       SELECT
-         nodes.id,
-         $2,
-         $3,
-         $4,
-         0,
-         'A',
-         '2026-06-01',
-         'Lineage depth fixture',
-         CASE WHEN nodes.ordinality = 1
-           THEN 'supplier_invoice_paid'
-           ELSE 'correction'
-         END,
-         'draft',
-         CASE WHEN nodes.ordinality = 1
-           THEN NULL
-           ELSE ($1::uuid[])[(nodes.ordinality - 1)::integer]
-         END
-       FROM nodes`,
-      [ids, tenant.userId, tenant.companyId, tenant.fiscalPeriodId],
-    )
+    const seedClient = await getPool().connect()
+    try {
+      await seedClient.query('BEGIN')
+      await seedClient.query('SET LOCAL session_replication_role = replica')
+      await seedClient.query(
+        `WITH nodes AS (
+           SELECT node.id, node.ordinality
+           FROM unnest($1::uuid[]) WITH ORDINALITY AS node(id, ordinality)
+         )
+         INSERT INTO public.journal_entries (
+           id,
+           user_id,
+           company_id,
+           fiscal_period_id,
+           voucher_number,
+           voucher_series,
+           entry_date,
+           description,
+           source_type,
+           status,
+           correction_of_id,
+           committed_at
+         )
+         SELECT
+           nodes.id,
+           $2,
+           $3,
+           $4,
+           0,
+           'A',
+           '2026-06-01',
+           'Lineage depth fixture',
+           CASE WHEN nodes.ordinality = 1
+             THEN 'supplier_invoice_paid'
+             ELSE 'correction'
+           END,
+           'reversed',
+           CASE WHEN nodes.ordinality = 1
+             THEN NULL
+             ELSE ($1::uuid[])[(nodes.ordinality - 1)::integer]
+           END,
+           '2026-06-01T10:00:00Z'
+         FROM nodes`,
+        [ids, tenant.userId, tenant.companyId, tenant.fiscalPeriodId],
+      )
+      await seedClient.query('COMMIT')
+    } catch (error) {
+      await seedClient.query('ROLLBACK').catch(() => {})
+      throw error
+    } finally {
+      seedClient.release()
+    }
 
     await withUserContext(tenant.userId, async (client) => {
       const accepted = await getSupplierPaymentLineage(
@@ -2469,9 +2904,12 @@ describe('supplier payment reversal retention migration', () => {
     })
   })
 
-  it('rejects a branching lineage above the emitted-row cap', async () => {
+  it('rejects committed lineage above the emitted-row cap', async () => {
     const tenant = await seedCompany()
-    const rootId = randomUUID()
+    const rootIds = Array.from(
+      { length: Math.floor(MAX_LINEAGE_ROWS / 2) + 1 },
+      () => randomUUID(),
+    )
     const client = await getPool().connect()
     try {
       await client.query('BEGIN')
@@ -2487,13 +2925,23 @@ describe('supplier payment reversal retention migration', () => {
            entry_date,
            description,
            source_type,
-           status
+           status,
+           committed_at
          )
-         VALUES (
-           $1, $2, $3, $4, 0, 'A', '2026-06-01',
-           'Lineage row-cap root', 'supplier_invoice_paid', 'draft'
-         )`,
-        [rootId, tenant.userId, tenant.companyId, tenant.fiscalPeriodId],
+         SELECT
+           root.id,
+           $2,
+           $3,
+           $4,
+           0,
+           'A',
+           '2026-06-01',
+           'Lineage row-cap root',
+           'supplier_invoice_paid',
+           'reversed',
+           '2026-06-01T10:00:00Z'
+         FROM unnest($1::uuid[]) AS root(id)`,
+        [rootIds, tenant.userId, tenant.companyId, tenant.fiscalPeriodId],
       )
       await client.query(
         `INSERT INTO public.journal_entries (
@@ -2507,28 +2955,24 @@ describe('supplier payment reversal retention migration', () => {
            description,
            source_type,
            status,
-           correction_of_id
+           reverses_id,
+           committed_at
          )
          SELECT
            gen_random_uuid(),
-           $1,
            $2,
            $3,
+           $4,
            0,
            'A',
            '2026-06-02',
-           'Lineage row-cap branch',
-           'correction',
-           'draft',
-           $4
-         FROM generate_series(1, $5)`,
-        [
-          tenant.userId,
-          tenant.companyId,
-          tenant.fiscalPeriodId,
-          rootId,
-          MAX_LINEAGE_ROWS,
-        ],
+           'Lineage row-cap storno',
+           'storno',
+           'posted',
+           root.id,
+           '2026-06-02T10:00:00Z'
+         FROM unnest($1::uuid[]) AS root(id)`,
+        [rootIds, tenant.userId, tenant.companyId, tenant.fiscalPeriodId],
       )
       await client.query('SET LOCAL session_replication_role = origin')
       await client.query(
@@ -2546,8 +2990,8 @@ describe('supplier payment reversal retention migration', () => {
       await client.query('SAVEPOINT lineage_row_cap')
 
       await expect(client.query(
-        `SELECT public.get_supplier_payment_lineage($1, ARRAY[$2]::uuid[])`,
-        [tenant.companyId, rootId],
+        `SELECT public.get_supplier_payment_lineage($1, $2::uuid[])`,
+        [tenant.companyId, rootIds],
       )).rejects.toThrow(
         `supplier payment lineage exceeds maximum emitted row count of ${MAX_LINEAGE_ROWS}`,
       )

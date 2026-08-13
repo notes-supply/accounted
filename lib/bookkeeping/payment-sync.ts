@@ -138,6 +138,111 @@ export async function hasSupplierPaymentReversalEvidence(
   return (exactReversed.data ?? []).length > 0
 }
 
+const MAX_SUPPLIER_CORRECTION_ANCESTRY_DEPTH = 32
+
+type SupplierCorrectionAncestryEntry = Pick<
+  JournalEntry,
+  | 'id'
+  | 'company_id'
+  | 'status'
+  | 'source_type'
+  | 'correction_of_id'
+  | 'reversed_by_id'
+>
+
+/**
+ * Resolve the exact supplier-payment root behind a correction descendant.
+ * Every correction ancestor must be a retained, company-scoped reversed row.
+ * Missing, cyclic, cross-company, or over-deep ancestry fails closed because
+ * otherwise reverseEntry could publish ordinary reversal events after skipping
+ * the atomic supplier-state restoration.
+ */
+export async function resolveSupplierPaymentRootId(
+  supabase: SupabaseClient,
+  companyId: string,
+  requested: SupplierCorrectionAncestryEntry,
+): Promise<string | null> {
+  if (requested.company_id !== companyId) {
+    throw new Error('Could not verify supplier payment correction ancestry: company mismatch')
+  }
+
+  const visited = new Set<string>()
+  let current = requested
+
+  for (let depth = 0; depth <= MAX_SUPPLIER_CORRECTION_ANCESTRY_DEPTH; depth += 1) {
+    if (visited.has(current.id)) {
+      throw new Error(
+        `Could not verify supplier payment correction ancestry: cyclic lineage at entry ${current.id}`,
+      )
+    }
+    visited.add(current.id)
+
+    if (current.id !== requested.id && current.status !== 'reversed') {
+      throw new Error(
+        `Could not verify supplier payment correction ancestry: non-reversed ancestor ${current.id}`,
+      )
+    }
+
+    if (current.source_type !== 'correction') {
+      if (current.correction_of_id) {
+        throw new Error(
+          `Could not verify supplier payment correction ancestry: malformed root ${current.id}`,
+        )
+      }
+      if (
+        current.source_type?.startsWith('supplier_invoice')
+        && isPaymentSourceType(current.source_type)
+      ) {
+        return current.id
+      }
+      if (current.source_type !== 'manual') return null
+
+      const hasEvidence = await hasSupplierPaymentReversalEvidence(
+        supabase,
+        companyId,
+        current.id,
+        requested.status === 'reversed'
+          ? requested.reversed_by_id ?? undefined
+          : undefined,
+      )
+      return hasEvidence ? current.id : null
+    }
+
+    const ancestorId = current.correction_of_id
+    if (!ancestorId) {
+      throw new Error(
+        `Could not verify supplier payment correction ancestry: correction ${current.id} has no ancestor`,
+      )
+    }
+    if (depth === MAX_SUPPLIER_CORRECTION_ANCESTRY_DEPTH) {
+      throw new Error(
+        'Could not verify supplier payment correction ancestry: maximum depth exceeded',
+      )
+    }
+
+    const { data: ancestor, error } = await supabase
+      .from('journal_entries')
+      .select(
+        'id, company_id, status, source_type, correction_of_id, reversed_by_id',
+      )
+      .eq('company_id', companyId)
+      .eq('id', ancestorId)
+      .maybeSingle()
+
+    if (error || !ancestor) {
+      throw new Error(
+        `Could not verify supplier payment correction ancestry:`
+        + ` missing or cross-company ancestor ${ancestorId}`,
+      )
+    }
+    current = ancestor as SupplierCorrectionAncestryEntry
+  }
+
+  throw new Error(
+    'Could not verify supplier payment correction ancestry: maximum depth exceeded',
+  )
+}
+
 
 /**
  * Revert the business-level paid status on the invoice or supplier invoice

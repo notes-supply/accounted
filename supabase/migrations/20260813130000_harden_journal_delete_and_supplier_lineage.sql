@@ -274,6 +274,7 @@ BEGIN
     JOIN public.journal_entries entry
       ON entry.id = requested.root_id
      AND entry.company_id = p_company_id
+     AND entry.status IN ('posted', 'reversed')
 
     UNION ALL
 
@@ -302,6 +303,7 @@ BEGIN
        child.correction_of_id = parent.id
        OR child.reverses_id = parent.id
      )
+     AND child.status IN ('posted', 'reversed')
     WHERE NOT parent.cycle
       AND parent.depth < v_max_depth + 1
   ),
@@ -1224,11 +1226,20 @@ SET search_path TO 'public'
 AS $$
 DECLARE
   v_original record;
+  v_root record;
+  v_current record;
   v_storno record;
   v_invoice record;
   v_legacy_invoice record;
   v_v1_invoice record;
   v_role text := COALESCE(auth.role(), '');
+  v_ancestry_ids uuid[] := ARRAY[]::uuid[];
+  v_current_id uuid := p_original_journal_entry_id;
+  v_root_journal_entry_id uuid;
+  v_expected_child_id uuid;
+  v_ancestry_index integer;
+  v_ancestry_depth integer := 0;
+  v_live_child_count integer;
   v_total_count integer;
   v_active_count integer;
   v_matching_reversed_count integer;
@@ -1260,21 +1271,85 @@ BEGIN
       USING ERRCODE = '42501';
   END IF;
 
-  -- Lock both journal rows in UUID order so concurrent retries share one
-  -- linearization point without introducing inverse lock ordering. The
-  -- original's UPDATE lock conflicts with correction_of_id foreign-key checks,
-  -- preventing a new correction child from appearing before this transaction
-  -- completes.
+  -- Resolve the requested cancellation backwards to one exact root before
+  -- taking the root-scoped advisory lock. Committed journal lineage is
+  -- immutable, but every row is revalidated after locking. The bounded walk
+  -- fails closed on cycles, missing/cross-company parents, and malformed roots.
+  LOOP
+    IF v_current_id = ANY(v_ancestry_ids) THEN
+      RAISE EXCEPTION 'supplier payment correction ancestry is cyclic'
+        USING ERRCODE = '55000';
+    END IF;
+    IF v_ancestry_depth > 32 THEN
+      RAISE EXCEPTION 'supplier payment correction ancestry exceeds maximum depth'
+        USING ERRCODE = '54000';
+    END IF;
+
+    SELECT je.company_id, je.status, je.source_type, je.source_id,
+           je.reversed_by_id, je.correction_of_id
+      INTO v_current
+      FROM public.journal_entries je
+     WHERE je.id = v_current_id;
+    IF NOT FOUND
+       OR v_current.company_id IS DISTINCT FROM p_company_id THEN
+      RAISE EXCEPTION 'supplier payment correction ancestry is missing or cross-company'
+        USING ERRCODE = '55000';
+    END IF;
+    IF v_current.status IS DISTINCT FROM 'reversed' THEN
+      RAISE EXCEPTION 'supplier payment correction ancestry contains a non-reversed entry'
+        USING ERRCODE = '55000';
+    END IF;
+
+    v_ancestry_ids := pg_catalog.array_append(v_ancestry_ids, v_current_id);
+    IF v_current.source_type = 'correction' THEN
+      IF v_current.correction_of_id IS NULL THEN
+        RAISE EXCEPTION 'supplier payment correction ancestry has a missing parent'
+          USING ERRCODE = '55000';
+      END IF;
+      v_current_id := v_current.correction_of_id;
+      v_ancestry_depth := v_ancestry_depth + 1;
+    ELSE
+      IF v_current.correction_of_id IS NOT NULL THEN
+        RAISE EXCEPTION 'supplier payment correction ancestry has a malformed root'
+          USING ERRCODE = '55000';
+      END IF;
+      v_root_journal_entry_id := v_current_id;
+      EXIT;
+    END IF;
+  END LOOP;
+
+  -- Every retry and every descendant cancellation for one supplier-payment
+  -- root shares this transaction-scoped linearization point. Row locks below
+  -- still protect against correction inserts and direct state mutations.
+  PERFORM pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      'supplier-payment-reversal:' || p_company_id::text
+      || ':' || v_root_journal_entry_id::text,
+      0
+    )
+  );
+
+  -- Lock the exact ancestry and requested storno in UUID order. Then lock all
+  -- existing correction children while their parent rows are already locked.
+  -- A concurrent child insert must finish before the parent lock is acquired
+  -- or wait until this transaction ends; the second query sees and validates
+  -- every child that won the race.
   PERFORM je.id
     FROM public.journal_entries je
-   WHERE je.company_id = p_company_id
-     AND je.id = ANY (
-       ARRAY[p_original_journal_entry_id, p_storno_journal_entry_id]
-     )
+   WHERE je.id = ANY (
+     v_ancestry_ids || ARRAY[p_storno_journal_entry_id]::uuid[]
+   )
    ORDER BY je.id
    FOR UPDATE;
 
-  SELECT je.company_id, je.status, je.source_type, je.source_id, je.reversed_by_id
+  PERFORM correction.id
+    FROM public.journal_entries correction
+   WHERE correction.correction_of_id = ANY(v_ancestry_ids)
+   ORDER BY correction.id
+   FOR UPDATE;
+
+  SELECT je.company_id, je.status, je.source_type, je.source_id,
+         je.reversed_by_id, je.correction_of_id
     INTO v_original
     FROM public.journal_entries je
    WHERE je.id = p_original_journal_entry_id;
@@ -1300,39 +1375,84 @@ BEGIN
   END IF;
   v_reversed_at := COALESCE(v_storno.committed_at, now());
 
-  -- Existing draft correction children do not take a new parent-key lock when
-  -- their status changes. Lock them in UUID order, then reject every live
-  -- construction or committed state. The parent lock closes the missing-child
-  -- insert race; cancelled cleanup artifacts remain harmless.
-  PERFORM correction.id
-    FROM public.journal_entries correction
-   WHERE correction.company_id = p_company_id
-     AND correction.correction_of_id = p_original_journal_entry_id
-     AND correction.source_type = 'correction'
-   ORDER BY correction.id
+  SELECT je.company_id, je.status, je.source_type, je.source_id,
+         je.reversed_by_id, je.correction_of_id
+    INTO v_root
+    FROM public.journal_entries je
+   WHERE je.id = v_root_journal_entry_id;
+  IF NOT FOUND
+     OR v_root.company_id IS DISTINCT FROM p_company_id
+     OR v_root.status IS DISTINCT FROM 'reversed'
+     OR v_root.source_type NOT IN (
+       'supplier_invoice_paid',
+       'supplier_invoice_cash_payment',
+       'manual'
+     ) THEN
+    RAISE EXCEPTION 'supplier payment reversal root journal entry mismatch'
+      USING ERRCODE = '23514';
+  END IF;
+
+  -- The committed ancestry must be one exact forward chain from root to the
+  -- requested cancellation. Draft siblings are live construction and block;
+  -- cancelled artifacts are retained but ignored. Any committed child outside
+  -- the exact path is malformed lineage and also blocks.
+  FOR v_ancestry_index IN REVERSE
+    pg_catalog.array_length(v_ancestry_ids, 1)..1
+  LOOP
+    v_expected_child_id := CASE
+      WHEN v_ancestry_index > 1 THEN v_ancestry_ids[v_ancestry_index - 1]
+      ELSE NULL
+    END;
+
+    SELECT count(*)::integer
+      INTO v_live_child_count
+      FROM public.journal_entries correction
+     WHERE correction.company_id = p_company_id
+       AND correction.correction_of_id = v_ancestry_ids[v_ancestry_index]
+       AND correction.source_type = 'correction'
+       AND correction.status IN ('draft', 'posted', 'reversed');
+
+    IF v_expected_child_id IS NULL THEN
+      IF v_live_child_count <> 0 THEN
+        RAISE EXCEPTION
+          'supplier payment reversal blocked by live correction child'
+          USING ERRCODE = '55000';
+      END IF;
+    ELSIF v_live_child_count <> 1
+       OR NOT EXISTS (
+         SELECT 1
+           FROM public.journal_entries correction
+          WHERE correction.id = v_expected_child_id
+            AND correction.company_id = p_company_id
+            AND correction.correction_of_id
+                = v_ancestry_ids[v_ancestry_index]
+            AND correction.source_type = 'correction'
+            AND correction.status = 'reversed'
+       ) THEN
+      RAISE EXCEPTION
+        'supplier payment reversal blocked by live correction child'
+        USING ERRCODE = '55000';
+    END IF;
+  END LOOP;
+
+  -- Lock every historical and active allocation attached anywhere in the
+  -- ancestry. Supplier semantics belong only to the exact root; an allocation
+  -- on a correction descendant is malformed and never inferred.
+  PERFORM sip.id
+    FROM public.supplier_invoice_payments sip
+   WHERE sip.journal_entry_id = ANY(v_ancestry_ids)
+   ORDER BY sip.id
    FOR UPDATE;
 
   IF EXISTS (
     SELECT 1
-      FROM public.journal_entries correction
-     WHERE correction.company_id = p_company_id
-       AND correction.correction_of_id = p_original_journal_entry_id
-       AND correction.source_type = 'correction'
-       AND correction.status IN ('draft', 'posted', 'reversed')
+      FROM public.supplier_invoice_payments sip
+     WHERE sip.journal_entry_id = ANY(v_ancestry_ids)
+       AND sip.journal_entry_id IS DISTINCT FROM v_root_journal_entry_id
   ) THEN
-    RAISE EXCEPTION
-      'supplier payment reversal blocked by live correction child'
+    RAISE EXCEPTION 'supplier payment correction ancestry has a non-root allocation'
       USING ERRCODE = '55000';
   END IF;
-
-  -- Lock every historical and active allocation for the original voucher.
-  -- Inspecting all rows makes a mixed active/reversed state a conflict rather
-  -- than silently completing a transition that started outside this command.
-  PERFORM sip.id
-    FROM public.supplier_invoice_payments sip
-   WHERE sip.journal_entry_id = p_original_journal_entry_id
-   ORDER BY sip.id
-   FOR UPDATE;
 
   SELECT count(*)::integer,
          count(*) FILTER (WHERE sip.reversed_at IS NULL)::integer,
@@ -1346,12 +1466,12 @@ BEGIN
          )::integer
     INTO v_total_count, v_active_count, v_matching_reversed_count
     FROM public.supplier_invoice_payments sip
-   WHERE sip.journal_entry_id = p_original_journal_entry_id;
+   WHERE sip.journal_entry_id = v_root_journal_entry_id;
 
   IF EXISTS (
     SELECT 1
       FROM public.supplier_invoice_payments sip
-     WHERE sip.journal_entry_id = p_original_journal_entry_id
+     WHERE sip.journal_entry_id = v_root_journal_entry_id
        AND (
          sip.company_id IS DISTINCT FROM p_company_id
          OR sip.amount IS NULL
@@ -1361,33 +1481,25 @@ BEGIN
     RAISE EXCEPTION 'supplier payment reversal allocation ownership or amount mismatch'
       USING ERRCODE = '55000';
   END IF;
-  IF v_original.source_type NOT IN (
-    'supplier_invoice_paid',
-    'supplier_invoice_cash_payment',
-    'manual'
-  ) THEN
-    RAISE EXCEPTION 'supplier payment reversal original journal entry mismatch'
-      USING ERRCODE = '23514';
-  END IF;
 
   -- Manual vouchers are supplier-payment targets only when the sanctioned
   -- voucher-link flow left exact retained allocations. Never infer supplier
   -- semantics for an allocation-less manual reversal.
-  IF v_original.source_type = 'manual' AND v_total_count = 0 THEN
+  IF v_root.source_type = 'manual' AND v_total_count = 0 THEN
     RAISE EXCEPTION 'manual supplier payment reversal has no retained allocations'
       USING ERRCODE = '55000';
   END IF;
 
 
   IF v_total_count = 0 THEN
-    IF v_original.source_type = 'supplier_invoice_paid' THEN
+    IF v_root.source_type = 'supplier_invoice_paid' THEN
       -- Compatibility recovery for the v1 mark-paid ordering: the posted
       -- voucher and invoice mutation may exist even when its explicitly
       -- non-blocking allocation insert failed. The exact source pointer,
       -- one unambiguous 2440 debit, the invoice before-state, and the durable
       -- event outbox marker bound this path. No other allocation-free payment
       -- source acquires this capability.
-      IF v_original.source_id IS NULL THEN
+      IF v_root.source_id IS NULL THEN
         RAISE EXCEPTION 'supplier payment recovery has no source invoice'
           USING ERRCODE = '55000';
       END IF;
@@ -1397,7 +1509,7 @@ BEGIN
              si.payment_journal_entry_id, si.is_credit_note
         INTO v_v1_invoice
         FROM public.supplier_invoices si
-       WHERE si.id = v_original.source_id
+       WHERE si.id = v_root.source_id
        FOR UPDATE;
       IF NOT FOUND OR v_v1_invoice.company_id IS DISTINCT FROM p_company_id THEN
         RAISE EXCEPTION 'supplier payment recovery invoice ownership mismatch'
@@ -1444,7 +1556,7 @@ BEGIN
              v_v1_total_credit,
              v_v1_payment_amount
         FROM public.journal_entry_lines jel
-       WHERE jel.journal_entry_id = p_original_journal_entry_id;
+       WHERE jel.journal_entry_id = v_root_journal_entry_id;
 
       IF v_v1_line_count < 2
          OR v_v1_2440_count <> 1
@@ -1461,7 +1573,7 @@ BEGIN
         SELECT count(*)
           FROM public.journal_entries je
          WHERE je.company_id = p_company_id
-           AND je.reverses_id = p_original_journal_entry_id
+           AND je.reverses_id = v_root_journal_entry_id
            AND je.source_type = 'storno'
            AND je.status = 'posted'
       ) <> 1 THEN
@@ -1474,14 +1586,14 @@ BEGIN
       -- rejected before any state change.
       PERFORM t.id
         FROM public.transactions t
-       WHERE t.journal_entry_id = p_original_journal_entry_id
+       WHERE t.journal_entry_id = v_root_journal_entry_id
        ORDER BY t.id
        FOR UPDATE;
 
       IF EXISTS (
         SELECT 1
           FROM public.transactions t
-         WHERE t.journal_entry_id = p_original_journal_entry_id
+         WHERE t.journal_entry_id = v_root_journal_entry_id
            AND (
              t.company_id IS DISTINCT FROM p_company_id
              OR t.invoice_id IS NOT NULL
@@ -1503,11 +1615,11 @@ BEGIN
          AND o.reversal_journal_entry_id = p_storno_journal_entry_id;
 
       IF v_v1_marker_count = 2 THEN
-        IF v_v1_invoice.payment_journal_entry_id = p_original_journal_entry_id
+        IF v_v1_invoice.payment_journal_entry_id = v_root_journal_entry_id
            OR EXISTS (
              SELECT 1
                FROM public.transactions t
-              WHERE t.journal_entry_id = p_original_journal_entry_id
+              WHERE t.journal_entry_id = v_root_journal_entry_id
            ) THEN
           RAISE EXCEPTION 'supplier payment recovery marker conflicts with current pointers'
             USING ERRCODE = '55000';
@@ -1532,7 +1644,7 @@ BEGIN
 
       IF v_v1_invoice.is_credit_note IS DISTINCT FROM false
          OR v_v1_invoice.payment_journal_entry_id
-            IS DISTINCT FROM p_original_journal_entry_id
+            IS DISTINCT FROM v_root_journal_entry_id
          OR v_v1_invoice.status NOT IN ('paid', 'partially_paid')
          OR round(COALESCE(v_v1_invoice.paid_amount, 0), 2)
             < v_v1_payment_amount
@@ -1587,7 +1699,7 @@ BEGIN
              payment_journal_entry_id = NULL
        WHERE si.id = v_v1_invoice.id
          AND si.company_id = p_company_id
-         AND si.payment_journal_entry_id = p_original_journal_entry_id;
+         AND si.payment_journal_entry_id = v_root_journal_entry_id;
       GET DIAGNOSTICS v_updated_count = ROW_COUNT;
       IF v_updated_count <> 1 THEN
         RAISE EXCEPTION 'supplier payment recovery did not restore its invoice'
@@ -1600,7 +1712,7 @@ BEGIN
              is_business = NULL,
              category = NULL
        WHERE t.company_id = p_company_id
-         AND t.journal_entry_id = p_original_journal_entry_id
+         AND t.journal_entry_id = v_root_journal_entry_id
          AND t.invoice_id IS NULL
          AND (
            t.supplier_invoice_id IS NULL
@@ -1610,7 +1722,7 @@ BEGIN
       IF EXISTS (
         SELECT 1
           FROM public.transactions t
-         WHERE t.journal_entry_id = p_original_journal_entry_id
+         WHERE t.journal_entry_id = v_root_journal_entry_id
       ) THEN
         RAISE EXCEPTION 'supplier payment recovery left a conflicting transaction pointer'
           USING ERRCODE = '55000';
@@ -1635,8 +1747,8 @@ BEGIN
     -- vouchers were source-linked before allocation rows became mandatory.
     -- The exact current payment pointer is the before-state marker; the fully
     -- restored invoice state is the retry marker.
-    IF v_original.source_type IS DISTINCT FROM 'supplier_invoice_cash_payment'
-       OR v_original.source_id IS NULL THEN
+    IF v_root.source_type IS DISTINCT FROM 'supplier_invoice_cash_payment'
+       OR v_root.source_id IS NULL THEN
       RAISE EXCEPTION 'supplier payment reversal has no retained allocations'
         USING ERRCODE = '55000';
     END IF;
@@ -1646,7 +1758,7 @@ BEGIN
            si.payment_journal_entry_id
       INTO v_legacy_invoice
       FROM public.supplier_invoices si
-     WHERE si.id = v_original.source_id
+     WHERE si.id = v_root.source_id
      FOR UPDATE;
     IF NOT FOUND OR v_legacy_invoice.company_id IS DISTINCT FROM p_company_id THEN
       RAISE EXCEPTION 'legacy supplier cash payment invoice mismatch'
@@ -1683,7 +1795,7 @@ BEGIN
     END IF;
 
     IF v_legacy_invoice.payment_journal_entry_id
-         IS DISTINCT FROM p_original_journal_entry_id
+         IS DISTINCT FROM v_root_journal_entry_id
        OR v_legacy_invoice.status IS DISTINCT FROM 'paid'
        OR round(COALESCE(v_legacy_invoice.paid_amount, 0), 2)
           IS DISTINCT FROM round(v_legacy_invoice.total, 2)
@@ -1710,7 +1822,7 @@ BEGIN
            is_business = NULL,
            category = NULL
      WHERE t.company_id = p_company_id
-       AND t.journal_entry_id = p_original_journal_entry_id;
+       AND t.journal_entry_id = v_root_journal_entry_id;
     GET DIAGNOSTICS v_released_count = ROW_COUNT;
 
     v_event_publication := public.record_supplier_payment_reversal_events(
@@ -1741,7 +1853,7 @@ BEGIN
       'invoice_count', (
         SELECT count(DISTINCT sip.supplier_invoice_id)
           FROM public.supplier_invoice_payments sip
-         WHERE sip.journal_entry_id = p_original_journal_entry_id
+         WHERE sip.journal_entry_id = v_root_journal_entry_id
       ),
       'transaction_count', 0,
       'event_publication', v_event_publication
@@ -1762,7 +1874,7 @@ BEGIN
    WHERE si.id IN (
      SELECT sip.supplier_invoice_id
        FROM public.supplier_invoice_payments sip
-      WHERE sip.journal_entry_id = p_original_journal_entry_id
+      WHERE sip.journal_entry_id = v_root_journal_entry_id
         AND sip.reversed_at IS NULL
    )
    ORDER BY si.id
@@ -1771,7 +1883,7 @@ BEGIN
   SELECT count(DISTINCT sip.supplier_invoice_id)::integer
     INTO v_expected_invoice_count
     FROM public.supplier_invoice_payments sip
-   WHERE sip.journal_entry_id = p_original_journal_entry_id
+   WHERE sip.journal_entry_id = v_root_journal_entry_id
      AND sip.reversed_at IS NULL;
   SELECT count(*)::integer
     INTO v_invoice_count
@@ -1780,7 +1892,7 @@ BEGIN
      AND si.id IN (
        SELECT sip.supplier_invoice_id
          FROM public.supplier_invoice_payments sip
-        WHERE sip.journal_entry_id = p_original_journal_entry_id
+        WHERE sip.journal_entry_id = v_root_journal_entry_id
           AND sip.reversed_at IS NULL
      );
   IF v_invoice_count IS DISTINCT FROM v_expected_invoice_count THEN
@@ -1795,7 +1907,7 @@ BEGIN
         SELECT sip.supplier_invoice_id,
                round(sum(sip.amount), 2) AS payment_amount
           FROM public.supplier_invoice_payments sip
-         WHERE sip.journal_entry_id = p_original_journal_entry_id
+         WHERE sip.journal_entry_id = v_root_journal_entry_id
            AND sip.reversed_at IS NULL
          GROUP BY sip.supplier_invoice_id
       ) amounts ON amounts.supplier_invoice_id = si.id
@@ -1818,13 +1930,13 @@ BEGIN
     SELECT 1
       FROM public.supplier_invoice_payments sip
       JOIN public.transactions t ON t.id = sip.transaction_id
-     WHERE sip.journal_entry_id = p_original_journal_entry_id
+     WHERE sip.journal_entry_id = v_root_journal_entry_id
        AND sip.reversed_at IS NULL
        AND (
          t.company_id IS DISTINCT FROM p_company_id
          OR (
            t.journal_entry_id IS NOT NULL
-           AND t.journal_entry_id IS DISTINCT FROM p_original_journal_entry_id
+           AND t.journal_entry_id IS DISTINCT FROM v_root_journal_entry_id
          )
          OR t.invoice_id IS NOT NULL
          OR (
@@ -1839,8 +1951,8 @@ BEGIN
         ON current_allocation.transaction_id = selected.transaction_id
        AND current_allocation.reversed_at IS NULL
        AND current_allocation.journal_entry_id
-           IS DISTINCT FROM p_original_journal_entry_id
-     WHERE selected.journal_entry_id = p_original_journal_entry_id
+          IS DISTINCT FROM v_root_journal_entry_id
+     WHERE selected.journal_entry_id = v_root_journal_entry_id
        AND selected.reversed_at IS NULL
   ) THEN
     RAISE EXCEPTION 'supplier payment reversal transaction ownership conflict'
@@ -1851,7 +1963,7 @@ BEGIN
     SELECT sip.supplier_invoice_id,
            round(sum(sip.amount), 2) AS payment_amount
       FROM public.supplier_invoice_payments sip
-     WHERE sip.journal_entry_id = p_original_journal_entry_id
+     WHERE sip.journal_entry_id = v_root_journal_entry_id
        AND sip.reversed_at IS NULL
      GROUP BY sip.supplier_invoice_id
   ),
@@ -1875,7 +1987,7 @@ BEGIN
          END,
          paid_at = NULL,
          payment_journal_entry_id = CASE
-           WHEN si.payment_journal_entry_id = p_original_journal_entry_id THEN NULL
+           WHEN si.payment_journal_entry_id = v_root_journal_entry_id THEN NULL
            ELSE si.payment_journal_entry_id
          END
     FROM restored
@@ -1894,12 +2006,12 @@ BEGIN
          category = NULL
    WHERE t.company_id = p_company_id
      AND (
-       t.journal_entry_id = p_original_journal_entry_id
+       t.journal_entry_id = v_root_journal_entry_id
        OR (
          t.id IN (
            SELECT sip.transaction_id
              FROM public.supplier_invoice_payments sip
-            WHERE sip.journal_entry_id = p_original_journal_entry_id
+            WHERE sip.journal_entry_id = v_root_journal_entry_id
               AND sip.reversed_at IS NULL
               AND sip.transaction_id IS NOT NULL
          )
@@ -1910,7 +2022,7 @@ BEGIN
            OR EXISTS (
              SELECT 1
                FROM public.supplier_invoice_payments sip
-              WHERE sip.journal_entry_id = p_original_journal_entry_id
+              WHERE sip.journal_entry_id = v_root_journal_entry_id
                 AND sip.reversed_at IS NULL
                 AND sip.transaction_id = t.id
                 AND sip.supplier_invoice_id = t.supplier_invoice_id
@@ -1922,13 +2034,13 @@ BEGIN
 
   PERFORM set_config(
     'gnubok.supplier_payment_reversal',
-    p_original_journal_entry_id::text || ':' || p_storno_journal_entry_id::text,
+    v_root_journal_entry_id::text || ':' || p_storno_journal_entry_id::text,
     true
   );
   UPDATE public.supplier_invoice_payments sip
      SET reversed_at = v_reversed_at,
          reversed_by_journal_entry_id = p_storno_journal_entry_id
-   WHERE sip.journal_entry_id = p_original_journal_entry_id
+   WHERE sip.journal_entry_id = v_root_journal_entry_id
      AND sip.reversed_at IS NULL;
   GET DIAGNOSTICS v_updated_count = ROW_COUNT;
   PERFORM set_config('gnubok.supplier_payment_reversal', '', true);
@@ -1957,7 +2069,7 @@ ALTER FUNCTION public.apply_supplier_payment_reversal(uuid, uuid, uuid)
   OWNER TO postgres;
 
 COMMENT ON FUNCTION public.apply_supplier_payment_reversal(uuid, uuid, uuid) IS
-  'Atomically restores supplier invoice payment state after one exact posted storno, retains allocation lineage, recovers a source-linked v1 payment only from an unambiguous 2440 debit and durable marker, and releases only owned transaction pointers.';
+  'Atomically resolves a cancelled supplier-payment correction descendant to its exact typed or allocation-backed manual root, restores supplier state once, retains allocation lineage, and releases only root-owned transaction pointers.';
 
 REVOKE ALL ON FUNCTION public.apply_supplier_payment_reversal(uuid, uuid, uuid)
   FROM PUBLIC, anon;

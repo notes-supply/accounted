@@ -30,8 +30,8 @@ import {
 import { fetchEntryLines, type EntryLinesQuery } from '@/lib/bookkeeping/entry-lines'
 import { backfillStandardBASAccounts } from '@/lib/bookkeeping/account-backfill'
 import {
-  hasSupplierPaymentReversalEvidence,
   isPaymentSourceType,
+  resolveSupplierPaymentRootId,
   syncInvoiceStatusFromPaymentEntry,
 } from '@/lib/bookkeeping/payment-sync'
 import { getActor } from '@/lib/bookkeeping/actor-context'
@@ -1506,37 +1506,30 @@ export async function reverseEntry(
   if (error || !original) {
     throw new JournalEntryNotFoundError()
   }
-  const supplierPaymentSource = Boolean(
-    original.source_type?.startsWith('supplier_invoice')
-    && isPaymentSourceType(original.source_type),
+  const supplierPaymentRootId = await resolveSupplierPaymentRootId(
+    supabase,
+    companyId,
+    original as JournalEntry,
   )
-  const supplierPaymentReversal = supplierPaymentSource || (
-    original.source_type === 'manual'
-    && await hasSupplierPaymentReversalEvidence(
-      supabase,
-      companyId,
-      original.id,
-      original.status === 'reversed' ? original.reversed_by_id ?? undefined : undefined,
-    )
-  )
+  const supplierPaymentReversal = supplierPaymentRootId !== null
 
 
   // A supplier-payment storno can commit before its business-state RPC returns.
   // Retrying the same reversal must therefore resume that exact, idempotent RPC
   // instead of attempting a second storno or stopping at the generic status
-  // guard. The persisted reversed_by_id is the only accepted recovery token;
-  // the database command revalidates the complete original/storno/company
-  // lineage before changing supplier state.
+  // guard. Correction descendants retain the same supplier-payment semantics,
+  // while the database command re-resolves and locks the allocation-bearing
+  // root before changing supplier state.
   if (
     original.status === 'reversed'
     && original.reversed_by_id
     && supplierPaymentReversal
   ) {
     // A supplier-payment root with a live correction child is not a plain
-    // post-storno recovery. A committed child still carries the payment effect,
-    // while a draft child may be waiting to commit. Restoring supplier state
-    // from the root would reopen the invoice behind that correction. Check the
-    // company-scoped lineage before reading the storno or invoking recovery.
+    // post-storno recovery. Cancelling the current correction descendant is
+    // sanctioned, but retrying an older root must not reopen the invoice behind
+    // the replacement. Check the company-scoped direct children before reading
+    // the storno or invoking recovery; the RPC repeats the full atomic check.
     const {
       data: committedCorrectionChildren,
       error: correctionChildrenError,

@@ -1,5 +1,9 @@
 import { describe, expect, it, beforeEach, vi } from 'vitest'
-import { isPaymentSourceType, syncInvoiceStatusFromPaymentEntry } from '@/lib/bookkeeping/payment-sync'
+import {
+  isPaymentSourceType,
+  resolveSupplierPaymentRootId,
+  syncInvoiceStatusFromPaymentEntry,
+} from '@/lib/bookkeeping/payment-sync'
 import { createQueuedMockSupabase } from '@/tests/helpers'
 import type { JournalEntry } from '@/types'
 
@@ -57,6 +61,94 @@ describe('isPaymentSourceType', () => {
       expect(isPaymentSourceType(sourceType)).toBe(false)
     }
   )
+})
+
+describe('resolveSupplierPaymentRootId', () => {
+  const correction = (overrides: Partial<JournalEntry> = {}) => ({
+    id: 'correction-1',
+    company_id: 'co-1',
+    status: 'posted',
+    source_type: 'correction',
+    correction_of_id: 'root-1',
+    reversed_by_id: null,
+    ...overrides,
+  }) as JournalEntry
+
+  it('resolves a typed supplier-payment root behind a correction descendant', async () => {
+    const { supabase, calls } = createRecordingSupabase([{
+      data: {
+        id: 'root-1',
+        company_id: 'co-1',
+        status: 'reversed',
+        source_type: 'supplier_invoice_paid',
+        correction_of_id: null,
+        reversed_by_id: 'root-storno-1',
+      },
+      error: null,
+    }])
+
+    await expect(resolveSupplierPaymentRootId(
+      supabase,
+      'co-1',
+      correction(),
+    )).resolves.toBe('root-1')
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({
+      table: 'journal_entries',
+      ops: expect.arrayContaining([
+        { method: 'eq', args: ['company_id', 'co-1'] },
+        { method: 'eq', args: ['id', 'root-1'] },
+      ]),
+    })
+  })
+
+  it('resolves an exact retry to an allocation-backed manual root', async () => {
+    const { supabase } = createRecordingSupabase([
+      {
+        data: {
+          id: 'root-1',
+          company_id: 'co-1',
+          status: 'reversed',
+          source_type: 'manual',
+          correction_of_id: null,
+          reversed_by_id: 'root-storno-1',
+        },
+        error: null,
+      },
+      { data: [], error: null },
+      { data: [{ id: 'allocation-1' }], error: null },
+    ])
+
+    await expect(resolveSupplierPaymentRootId(
+      supabase,
+      'co-1',
+      correction({
+        status: 'reversed',
+        reversed_by_id: 'descendant-storno-1',
+      }),
+    )).resolves.toBe('root-1')
+  })
+
+  it('fails closed for missing or cross-company ancestry', async () => {
+    const { supabase } = createRecordingSupabase([{ data: null, error: null }])
+
+    await expect(resolveSupplierPaymentRootId(
+      supabase,
+      'co-1',
+      correction(),
+    )).rejects.toThrow(/missing or cross-company ancestor root-1/)
+  })
+
+  it('fails closed for a malformed correction without an ancestor', async () => {
+    const { supabase } = createRecordingSupabase([])
+
+    await expect(resolveSupplierPaymentRootId(
+      supabase,
+      'co-1',
+      correction({ correction_of_id: null }),
+    )).rejects.toThrow(/correction correction-1 has no ancestor/)
+  })
 })
 
 describe('syncInvoiceStatusFromPaymentEntry', () => {
