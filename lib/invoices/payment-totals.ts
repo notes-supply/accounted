@@ -49,10 +49,10 @@ export async function fetchPaymentTotalsByParent({
       const rows = await fetchAllRows<Record<string, unknown>>(({ from, to }) =>
         supabase
           .from('invoice_payments')
-          .select(`id, ${parentColumn}, amount`)
+          .select('id, invoice_id, amount')
           .eq('company_id', companyId)
           .lte('payment_date', throughDate)
-          .in(parentColumn, parentIdChunk)
+          .in('invoice_id', parentIdChunk)
           .order('id', { ascending: true })
           .range(from, to),
       )
