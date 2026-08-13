@@ -100,7 +100,7 @@ function parseLineageRow(value: unknown): JournalLineageRpcRow {
   return row as unknown as JournalLineageRpcRow
 }
 
-async function fetchSupplierJournalLineage(
+export async function fetchSupplierJournalLineage(
   supabase: SupabaseClient,
   companyId: string,
   rootIds: string[],
@@ -263,7 +263,7 @@ async function fetchSupplierJournalLineage(
   }
 }
 
-function effectiveAccountingDateAtCutoff(
+export function effectiveAccountingDateAtCutoff(
   entry: JournalLineageRow,
   lineage: JournalLineage,
   asOfDate: string,
