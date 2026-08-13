@@ -1,6 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { eventBus } from '@/lib/events'
-import { kickWebhookDispatch } from '@/lib/webhooks/dispatch-kick'
+import { notifyDurableWebhookDeliveries } from '@/lib/webhooks/durable-dispatch-notify'
 import { createLogger } from '@/lib/logger'
 import {
   AccountsNotInChartError,
@@ -1553,7 +1553,7 @@ export async function reverseEntry(
       original.reversed_by_id,
       true,
     )
-    if (recoveryPublication !== 'none') kickWebhookDispatch()
+    if (recoveryPublication !== 'none') notifyDurableWebhookDeliveries()
 
     return existingReversal as JournalEntry
   }
@@ -1785,7 +1785,7 @@ export async function reverseEntry(
     // The atomic supplier command already inserted durable delivery rows. Kick
     // their first attempt without replaying event handlers or blocking the
     // reversal on receiver HTTP; the cron remains the retry/sweep path.
-    kickWebhookDispatch()
+    notifyDurableWebhookDeliveries()
   }
 
   return result

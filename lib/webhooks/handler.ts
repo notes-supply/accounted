@@ -28,6 +28,7 @@ import { createServiceClientNoCookies } from '@/lib/auth/api-keys'
 import { createLogger } from '@/lib/logger'
 import { API_V1_VERSION } from '@/lib/api/v1/version'
 import { kickWebhookDispatch } from './dispatch-kick'
+import { registerDurableDispatchKick } from './durable-dispatch-notify'
 
 const log = createLogger('webhooks/handler')
 
@@ -74,6 +75,10 @@ let registered = false
  * Idempotent: safe to call from ensureInitialized() across hot reloads.
  */
 export function registerWebhookHandler(): void {
+  // reverseEntry is imported by client code, so it cannot import the server-only
+  // dispatcher directly. Register the kick behind a client-safe notification
+  // seam whenever server initialization wires webhook subscribers.
+  registerDurableDispatchKick(kickWebhookDispatch)
   if (registered) return
   registered = true
 
