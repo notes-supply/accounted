@@ -143,6 +143,14 @@ function buildFilterChain(data: unknown[]) {
     return chain
   })
 
+  chain.is = vi.fn().mockImplementation((col: string, val: unknown) => {
+    filtered = filtered.filter((row) => {
+      const field = (row as Record<string, unknown>)[col]
+      return val === null ? field === null || field === undefined : field === val
+    })
+    return chain
+  })
+
   chain.neq = vi.fn().mockImplementation((col: string, val: unknown) => {
     filtered = filtered.filter((row) => (row as Record<string, unknown>)[col] !== val)
     return chain

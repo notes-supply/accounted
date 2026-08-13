@@ -956,6 +956,8 @@ export interface SupplierInvoicePayment {
   journal_entry_id: string | null
   transaction_id: string | null
   notes: string | null
+  reversed_at: string | null
+  reversed_by_journal_entry_id: string | null
 
   created_at: string
 }

@@ -16,129 +16,112 @@ export function isPaymentSourceType(sourceType: string | null | undefined): bool
   if (!sourceType) return false
   return (PAYMENT_SOURCE_TYPES as readonly string[]).includes(sourceType)
 }
+/**
+ * Manual vouchers gain supplier-payment semantics only from retained
+ * allocation evidence. A fresh reversal requires an active allocation. A
+ * recovery may also use an allocation already soft-reversed by the exact
+ * original/storno pair. Missing evidence leaves an arbitrary manual reversal
+ * on the normal non-posted error path.
+ */
+export async function hasSupplierPaymentReversalEvidence(
+  supabase: SupabaseClient,
+  companyId: string,
+  originalJournalEntryId: string,
+  stornoJournalEntryId?: string,
+): Promise<boolean> {
+  const active = await supabase
+    .from('supplier_invoice_payments')
+    .select('id')
+    .eq('company_id', companyId)
+    .eq('journal_entry_id', originalJournalEntryId)
+    .is('reversed_at', null)
+    .limit(1)
+
+  if (active.error) {
+    throw new Error(`Failed to inspect supplier payment allocations: ${active.error.message}`)
+  }
+  if ((active.data ?? []).length > 0) return true
+  if (!stornoJournalEntryId) return false
+
+  const exactReversed = await supabase
+    .from('supplier_invoice_payments')
+    .select('id')
+    .eq('company_id', companyId)
+    .eq('journal_entry_id', originalJournalEntryId)
+    .eq('reversed_by_journal_entry_id', stornoJournalEntryId)
+    .limit(1)
+
+  if (exactReversed.error) {
+    throw new Error(`Failed to inspect supplier payment reversal evidence: ${exactReversed.error.message}`)
+  }
+  return (exactReversed.data ?? []).length > 0
+}
+
 
 /**
  * Revert the business-level paid status on the invoice or supplier invoice
- * that a payment journal entry was attached to. Used by both reverseEntry()
- * (storno) and the DELETE journal entry route: both paths leave the GL in a
- * consistent state but the invoice's status/paid_amount/paid_at would otherwise
- * stay stuck on "paid".
+ * attached to a payment journal entry. `reversalJournalEntryId` is required
+ * when retained supplier allocation rows exist: those rows are soft-reversed
+ * against the exact storno instead of being deleted.
  *
- * Safe to call with any entry: returns early if source_type is not a payment.
+ * Returns the durable supplier publication state. The caller skips the full
+ * EventBus and dispatches extensions only for a newly published intent.
  */
 export async function syncInvoiceStatusFromPaymentEntry(
   supabase: SupabaseClient,
   companyId: string,
-  entry: Pick<JournalEntry, 'id' | 'source_type' | 'source_id'>
-): Promise<void> {
-  if (!isPaymentSourceType(entry.source_type) || !entry.source_id) return
+  entry: Pick<JournalEntry, 'id' | 'source_type' | 'source_id'>,
+  reversalJournalEntryId?: string,
+  supplierPaymentSemantics = false,
+): Promise<'none' | 'published' | 'already_published'> {
+  if (!isPaymentSourceType(entry.source_type) && !supplierPaymentSemantics) return 'none'
 
   const entryId = entry.id
 
-  if (entry.source_type.startsWith('supplier_invoice')) {
-    // Scope to THIS invoice's payment row: a batch voucher (match_batch_allocate)
-    // carries one payment row per invoice under the same journal_entry_id, so an
-    // unfiltered .single() errors out on multi-row and silently yields null.
-    const { data: payment } = await supabase
-      .from('supplier_invoice_payments')
-      .select('amount')
-      .eq('journal_entry_id', entryId)
-      .eq('supplier_invoice_id', entry.source_id)
-      .eq('company_id', companyId)
-      .single()
-
-    // Column is `total`, not `total_amount` (supplier_invoices has never had a
-    // total_amount column). Selecting the wrong name made PostgREST reject the
-    // whole query, so `supplierInvoice` was always null: the restore below was
-    // silently skipped while the payment-row delete and the bank-line release
-    // still ran. The invoice then stayed 'paid' with a stale paid_amount and
-    // nothing behind it, so the AP ledger (leverantörsreskontra) showed money
-    // as paid that was never paid.
-    const { data: supplierInvoice, error: supplierInvoiceError } = await supabase
-      .from('supplier_invoices')
-      .select('paid_amount, total, due_date')
-      .eq('id', entry.source_id)
-      .eq('company_id', companyId)
-      .single()
-
-    // PGRST116 = no row: the invoice itself is gone, so there is nothing to
-    // restore and the cleanup below is still the right thing to do. Any OTHER
-    // error means we could not read the state we are about to overwrite.
-    // Deleting the payment row and releasing the bank line at that point would
-    // destroy the only evidence of the payment while the invoice stays 'paid':
-    // exactly the wrong-AP-ledger outcome above. Abort instead, at ERROR level
-    // so the failure is observable: the storno is already committed and both
-    // callers (reverseEntry, the DELETE voucher route) treat this sync as
-    // best-effort, so bailing out leaves invoice + payment row + bank line
-    // mutually consistent and the operation safely re-runnable.
-    if (supplierInvoiceError && supplierInvoiceError.code !== 'PGRST116') {
-      log.error(
-        'Failed to read supplier invoice for payment reversal: aborting status sync',
-        supplierInvoiceError,
-        { companyId, journalEntryId: entryId, supplierInvoiceId: entry.source_id }
-      )
-      return
+  if (supplierPaymentSemantics || entry.source_type?.startsWith('supplier_invoice')) {
+    if (!reversalJournalEntryId) {
+      throw new Error(`Supplier payment reversal ${entryId} is missing its storno journal entry id`)
     }
 
-    if (supplierInvoice) {
-      // Same fallback semantics as the customer branch below: a cash payment
-      // (supplier_invoice_cash_payment) books no payment row and is only ever
-      // a FULL payment, so reverting the whole paid_amount is correct. The
-      // old `&& payment` guard skipped the restore entirely for cash
-      // reversals, leaving the supplier invoice deadlocked on 'paid'.
-      const paymentAmount = payment?.amount ?? supplierInvoice.paid_amount
-      const newPaidAmount = roundOre(supplierInvoice.paid_amount - paymentAmount)
-      const newRemaining = roundOre(supplierInvoice.total - Math.max(0, newPaidAmount))
-      let newStatus: string
-      if (newPaidAmount > 0) {
-        newStatus = 'partially_paid'
-      } else if (supplierInvoice.due_date && new Date(supplierInvoice.due_date) < new Date()) {
-        newStatus = 'overdue'
-      } else {
-        newStatus = 'approved'
+    const { data, error } = await supabase.rpc('apply_supplier_payment_reversal', {
+      p_company_id: companyId,
+      p_original_journal_entry_id: entryId,
+      p_storno_journal_entry_id: reversalJournalEntryId,
+    })
+
+    if (error) {
+      log.error('Atomic supplier payment reversal failed', error, {
+        companyId,
+        journalEntryId: entryId,
+        reversalJournalEntryId,
+      })
+      throw new Error(`Failed to restore supplier payment state: ${error.message}`)
+    }
+
+    const result = data as {
+      ok?: boolean
+      status?: string
+      event_publication?: {
+        status?: string
+        event_outbox_ids?: unknown[]
+        event_log_count?: number
+        webhook_delivery_count?: number
       }
-
-      await supabase
-        .from('supplier_invoices')
-        .update({
-          status: newStatus,
-          paid_amount: Math.max(0, newPaidAmount),
-          remaining_amount: newRemaining,
-          paid_at: null,
-          payment_journal_entry_id: null,
-        })
-        .eq('id', entry.source_id)
-        .eq('company_id', companyId)
+    } | null
+    const publication = result?.event_publication
+    if (
+      !result?.ok
+      || !publication
+      || !['published', 'already_published'].includes(publication.status ?? '')
+      || !Array.isArray(publication.event_outbox_ids)
+      || publication.event_outbox_ids.length !== 2
+      || publication.event_outbox_ids[0] === publication.event_outbox_ids[1]
+      || publication.event_log_count !== 2
+      || typeof publication.webhook_delivery_count !== 'number'
+    ) {
+      throw new Error(`Supplier payment reversal ${entryId} returned an invalid result`)
     }
-
-    // Remove THIS invoice's payment row tied to the reversed voucher so a
-    // re-match of the same bank line doesn't double-count or trip the unique
-    // index on supplier_invoice_payments. Scoped to the source invoice: a
-    // batch voucher carries sibling rows for other invoices whose status this
-    // call does not restore, so deleting them here would desync paid_amount
-    // from the payment rows (PR #666 review, SOC 2 CC6.3). Capture the linked
-    // transaction id first so the bank line can be released back to the inbox.
-    const { data: spRows } = await supabase
-      .from('supplier_invoice_payments')
-      .select('transaction_id')
-      .eq('journal_entry_id', entryId)
-      .eq('supplier_invoice_id', entry.source_id)
-      .eq('company_id', companyId)
-
-    await supabase
-      .from('supplier_invoice_payments')
-      .delete()
-      .eq('journal_entry_id', entryId)
-      .eq('supplier_invoice_id', entry.source_id)
-      .eq('company_id', companyId)
-
-    await releaseLinkedTransactions(
-      supabase,
-      companyId,
-      entryId,
-      (spRows ?? []).map((r) => (r as { transaction_id: string | null }).transaction_id),
-      'supplier_invoice_id',
-    )
+    return publication.status === 'published' ? 'published' : 'already_published'
   } else {
     // Scoped like the supplier branch: filter by invoice_id + company_id so a
     // batch voucher's sibling payment rows don't break the .single().
@@ -219,6 +202,7 @@ export async function syncInvoiceStatusFromPaymentEntry(
       'invoice_id',
     )
   }
+  return 'none'
 }
 
 /**

@@ -48,7 +48,14 @@ import { fetchPaymentTotalsByParent } from '@/lib/invoices/payment-totals'
 import { getVatTreatmentForRate } from '@/lib/invoices/vat-rules'
 
 const log = createLogger('kontantmetod-cutoff')
-const INVOICE_SOURCE_ID_CHUNK_SIZE = 500
+const SOURCE_ID_CHUNK_SIZE = 500
+const CUSTOMER_DOCUMENT_SOURCE_TYPES = ['invoice_created', 'credit_note'] as const
+const SUPPLIER_DOCUMENT_SOURCE_TYPES = [
+  'supplier_invoice_registered',
+  'supplier_invoice_cash_payment',
+  'supplier_invoice_privately_paid',
+  'supplier_credit_note',
+] as const
 
 /**
  * Vilande utgående moms per VAT treatment. Rates outside 25/12/6 (export,
@@ -300,7 +307,7 @@ export function buildCutoffLines(
       // rather than dropping it. The entry is reversed the next day, so the
       // account choice never survives into the new year.
       : [{ account: '6990', amount: 1 }]
-    const shares = distributeOre(netOre, buckets.map((b) => b.amount))
+    const shares = distributeSignedOre(netOre, buckets.map((b) => b.amount))
     buckets.forEach((bucket, index) => {
       const share = shares[index]
       if (share === 0) return
@@ -308,31 +315,33 @@ export function buildCutoffLines(
     })
   }
 
+  for (const [account, netOre] of expenseByAccount) {
+    if (netOre === 0) continue
+    payableLines.push({
+      account_number: account,
+      debit_amount: netOre > 0 ? toKronor(netOre) : 0,
+      credit_amount: netOre < 0 ? toKronor(-netOre) : 0,
+      line_description: 'Obetalda leverantörsfakturor och kreditnotor vid bokslut',
+    })
+  }
+
+  if (inputVatOre !== 0) {
+    payableLines.push({
+      account_number: VILANDE_INPUT_VAT_ACCOUNT,
+      debit_amount: inputVatOre > 0 ? toKronor(inputVatOre) : 0,
+      credit_amount: inputVatOre < 0 ? toKronor(-inputVatOre) : 0,
+      line_description: 'Vilande ingående moms, dras av vid betalning',
+    })
+  }
+
   if (payableOre !== 0) {
-    for (const [account, netOre] of expenseByAccount) {
-      if (netOre === 0) continue
-      payableLines.push({
-        account_number: account,
-        debit_amount: toKronor(netOre),
-        credit_amount: 0,
-        line_description: 'Obetalda leverantörsfakturor vid bokslut',
-      })
-    }
-
-    if (inputVatOre !== 0) {
-      payableLines.push({
-        account_number: VILANDE_INPUT_VAT_ACCOUNT,
-        debit_amount: toKronor(inputVatOre),
-        credit_amount: 0,
-        line_description: 'Vilande ingående moms, dras av vid betalning',
-      })
-    }
-
     payableLines.push({
       account_number: PAYABLES_ACCOUNT,
-      debit_amount: 0,
-      credit_amount: toKronor(payableOre),
-      line_description: 'Leverantörsskulder vid räkenskapsårets utgång (kontantmetoden)',
+      debit_amount: payableOre < 0 ? toKronor(-payableOre) : 0,
+      credit_amount: payableOre > 0 ? toKronor(payableOre) : 0,
+      line_description: payableOre > 0
+        ? 'Leverantörsskulder vid räkenskapsårets utgång (kontantmetoden)'
+        : 'Leverantörsfordran vid räkenskapsårets utgång (kontantmetoden)',
     })
   }
 
@@ -414,6 +423,12 @@ type CustomerInvoiceItemRow = {
   revenue_account?: string | null
 }
 
+type SupplierInvoiceItemRow = {
+  sort_order?: number | null
+  account_number?: string | null
+  line_total?: number | null
+}
+
 function itemTreatment(rate: number, invoiceTreatment: VatTreatment): VatTreatment {
   return rate === 0 && (invoiceTreatment === 'reverse_charge' || invoiceTreatment === 'export')
     ? invoiceTreatment
@@ -459,33 +474,385 @@ function buildReceivableComponents(
   return { netComponents, vatComponents }
 }
 
-async function fetchBookedInvoiceSourceIds(
+type JournalLineageRow = {
+  id: string
+  source_id: string | null
+  source_type: string | null
+  status: string
+  entry_date: string
+  correction_of_id: string | null
+  reverses_id: string | null
+  committed_at: string | null
+}
+
+type SupplierPaymentRow = {
+  id: string
+  supplier_invoice_id: string
+  payment_date: string
+  amount: number | string
+  journal_entry_id: string | null
+}
+
+type JournalLineage = {
+  correctionsByParent: Map<string, JournalLineageRow[]>
+  reversalsByParent: Map<string, JournalLineageRow[]>
+}
+
+const JOURNAL_LINEAGE_COLUMNS =
+  'id, source_id, source_type, status, entry_date, correction_of_id, reverses_id, committed_at'
+
+function assertCommittedLineageEntry(entry: JournalLineageRow): void {
+  if (!entry.id || !entry.entry_date) {
+    throw new Error(
+      `Could not prove journal lineage for entry ${entry.id || '<missing id>'}`,
+    )
+  }
+  if (entry.status !== 'posted' && entry.status !== 'reversed') {
+    throw new Error(
+      `Unexpected journal lineage status ${entry.status} for entry ${entry.id}`,
+    )
+  }
+}
+
+async function fetchLineageChildren(
   supabase: SupabaseClient,
   companyId: string,
-  invoiceIds: string[],
-  periodEnd: string,
-): Promise<Set<string>> {
-  const booked = new Set<string>()
-  const uniqueIds = Array.from(new Set(invoiceIds))
+  parentIds: string[],
+): Promise<{ corrections: JournalLineageRow[]; reversals: JournalLineageRow[] }> {
+  const corrections: JournalLineageRow[] = []
+  const reversals: JournalLineageRow[] = []
+  const uniqueIds = Array.from(new Set(parentIds))
 
-  for (let i = 0; i < uniqueIds.length; i += INVOICE_SOURCE_ID_CHUNK_SIZE) {
-    const chunk = uniqueIds.slice(i, i + INVOICE_SOURCE_ID_CHUNK_SIZE)
-    const entries = await fetchAllRows<{ source_id: string }>(({ from, to }) =>
+  for (let i = 0; i < uniqueIds.length; i += SOURCE_ID_CHUNK_SIZE) {
+    const chunk = uniqueIds.slice(i, i + SOURCE_ID_CHUNK_SIZE)
+    const [correctionRows, reversalRows] = await Promise.all([
+      fetchAllRows<JournalLineageRow>(({ from, to }) =>
+        supabase
+          .from('journal_entries')
+          .select(JOURNAL_LINEAGE_COLUMNS)
+          .eq('company_id', companyId)
+          .eq('source_type', 'correction')
+          .in('status', ['posted', 'reversed'])
+          .in('correction_of_id', chunk)
+          .order('id', { ascending: true })
+          .range(from, to),
+      ),
+      fetchAllRows<JournalLineageRow>(({ from, to }) =>
+        supabase
+          .from('journal_entries')
+          .select(JOURNAL_LINEAGE_COLUMNS)
+          .eq('company_id', companyId)
+          .eq('source_type', 'storno')
+          .eq('status', 'posted')
+          .in('reverses_id', chunk)
+          .order('id', { ascending: true })
+          .range(from, to),
+      ),
+    ])
+    corrections.push(...correctionRows)
+    reversals.push(...reversalRows)
+  }
+
+  return { corrections, reversals }
+}
+
+async function fetchJournalLineage(
+  supabase: SupabaseClient,
+  companyId: string,
+  roots: JournalLineageRow[],
+): Promise<JournalLineage> {
+  const correctionsByParent = new Map<string, JournalLineageRow[]>()
+  const reversalsByParent = new Map<string, JournalLineageRow[]>()
+  let frontier = roots
+    .filter((entry) => entry.status === 'reversed')
+    .map((entry) => entry.id)
+  const expanded = new Set<string>()
+
+  while (frontier.length > 0) {
+    const parentIds = frontier.filter((id) => !expanded.has(id))
+    if (parentIds.length === 0) break
+    parentIds.forEach((id) => expanded.add(id))
+
+    const { corrections, reversals } = await fetchLineageChildren(
+      supabase,
+      companyId,
+      parentIds,
+    )
+    for (const child of corrections) {
+      if (!child.correction_of_id) {
+        throw new Error(`Correction ${child.id} has no correction_of_id`)
+      }
+      const siblings = correctionsByParent.get(child.correction_of_id) ?? []
+      siblings.push(child)
+      correctionsByParent.set(child.correction_of_id, siblings)
+    }
+    for (const child of reversals) {
+      if (!child.reverses_id) {
+        throw new Error(`Storno ${child.id} has no reverses_id`)
+      }
+      const siblings = reversalsByParent.get(child.reverses_id) ?? []
+      siblings.push(child)
+      reversalsByParent.set(child.reverses_id, siblings)
+    }
+    frontier = corrections
+      .filter((entry) => entry.status === 'reversed')
+      .map((entry) => entry.id)
+  }
+
+  return { correctionsByParent, reversalsByParent }
+}
+
+function hasLiveEffectAtCutoff(
+  entry: JournalLineageRow,
+  lineage: JournalLineage,
+  periodEnd: string,
+  visiting: Set<string> = new Set(),
+): boolean {
+  assertCommittedLineageEntry(entry)
+  if (entry.status === 'posted') return entry.entry_date <= periodEnd
+  if (visiting.has(entry.id)) {
+    throw new Error(`Cyclic journal lineage at entry ${entry.id}`)
+  }
+
+  const nextVisiting = new Set(visiting)
+  nextVisiting.add(entry.id)
+  const corrections = lineage.correctionsByParent.get(entry.id) ?? []
+  const reversals = lineage.reversalsByParent.get(entry.id) ?? []
+
+  if (corrections.length > 1) {
+    throw new Error(`Ambiguous correction lineage for entry ${entry.id}`)
+  }
+  if (reversals.length !== 1) {
+    throw new Error(`Could not resolve storno lineage for entry ${entry.id}`)
+  }
+
+  const reversal = reversals[0]
+  assertCommittedLineageEntry(reversal)
+  if (
+    reversal.source_type !== 'storno' ||
+    reversal.reverses_id !== entry.id ||
+    reversal.status !== 'posted'
+  ) {
+    throw new Error(`Malformed storno lineage for entry ${entry.id}`)
+  }
+
+  const correction = corrections[0]
+  if (!correction) {
+    // A plain storno removes only an effect that had started by the cutoff.
+    // Posting it later does not turn this accounting-date report into a
+    // transaction-time snapshot.
+    return entry.entry_date <= periodEnd && reversal.entry_date > periodEnd
+  }
+
+  assertCommittedLineageEntry(correction)
+  if (
+    correction.source_type !== 'correction' ||
+    correction.correction_of_id !== entry.id ||
+    reversal.entry_date !== entry.entry_date
+  ) {
+    throw new Error(`Malformed correction lineage for entry ${entry.id}`)
+  }
+
+  // Traverse first even when the immediate replacement is future-dated: that
+  // child may itself have been corrected back into the cutoff period. If no
+  // descendant has a live effect yet, the parent remains represented until
+  // the immediate replacement's accounting date.
+  if (hasLiveEffectAtCutoff(correction, lineage, periodEnd, nextVisiting)) {
+    return true
+  }
+  return correction.entry_date > periodEnd && entry.entry_date <= periodEnd
+}
+
+async function fetchJournalEntriesByIds(
+  supabase: SupabaseClient,
+  companyId: string,
+  entryIds: string[],
+): Promise<Map<string, JournalLineageRow>> {
+  const entries = new Map<string, JournalLineageRow>()
+  const uniqueIds = Array.from(new Set(entryIds))
+
+  for (let i = 0; i < uniqueIds.length; i += SOURCE_ID_CHUNK_SIZE) {
+    const chunk = uniqueIds.slice(i, i + SOURCE_ID_CHUNK_SIZE)
+    const rows = await fetchAllRows<JournalLineageRow>(({ from, to }) =>
       supabase
         .from('journal_entries')
-        .select('id, source_id')
+        .select(JOURNAL_LINEAGE_COLUMNS)
         .eq('company_id', companyId)
-        .in('source_type', ['invoice_created', 'credit_note'])
-        .eq('status', 'posted')
-        .lte('entry_date', periodEnd)
+        .in('id', chunk)
+        .order('id', { ascending: true })
+        .range(from, to),
+    )
+    for (const entry of rows) entries.set(entry.id, entry)
+  }
+
+  const unresolved = uniqueIds.filter((id) => !entries.has(id))
+  if (unresolved.length > 0) {
+    throw new Error(
+      `Could not resolve ${unresolved.length} supplier payment journal entries`,
+    )
+  }
+  return entries
+}
+
+async function fetchSupplierPaymentVoucherRoots(
+  supabase: SupabaseClient,
+  companyId: string,
+  supplierInvoiceIds: string[],
+): Promise<JournalLineageRow[]> {
+  const roots: JournalLineageRow[] = []
+  const uniqueIds = Array.from(new Set(supplierInvoiceIds))
+
+  for (let i = 0; i < uniqueIds.length; i += SOURCE_ID_CHUNK_SIZE) {
+    const chunk = uniqueIds.slice(i, i + SOURCE_ID_CHUNK_SIZE)
+    const rows = await fetchAllRows<JournalLineageRow>(({ from, to }) =>
+      supabase
+        .from('journal_entries')
+        .select(JOURNAL_LINEAGE_COLUMNS)
+        .eq('company_id', companyId)
+        .eq('source_type', 'supplier_invoice_paid')
+        .in('status', ['posted', 'reversed'])
         .in('source_id', chunk)
         .order('id', { ascending: true })
         .range(from, to),
     )
-    for (const entry of entries) booked.add(entry.source_id)
+    roots.push(...rows)
   }
 
-  return booked
+  return roots
+}
+
+async function fetchSupplierPaymentTotalsAtCutoff(
+  supabase: SupabaseClient,
+  companyId: string,
+  supplierInvoiceIds: string[],
+  periodEnd: string,
+): Promise<Map<string, number>> {
+  const payments: SupplierPaymentRow[] = []
+  const uniqueIds = Array.from(new Set(supplierInvoiceIds))
+
+  for (let i = 0; i < uniqueIds.length; i += SOURCE_ID_CHUNK_SIZE) {
+    const chunk = uniqueIds.slice(i, i + SOURCE_ID_CHUNK_SIZE)
+    const rows = await fetchAllRows<SupplierPaymentRow>(({ from, to }) =>
+      supabase
+        .from('supplier_invoice_payments')
+        .select('id, supplier_invoice_id, payment_date, amount, journal_entry_id')
+        .eq('company_id', companyId)
+        .lte('payment_date', periodEnd)
+        .in('supplier_invoice_id', chunk)
+        .order('id', { ascending: true })
+        .range(from, to),
+    )
+    payments.push(...rows)
+  }
+
+  const linkedIds = payments.flatMap((payment) =>
+    payment.journal_entry_id ? [payment.journal_entry_id] : []
+  )
+  const [linkedRoots, paymentVoucherRoots] = await Promise.all([
+    linkedIds.length > 0
+      ? fetchJournalEntriesByIds(supabase, companyId, linkedIds)
+      : Promise.resolve(new Map<string, JournalLineageRow>()),
+    fetchSupplierPaymentVoucherRoots(supabase, companyId, supplierInvoiceIds),
+  ])
+  const allRoots = new Map(linkedRoots)
+  for (const root of paymentVoucherRoots) allRoots.set(root.id, root)
+  const lineage = allRoots.size > 0
+    ? await fetchJournalLineage(
+      supabase,
+      companyId,
+      Array.from(allRoots.values()),
+    )
+    : { correctionsByParent: new Map(), reversalsByParent: new Map() }
+
+  const totals = new Map<string, number>()
+  const durablePaymentLinks = new Set<string>()
+  for (const payment of payments) {
+    if (payment.journal_entry_id) {
+      durablePaymentLinks.add(
+        `${payment.journal_entry_id}:${payment.supplier_invoice_id}`,
+      )
+    }
+    // The column has been nullable since supplier_invoice_payments was
+    // introduced. Early mark-paid flows could legitimately write a row after
+    // the journal helper returned null, so an unlinked row remains a documented
+    // compatibility case. Every non-null link must resolve and prove a live
+    // company-scoped ledger effect.
+    const countsAtCutoff = payment.journal_entry_id === null ||
+      hasLiveEffectAtCutoff(
+        linkedRoots.get(payment.journal_entry_id)!,
+        lineage,
+        periodEnd,
+      )
+    if (!countsAtCutoff) continue
+    totals.set(
+      payment.supplier_invoice_id,
+      (totals.get(payment.supplier_invoice_id) ?? 0) + Number(payment.amount),
+    )
+  }
+
+  for (const root of paymentVoucherRoots) {
+    if (
+      root.source_id &&
+      hasLiveEffectAtCutoff(root, lineage, periodEnd) &&
+      !durablePaymentLinks.has(`${root.id}:${root.source_id}`)
+    ) {
+      // Successful plain-reversal cleanup deletes this row. The immutable
+      // voucher proves a payment existed, but custom and FX payment vouchers
+      // make its invoice-currency amount impossible to reconstruct exactly
+      // from balancing totals. Refuse the cutoff instead of guessing.
+      throw new Error(
+        `Missing supplier payment history for live journal entry ${root.id}`,
+      )
+    }
+  }
+  return totals
+}
+
+async function fetchPostedSourceLiveness(
+  supabase: SupabaseClient,
+  companyId: string,
+  sourceIds: string[],
+  sourceTypes: readonly string[],
+  periodEnd: string,
+): Promise<{ live: Set<string>; reversedByCutoff: Set<string> }> {
+  const roots: JournalLineageRow[] = []
+  const uniqueIds = Array.from(new Set(sourceIds))
+
+  for (let i = 0; i < uniqueIds.length; i += SOURCE_ID_CHUNK_SIZE) {
+    const chunk = uniqueIds.slice(i, i + SOURCE_ID_CHUNK_SIZE)
+    const entries = await fetchAllRows<JournalLineageRow>(({ from, to }) =>
+      supabase
+        .from('journal_entries')
+        .select(JOURNAL_LINEAGE_COLUMNS)
+        .eq('company_id', companyId)
+        .in('source_type', [...sourceTypes])
+        .in('status', ['posted', 'reversed'])
+        .in('source_id', chunk)
+        .order('id', { ascending: true })
+        .range(from, to),
+    )
+    roots.push(...entries)
+  }
+
+  const lineage = await fetchJournalLineage(
+    supabase,
+    companyId,
+    roots,
+  )
+  const live = new Set<string>()
+  const reversedByCutoff = new Set<string>()
+  for (const entry of roots) {
+    if (!entry.source_id) continue
+    if (hasLiveEffectAtCutoff(entry, lineage, periodEnd)) {
+      live.add(entry.source_id)
+    } else if (entry.status === 'reversed' && entry.entry_date <= periodEnd) {
+      // A source voucher that started by the cutoff and whose exact storno
+      // lineage removed it by then proves the document was no longer live.
+      // Future-dated source vouchers do not prove historical cancellation.
+      reversedByCutoff.add(entry.source_id)
+    }
+  }
+  return { live, reversedByCutoff }
 }
 
 /**
@@ -517,10 +884,10 @@ export async function collectKontantmetodCutoff(
     fetchAllRows<Record<string, unknown>>(({ from, to }) =>
       supabase
         .from('supplier_invoices')
-        .select('id, supplier_invoice_number, invoice_date, status, total, total_sek, vat_amount, vat_amount_sek, reverse_charge, is_credit_note, items:supplier_invoice_items(account_number, line_total)')
+        .select('id, supplier_invoice_number, invoice_date, status, reversed_at, total, total_sek, vat_amount, vat_amount_sek, reverse_charge, is_credit_note, credited_invoice_id, items:supplier_invoice_items(sort_order, account_number, line_total)')
         .eq('company_id', companyId)
         .lte('invoice_date', periodEnd)
-        .in('status', ['registered', 'approved', 'partially_paid', 'paid'])
+        .in('status', ['registered', 'approved', 'partially_paid', 'paid', 'overdue', 'credited', 'disputed', 'reversed'])
         .order('id', { ascending: true })
         .range(from, to),
     ),
@@ -528,10 +895,38 @@ export async function collectKontantmetodCutoff(
 
   const invoiceIds = invoices.map((row) => row.id as string)
   const supplierIds = supplierInvoices.map((row) => row.id as string)
-  // Payments ON OR BEFORE period end reduce the outstanding balance; later
-  // ones must not. Documents with a source voucher by the selected date are
-  // already represented in the ledger even if row-pointer write-back failed.
-  const [paidByInvoice, paidBySupplierInvoice, bookedInvoiceSourceIds] = await Promise.all([
+  // Resolve document-source vouchers first. A supplier document already
+  // represented in the ledger is not a cash-cutoff candidate, so its missing
+  // or legacy payment evidence must not block reconstruction of unrelated
+  // invoices.
+  const [invoiceSourceLiveness, supplierSourceLiveness] = await Promise.all([
+    fetchPostedSourceLiveness(
+      supabase,
+      companyId,
+      invoiceIds,
+      CUSTOMER_DOCUMENT_SOURCE_TYPES,
+      periodEnd,
+    ),
+    fetchPostedSourceLiveness(
+      supabase,
+      companyId,
+      supplierIds,
+      SUPPLIER_DOCUMENT_SOURCE_TYPES,
+      periodEnd,
+    ),
+  ])
+  const bookedInvoiceSourceIds = invoiceSourceLiveness.live
+  const bookedSupplierSourceIds = supplierSourceLiveness.live
+  const supplierPaymentCandidateIds = supplierInvoices
+    .filter((row) =>
+      !bookedSupplierSourceIds.has(row.id as string) &&
+      Number(row.total ?? 0) !== 0
+    )
+    .map((row) => row.id as string)
+
+  // Payments ON OR BEFORE period end reduce the remaining cash-cutoff
+  // candidates; later payments do not.
+  const [paidByInvoice, paidBySupplierInvoice] = await Promise.all([
     fetchPaymentTotalsByParent({
       supabase,
       table: 'invoice_payments',
@@ -540,15 +935,12 @@ export async function collectKontantmetodCutoff(
       parentIds: invoiceIds,
       throughDate: periodEnd,
     }),
-    fetchPaymentTotalsByParent({
+    fetchSupplierPaymentTotalsAtCutoff(
       supabase,
-      table: 'supplier_invoice_payments',
-      parentColumn: 'supplier_invoice_id',
       companyId,
-      parentIds: supplierIds,
-      throughDate: periodEnd,
-    }),
-    fetchBookedInvoiceSourceIds(supabase, companyId, invoiceIds, periodEnd),
+      supplierPaymentCandidateIds,
+      periodEnd,
+    ),
   ])
 
   const invoicesById = new Map(invoices.map((row) => [row.id as string, row]))
@@ -622,30 +1014,63 @@ export async function collectKontantmetodCutoff(
     })
   }
 
+  const supplierInvoicesById = new Map(
+    supplierInvoices.map((row) => [row.id as string, row]),
+  )
   const payables: CutoffPayable[] = []
   for (const row of supplierInvoices) {
-    const invoiceTotal = Number(row.total ?? 0)
-    const totalSek = Number(row.total_sek ?? row.total ?? 0)
-    const vatSek = Number(row.vat_amount_sek ?? row.vat_amount ?? 0)
-    const paid = paidBySupplierInvoice.get(row.id as string) ?? 0
-    const outstandingInInvoiceCurrency = roundOre(invoiceTotal - paid)
-    const ratio = invoiceTotal === 0 ? 0 : outstandingInInvoiceCurrency / invoiceTotal
-    const outstanding = roundOre(totalSek * ratio)
+    const id = row.id as string
+    if (bookedSupplierSourceIds.has(id)) continue
+    if (row.status === 'reversed') {
+      const reversedAt = typeof row.reversed_at === 'string'
+        ? row.reversed_at.slice(0, 10)
+        : null
+      if (
+        supplierSourceLiveness.reversedByCutoff.has(id)
+        || (reversedAt !== null && reversedAt <= periodEnd)
+      ) {
+        continue
+      }
+    }
+
+
+    const isCreditNote = Boolean(row.is_credit_note)
+    const invoiceMagnitude = Math.abs(Number(row.total ?? 0))
+    const totalSekMagnitude = Math.abs(Number(row.total_sek ?? row.total ?? 0))
+    const vatSekMagnitude = Math.abs(Number(row.vat_amount_sek ?? row.vat_amount ?? 0))
+    const documentSign = isCreditNote ? -1 : Math.sign(Number(row.total ?? 0)) || 1
+    const paid = paidBySupplierInvoice.get(id) ?? 0
+    const outstandingMagnitude = roundOre(invoiceMagnitude - paid)
+    const ratio = invoiceMagnitude === 0 ? 0 : outstandingMagnitude / invoiceMagnitude
+    const outstanding = roundOre(documentSign * totalSekMagnitude * ratio)
     if (Math.abs(outstanding) < ORE_TOLERANCE) continue
 
-    const items = (row.items ?? []) as Array<Record<string, unknown>>
+    const vat = roundOre(documentSign * vatSekMagnitude * ratio)
+    const items = (row.items ?? []) as SupplierInvoiceItemRow[]
+    const creditedInvoiceId = row.credited_invoice_id as string | null
+    const originalItems = creditedInvoiceId
+      ? (supplierInvoicesById.get(creditedInvoiceId)?.items ?? []) as SupplierInvoiceItemRow[]
+      : []
+    const originalAccounts = new Map(
+      originalItems
+        .filter((item) => item.sort_order != null && item.account_number)
+        .map((item) => [item.sort_order as number, item.account_number as string]),
+    )
+    const effectiveItems = items.length > 0 ? items : originalItems
     payables.push({
-      id: row.id as string,
+      id,
       reference: (row.supplier_invoice_number as string) ?? '',
       outstanding,
-      vat: roundOre(vatSek * ratio),
+      vat,
       reverseCharge: Boolean(row.reverse_charge),
-      netByAccount: items
-        .filter((item) => item.account_number)
+      netByAccount: effectiveItems
         .map((item) => ({
-          account: item.account_number as string,
+          account: item.account_number ??
+            originalAccounts.get(Number(item.sort_order)) ??
+            '',
           amount: Math.abs(Number(item.line_total ?? 0)),
-        })),
+        }))
+        .filter((item) => item.account),
     })
   }
 

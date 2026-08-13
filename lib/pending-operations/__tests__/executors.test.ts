@@ -95,6 +95,11 @@ vi.mock('@/lib/entitlements/has-capability', async (importOriginal) => {
   return { ...actual, hasCapability: vi.fn().mockResolvedValue(true) }
 })
 
+vi.mock('@/lib/mileage/mileage-service', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/mileage/mileage-service')>()
+  return { ...actual, bookMileagePeriod: vi.fn() }
+})
+
 vi.mock('@/lib/email/service', () => ({
   getEmailService: () => ({
     isConfigured: () => true,
@@ -126,6 +131,7 @@ import {
 } from '@/lib/transactions/categorize-core'
 import { createSupplierCreditNoteEntry } from '@/lib/bookkeeping/supplier-invoice-entries'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
+import { bookMileagePeriod } from '@/lib/mileage/mileage-service'
 
 function makePendingOp(overrides: Partial<PendingOperation>): PendingOperation {
   return {
@@ -152,6 +158,101 @@ function makePendingOp(overrides: Partial<PendingOperation>): PendingOperation {
 beforeEach(() => {
   vi.clearAllMocks()
   eventBus.clear()
+})
+
+describe('commitPendingOperation: book_mileage_period recovery', () => {
+  const params = {
+    from: '2026-05-01',
+    to: '2026-05-31',
+    entry_date: '2026-05-31',
+    counter_account: '2820',
+    trip_ids: ['trip-1'],
+  }
+
+  it.each([
+    {
+      name: 'uncertain commit',
+      serviceResult: {
+        ok: false as const,
+        code: 'POST_COMMIT_UNCERTAIN' as const,
+        journalEntryId: 'je-uncertain',
+        voucherNumber: 73,
+      },
+      journalEntryId: 'je-uncertain',
+    },
+    {
+      name: 'incomplete trip stamp',
+      serviceResult: {
+        ok: false as const,
+        code: 'STAMP_FAILED' as const,
+        journalEntryId: 'je-stamped',
+        voucherNumber: 74,
+        voucherSeries: 'A',
+      },
+      journalEntryId: 'je-stamped',
+    },
+  ])('persists $name as failed_partial with journal identity', async ({
+    serviceResult,
+    journalEntryId,
+  }) => {
+    vi.mocked(bookMileagePeriod).mockResolvedValueOnce(serviceResult)
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null })
+    enqueue({
+      data: {
+        id: 'op-1',
+        company_id: 'company-1',
+        status: 'failed_partial',
+        result_data: { posted_ids: { journal_entry_id: journalEntryId } },
+      },
+      error: null,
+    })
+
+    const result = await commitPendingOperation(
+      supabase as never,
+      'user-1',
+      'company-1',
+      makePendingOp({ operation_type: 'book_mileage_period', params }),
+    )
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      code: 'partial_commit',
+      data: {
+        posted_ids: { journal_entry_id: journalEntryId },
+        partial_failure_state: {
+          persistence: 'confirmed',
+          operation_status: 'failed_partial',
+        },
+      },
+    })
+  })
+
+  it('rejects without posted ids when claim release itself requires recovery', async () => {
+    vi.mocked(bookMileagePeriod).mockResolvedValueOnce({
+      ok: false,
+      code: 'CLAIM_RELEASE_FAILED',
+      reason: 'INCOMPLETE_RELEASE',
+      claimedTripIds: ['trip-1'],
+      releasedTripIds: [],
+      detail: 'release mismatch',
+    })
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { id: 'op-1' }, error: null })
+    enqueue({ data: null, error: null })
+
+    const result = await commitPendingOperation(
+      supabase as never,
+      'user-1',
+      'company-1',
+      makePendingOp({ operation_type: 'book_mileage_period', params }),
+    )
+
+    expect(result).toMatchObject({ status: 'failed', http_status: 500 })
+    expect(result.code).toBeUndefined()
+    expect(result.data).toBeUndefined()
+    expect(result.error).toContain('claims require recovery')
+  })
 })
 
 // ─── unlock_period ──────────────────────────────────────────────────

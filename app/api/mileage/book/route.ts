@@ -23,45 +23,85 @@ export const POST = withRouteContext(
     })
 
     if (!result.ok) {
-      if (result.code === 'NO_TRIPS') {
-        return NextResponse.json(
-          { error: 'Inga obokförda resor i den valda perioden' },
-          { status: 400 }
-        )
+      switch (result.code) {
+        case 'NO_TRIPS':
+          return NextResponse.json(
+            { error: 'Inga obokförda resor i den valda perioden' },
+            { status: 400 }
+          )
+        case 'MIXED_EMPLOYEES':
+          return NextResponse.json(
+            { error: 'Resorna i perioden gäller flera anställda. Bokför per anställd.' },
+            { status: 400 }
+          )
+        case 'PERIOD_NOT_OPEN':
+          return NextResponse.json(
+            { error: 'Bokföringsdatumet ligger i en stängd eller låst period' },
+            { status: 400 }
+          )
+        case 'CLAIM_LOST':
+        case 'TRIPS_CHANGED':
+          return NextResponse.json(
+            { error: 'Körjournalen ändrades samtidigt av en annan bokning. Ladda om och försök igen.' },
+            { status: 409 }
+          )
+        case 'CLAIM_RELEASE_FAILED':
+          log.error('mileage claim release requires recovery', undefined, {
+            operation: 'mileage.book',
+            companyId,
+            reason: result.reason,
+            claimedTripIds: result.claimedTripIds,
+            releasedTripIds: result.releasedTripIds,
+            detail: result.detail,
+          })
+          return NextResponse.json(
+            {
+              error:
+                'Resorna kunde inte återställas efter en avbruten bokning. Försök inte igen innan körjournalen har kontrollerats.',
+              code: result.code,
+            },
+            { status: 500 }
+          )
+        case 'POST_COMMIT_UNCERTAIN':
+          log.error('mileage voucher outcome requires recovery', undefined, {
+            operation: 'mileage.book',
+            companyId,
+            entityType: 'journal_entry',
+            entityId: result.journalEntryId,
+            voucherNumber: result.voucherNumber,
+          })
+          return NextResponse.json(
+            {
+              error:
+                'Verifikatet kan ha bokförts, men resultatet kunde inte bekräftas. Försök inte igen innan verifikatet och körjournalen har kontrollerats.',
+              code: result.code,
+              journal_entry_id: result.journalEntryId,
+              voucher_number: result.voucherNumber,
+            },
+            { status: 500 }
+          )
+        case 'STAMP_FAILED':
+          log.error('mileage stamp failed after verifikat creation', undefined, {
+            operation: 'mileage.book',
+            companyId,
+            entityType: 'journal_entry',
+            entityId: result.journalEntryId,
+            voucherNumber: result.voucherNumber,
+          })
+          return NextResponse.json(
+            {
+              error:
+                'Verifikatet skapades men alla resor kunde inte markeras som bokförda. Kontrollera körjournalen innan du bokför perioden igen.',
+              code: result.code,
+              journal_entry_id: result.journalEntryId,
+              voucher_series: result.voucherSeries,
+              voucher_number: result.voucherNumber,
+            },
+            { status: 500 }
+          )
       }
-      if (result.code === 'MIXED_EMPLOYEES') {
-        return NextResponse.json(
-          { error: 'Resorna i perioden gäller flera anställda. Bokför per anställd.' },
-          { status: 400 }
-        )
-      }
-      if (result.code === 'PERIOD_NOT_OPEN') {
-        return NextResponse.json(
-          { error: 'Bokföringsdatumet ligger i en stängd eller låst period' },
-          { status: 400 }
-        )
-      }
-      if (result.code === 'CLAIM_LOST' || result.code === 'TRIPS_CHANGED') {
-        return NextResponse.json(
-          { error: 'Körjournalen ändrades samtidigt av en annan bokning. Ladda om och försök igen.' },
-          { status: 409 }
-        )
-      }
-      // STAMP_FAILED: the verifikat exists but some trips could not be marked
-      // as booked. Surface loudly so the user does not book the period twice.
-      log.error('mileage stamp failed after verifikat creation', undefined, {
-        operation: 'mileage.book',
-        companyId,
-        entityType: 'journal_entry',
-        entityId: result.journalEntryId,
-      })
-      return NextResponse.json(
-        {
-          error:
-            'Verifikatet skapades men alla resor kunde inte markeras som bokförda. Kontrollera körjournalen innan du bokför perioden igen.',
-        },
-        { status: 500 }
-      )
+      const unhandledResult: never = result
+      throw new Error(`Unhandled mileage booking result: ${String(unhandledResult)}`)
     }
 
     return NextResponse.json({

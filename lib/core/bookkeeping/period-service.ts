@@ -116,10 +116,13 @@ export async function countUnbookedInPeriod(
   for (const table of ['transaction_voucher_links', 'invoice_payments', 'supplier_invoice_payments'] as const) {
     for (let i = 0; i < candidateIds.length; i += ANCHOR_LOOKUP_CHUNK) {
       const chunk = candidateIds.slice(i, i + ANCHOR_LOOKUP_CHUNK)
-      const { data, error } = await supabase
+      const query = supabase
         .from(table)
         .select('transaction_id')
         .in('transaction_id', chunk)
+      const { data, error } = table === 'supplier_invoice_payments'
+        ? await query.is('reversed_at', null)
+        : await query
       if (error) {
         throw new Error(`${table} anchor lookup failed: ${error.message}`)
       }

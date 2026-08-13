@@ -4844,25 +4844,50 @@ async function commitBookMileagePeriod(
         : undefined,
     })
     if (!result.ok) {
-      if (result.code === 'NO_TRIPS') {
-        return { error: 'No unbooked trips in the selected period', status: 400 }
+      switch (result.code) {
+        case 'NO_TRIPS':
+          return { error: 'No unbooked trips in the selected period', status: 400 }
+        case 'MIXED_EMPLOYEES':
+          return { error: 'The period spans several employees; book per employee via employee_id', status: 400 }
+        case 'PERIOD_NOT_OPEN':
+          return { error: 'The entry date falls in a closed or locked period', status: 400 }
+        case 'TRIPS_CHANGED':
+        case 'CLAIM_LOST':
+          return {
+            error: 'The körjournal changed since this booking was staged; stage it again to get a fresh preview',
+            status: 409,
+          }
+        case 'CLAIM_RELEASE_FAILED':
+          return {
+            error:
+              `Mileage claims require recovery after a failed release (${result.reason}); ` +
+              `claimed trips: ${result.claimedTripIds.join(', ') || 'none'}; ` +
+              `released trips: ${result.releasedTripIds.join(', ') || 'none'}`,
+            status: 500,
+          }
+        case 'POST_COMMIT_UNCERTAIN':
+          return {
+            error:
+              `Journal entry ${result.journalEntryId} may have been posted` +
+              (result.voucherNumber === null
+                ? ''
+                : ` as voucher ${result.voucherNumber}`) +
+              '; do not retry before reviewing the journal and körjournal',
+            status: 500,
+            partialPostedIds: { journal_entry_id: result.journalEntryId },
+          }
+        case 'STAMP_FAILED':
+          return {
+            error:
+              `Voucher ${result.voucherSeries ?? ''}${result.voucherNumber ?? ''} ` +
+              `(${result.journalEntryId}) was created but trips could not all be linked; ` +
+              'review the körjournal before booking again',
+            status: 500,
+            partialPostedIds: { journal_entry_id: result.journalEntryId },
+          }
       }
-      if (result.code === 'MIXED_EMPLOYEES') {
-        return { error: 'The period spans several employees; book per employee via employee_id', status: 400 }
-      }
-      if (result.code === 'PERIOD_NOT_OPEN') {
-        return { error: 'The entry date falls in a closed or locked period', status: 400 }
-      }
-      if (result.code === 'TRIPS_CHANGED' || result.code === 'CLAIM_LOST') {
-        return {
-          error: 'The körjournal changed since this booking was staged; stage it again to get a fresh preview',
-          status: 409,
-        }
-      }
-      return {
-        error: `Voucher ${result.journalEntryId} was created but trips could not all be linked; review the körjournal before booking again`,
-        status: 500,
-      }
+      const unhandledResult: never = result
+      throw new Error(`Unhandled mileage booking result: ${String(unhandledResult)}`)
     }
     return {
       data: {

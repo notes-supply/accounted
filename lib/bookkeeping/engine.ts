@@ -28,7 +28,11 @@ import {
 } from '@/lib/bookkeeping/dimension-rules'
 import { fetchEntryLines, type EntryLinesQuery } from '@/lib/bookkeeping/entry-lines'
 import { backfillStandardBASAccounts } from '@/lib/bookkeeping/account-backfill'
-import { syncInvoiceStatusFromPaymentEntry, isPaymentSourceType } from '@/lib/bookkeeping/payment-sync'
+import {
+  hasSupplierPaymentReversalEvidence,
+  isPaymentSourceType,
+  syncInvoiceStatusFromPaymentEntry,
+} from '@/lib/bookkeeping/payment-sync'
 import { getActor } from '@/lib/bookkeeping/actor-context'
 import type {
   AssetDisposalType,
@@ -1501,6 +1505,56 @@ export async function reverseEntry(
   if (error || !original) {
     throw new JournalEntryNotFoundError()
   }
+  const supplierPaymentSource = Boolean(
+    original.source_type?.startsWith('supplier_invoice')
+    && isPaymentSourceType(original.source_type),
+  )
+  const supplierPaymentReversal = supplierPaymentSource || (
+    original.source_type === 'manual'
+    && await hasSupplierPaymentReversalEvidence(
+      supabase,
+      companyId,
+      original.id,
+      original.status === 'reversed' ? original.reversed_by_id ?? undefined : undefined,
+    )
+  )
+
+
+  // A supplier-payment storno can commit before its business-state RPC returns.
+  // Retrying the same reversal must therefore resume that exact, idempotent RPC
+  // instead of attempting a second storno or stopping at the generic status
+  // guard. The persisted reversed_by_id is the only accepted recovery token;
+  // the database command revalidates the complete original/storno/company
+  // lineage before changing supplier state.
+  if (
+    original.status === 'reversed'
+    && original.reversed_by_id
+    && supplierPaymentReversal
+  ) {
+    const { data: existingReversal, error: existingReversalError } = await supabase
+      .from('journal_entries')
+      .select('*, lines:journal_entry_lines(*)')
+      .eq('id', original.reversed_by_id)
+      .eq('company_id', companyId)
+      .single()
+
+    if (existingReversalError || !existingReversal) {
+      throw new BookkeepingDatabaseError(
+        'read_existing_supplier_payment_reversal',
+        existingReversalError?.message,
+      )
+    }
+
+    await syncInvoiceStatusFromPaymentEntry(
+      supabase,
+      companyId,
+      original as JournalEntry,
+      original.reversed_by_id,
+      true,
+    )
+
+    return existingReversal as JournalEntry
+  }
 
   if (original.status !== 'posted') {
     throw new CannotReverseNonPostedError(original.status)
@@ -1634,13 +1688,15 @@ export async function reverseEntry(
   // as bokförd forever, and has no re-booking affordance: the agent paths
   // (lib/pending-operations/commit.ts) already did this manually after every
   // reverseEntry call; the dashboard reverse route did not.
-  const { error: unlinkError } = await supabase
-    .from('transactions')
-    .update({ journal_entry_id: null })
-    .eq('company_id', companyId)
-    .eq('journal_entry_id', entryId)
-  if (unlinkError) {
-    log.error('failed to unlink transactions from reversed entry', unlinkError, { entryId })
+  if (!supplierPaymentReversal) {
+    const { error: unlinkError } = await supabase
+      .from('transactions')
+      .update({ journal_entry_id: null })
+      .eq('company_id', companyId)
+      .eq('journal_entry_id', entryId)
+    if (unlinkError) {
+      log.error('failed to unlink transactions from reversed entry', unlinkError, { entryId })
+    }
   }
 
   // Same hazard one table over: a period whose opening_balance_entry_id still
@@ -1689,8 +1745,15 @@ export async function reverseEntry(
   // Helper is shared with the DELETE journal entry route so both code paths leave
   // the invoice in a consistent state (BFL 5 kap 5§ requires GL reversal; this
   // covers the business-level state that lives outside the GL).
-  if (isPaymentSourceType(original.source_type)) {
-    await syncInvoiceStatusFromPaymentEntry(supabase, companyId, original as JournalEntry)
+  let supplierEventPublication: 'none' | 'published' | 'already_published' = 'none'
+  if (isPaymentSourceType(original.source_type) || supplierPaymentReversal) {
+    supplierEventPublication = await syncInvoiceStatusFromPaymentEntry(
+      supabase,
+      companyId,
+      original as JournalEntry,
+      reversalEntry.id,
+      supplierPaymentReversal,
+    )
   }
 
   // Fetch complete reversal entry with lines
@@ -1702,15 +1765,21 @@ export async function reverseEntry(
 
   const result = completeEntry as JournalEntry
 
-  await eventBus.emit({
-    type: 'journal_entry.committed',
-    payload: { entry: result, userId, companyId },
-  })
+  // Supplier reversals persist event_log rows and webhook deliveries inside the
+  // same database transaction as the business-state change. Do not replay the
+  // ordinary in-process bus here: its core subscribers would duplicate those
+  // durable records, and no enabled extension subscribes to these event types.
+  if (supplierEventPublication === 'none') {
+    await eventBus.emit({
+      type: 'journal_entry.committed',
+      payload: { entry: result, userId, companyId },
+    })
 
-  await eventBus.emit({
-    type: 'journal_entry.reversed',
-    payload: { originalEntry: original as JournalEntry, reversalEntry: result, userId, companyId },
-  })
+    await eventBus.emit({
+      type: 'journal_entry.reversed',
+      payload: { originalEntry: original as JournalEntry, reversalEntry: result, userId, companyId },
+    })
+  }
 
   return result
 }

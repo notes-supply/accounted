@@ -4,6 +4,7 @@ import { fetchPaymentTotalsByParent } from '../payment-totals'
 interface PaymentRow {
   id: string
   invoice_id: string
+  supplier_invoice_id?: string
   amount: number
 }
 
@@ -24,6 +25,10 @@ function makeSupabase(
     }),
     lte: vi.fn().mockImplementation((...args: unknown[]) => {
       filters.push({ method: 'lte', args })
+      return builder
+    }),
+    is: vi.fn().mockImplementation((...args: unknown[]) => {
+      filters.push({ method: 'is', args })
       return builder
     }),
     in: vi.fn().mockImplementation((...args: unknown[]) => {
@@ -77,6 +82,30 @@ describe('fetchPaymentTotalsByParent', () => {
       (filter.args[1] as string[]).length)).toEqual([500, 500, 1])
     expect(filters).toContainEqual({ method: 'eq', args: ['company_id', 'co-1'] })
     expect(filters).toContainEqual({ method: 'lte', args: ['payment_date', '2025-12-31'] })
+  })
+
+  it('excludes soft-reversed supplier allocations from current totals', async () => {
+    const { supabase, filters } = makeSupabase(() => ({
+      data: [{
+        id: 'payment-1',
+        invoice_id: '',
+        supplier_invoice_id: 'supplier-invoice-1',
+        amount: 500,
+      }],
+      error: null,
+    }))
+
+    const totals = await fetchPaymentTotalsByParent({
+      supabase: supabase as never,
+      table: 'supplier_invoice_payments',
+      parentColumn: 'supplier_invoice_id',
+      companyId: 'co-1',
+      parentIds: ['supplier-invoice-1'],
+      throughDate: '2025-12-31',
+    })
+
+    expect(totals.get('supplier-invoice-1')).toBe(500)
+    expect(filters).toContainEqual({ method: 'is', args: ['reversed_at', null] })
   })
 
   it('throws instead of converting a database error into an empty total', async () => {

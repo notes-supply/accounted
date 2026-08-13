@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import {
   validateBalance,
   getSwedishLocalDate,
@@ -13,10 +13,20 @@ import {
   PostCommitReadbackError,
 } from '../errors'
 import type { CreateJournalEntryLineInput, JournalEntryStatus } from '@/types'
+import { eventBus } from '@/lib/events'
+
+const SUPPLIER_EVENT_PUBLICATION = {
+  status: 'published',
+  event_outbox_ids: ['event-committed', 'event-reversed'],
+  event_log_count: 2,
+  webhook_delivery_count: 0,
+}
+
 
 // Mock Supabase client for createDraftEntry/reverseEntry tests
 function createMockChain(overrides: Record<string, unknown> = {}) {
   const chain: Record<string, unknown> = {
+    is: vi.fn().mockReturnThis(),
     select: vi.fn().mockReturnThis(),
     single: vi.fn().mockResolvedValue({ data: overrides.singleData ?? null, error: overrides.singleError ?? null }),
     eq: vi.fn().mockReturnThis(),
@@ -732,6 +742,129 @@ describe('reverseEntry: storno guard', () => {
     expect(supabase.rpc).not.toHaveBeenCalled()
   })
 
+  it.each([
+    {
+      label: 'typed supplier payment with already-published intent',
+      sourceType: 'supplier_invoice_paid',
+      allocationBacked: false,
+      publicationStatus: 'already_published',
+    },
+    {
+      label: 'allocation-backed manual payment with unpublished intent',
+      sourceType: 'manual',
+      allocationBacked: true,
+      publicationStatus: 'published',
+    },
+  ])('resumes the exact $label after a post-storno RPC failure', async ({
+    sourceType,
+    allocationBacked,
+    publicationStatus,
+  }) => {
+    const original = {
+      id: 'entry-1',
+      company_id: 'company-1',
+      status: 'reversed',
+      reversed_by_id: 'storno-1',
+      fiscal_period_id: 'period-1',
+      voucher_series: 'A',
+      voucher_number: 3,
+      entry_date: '2024-11-15',
+      description: 'Leverantörsbetalning',
+      source_type: sourceType,
+      source_id: null,
+      lines: [],
+    }
+    const existingReversal = {
+      id: 'storno-1',
+      company_id: 'company-1',
+      status: 'posted',
+      source_type: 'storno',
+      reverses_id: 'entry-1',
+      lines: [],
+    }
+
+    let journalRead = 0
+    let allocationRead = 0
+    const inserts: unknown[] = []
+    const supabase = {
+      rpc: vi.fn().mockResolvedValue({
+        data: {
+          ok: true,
+          status: 'already_applied',
+          allocation_count: 2,
+          invoice_count: 2,
+          transaction_count: 0,
+          event_publication: {
+            ...SUPPLIER_EVENT_PUBLICATION,
+            status: publicationStatus,
+          },
+        },
+        error: null,
+      }),
+      from: vi.fn().mockImplementation((table: string) => {
+        if (table === 'supplier_invoice_payments' && allocationBacked) {
+          const b = createMockChain()
+          const result = allocationRead++ === 0
+            ? { data: [], error: null }
+            : { data: [{ id: 'allocation-1' }], error: null }
+          Object.assign(b, {
+            is: vi.fn().mockReturnValue(b),
+            then: (resolve: (value: unknown) => void) => resolve(result),
+          })
+          return b
+        }
+        if (table !== 'journal_entries') return createMockChain()
+        const b: Record<string, unknown> = {}
+        for (const m of ['select', 'eq']) b[m] = vi.fn().mockReturnValue(b)
+        b.insert = vi.fn().mockImplementation((payload: unknown) => {
+          inserts.push(payload)
+          return b
+        })
+        b.single = vi.fn().mockImplementation(async () => ({
+          data: journalRead++ === 0 ? original : existingReversal,
+          error: null,
+        }))
+        return b
+      }),
+    }
+
+    vi.mocked(eventBus.emit).mockClear()
+    const result = await reverseEntry(
+      supabase as never,
+      'company-1',
+      'user-1',
+      'entry-1',
+    )
+
+    expect(result).toEqual(existingReversal)
+    expect(supabase.rpc).toHaveBeenCalledTimes(1)
+    expect(supabase.rpc).toHaveBeenCalledWith('apply_supplier_payment_reversal', {
+      p_company_id: 'company-1',
+      p_original_journal_entry_id: 'entry-1',
+      p_storno_journal_entry_id: 'storno-1',
+    })
+    expect(inserts).toEqual([])
+    expect(eventBus.emit).not.toHaveBeenCalled()
+  })
+
+  it('does not recover an arbitrary allocation-less manual reversal', async () => {
+    const original = {
+      id: 'entry-1',
+      company_id: 'company-1',
+      status: 'reversed',
+      reversed_by_id: 'storno-1',
+      source_type: 'manual',
+      source_id: null,
+      lines: [],
+    }
+    const supabase = supabaseReturningOriginal(original)
+
+    await expect(
+      reverseEntry(supabase as never, 'company-1', 'user-1', 'entry-1'),
+    ).rejects.toThrow(/only reverse posted entries/i)
+    expect(supabase.rpc).not.toHaveBeenCalled()
+  })
+
   it(`reverses a correction entry like any regular verifikat`, async () => {
     // A rättelseverifikation that turned out to duplicate another booking
     // (support case 2026-07-26) is nullified with a normal storno; the
@@ -889,6 +1022,131 @@ describe('reverseEntry: bank transaction unlink', () => {
     expect(result.id).toBe('reversal-1')
     expect(txUpdatePayloads).toEqual([{ journal_entry_id: null }])
     expect(txFilters).toMatchObject({ company_id: 'company-1', journal_entry_id: 'entry-1' })
+  })
+
+  it.each([
+    { label: 'typed supplier payment', sourceType: 'supplier_invoice_paid', allocationBacked: false },
+    { label: 'allocation-backed manual voucher', sourceType: 'manual', allocationBacked: true },
+  ])('leaves $label transaction changes to the atomic reversal RPC', async ({
+    sourceType,
+    allocationBacked,
+  }) => {
+    const original = {
+      id: 'entry-1',
+      company_id: 'company-1',
+      status: 'posted',
+      fiscal_period_id: 'period-1',
+      voucher_series: 'A',
+      voucher_number: 7,
+      entry_date: '2026-02-02',
+      description: 'Leverantörsbetalning',
+      source_type: sourceType,
+      source_id: allocationBacked ? null : 'supplier-invoice-1',
+      lines: [
+        { account_number: '2440', debit_amount: 1000, credit_amount: 0 },
+        { account_number: '1930', debit_amount: 0, credit_amount: 1000 },
+      ],
+    }
+    const reversal = {
+      id: 'reversal-1',
+      company_id: 'company-1',
+      fiscal_period_id: 'period-1',
+      status: 'posted',
+      source_type: 'storno',
+      reverses_id: 'entry-1',
+      lines: [],
+    }
+    let jeCall = 0
+    const jeResults = [
+      { data: original, error: null },
+      { data: reversal, error: null },
+      { data: null, error: null },
+      { data: [{ id: 'entry-1' }], error: null },
+      { data: reversal, error: null },
+    ]
+    const transactionUpdates: unknown[] = []
+    const rpc = vi.fn()
+      .mockResolvedValueOnce({ data: 8, error: null })
+      .mockResolvedValueOnce({
+        data: {
+          ok: true,
+          status: 'applied',
+          allocation_count: 1,
+          invoice_count: 1,
+          transaction_count: 1,
+          event_publication: SUPPLIER_EVENT_PUBLICATION,
+        },
+        error: null,
+      })
+
+    const supabase = {
+      rpc,
+      from: vi.fn().mockImplementation((table: string) => {
+        if (table === 'journal_entries') {
+          const b: Record<string, unknown> = {}
+          for (const m of ['select', 'eq', 'in', 'update', 'insert']) {
+            b[m] = vi.fn().mockReturnValue(b)
+          }
+          b.single = vi.fn().mockImplementation(async () => jeResults[jeCall++])
+          b.then = (resolve: (value: unknown) => void) => resolve(jeResults[jeCall++])
+          return b
+        }
+        if (table === 'supplier_invoice_payments' && allocationBacked) {
+          const b = createMockChain()
+          Object.assign(b, {
+            is: vi.fn().mockReturnValue(b),
+            then: (resolve: (value: unknown) => void) => resolve({
+              data: [{ id: 'allocation-1' }],
+              error: null,
+            }),
+          })
+          return b
+        }
+        if (table === 'chart_of_accounts') {
+          const b: Record<string, unknown> = {}
+          for (const m of ['select', 'eq', 'in']) b[m] = vi.fn().mockReturnValue(b)
+          b.then = (resolve: (value: unknown) => void) => resolve({
+            data: [
+              { id: 'acc-2440', account_number: '2440' },
+              { id: 'acc-1930', account_number: '1930' },
+            ],
+            error: null,
+          })
+          return b
+        }
+        if (table === 'journal_entry_lines') {
+          return { insert: vi.fn().mockResolvedValue({ error: null }) }
+        }
+        if (table === 'transactions') {
+          const b: Record<string, unknown> = {}
+          b.update = vi.fn().mockImplementation((payload: unknown) => {
+            transactionUpdates.push(payload)
+            return b
+          })
+          b.eq = vi.fn().mockReturnValue(b)
+          b.then = (resolve: (value: unknown) => void) => resolve({ error: null })
+          return b
+        }
+        return createMockChain()
+      }),
+    }
+
+    vi.mocked(eventBus.emit).mockClear()
+    const result = await reverseEntry(
+      supabase as never,
+      'company-1',
+      'user-1',
+      'entry-1',
+    )
+
+    expect(result.id).toBe('reversal-1')
+    expect(transactionUpdates).toEqual([])
+    expect(rpc).toHaveBeenLastCalledWith('apply_supplier_payment_reversal', {
+      p_company_id: 'company-1',
+      p_original_journal_entry_id: 'entry-1',
+      p_storno_journal_entry_id: 'reversal-1',
+    })
+    expect(eventBus.emit).not.toHaveBeenCalled()
   })
 })
 

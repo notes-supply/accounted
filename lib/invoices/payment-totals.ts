@@ -33,16 +33,20 @@ export async function fetchPaymentTotalsByParent({
 
   for (let i = 0; i < uniqueIds.length; i += PARENT_ID_CHUNK_SIZE) {
     const parentIdChunk = uniqueIds.slice(i, i + PARENT_ID_CHUNK_SIZE)
-    const rows = await fetchAllRows<Record<string, unknown>>(({ from, to }) =>
-      supabase
+    const rows = await fetchAllRows<Record<string, unknown>>(({ from, to }) => {
+      const query = supabase
         .from(table)
         .select(`id, ${parentColumn}, amount`)
         .eq('company_id', companyId)
         .lte('payment_date', throughDate)
         .in(parentColumn, parentIdChunk)
+      const activeQuery = table === 'supplier_invoice_payments'
+        ? query.is('reversed_at', null)
+        : query
+      return activeQuery
         .order('id', { ascending: true })
-        .range(from, to),
-    )
+        .range(from, to)
+    })
 
     for (const row of rows) {
       const parentId = row[parentColumn]

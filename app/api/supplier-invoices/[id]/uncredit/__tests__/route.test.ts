@@ -152,6 +152,8 @@ describe('POST /api/supplier-invoices/[id]/uncredit', () => {
           journal_entry_id: 'je-pay',
           transaction_id: null,
           notes: null,
+          reversed_at: null,
+          reversed_by_journal_entry_id: null,
           created_at: '2024-06-15T00:00:00Z',
         },
       ],

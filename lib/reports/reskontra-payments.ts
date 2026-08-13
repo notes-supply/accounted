@@ -34,15 +34,19 @@ export async function fetchPaymentsAsOf(
   companyId: string,
   asOfDate: string
 ): Promise<PaymentsAsOf> {
-  const rows = await fetchAllRows<PaymentRow & Record<string, unknown>>(({ from, to }) =>
-    supabase
+  const rows = await fetchAllRows<PaymentRow & Record<string, unknown>>(({ from, to }) => {
+    const query = supabase
       .from(table)
       .select(`${invoiceIdColumn}, amount, payment_date`)
       .eq('company_id', companyId)
+    const activeQuery = table === 'supplier_invoice_payments'
+      ? query.is('reversed_at', null)
+      : query
+    return activeQuery
       // Stable total order for correct paging (see fetch-all.ts).
       .order('id', { ascending: true })
       .range(from, to)
-  )
+  })
 
   const paidThrough = new Map<string, number>()
   const hasRows = new Set<string>()

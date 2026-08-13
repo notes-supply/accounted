@@ -105,6 +105,68 @@ describe('POST /api/mileage/book', () => {
     expect(res.status).toBe(400)
   })
 
+  it('requires recovery without exposing claim ids when release cannot be verified', async () => {
+    authed()
+    vi.mocked(bookMileagePeriod).mockResolvedValue({
+      ok: false,
+      code: 'CLAIM_RELEASE_FAILED',
+      reason: 'INCOMPLETE_RELEASE',
+      claimedTripIds: ['trip-1', 'trip-2'],
+      releasedTripIds: ['trip-1'],
+      detail: 'release mismatch',
+    })
+
+    const res = await POST(postReq(VALID_BODY), params)
+
+    expect(res.status).toBe(500)
+    const body = await res.json()
+    expect(body).toMatchObject({
+      code: 'CLAIM_RELEASE_FAILED',
+    })
+    expect(body).not.toHaveProperty('claimed_trip_ids')
+    expect(body).not.toHaveProperty('released_trip_ids')
+  })
+
+  it('returns durable identity when the voucher commit outcome is uncertain', async () => {
+    authed()
+    vi.mocked(bookMileagePeriod).mockResolvedValue({
+      ok: false,
+      code: 'POST_COMMIT_UNCERTAIN',
+      journalEntryId: 'je-uncertain',
+      voucherNumber: 73,
+    })
+
+    const res = await POST(postReq(VALID_BODY), params)
+
+    expect(res.status).toBe(500)
+    expect(await res.json()).toMatchObject({
+      code: 'POST_COMMIT_UNCERTAIN',
+      journal_entry_id: 'je-uncertain',
+      voucher_number: 73,
+    })
+  })
+
+  it('returns journal identity when trip stamping is incomplete', async () => {
+    authed()
+    vi.mocked(bookMileagePeriod).mockResolvedValue({
+      ok: false,
+      code: 'STAMP_FAILED',
+      journalEntryId: 'je-1',
+      voucherNumber: 42,
+      voucherSeries: 'A',
+    })
+
+    const res = await POST(postReq(VALID_BODY), params)
+
+    expect(res.status).toBe(500)
+    expect(await res.json()).toMatchObject({
+      code: 'STAMP_FAILED',
+      journal_entry_id: 'je-1',
+      voucher_series: 'A',
+      voucher_number: 42,
+    })
+  })
+
   it('returns the verifikat summary on success', async () => {
     authed()
     vi.mocked(bookMileagePeriod).mockResolvedValue({

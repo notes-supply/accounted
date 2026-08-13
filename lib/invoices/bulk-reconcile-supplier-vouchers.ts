@@ -195,6 +195,7 @@ export async function reconcileSupplierInvoiceVouchers(
       .from('supplier_invoice_payments')
       .select('journal_entry_id')
       .eq('company_id', companyId)
+      .is('reversed_at', null)
       .not('journal_entry_id', 'is', null)
       .range(from, to),
   )

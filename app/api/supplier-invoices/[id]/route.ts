@@ -24,6 +24,7 @@ export const GET = withRouteContext<{ params: Promise<{ id: string }> }>(
     )
     .eq('id', id)
     .eq('company_id', companyId)
+    .is('payments.reversed_at', null)
     .single()
 
   if (error || !invoice) {

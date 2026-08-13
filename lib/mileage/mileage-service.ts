@@ -6,11 +6,13 @@ import type {
   MileageVehicleType,
 } from '@/types'
 import { createJournalEntry } from '@/lib/bookkeeping/engine'
+import { PostCommitReadbackError } from '@/lib/bookkeeping/errors'
 import { loadPayrollConfig, type PayrollConfig } from '@/lib/salary/payroll-config'
 import { getLineItemAccount } from '@/lib/salary/account-mapping'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import { resolvePeriodStatusForDate } from '@/lib/core/bookkeeping/period-service'
 import { roundOre } from '@/lib/money'
+import { createLogger } from '@/lib/logger'
 
 /**
  * Körjournal service: trip log per Skatteverket documentation requirements
@@ -21,6 +23,8 @@ import { roundOre } from '@/lib/money'
  * taxable excess arises; the 7332 path exists in the salary module for
  * companies that pay above schablon through payroll.
  */
+const log = createLogger('mileage.service')
+
 
 const KM_PER_MIL = 10
 
@@ -166,6 +170,13 @@ export async function createTrip(
   return data as MileageTrip
 }
 
+type BookMileageSimpleFailureCode =
+  | 'NO_TRIPS'
+  | 'MIXED_EMPLOYEES'
+  | 'PERIOD_NOT_OPEN'
+  | 'CLAIM_LOST'
+  | 'TRIPS_CHANGED'
+
 export type BookMileageResult =
   | {
       ok: true
@@ -176,16 +187,27 @@ export type BookMileageResult =
       totalAmount: number
       summaries: MileagePeriodSummary[]
     }
+  | { ok: false; code: BookMileageSimpleFailureCode }
   | {
       ok: false
-      code:
-        | 'NO_TRIPS'
-        | 'MIXED_EMPLOYEES'
-        | 'PERIOD_NOT_OPEN'
-        | 'CLAIM_LOST'
-        | 'TRIPS_CHANGED'
-        | 'STAMP_FAILED'
-      journalEntryId?: string
+      code: 'CLAIM_RELEASE_FAILED'
+      reason: 'DATABASE_ERROR' | 'INCOMPLETE_RELEASE'
+      claimedTripIds: string[]
+      releasedTripIds: string[]
+      detail: string
+    }
+  | {
+      ok: false
+      code: 'POST_COMMIT_UNCERTAIN'
+      journalEntryId: string
+      voucherNumber: number | null
+    }
+  | {
+      ok: false
+      code: 'STAMP_FAILED'
+      journalEntryId: string
+      voucherNumber: number | null
+      voucherSeries: string | null
     }
 
 /**
@@ -300,20 +322,53 @@ export async function bookMileagePeriod(
     throw new Error(`Failed to claim mileage trips: ${claimError.message}`)
   }
   const claimedIds = (claimed ?? []).map((row) => row.id as string)
-  const revertClaim = async () => {
-    if (claimedIds.length === 0) return
-    await supabase
+  const releaseClaim = async (): Promise<
+    Extract<BookMileageResult, { code: 'CLAIM_RELEASE_FAILED' }> | null
+  > => {
+    if (claimedIds.length === 0) return null
+    const { data: released, error: releaseError } = await supabase
       .from('mileage_trips')
       .update({ status: 'draft' })
       .eq('company_id', companyId)
       .eq('status', 'booked')
       .is('journal_entry_id', null)
       .in('id', claimedIds)
+      .select('id')
+
+    const releasedIds = (released ?? []).map((row) => row.id as string)
+    if (releaseError) {
+      return {
+        ok: false,
+        code: 'CLAIM_RELEASE_FAILED',
+        reason: 'DATABASE_ERROR',
+        claimedTripIds: claimedIds,
+        releasedTripIds: releasedIds,
+        detail: releaseError.message,
+      }
+    }
+
+    const releasedIdSet = new Set(releasedIds)
+    const releasedExactlyClaimed =
+      releasedIdSet.size === claimedIds.length &&
+      claimedIds.every((id) => releasedIdSet.has(id))
+    if (!releasedExactlyClaimed) {
+      return {
+        ok: false,
+        code: 'CLAIM_RELEASE_FAILED',
+        reason: 'INCOMPLETE_RELEASE',
+        claimedTripIds: claimedIds,
+        releasedTripIds: releasedIds,
+        detail: 'Mileage claim release did not affect every claimed trip',
+      }
+    }
+    return null
   }
   if (claimedIds.length !== tripIds.length) {
     // A concurrent booking claimed part of the set first: distinct from
-    // "nothing to book" so the caller can say "reload and retry".
-    await revertClaim()
+    // "nothing to book" so the caller can say "reload and retry". Only call
+    // it retryable after proving every row this attempt claimed was released.
+    const releaseFailure = await releaseClaim()
+    if (releaseFailure) return releaseFailure
     return { ok: false, code: 'CLAIM_LOST' }
   }
 
@@ -340,7 +395,30 @@ export async function bookMileagePeriod(
       ],
     })
   } catch (err) {
-    await revertClaim()
+    if (err instanceof PostCommitReadbackError) {
+      // The engine contract says the durable entry may already be posted.
+      // Keep the claims booked: releasing them would permit a duplicate entry.
+      return {
+        ok: false,
+        code: 'POST_COMMIT_UNCERTAIN',
+        journalEntryId: err.journalEntryId,
+        voucherNumber: err.voucherNumber,
+      }
+    }
+    const releaseFailure = await releaseClaim()
+    if (releaseFailure) {
+      log.error(
+        'journal creation failed and mileage claim release could not be verified',
+        err,
+        {
+          companyId,
+          releaseReason: releaseFailure.reason,
+          claimedTripCount: releaseFailure.claimedTripIds.length,
+          releasedTripCount: releaseFailure.releasedTripIds.length,
+        },
+      )
+      return releaseFailure
+    }
     throw err
   }
 
@@ -355,7 +433,13 @@ export async function bookMileagePeriod(
   if (linkError || !linked || linked.length !== claimedIds.length) {
     // The verifikat exists and the trips are booked, but some rows lost the
     // entry link. Surface loudly so the körjournal can be repaired.
-    return { ok: false, code: 'STAMP_FAILED', journalEntryId: entry.id }
+    return {
+      ok: false,
+      code: 'STAMP_FAILED',
+      journalEntryId: entry.id,
+      voucherNumber: entry.voucher_number ?? null,
+      voucherSeries: entry.voucher_series ?? null,
+    }
   }
 
   return {

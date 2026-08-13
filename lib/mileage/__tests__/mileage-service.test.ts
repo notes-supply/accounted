@@ -1,6 +1,21 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PayrollConfig } from '@/lib/salary/payroll-config'
 import type { MileageTrip } from '@/types'
+const { mockLogError } = vi.hoisted(() => ({
+  mockLogError: vi.fn(),
+}))
+
+vi.mock('@/lib/logger', () => {
+  const logger = {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: mockLogError,
+    child: vi.fn(),
+  }
+  logger.child.mockReturnValue(logger)
+  return { createLogger: vi.fn(() => logger) }
+})
+
 
 vi.mock('@/lib/supabase/fetch-all', () => ({ fetchAllRows: vi.fn() }))
 vi.mock('@/lib/bookkeeping/engine', async (importOriginal) => {
@@ -26,6 +41,7 @@ import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import { createJournalEntry } from '@/lib/bookkeeping/engine'
 import { loadPayrollConfig } from '@/lib/salary/payroll-config'
 import { resolvePeriodStatusForDate } from '@/lib/core/bookkeeping/period-service'
+import { PostCommitReadbackError } from '@/lib/bookkeeping/errors'
 
 const CONFIG = {
   milersattningEgenBil: 25,
@@ -243,18 +259,30 @@ describe('bookMileagePeriod', () => {
     counterAccount: '2820' as const,
   }
 
-  // Queued mock: each .select() call consumes the next result (claim first,
-  // then the journal_entry_id link). The orphan sweep and revert paths await
-  // the chain without .select(), so the chain itself is thenable.
-  function stampSupabase(selectResults: string[][]) {
+  type SelectResult =
+    | string[]
+    | { ids?: string[]; error: { message: string } }
+
+  // Queued mock: each .select() call consumes the next result. Claim,
+  // verified release, and journal_entry_id stamping all return affected ids.
+  function stampSupabase(selectResults: SelectResult[]) {
     const queue = [...selectResults]
     const chain: Record<string, unknown> = {}
     for (const method of ['update', 'eq', 'in', 'is', 'lt', 'gte', 'lte', 'maybeSingle']) {
       chain[method] = vi.fn(() => chain)
     }
     chain.select = vi.fn(() => {
-      const ids = queue.shift() ?? []
-      return Promise.resolve({ data: ids.map((id) => ({ id })), error: null })
+      const result = queue.shift() ?? []
+      if (Array.isArray(result)) {
+        return Promise.resolve({
+          data: result.map((id) => ({ id })),
+          error: null,
+        })
+      }
+      return Promise.resolve({
+        data: (result.ids ?? []).map((id) => ({ id })),
+        error: result.error,
+      })
     })
     chain.then = (resolve: (v: unknown) => unknown) =>
       Promise.resolve({ data: null, error: null }).then(resolve)
@@ -285,10 +313,63 @@ describe('bookMileagePeriod', () => {
     } as never)
     vi.mocked(loadPayrollConfig).mockResolvedValue(CONFIG)
 
-    // Another booking claimed t2 first: our claim only gets t1.
-    const supabase = stampSupabase([['t1']])
+    // Another booking claimed t2 first: our claim only gets t1. The release
+    // CAS confirms that this attempt's t1 claim returned to draft.
+    const supabase = stampSupabase([['t1'], ['t1']])
     const result = await bookMileagePeriod(supabase as never, 'company-1', 'user-1', params)
     expect(result).toEqual({ ok: false, code: 'CLAIM_LOST' })
+    expect(createJournalEntry).not.toHaveBeenCalled()
+    expect(supabase.chain.update).toHaveBeenCalledWith({ status: 'draft' })
+  })
+
+  it('requires recovery when a partial-claim release returns a database error', async () => {
+    vi.mocked(fetchAllRows).mockResolvedValue([trip({ id: 't1' }), trip({ id: 't2' })])
+    vi.mocked(resolvePeriodStatusForDate).mockResolvedValue({
+      status: 'open',
+      period_id: 'period-1',
+    } as never)
+    vi.mocked(loadPayrollConfig).mockResolvedValue(CONFIG)
+
+    const supabase = stampSupabase([
+      ['t1'],
+      { ids: [], error: { message: 'connection lost during release' } },
+    ])
+    const result = await bookMileagePeriod(supabase as never, 'company-1', 'user-1', params)
+
+    expect(result).toEqual({
+      ok: false,
+      code: 'CLAIM_RELEASE_FAILED',
+      reason: 'DATABASE_ERROR',
+      claimedTripIds: ['t1'],
+      releasedTripIds: [],
+      detail: 'connection lost during release',
+    })
+    expect(createJournalEntry).not.toHaveBeenCalled()
+  })
+
+  it('requires recovery when a partial-claim release affects an incomplete set', async () => {
+    vi.mocked(fetchAllRows).mockResolvedValue([
+      trip({ id: 't1' }),
+      trip({ id: 't2' }),
+      trip({ id: 't3' }),
+    ])
+    vi.mocked(resolvePeriodStatusForDate).mockResolvedValue({
+      status: 'open',
+      period_id: 'period-1',
+    } as never)
+    vi.mocked(loadPayrollConfig).mockResolvedValue(CONFIG)
+
+    const supabase = stampSupabase([['t1', 't2'], ['t1']])
+    const result = await bookMileagePeriod(supabase as never, 'company-1', 'user-1', params)
+
+    expect(result).toEqual({
+      ok: false,
+      code: 'CLAIM_RELEASE_FAILED',
+      reason: 'INCOMPLETE_RELEASE',
+      claimedTripIds: ['t1', 't2'],
+      releasedTripIds: ['t1'],
+      detail: 'Mileage claim release did not affect every claimed trip',
+    })
     expect(createJournalEntry).not.toHaveBeenCalled()
   })
 
@@ -395,13 +476,47 @@ describe('bookMileagePeriod', () => {
       period_id: 'period-1',
     } as never)
     vi.mocked(loadPayrollConfig).mockResolvedValue(CONFIG)
-    vi.mocked(createJournalEntry).mockResolvedValue({ id: 'je-1' } as never)
+    vi.mocked(createJournalEntry).mockResolvedValue({
+      id: 'je-1',
+      voucher_number: 42,
+      voucher_series: 'A',
+    } as never)
 
     // Claim succeeds for both trips; the journal_entry_id backfill only lands
     // on one row.
     const supabase = stampSupabase([['t1', 't2'], ['t1']])
     const result = await bookMileagePeriod(supabase as never, 'company-1', 'user-1', params)
-    expect(result).toEqual({ ok: false, code: 'STAMP_FAILED', journalEntryId: 'je-1' })
+    expect(result).toEqual({
+      ok: false,
+      code: 'STAMP_FAILED',
+      journalEntryId: 'je-1',
+      voucherNumber: 42,
+      voucherSeries: 'A',
+    })
+    expect(supabase.chain.update).not.toHaveBeenCalledWith({ status: 'draft' })
+  })
+
+  it('preserves claims and journal identity when commit readback is uncertain', async () => {
+    vi.mocked(fetchAllRows).mockResolvedValue([trip({ id: 't1' })])
+    vi.mocked(resolvePeriodStatusForDate).mockResolvedValue({
+      status: 'open',
+      period_id: 'period-1',
+    } as never)
+    vi.mocked(loadPayrollConfig).mockResolvedValue(CONFIG)
+    vi.mocked(createJournalEntry).mockRejectedValue(
+      new PostCommitReadbackError('je-uncertain', 73, 'readback timeout'),
+    )
+
+    const supabase = stampSupabase([['t1']])
+    const result = await bookMileagePeriod(supabase as never, 'company-1', 'user-1', params)
+
+    expect(result).toEqual({
+      ok: false,
+      code: 'POST_COMMIT_UNCERTAIN',
+      journalEntryId: 'je-uncertain',
+      voucherNumber: 73,
+    })
+    expect(supabase.chain.update).not.toHaveBeenCalledWith({ status: 'draft' })
   })
 
   it('reverts the claim when verifikat creation fails', async () => {
@@ -413,12 +528,49 @@ describe('bookMileagePeriod', () => {
     vi.mocked(loadPayrollConfig).mockResolvedValue(CONFIG)
     vi.mocked(createJournalEntry).mockRejectedValue(new Error('period locked'))
 
-    const supabase = stampSupabase([['t1']])
+    const supabase = stampSupabase([['t1'], ['t1']])
     await expect(
       bookMileagePeriod(supabase as never, 'company-1', 'user-1', params)
     ).rejects.toThrow('period locked')
-    // Claim + revert both went through the update chain.
+    // The ordinary pre-commit failure is rethrown only after the release CAS
+    // proves this attempt's complete claim returned to draft.
     expect(supabase.chain.update).toHaveBeenCalledWith({ status: 'booked' })
     expect(supabase.chain.update).toHaveBeenCalledWith({ status: 'draft' })
+  })
+
+  it('surfaces release recovery instead of the engine error when rollback is incomplete', async () => {
+    vi.mocked(fetchAllRows).mockResolvedValue([trip({ id: 't1' })])
+    vi.mocked(resolvePeriodStatusForDate).mockResolvedValue({
+      status: 'open',
+      period_id: 'period-1',
+    } as never)
+    vi.mocked(loadPayrollConfig).mockResolvedValue(CONFIG)
+    vi.mocked(createJournalEntry).mockRejectedValue(new Error('period locked'))
+
+    const result = await bookMileagePeriod(
+      stampSupabase([['t1'], []]) as never,
+      'company-1',
+      'user-1',
+      params,
+    )
+
+    expect(result).toEqual({
+      ok: false,
+      code: 'CLAIM_RELEASE_FAILED',
+      reason: 'INCOMPLETE_RELEASE',
+      claimedTripIds: ['t1'],
+      releasedTripIds: [],
+      detail: 'Mileage claim release did not affect every claimed trip',
+    })
+    expect(mockLogError).toHaveBeenCalledWith(
+      'journal creation failed and mileage claim release could not be verified',
+      expect.objectContaining({ message: 'period locked' }),
+      {
+        companyId: 'company-1',
+        releaseReason: 'INCOMPLETE_RELEASE',
+        claimedTripCount: 1,
+        releasedTripCount: 0,
+      },
+    )
   })
 })

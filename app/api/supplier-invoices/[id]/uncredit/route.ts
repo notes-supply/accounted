@@ -23,6 +23,7 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
     .select('*, payments:supplier_invoice_payments(*)')
     .eq('id', id)
     .eq('company_id', companyId)
+    .is('payments.reversed_at', null)
     .single()
 
   if (fetchError || !original) {

@@ -41,7 +41,7 @@ const SI_ITEM_COLUMNS =
   'id, sort_order, description, quantity, unit, unit_price, line_total, account_number, vat_code, vat_rate, vat_amount, reverse_charge_rate, dimensions'
 
 const SI_PAYMENT_COLUMNS =
-  'id, payment_date, amount, currency, exchange_rate, exchange_rate_difference, journal_entry_id, transaction_id, notes, created_at'
+  'id, payment_date, amount, currency, exchange_rate, exchange_rate_difference, journal_entry_id, transaction_id, notes, reversed_at, reversed_by_journal_entry_id, created_at'
 
 const SUPPLIER_DETAIL_COLUMNS_EXPAND =
   'id, name, supplier_type, email, org_number, vat_number, default_payment_terms, default_currency, bankgiro, plusgiro, iban, bic, default_expense_account, archived_at'
@@ -150,12 +150,15 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string; id: string }
     if (expand.has('payments')) parts.push(`payments:supplier_invoice_payments(${SI_PAYMENT_COLUMNS})`)
     const selectClause = parts.join(', ')
 
-    const { data, error } = await ctx.supabase
+    let query = ctx.supabase
       .from('supplier_invoices')
       .select(selectClause)
       .eq('company_id', ctx.companyId!)
       .eq('id', invoiceId)
-      .maybeSingle()
+    if (expand.has('payments')) {
+      query = query.is('payments.reversed_at', null)
+    }
+    const { data, error } = await query.maybeSingle()
 
     if (error) {
       return v1ErrorResponse(error, ctx.log, { requestId: ctx.requestId })

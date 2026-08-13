@@ -224,6 +224,7 @@ export async function findMatchingVouchersForSupplierInvoice(
     .select('journal_entry_id')
     .eq('company_id', companyId)
     .eq('supplier_invoice_id', invoice.id)
+    .is('reversed_at', null)
     .in('journal_entry_id', candidateEntryIds)
 
   const alreadyLinked = new Set(
@@ -528,6 +529,7 @@ export async function validateVoucherForSupplierInvoiceLink(
     .select('id')
     .eq('company_id', companyId)
     .eq('supplier_invoice_id', invoice.id)
+    .is('reversed_at', null)
     .eq('journal_entry_id', journalEntryId)
     .limit(1)
   if (existingLinks && existingLinks.length > 0) {

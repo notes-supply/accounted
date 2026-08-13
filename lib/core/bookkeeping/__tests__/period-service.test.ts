@@ -344,11 +344,26 @@ describe('lockPeriod: unbooked transaction guard', () => {
       ],
       transaction_voucher_links: [{ transaction_id: 'b2' }],
       invoice_payments: [{ transaction_id: 'b3' }],
-      supplier_invoice_payments: [{ transaction_id: 'b4' }],
+      supplier_invoice_payments: [{ transaction_id: 'b4', reversed_at: null }],
     })
 
     const result = await lockPeriod(client as never, 'company-1', 'user-1', 'fp-1')
     expect(result.locked_at).toBeTruthy()
+  })
+
+  it('does not treat a soft-reversed supplier allocation as a booking anchor', async () => {
+    results = [{ data: openPeriod(), error: null }]
+    const { client } = makeGuardClient({
+      transactions: [tx({ id: 'b4', is_business: true, journal_entry_id: null })],
+      supplier_invoice_payments: [{
+        transaction_id: 'b4',
+        reversed_at: '2026-06-02T10:00:00Z',
+      }],
+    })
+
+    await expect(
+      lockPeriod(client as never, 'company-1', 'user-1', 'fp-1'),
+    ).rejects.toThrow(/1 markerade som affärshändelse men utan verifikat/)
   })
 
   it('paginates the business-unbooked candidate fetch past the 1000-row PostgREST page cap', async () => {

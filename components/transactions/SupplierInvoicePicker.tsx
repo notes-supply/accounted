@@ -67,6 +67,7 @@ export default function SupplierInvoicePicker({
           .from('supplier_invoice_payments')
           .select('supplier_invoice_id')
           .eq('company_id', companyId)
+          .is('reversed_at', null)
           .in('supplier_invoice_id', fullIds)
           .not('journal_entry_id', 'is', null)
         if (cancelled) return

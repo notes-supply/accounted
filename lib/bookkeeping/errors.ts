@@ -295,6 +295,7 @@ export type BookkeepingOperation =
   | 'create_reversal_entry'
   | 'create_reversal_lines'
   | 'post_reversal_entry'
+  | 'read_existing_supplier_payment_reversal'
   | 'replace_opening_balance'
   | 'create_corrected_entry'
   | 'create_corrected_lines'
