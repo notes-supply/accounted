@@ -1532,6 +1532,33 @@ export async function reverseEntry(
     && original.reversed_by_id
     && supplierPaymentReversal
   ) {
+    // A supplier-payment root with a live correction child is not a plain
+    // post-storno recovery. A committed child still carries the payment effect,
+    // while a draft child may be waiting to commit. Restoring supplier state
+    // from the root would reopen the invoice behind that correction. Check the
+    // company-scoped lineage before reading the storno or invoking recovery.
+    const {
+      data: committedCorrectionChildren,
+      error: correctionChildrenError,
+    } = await supabase
+      .from('journal_entries')
+      .select('id')
+      .eq('company_id', companyId)
+      .eq('correction_of_id', original.id)
+      .eq('source_type', 'correction')
+      .in('status', ['draft', 'posted', 'reversed'])
+      .limit(1)
+
+    if (correctionChildrenError) {
+      throw new BookkeepingDatabaseError(
+        'read_existing_supplier_payment_reversal',
+        correctionChildrenError.message,
+      )
+    }
+    if ((committedCorrectionChildren ?? []).length > 0) {
+      throw new CannotReverseNonPostedError(original.status)
+    }
+
     const { data: existingReversal, error: existingReversalError } = await supabase
       .from('journal_entries')
       .select('*, lines:journal_entry_lines(*)')

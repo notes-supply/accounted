@@ -9,6 +9,7 @@ import {
 import {
   BookkeepingDatabaseError,
   AccountsNotInChartError,
+  CannotReverseNonPostedError,
   CannotReverseStornoError,
   PostCommitReadbackError,
 } from '../errors'
@@ -820,7 +821,7 @@ describe('reverseEntry: storno guard', () => {
         }
         if (table !== 'journal_entries') return createMockChain()
         const b: Record<string, unknown> = {}
-        for (const m of ['select', 'eq']) b[m] = vi.fn().mockReturnValue(b)
+        for (const m of ['select', 'eq', 'in', 'limit']) b[m] = vi.fn().mockReturnValue(b)
         b.insert = vi.fn().mockImplementation((payload: unknown) => {
           inserts.push(payload)
           return b
@@ -829,6 +830,7 @@ describe('reverseEntry: storno guard', () => {
           data: journalRead++ === 0 ? original : existingReversal,
           error: null,
         }))
+        b.then = (resolve: (value: unknown) => void) => resolve({ data: [], error: null })
         return b
       }),
     }
@@ -852,6 +854,137 @@ describe('reverseEntry: storno guard', () => {
     expect(inserts).toEqual([])
     expect(eventBus.emit).not.toHaveBeenCalled()
     expect(notifyDurableWebhookDeliveries).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    {
+      label: 'typed supplier payment with a posted correction child',
+      sourceType: 'supplier_invoice_paid',
+      allocationBacked: false,
+      correctionData: [{ id: 'correction-1' }],
+      correctionError: null,
+    },
+    {
+      label: 'allocation-backed manual payment with a posted correction child',
+      sourceType: 'manual',
+      allocationBacked: true,
+      correctionData: [{ id: 'correction-1' }],
+      correctionError: null,
+    },
+    {
+      label: 'typed supplier payment with a draft correction child',
+      sourceType: 'supplier_invoice_paid',
+      allocationBacked: false,
+      correctionData: [{ id: 'correction-draft-1' }],
+      correctionError: null,
+    },
+    {
+      label: 'typed supplier payment when the correction lookup fails',
+      sourceType: 'supplier_invoice_paid',
+      allocationBacked: false,
+      correctionData: null,
+      correctionError: { message: 'correction lookup failed' },
+    },
+  ])('fails closed for a $label before post-storno recovery', async ({
+    sourceType,
+    allocationBacked,
+    correctionData,
+    correctionError,
+  }) => {
+    const original = {
+      id: 'entry-1',
+      company_id: 'company-1',
+      status: 'reversed',
+      reversed_by_id: 'storno-1',
+      source_type: sourceType,
+      source_id: allocationBacked ? null : 'supplier-invoice-1',
+      lines: [],
+    }
+    const correctionEqFilters: Array<[string, unknown]> = []
+    const correctionInFilters: Array<[string, unknown]> = []
+    const writes: Array<{ table: string; method: string }> = []
+    let allocationRead = 0
+    let journalQuery = 0
+    let journalSingleReads = 0
+
+    const rpc = vi.fn()
+    const from = vi.fn().mockImplementation((table: string) => {
+      const query = createMockChain()
+      for (const method of ['insert', 'update', 'delete']) {
+        query[method] = vi.fn().mockImplementation(() => {
+          writes.push({ table, method })
+          return query
+        })
+      }
+
+      if (table === 'supplier_invoice_payments' && allocationBacked) {
+        const result = allocationRead++ === 0
+          ? { data: [], error: null }
+          : {
+              data: [{ id: 'allocation-1', transaction_id: null }],
+              error: null,
+            }
+        query.then = (resolve: (value: unknown) => void) => resolve(result)
+        return query
+      }
+
+      if (table === 'journal_entries') {
+        const queryIndex = journalQuery++
+        query.single = vi.fn().mockImplementation(async () => {
+          journalSingleReads += 1
+          return {
+            data: queryIndex === 0 ? original : { id: 'storno-1' },
+            error: null,
+          }
+        })
+        query.eq = vi.fn().mockImplementation((column: string, value: unknown) => {
+          if (queryIndex === 1) correctionEqFilters.push([column, value])
+          return query
+        })
+        query.in = vi.fn().mockImplementation((column: string, value: unknown) => {
+          if (queryIndex === 1) correctionInFilters.push([column, value])
+          return query
+        })
+        query.then = (resolve: (value: unknown) => void) => resolve({
+          data: correctionData,
+          error: correctionError,
+        })
+      }
+
+      return query
+    })
+    const supabase = { rpc, from }
+
+    vi.mocked(eventBus.emit).mockClear()
+    vi.mocked(notifyDurableWebhookDeliveries).mockClear()
+
+    if (correctionError) {
+      await expect(
+        reverseEntry(supabase as never, 'company-1', 'user-1', 'entry-1'),
+      ).rejects.toMatchObject({
+        name: 'BookkeepingDatabaseError',
+        operation: 'read_existing_supplier_payment_reversal',
+        cause: 'correction lookup failed',
+      })
+    } else {
+      await expect(
+        reverseEntry(supabase as never, 'company-1', 'user-1', 'entry-1'),
+      ).rejects.toBeInstanceOf(CannotReverseNonPostedError)
+    }
+
+    expect(correctionEqFilters).toEqual([
+      ['company_id', 'company-1'],
+      ['correction_of_id', 'entry-1'],
+      ['source_type', 'correction'],
+    ])
+    expect(correctionInFilters).toEqual([
+      ['status', ['draft', 'posted', 'reversed']],
+    ])
+    expect(journalSingleReads).toBe(1)
+    expect(rpc).not.toHaveBeenCalled()
+    expect(writes).toEqual([])
+    expect(eventBus.emit).not.toHaveBeenCalled()
+    expect(notifyDurableWebhookDeliveries).not.toHaveBeenCalled()
   })
 
   it('does not recover an arbitrary allocation-less manual reversal', async () => {
