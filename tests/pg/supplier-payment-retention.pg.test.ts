@@ -1482,7 +1482,7 @@ describe('supplier payment reversal retention migration', () => {
       deleted: true,
       voucher_series: 'A',
       voucher_number: 0,
-      was_period_ib: false,
+      was_period_ib: null,
     })
     const state = await getPool().query(
       `SELECT si.status,
