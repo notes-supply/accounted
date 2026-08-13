@@ -176,6 +176,18 @@ async function applySupplierPaymentReversal(
   return result.rows[0].result as Record<string, unknown>
 }
 
+async function deleteLastVoucher(
+  client: QueryClient,
+  companyId: string,
+  journalEntryId: string,
+): Promise<Record<string, unknown>> {
+  const result = await client.query(
+    `SELECT public.delete_last_voucher($1, $2) AS result`,
+    [companyId, journalEntryId],
+  )
+  return result.rows[0].result as Record<string, unknown>
+}
+
 async function seedPaymentVoucher(total = 1000) {
   const tenant = await seedCompany()
   const supplierInvoiceId = await insertSupplierInvoice({
@@ -194,7 +206,157 @@ async function seedPaymentVoucher(total = 1000) {
       { accountNumber: '1930', debitAmount: 0, creditAmount: total },
     ],
   })
-  return { ...tenant, supplierInvoiceId, journalEntryId }
+  return { ...tenant, supplierInvoiceId, journalEntryId, total }
+}
+
+async function seedV1PaymentWithoutAllocation(params: {
+  total?: number
+  priorPaidAmount?: number
+  paymentAmount?: number
+  lines?: Array<{
+    accountNumber: string
+    debitAmount: number
+    creditAmount: number
+  }>
+  withTransaction?: boolean
+}) {
+  const tenant = await seedCompany()
+  const total = params.total ?? 1000
+  const priorPaidAmount = params.priorPaidAmount ?? 0
+  const paymentAmount = params.paymentAmount ?? 400
+  const paidAmount = Math.round((priorPaidAmount + paymentAmount) * 100) / 100
+  const remainingAmount = Math.round((total - paidAmount) * 100) / 100
+  const supplierInvoiceId = await insertSupplierInvoice({
+    userId: tenant.userId,
+    companyId: tenant.companyId,
+    total,
+    initiallyPaid: false,
+  })
+  const journalEntryId = await insertPostedJournalEntry({
+    ...tenant,
+    sourceType: 'supplier_invoice_paid',
+    sourceId: supplierInvoiceId,
+    entryDate: '2026-06-01',
+    committedAt: '2026-06-01T10:00:00Z',
+    lines: params.lines ?? [
+      { accountNumber: '2440', debitAmount: paymentAmount, creditAmount: 0 },
+      { accountNumber: '1930', debitAmount: 0, creditAmount: paymentAmount },
+    ],
+  })
+  await getPool().query(
+    `UPDATE public.supplier_invoices
+        SET status = $1,
+            paid_amount = $2,
+            remaining_amount = $3,
+            paid_at = $4,
+            payment_journal_entry_id = $5
+      WHERE id = $6`,
+    [
+      remainingAmount === 0 ? 'paid' : 'partially_paid',
+      paidAmount,
+      remainingAmount,
+      remainingAmount === 0 ? '2026-06-01T12:00:00Z' : null,
+      journalEntryId,
+      supplierInvoiceId,
+    ],
+  )
+
+  let transactionId: string | null = null
+  if (params.withTransaction) {
+    transactionId = await insertTransaction({
+      ...tenant,
+      amount: -paymentAmount,
+      journalEntryId,
+    })
+    await getPool().query(
+      `UPDATE public.transactions
+          SET supplier_invoice_id = $1,
+              is_business = true,
+              category = 'expense_other'
+        WHERE id = $2`,
+      [supplierInvoiceId, transactionId],
+    )
+  }
+
+  return {
+    ...tenant,
+    supplierInvoiceId,
+    journalEntryId,
+    transactionId,
+    total,
+    paidAmount,
+    remainingAmount,
+    paymentAmount,
+  }
+}
+
+async function seedAllocationFreeDeleteVoucher(params: {
+  sourceType?: 'supplier_invoice_cash_payment' | 'supplier_invoice_paid'
+  total?: number
+  paidAmount?: number
+  voucherNumber?: number
+  lines?: Array<{
+    accountNumber: string
+    debitAmount: number
+    creditAmount: number
+  }>
+}) {
+  const tenant = await seedCompany()
+  const total = params.total ?? 750
+  const paidAmount = params.paidAmount ?? total
+  const remainingAmount = Math.round((total - paidAmount) * 100) / 100
+  const sourceType = params.sourceType ?? 'supplier_invoice_cash_payment'
+  const supplierInvoiceId = await insertSupplierInvoice({
+    userId: tenant.userId,
+    companyId: tenant.companyId,
+    total,
+    initiallyPaid: false,
+  })
+  const journalEntryId = await insertPostedJournalEntry({
+    ...tenant,
+    sourceType,
+    sourceId: supplierInvoiceId,
+    voucherNumber: params.voucherNumber,
+    entryDate: '2026-06-01',
+    committedAt: '2026-06-01T10:00:00Z',
+    lines: params.lines ?? (
+      sourceType === 'supplier_invoice_paid'
+        ? [
+            { accountNumber: '2440', debitAmount: total - remainingAmount, creditAmount: 0 },
+            { accountNumber: '1930', debitAmount: 0, creditAmount: total - remainingAmount },
+          ]
+        : [
+            { accountNumber: '6000', debitAmount: total, creditAmount: 0 },
+            { accountNumber: '1930', debitAmount: 0, creditAmount: total },
+          ]
+    ),
+  })
+  await getPool().query(
+    `UPDATE public.supplier_invoices
+        SET status = $1,
+            paid_amount = $2,
+            remaining_amount = $3,
+            paid_at = $4,
+            due_date = '2099-12-31',
+            payment_journal_entry_id = $5
+      WHERE id = $6`,
+    [
+      remainingAmount === 0 ? 'paid' : 'partially_paid',
+      paidAmount,
+      remainingAmount,
+      remainingAmount === 0 ? '2026-06-01T12:00:00Z' : null,
+      journalEntryId,
+      supplierInvoiceId,
+    ],
+  )
+  return {
+    ...tenant,
+    supplierInvoiceId,
+    journalEntryId,
+    total,
+    paidAmount,
+    remainingAmount,
+  }
 }
 
 describe('supplier payment reversal retention migration', () => {
@@ -923,21 +1085,311 @@ describe('supplier payment reversal retention migration', () => {
     expect(transaction.rows).toEqual([{ journal_entry_id: seeded.journalEntryId }])
   })
 
-  it('rejects an ordinary supplier payment with no retained allocation evidence', async () => {
-    const seeded = await seedPaymentVoucher()
+  it('recovers a partial v1 payment without an allocation and releases only its owned transaction', async () => {
+    const seeded = await seedV1PaymentWithoutAllocation({
+      paymentAmount: 400,
+      withTransaction: true,
+    })
     const stornoId = await insertPostedStorno({
       ...seeded,
       originalJournalEntryId: seeded.journalEntryId,
+      amount: seeded.paymentAmount,
+    })
+
+    const result = await withUserContext(seeded.userId, async (client) =>
+      applySupplierPaymentReversal(client, {
+        companyId: seeded.companyId,
+        originalJournalEntryId: seeded.journalEntryId,
+        stornoJournalEntryId: stornoId,
+      }), { commit: true })
+
+    expect(result).toMatchObject({
+      ok: true,
+      status: 'applied_v1_recovery',
+      allocation_count: 0,
+      invoice_count: 1,
+      transaction_count: 1,
+    })
+    const invoice = await getPool().query(
+      `SELECT status, paid_amount::double precision AS paid_amount,
+              remaining_amount::double precision AS remaining_amount, paid_at,
+              payment_journal_entry_id
+         FROM public.supplier_invoices
+        WHERE id = $1`,
+      [seeded.supplierInvoiceId],
+    )
+    expect(invoice.rows).toEqual([{
+      status: 'overdue',
+      paid_amount: 0,
+      remaining_amount: 1000,
+      paid_at: null,
+      payment_journal_entry_id: null,
+    }])
+    const transaction = await getPool().query(
+      `SELECT journal_entry_id, supplier_invoice_id, is_business, category
+         FROM public.transactions
+        WHERE id = $1`,
+      [seeded.transactionId],
+    )
+    expect(transaction.rows).toEqual([{
+      journal_entry_id: null,
+      supplier_invoice_id: null,
+      is_business: null,
+      category: null,
+    }])
+    const events = await getPool().query(
+      `SELECT count(*)::integer AS outbox_count,
+              count(*) FILTER (WHERE published_at IS NOT NULL)::integer AS published_count
+         FROM public.supplier_payment_reversal_event_outbox
+        WHERE company_id = $1
+          AND original_journal_entry_id = $2
+          AND reversal_journal_entry_id = $3`,
+      [seeded.companyId, seeded.journalEntryId, stornoId],
+    )
+    expect(events.rows).toEqual([{ outbox_count: 2, published_count: 2 }])
+  })
+
+  it('restores the prior partial state once when a final v1 payment is retried', async () => {
+    const seeded = await seedV1PaymentWithoutAllocation({
+      priorPaidAmount: 300,
+      paymentAmount: 700,
+    })
+    const stornoId = await insertPostedStorno({
+      ...seeded,
+      originalJournalEntryId: seeded.journalEntryId,
+      amount: seeded.paymentAmount,
     })
 
     await withUserContext(seeded.userId, async (client) => {
-      await expect(
-        applySupplierPaymentReversal(client, {
-          companyId: seeded.companyId,
-          originalJournalEntryId: seeded.journalEntryId,
-          stornoJournalEntryId: stornoId,
-        }),
-      ).rejects.toThrow(/no retained allocations/i)
+      const first = await applySupplierPaymentReversal(client, {
+        companyId: seeded.companyId,
+        originalJournalEntryId: seeded.journalEntryId,
+        stornoJournalEntryId: stornoId,
+      })
+      const second = await applySupplierPaymentReversal(client, {
+        companyId: seeded.companyId,
+        originalJournalEntryId: seeded.journalEntryId,
+        stornoJournalEntryId: stornoId,
+      })
+      expect(first).toMatchObject({ ok: true, status: 'applied_v1_recovery' })
+      expect(second).toMatchObject({
+        ok: true,
+        status: 'already_applied_v1_recovery',
+      })
+    }, { commit: true })
+
+    const invoice = await getPool().query(
+      `SELECT status, paid_amount::double precision AS paid_amount,
+              remaining_amount::double precision AS remaining_amount, paid_at,
+              payment_journal_entry_id
+         FROM public.supplier_invoices
+        WHERE id = $1`,
+      [seeded.supplierInvoiceId],
+    )
+    expect(invoice.rows).toEqual([{
+      status: 'partially_paid',
+      paid_amount: 300,
+      remaining_amount: 700,
+      paid_at: null,
+      payment_journal_entry_id: null,
+    }])
+    const markers = await getPool().query(
+      `SELECT count(*)::integer AS count
+         FROM public.supplier_payment_reversal_event_outbox
+        WHERE company_id = $1
+          AND original_journal_entry_id = $2
+          AND reversal_journal_entry_id = $3`,
+      [seeded.companyId, seeded.journalEntryId, stornoId],
+    )
+    expect(markers.rows).toEqual([{ count: 2 }])
+  })
+
+  it('rejects conflicting v1 invoice state without releasing pointers or publishing events', async () => {
+    const seeded = await seedV1PaymentWithoutAllocation({
+      paymentAmount: 400,
+      withTransaction: true,
+    })
+    await getPool().query(
+      `UPDATE public.supplier_invoices
+          SET remaining_amount = 500
+        WHERE id = $1`,
+      [seeded.supplierInvoiceId],
+    )
+    const stornoId = await insertPostedStorno({
+      ...seeded,
+      originalJournalEntryId: seeded.journalEntryId,
+      amount: seeded.paymentAmount,
+    })
+
+    await withUserContext(seeded.userId, async (client) => {
+      await expect(applySupplierPaymentReversal(client, {
+        companyId: seeded.companyId,
+        originalJournalEntryId: seeded.journalEntryId,
+        stornoJournalEntryId: stornoId,
+      })).rejects.toThrow(/invoice state conflict/i)
+    }, { commit: true })
+
+    const state = await getPool().query(
+      `SELECT si.paid_amount::double precision AS paid_amount,
+              si.remaining_amount::double precision AS remaining_amount,
+              si.payment_journal_entry_id,
+              t.journal_entry_id AS transaction_journal_entry_id,
+              (
+                SELECT count(*)::integer
+                  FROM public.supplier_payment_reversal_event_outbox o
+                 WHERE o.original_journal_entry_id = $2
+              ) AS marker_count
+         FROM public.supplier_invoices si
+         JOIN public.transactions t ON t.id = $3
+        WHERE si.id = $1`,
+      [seeded.supplierInvoiceId, seeded.journalEntryId, seeded.transactionId],
+    )
+    expect(state.rows).toEqual([{
+      paid_amount: 400,
+      remaining_amount: 500,
+      payment_journal_entry_id: seeded.journalEntryId,
+      transaction_journal_entry_id: seeded.journalEntryId,
+      marker_count: 0,
+    }])
+  })
+
+  it('rejects an ambiguous 2440 journal shape without changing invoice state', async () => {
+    const seeded = await seedV1PaymentWithoutAllocation({
+      paymentAmount: 400,
+      lines: [
+        { accountNumber: '2440', debitAmount: 300, creditAmount: 0 },
+        { accountNumber: '2440', debitAmount: 100, creditAmount: 0 },
+        { accountNumber: '1930', debitAmount: 0, creditAmount: 400 },
+      ],
+    })
+    const stornoId = await insertPostedStorno({
+      ...seeded,
+      originalJournalEntryId: seeded.journalEntryId,
+      amount: seeded.paymentAmount,
+    })
+
+    await withUserContext(seeded.userId, async (client) => {
+      await expect(applySupplierPaymentReversal(client, {
+        companyId: seeded.companyId,
+        originalJournalEntryId: seeded.journalEntryId,
+        stornoJournalEntryId: stornoId,
+      })).rejects.toThrow(/journal line shape is ambiguous/i)
+    }, { commit: true })
+
+    const state = await getPool().query(
+      `SELECT si.status, si.paid_amount::double precision AS paid_amount,
+              si.remaining_amount::double precision AS remaining_amount,
+              si.payment_journal_entry_id,
+              (
+                SELECT count(*)::integer
+                  FROM public.supplier_payment_reversal_event_outbox o
+                 WHERE o.original_journal_entry_id = $2
+              ) AS marker_count
+         FROM public.supplier_invoices si
+        WHERE si.id = $1`,
+      [seeded.supplierInvoiceId, seeded.journalEntryId],
+    )
+    expect(state.rows).toEqual([{
+      status: 'partially_paid',
+      paid_amount: 400,
+      remaining_amount: 600,
+      payment_journal_entry_id: seeded.journalEntryId,
+      marker_count: 0,
+    }])
+  })
+
+  it('rejects cross-tenant transaction ownership without changing either tenant', async () => {
+    const seeded = await seedV1PaymentWithoutAllocation({ paymentAmount: 400 })
+    const foreign = await seedCompany()
+    const foreignTransactionId = await insertTransaction({
+      ...foreign,
+      journalEntryId: seeded.journalEntryId,
+    })
+    const stornoId = await insertPostedStorno({
+      ...seeded,
+      originalJournalEntryId: seeded.journalEntryId,
+      amount: seeded.paymentAmount,
+    })
+
+    await withUserContext(seeded.userId, async (client) => {
+      await expect(applySupplierPaymentReversal(client, {
+        companyId: seeded.companyId,
+        originalJournalEntryId: seeded.journalEntryId,
+        stornoJournalEntryId: stornoId,
+      })).rejects.toThrow(/transaction ownership conflict/i)
+    }, { commit: true })
+
+    const transaction = await getPool().query(
+      `SELECT company_id, journal_entry_id
+         FROM public.transactions
+        WHERE id = $1`,
+      [foreignTransactionId],
+    )
+    expect(transaction.rows).toEqual([{
+      company_id: foreign.companyId,
+      journal_entry_id: seeded.journalEntryId,
+    }])
+    const invoice = await getPool().query(
+      `SELECT paid_amount::double precision AS paid_amount,
+              remaining_amount::double precision AS remaining_amount,
+              payment_journal_entry_id
+         FROM public.supplier_invoices
+        WHERE id = $1`,
+      [seeded.supplierInvoiceId],
+    )
+    expect(invoice.rows).toEqual([{
+      paid_amount: 400,
+      remaining_amount: 600,
+      payment_journal_entry_id: seeded.journalEntryId,
+    }])
+  })
+
+  it('continues to reject allocation-free manual and unlinked ordinary vouchers', async () => {
+    const tenant = await seedCompany()
+    const supplierInvoiceId = await insertSupplierInvoice({
+      userId: tenant.userId,
+      companyId: tenant.companyId,
+    })
+    const manualId = await insertPostedJournalEntry({
+      ...tenant,
+      sourceType: 'manual',
+      sourceId: supplierInvoiceId,
+      lines: [
+        { accountNumber: '2440', debitAmount: 1000, creditAmount: 0 },
+        { accountNumber: '1930', debitAmount: 0, creditAmount: 1000 },
+      ],
+    })
+    const manualStornoId = await insertPostedStorno({
+      ...tenant,
+      originalJournalEntryId: manualId,
+    })
+    const ordinaryId = await insertPostedJournalEntry({
+      ...tenant,
+      sourceType: 'supplier_invoice_paid',
+      sourceId: null,
+      lines: [
+        { accountNumber: '2440', debitAmount: 1000, creditAmount: 0 },
+        { accountNumber: '1930', debitAmount: 0, creditAmount: 1000 },
+      ],
+    })
+    const ordinaryStornoId = await insertPostedStorno({
+      ...tenant,
+      originalJournalEntryId: ordinaryId,
+    })
+
+    await withUserContext(tenant.userId, async (client) => {
+      await expect(applySupplierPaymentReversal(client, {
+        companyId: tenant.companyId,
+        originalJournalEntryId: manualId,
+        stornoJournalEntryId: manualStornoId,
+      })).rejects.toThrow(/manual supplier payment reversal has no retained allocations/i)
+    }, { commit: true })
+    await withUserContext(tenant.userId, async (client) => {
+      await expect(applySupplierPaymentReversal(client, {
+        companyId: tenant.companyId,
+        originalJournalEntryId: ordinaryId,
+        stornoJournalEntryId: ordinaryStornoId,
+      })).rejects.toThrow(/has no source invoice/i)
     }, { commit: true })
 
     const invoice = await getPool().query(
@@ -945,7 +1397,7 @@ describe('supplier payment reversal retention migration', () => {
               remaining_amount::double precision AS remaining_amount
          FROM public.supplier_invoices
         WHERE id = $1`,
-      [seeded.supplierInvoiceId],
+      [supplierInvoiceId],
     )
     expect(invoice.rows).toEqual([{
       status: 'paid',
@@ -998,6 +1450,350 @@ describe('supplier payment reversal retention migration', () => {
       expect(first).toMatchObject({ ok: true, status: 'applied_legacy' })
       expect(second).toMatchObject({ ok: true, status: 'already_applied_legacy' })
     })
+  })
+
+  it('atomically restores an allocation-free cash payment during physical delete', async () => {
+    const seeded = await seedAllocationFreeDeleteVoucher({})
+    const transactionId = await insertTransaction({
+      ...seeded,
+      amount: -seeded.total,
+      journalEntryId: seeded.journalEntryId,
+    })
+    await getPool().query(
+      `UPDATE public.transactions
+          SET supplier_invoice_id = $1,
+              is_business = true,
+              category = 'expense_other'
+        WHERE id = $2`,
+      [seeded.supplierInvoiceId, transactionId],
+    )
+
+    const deleted = await withUserContext(
+      seeded.userId,
+      (client) => deleteLastVoucher(
+        client,
+        seeded.companyId,
+        seeded.journalEntryId,
+      ),
+      { commit: true },
+    )
+
+    expect(deleted).toEqual({
+      deleted: true,
+      voucher_series: 'A',
+      voucher_number: 0,
+      was_period_ib: false,
+    })
+    const state = await getPool().query(
+      `SELECT si.status,
+              si.paid_at,
+              si.paid_amount::double precision AS paid_amount,
+              si.remaining_amount::double precision AS remaining_amount,
+              si.payment_journal_entry_id,
+              t.journal_entry_id AS transaction_journal_entry_id,
+              t.supplier_invoice_id AS transaction_supplier_invoice_id,
+              t.is_business,
+              t.category,
+              (
+                SELECT count(*)::integer
+                  FROM public.journal_entries je
+                 WHERE je.id = $1
+              ) AS journal_count
+         FROM public.supplier_invoices si
+         JOIN public.transactions t ON t.id = $2
+        WHERE si.id = $3`,
+      [seeded.journalEntryId, transactionId, seeded.supplierInvoiceId],
+    )
+    expect(state.rows).toEqual([{
+      status: 'approved',
+      paid_at: null,
+      paid_amount: 0,
+      remaining_amount: seeded.total,
+      payment_journal_entry_id: null,
+      transaction_journal_entry_id: null,
+      transaction_supplier_invoice_id: null,
+      is_business: null,
+      category: null,
+      journal_count: 0,
+    }])
+  })
+
+  it('restores an unambiguous allocation-free v1 final payment during delete', async () => {
+    const seeded = await seedAllocationFreeDeleteVoucher({
+      sourceType: 'supplier_invoice_paid',
+      total: 1000,
+      paidAmount: 1000,
+      lines: [
+        { accountNumber: '2440', debitAmount: 700, creditAmount: 0 },
+        { accountNumber: '1930', debitAmount: 0, creditAmount: 700 },
+      ],
+    })
+
+    const deleted = await withUserContext(
+      seeded.userId,
+      (client) => deleteLastVoucher(
+        client,
+        seeded.companyId,
+        seeded.journalEntryId,
+      ),
+      { commit: true },
+    )
+    expect(deleted).toMatchObject({ deleted: true })
+
+    const state = await getPool().query(
+      `SELECT status,
+              paid_at,
+              paid_amount::double precision AS paid_amount,
+              remaining_amount::double precision AS remaining_amount,
+              payment_journal_entry_id,
+              (
+                SELECT count(*)::integer
+                  FROM public.journal_entries je
+                 WHERE je.id = $1
+              ) AS journal_count
+         FROM public.supplier_invoices
+        WHERE id = $2`,
+      [seeded.journalEntryId, seeded.supplierInvoiceId],
+    )
+    expect(state.rows).toEqual([{
+      status: 'partially_paid',
+      paid_at: null,
+      paid_amount: 300,
+      remaining_amount: 700,
+      payment_journal_entry_id: null,
+      journal_count: 0,
+    }])
+  })
+
+  it('rejects allocation-backed physical deletion without cleaning business state', async () => {
+    const seeded = await seedPaymentVoucher()
+    await getPool().query(
+      `UPDATE public.supplier_invoices
+          SET payment_journal_entry_id = $1,
+              paid_at = '2026-06-01T12:00:00Z',
+              due_date = '2099-12-31'
+        WHERE id = $2`,
+      [seeded.journalEntryId, seeded.supplierInvoiceId],
+    )
+    const transactionId = await insertTransaction({
+      ...seeded,
+      amount: -seeded.total,
+      journalEntryId: seeded.journalEntryId,
+    })
+    await getPool().query(
+      `UPDATE public.transactions
+          SET supplier_invoice_id = $1,
+              is_business = true,
+              category = 'expense_other'
+        WHERE id = $2`,
+      [seeded.supplierInvoiceId, transactionId],
+    )
+    const paymentId = await insertPayment({ ...seeded, transactionId })
+
+    await withUserContext(seeded.userId, async (client) => {
+      await expect(deleteLastVoucher(
+        client,
+        seeded.companyId,
+        seeded.journalEntryId,
+      )).rejects.toThrow(/allocation-backed supplier payment voucher/i)
+    }, { commit: true })
+
+    const state = await getPool().query(
+      `SELECT si.status,
+              si.paid_amount::double precision AS paid_amount,
+              si.remaining_amount::double precision AS remaining_amount,
+              si.payment_journal_entry_id,
+              sip.journal_entry_id AS allocation_journal_entry_id,
+              sip.reversed_at,
+              t.journal_entry_id AS transaction_journal_entry_id,
+              t.supplier_invoice_id AS transaction_supplier_invoice_id,
+              (
+                SELECT count(*)::integer
+                  FROM public.journal_entries je
+                 WHERE je.id = $1
+              ) AS journal_count
+         FROM public.supplier_invoices si
+         JOIN public.supplier_invoice_payments sip ON sip.id = $2
+         JOIN public.transactions t ON t.id = $3
+        WHERE si.id = $4`,
+      [
+        seeded.journalEntryId,
+        paymentId,
+        transactionId,
+        seeded.supplierInvoiceId,
+      ],
+    )
+    expect(state.rows).toEqual([{
+      status: 'paid',
+      paid_amount: seeded.total,
+      remaining_amount: 0,
+      payment_journal_entry_id: seeded.journalEntryId,
+      allocation_journal_entry_id: seeded.journalEntryId,
+      reversed_at: null,
+      transaction_journal_entry_id: seeded.journalEntryId,
+      transaction_supplier_invoice_id: seeded.supplierInvoiceId,
+      journal_count: 1,
+    }])
+  })
+
+  it('leaves supplier state untouched when the last-in-series rule refuses delete', async () => {
+    const seeded = await seedAllocationFreeDeleteVoucher({ voucherNumber: 1 })
+    const transactionId = await insertTransaction({
+      ...seeded,
+      amount: -seeded.total,
+      journalEntryId: seeded.journalEntryId,
+    })
+    await getPool().query(
+      `UPDATE public.transactions
+          SET supplier_invoice_id = $1,
+              is_business = true,
+              category = 'expense_other'
+        WHERE id = $2`,
+      [seeded.supplierInvoiceId, transactionId],
+    )
+    const laterJournalEntryId = await insertPostedJournalEntry({
+      ...seeded,
+      voucherNumber: 2,
+      sourceType: 'manual',
+    })
+
+    await withUserContext(seeded.userId, async (client) => {
+      await expect(deleteLastVoucher(
+        client,
+        seeded.companyId,
+        seeded.journalEntryId,
+      )).rejects.toThrow(/sista verifikatet i serien/i)
+    }, { commit: true })
+
+    const state = await getPool().query(
+      `SELECT si.status,
+              si.paid_amount::double precision AS paid_amount,
+              si.remaining_amount::double precision AS remaining_amount,
+              si.payment_journal_entry_id,
+              t.journal_entry_id AS transaction_journal_entry_id,
+              t.supplier_invoice_id AS transaction_supplier_invoice_id,
+              (
+                SELECT count(*)::integer
+                  FROM public.journal_entries je
+                 WHERE je.id = ANY($1::uuid[])
+              ) AS journal_count
+         FROM public.supplier_invoices si
+         JOIN public.transactions t ON t.id = $2
+        WHERE si.id = $3`,
+      [
+        [seeded.journalEntryId, laterJournalEntryId],
+        transactionId,
+        seeded.supplierInvoiceId,
+      ],
+    )
+    expect(state.rows).toEqual([{
+      status: 'paid',
+      paid_amount: seeded.total,
+      remaining_amount: 0,
+      payment_journal_entry_id: seeded.journalEntryId,
+      transaction_journal_entry_id: seeded.journalEntryId,
+      transaction_supplier_invoice_id: seeded.supplierInvoiceId,
+      journal_count: 2,
+    }])
+  })
+
+  it('rejects ambiguous allocation-free 2440 evidence without deleting', async () => {
+    const seeded = await seedAllocationFreeDeleteVoucher({
+      sourceType: 'supplier_invoice_paid',
+      total: 500,
+      lines: [
+        { accountNumber: '2440', debitAmount: 250, creditAmount: 0 },
+        { accountNumber: '2440', debitAmount: 250, creditAmount: 0 },
+        { accountNumber: '1930', debitAmount: 0, creditAmount: 500 },
+      ],
+    })
+
+    await withUserContext(seeded.userId, async (client) => {
+      await expect(deleteLastVoucher(
+        client,
+        seeded.companyId,
+        seeded.journalEntryId,
+      )).rejects.toThrow(/2440 evidence is ambiguous/i)
+    }, { commit: true })
+
+    const state = await getPool().query(
+      `SELECT si.status,
+              si.paid_amount::double precision AS paid_amount,
+              si.remaining_amount::double precision AS remaining_amount,
+              si.payment_journal_entry_id,
+              (
+                SELECT count(*)::integer
+                  FROM public.journal_entries je
+                 WHERE je.id = $1
+              ) AS journal_count
+         FROM public.supplier_invoices si
+        WHERE si.id = $2`,
+      [seeded.journalEntryId, seeded.supplierInvoiceId],
+    )
+    expect(state.rows).toEqual([{
+      status: 'paid',
+      paid_amount: 500,
+      remaining_amount: 0,
+      payment_journal_entry_id: seeded.journalEntryId,
+      journal_count: 1,
+    }])
+  })
+
+  it('rejects conflicting transaction ownership without releasing any pointer', async () => {
+    const seeded = await seedAllocationFreeDeleteVoucher({})
+    const conflictingInvoiceId = await insertSupplierInvoice({
+      userId: seeded.userId,
+      companyId: seeded.companyId,
+      initiallyPaid: false,
+    })
+    const transactionId = await insertTransaction({
+      ...seeded,
+      amount: -seeded.total,
+      journalEntryId: seeded.journalEntryId,
+    })
+    await getPool().query(
+      `UPDATE public.transactions
+          SET supplier_invoice_id = $1,
+              is_business = true,
+              category = 'expense_other'
+        WHERE id = $2`,
+      [conflictingInvoiceId, transactionId],
+    )
+
+    await withUserContext(seeded.userId, async (client) => {
+      await expect(deleteLastVoucher(
+        client,
+        seeded.companyId,
+        seeded.journalEntryId,
+      )).rejects.toThrow(/transaction ownership conflicts with voucher/i)
+    }, { commit: true })
+
+    const state = await getPool().query(
+      `SELECT si.status,
+              si.paid_amount::double precision AS paid_amount,
+              si.remaining_amount::double precision AS remaining_amount,
+              si.payment_journal_entry_id,
+              t.journal_entry_id AS transaction_journal_entry_id,
+              t.supplier_invoice_id AS transaction_supplier_invoice_id,
+              (
+                SELECT count(*)::integer
+                  FROM public.journal_entries je
+                 WHERE je.id = $1
+              ) AS journal_count
+         FROM public.supplier_invoices si
+         JOIN public.transactions t ON t.id = $2
+        WHERE si.id = $3`,
+      [seeded.journalEntryId, transactionId, seeded.supplierInvoiceId],
+    )
+    expect(state.rows).toEqual([{
+      status: 'paid',
+      paid_amount: seeded.total,
+      remaining_amount: 0,
+      payment_journal_entry_id: seeded.journalEntryId,
+      transaction_journal_entry_id: seeded.journalEntryId,
+      transaction_supplier_invoice_id: conflictingInvoiceId,
+      journal_count: 1,
+    }])
   })
 
   it('records the authenticated reversing member without changing allocation ownership', async () => {

@@ -1337,8 +1337,26 @@ describe('currency-revaluation', () => {
       const supabase = createMockSupabase({
         supplierInvoices: [straddlingPayable],
         supplierInvoicePayments: [
-          { company_id: 'company-1', supplier_invoice_id: 'si-straddle', amount: 500, payment_date: '2024-12-01' },
-          { company_id: 'company-1', supplier_invoice_id: 'si-straddle', amount: 1300, payment_date: '2025-03-04' },
+          {
+            id: 'sip-before',
+            company_id: 'company-1',
+            supplier_invoice_id: 'si-straddle',
+            amount: 500,
+            payment_date: '2024-12-01',
+            journal_entry_id: null,
+            reversed_at: null,
+            reversed_by_journal_entry_id: null,
+          },
+          {
+            id: 'sip-after',
+            company_id: 'company-1',
+            supplier_invoice_id: 'si-straddle',
+            amount: 1300,
+            payment_date: '2025-03-04',
+            journal_entry_id: null,
+            reversed_at: null,
+            reversed_by_journal_entry_id: null,
+          },
         ],
       })
       // eslint-disable-next-line @typescript-eslint/no-explicit-any

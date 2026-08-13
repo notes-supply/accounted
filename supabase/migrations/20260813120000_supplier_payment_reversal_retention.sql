@@ -631,6 +631,7 @@ DECLARE
   v_storno record;
   v_invoice record;
   v_legacy_invoice record;
+  v_v1_invoice record;
   v_role text := COALESCE(auth.role(), '');
   v_total_count integer;
   v_active_count integer;
@@ -641,6 +642,16 @@ DECLARE
   v_released_count integer;
   v_reversed_at timestamptz;
   v_legacy_status text;
+  v_v1_status text;
+  v_v1_line_count integer;
+  v_v1_2440_count integer;
+  v_v1_2440_debit_count integer;
+  v_v1_malformed_line_count integer;
+  v_v1_marker_count integer;
+  v_v1_total_debit numeric;
+  v_v1_total_credit numeric;
+  v_v1_payment_amount numeric;
+  v_v1_restored_paid numeric;
   v_event_publication jsonb;
 BEGIN
   IF v_role = 'service_role' THEN
@@ -744,6 +755,257 @@ BEGIN
 
 
   IF v_total_count = 0 THEN
+    IF v_original.source_type = 'supplier_invoice_paid' THEN
+      -- Compatibility recovery for the v1 mark-paid ordering: the posted
+      -- voucher and invoice mutation may exist even when its explicitly
+      -- non-blocking allocation insert failed. The exact source pointer,
+      -- one unambiguous 2440 debit, the invoice before-state, and the durable
+      -- event outbox marker bound this path. No other allocation-free payment
+      -- source acquires this capability.
+      IF v_original.source_id IS NULL THEN
+        RAISE EXCEPTION 'supplier payment recovery has no source invoice'
+          USING ERRCODE = '55000';
+      END IF;
+
+      SELECT si.id, si.company_id, si.status, si.paid_at, si.paid_amount,
+             si.remaining_amount, si.total, si.due_date,
+             si.payment_journal_entry_id, si.is_credit_note
+        INTO v_v1_invoice
+        FROM public.supplier_invoices si
+       WHERE si.id = v_original.source_id
+       FOR UPDATE;
+      IF NOT FOUND OR v_v1_invoice.company_id IS DISTINCT FROM p_company_id THEN
+        RAISE EXCEPTION 'supplier payment recovery invoice ownership mismatch'
+          USING ERRCODE = '55000';
+      END IF;
+
+      SELECT count(*)::integer,
+             count(*) FILTER (
+               WHERE jel.account_number = '2440'
+             )::integer,
+             count(*) FILTER (
+               WHERE jel.account_number = '2440'
+                 AND round(COALESCE(jel.debit_amount, 0), 2) > 0
+                 AND round(COALESCE(jel.credit_amount, 0), 2) = 0
+             )::integer,
+             count(*) FILTER (
+               WHERE jel.account_number IS NULL
+                  OR btrim(jel.account_number) = ''
+                  OR jel.debit_amount IS NULL
+                  OR jel.credit_amount IS NULL
+                  OR jel.debit_amount < 0
+                  OR jel.credit_amount < 0
+                  OR (
+                    (round(jel.debit_amount, 2) > 0)::integer
+                    + (round(jel.credit_amount, 2) > 0)::integer
+                  ) <> 1
+             )::integer,
+             round(COALESCE(sum(jel.debit_amount), 0), 2),
+             round(COALESCE(sum(jel.credit_amount), 0), 2),
+             round(
+               COALESCE(
+                 sum(jel.debit_amount) FILTER (
+                   WHERE jel.account_number = '2440'
+                 ),
+                 0
+               ),
+               2
+             )
+        INTO v_v1_line_count,
+             v_v1_2440_count,
+             v_v1_2440_debit_count,
+             v_v1_malformed_line_count,
+             v_v1_total_debit,
+             v_v1_total_credit,
+             v_v1_payment_amount
+        FROM public.journal_entry_lines jel
+       WHERE jel.journal_entry_id = p_original_journal_entry_id;
+
+      IF v_v1_line_count < 2
+         OR v_v1_2440_count <> 1
+         OR v_v1_2440_debit_count <> 1
+         OR v_v1_malformed_line_count <> 0
+         OR v_v1_payment_amount <= 0
+         OR v_v1_total_debit <= 0
+         OR v_v1_total_debit IS DISTINCT FROM v_v1_total_credit THEN
+        RAISE EXCEPTION 'supplier payment recovery journal line shape is ambiguous'
+          USING ERRCODE = '55000';
+      END IF;
+
+      IF (
+        SELECT count(*)
+          FROM public.journal_entries je
+         WHERE je.company_id = p_company_id
+           AND je.reverses_id = p_original_journal_entry_id
+           AND je.source_type = 'storno'
+           AND je.status = 'posted'
+      ) <> 1 THEN
+        RAISE EXCEPTION 'supplier payment recovery storno lineage is ambiguous'
+          USING ERRCODE = '55000';
+      END IF;
+
+      -- A transaction belongs to this recovery only through the exact original
+      -- voucher pointer. Foreign-tenant and conflicting invoice pointers are
+      -- rejected before any state change.
+      PERFORM t.id
+        FROM public.transactions t
+       WHERE t.journal_entry_id = p_original_journal_entry_id
+       ORDER BY t.id
+       FOR UPDATE;
+
+      IF EXISTS (
+        SELECT 1
+          FROM public.transactions t
+         WHERE t.journal_entry_id = p_original_journal_entry_id
+           AND (
+             t.company_id IS DISTINCT FROM p_company_id
+             OR t.invoice_id IS NOT NULL
+             OR (
+               t.supplier_invoice_id IS NOT NULL
+               AND t.supplier_invoice_id IS DISTINCT FROM v_v1_invoice.id
+             )
+           )
+      ) THEN
+        RAISE EXCEPTION 'supplier payment recovery transaction ownership conflict'
+          USING ERRCODE = '55000';
+      END IF;
+
+      SELECT count(*)::integer
+        INTO v_v1_marker_count
+        FROM public.supplier_payment_reversal_event_outbox o
+       WHERE o.company_id = p_company_id
+         AND o.original_journal_entry_id = p_original_journal_entry_id
+         AND o.reversal_journal_entry_id = p_storno_journal_entry_id;
+
+      IF v_v1_marker_count = 2 THEN
+        IF v_v1_invoice.payment_journal_entry_id = p_original_journal_entry_id
+           OR EXISTS (
+             SELECT 1
+               FROM public.transactions t
+              WHERE t.journal_entry_id = p_original_journal_entry_id
+           ) THEN
+          RAISE EXCEPTION 'supplier payment recovery marker conflicts with current pointers'
+            USING ERRCODE = '55000';
+        END IF;
+        v_event_publication := public.record_supplier_payment_reversal_events(
+          p_company_id,
+          p_original_journal_entry_id,
+          p_storno_journal_entry_id
+        );
+        RETURN jsonb_build_object(
+          'ok', true,
+          'status', 'already_applied_v1_recovery',
+          'allocation_count', 0,
+          'invoice_count', 1,
+          'transaction_count', 0,
+          'event_publication', v_event_publication
+        );
+      ELSIF v_v1_marker_count <> 0 THEN
+        RAISE EXCEPTION 'supplier payment recovery marker is incomplete'
+          USING ERRCODE = '55000';
+      END IF;
+
+      IF v_v1_invoice.is_credit_note IS DISTINCT FROM false
+         OR v_v1_invoice.payment_journal_entry_id
+            IS DISTINCT FROM p_original_journal_entry_id
+         OR v_v1_invoice.status NOT IN ('paid', 'partially_paid')
+         OR round(COALESCE(v_v1_invoice.paid_amount, 0), 2)
+            < v_v1_payment_amount
+         OR round(COALESCE(v_v1_invoice.paid_amount, 0), 2)
+            > round(v_v1_invoice.total, 2)
+         OR round(
+           COALESCE(v_v1_invoice.remaining_amount, v_v1_invoice.total),
+           2
+         ) IS DISTINCT FROM round(
+           v_v1_invoice.total - COALESCE(v_v1_invoice.paid_amount, 0),
+           2
+         )
+         OR (
+           v_v1_invoice.status = 'paid'
+           AND (
+             round(COALESCE(v_v1_invoice.remaining_amount, 0), 2) <> 0
+             OR v_v1_invoice.paid_at IS NULL
+           )
+         )
+         OR (
+           v_v1_invoice.status = 'partially_paid'
+           AND (
+             round(COALESCE(v_v1_invoice.paid_amount, 0), 2) <= 0
+             OR round(COALESCE(v_v1_invoice.remaining_amount, 0), 2) <= 0
+             OR v_v1_invoice.paid_at IS NOT NULL
+           )
+         ) THEN
+        RAISE EXCEPTION 'supplier payment recovery invoice state conflict'
+          USING ERRCODE = '55000';
+      END IF;
+
+      v_v1_restored_paid := round(
+        v_v1_invoice.paid_amount - v_v1_payment_amount,
+        2
+      );
+      IF v_v1_restored_paid < 0 THEN
+        RAISE EXCEPTION 'supplier payment recovery amount exceeds paid state'
+          USING ERRCODE = '55000';
+      END IF;
+      v_v1_status := CASE
+        WHEN v_v1_restored_paid > 0 THEN 'partially_paid'
+        WHEN v_v1_invoice.due_date IS NOT NULL
+         AND v_v1_invoice.due_date < current_date THEN 'overdue'
+        ELSE 'approved'
+      END;
+
+      UPDATE public.supplier_invoices si
+         SET status = v_v1_status,
+             paid_amount = v_v1_restored_paid,
+             remaining_amount = round(si.total - v_v1_restored_paid, 2),
+             paid_at = NULL,
+             payment_journal_entry_id = NULL
+       WHERE si.id = v_v1_invoice.id
+         AND si.company_id = p_company_id
+         AND si.payment_journal_entry_id = p_original_journal_entry_id;
+      GET DIAGNOSTICS v_updated_count = ROW_COUNT;
+      IF v_updated_count <> 1 THEN
+        RAISE EXCEPTION 'supplier payment recovery did not restore its invoice'
+          USING ERRCODE = '55000';
+      END IF;
+
+      UPDATE public.transactions t
+         SET journal_entry_id = NULL,
+             supplier_invoice_id = NULL,
+             is_business = NULL,
+             category = NULL
+       WHERE t.company_id = p_company_id
+         AND t.journal_entry_id = p_original_journal_entry_id
+         AND t.invoice_id IS NULL
+         AND (
+           t.supplier_invoice_id IS NULL
+           OR t.supplier_invoice_id = v_v1_invoice.id
+         );
+      GET DIAGNOSTICS v_released_count = ROW_COUNT;
+      IF EXISTS (
+        SELECT 1
+          FROM public.transactions t
+         WHERE t.journal_entry_id = p_original_journal_entry_id
+      ) THEN
+        RAISE EXCEPTION 'supplier payment recovery left a conflicting transaction pointer'
+          USING ERRCODE = '55000';
+      END IF;
+
+      v_event_publication := public.record_supplier_payment_reversal_events(
+        p_company_id,
+        p_original_journal_entry_id,
+        p_storno_journal_entry_id
+      );
+      RETURN jsonb_build_object(
+        'ok', true,
+        'status', 'applied_v1_recovery',
+        'allocation_count', 0,
+        'invoice_count', 1,
+        'transaction_count', v_released_count,
+        'event_publication', v_event_publication
+      );
+    END IF;
+
     -- Deliberately bounded compatibility path: old cash-method full-payment
     -- vouchers were source-linked before allocation rows became mandatory.
     -- The exact current payment pointer is the before-state marker; the fully
@@ -1067,7 +1329,7 @@ END;
 $$;
 
 COMMENT ON FUNCTION public.apply_supplier_payment_reversal(uuid, uuid, uuid) IS
-  'Atomically restores supplier invoice payment state after one exact posted storno, retains allocation lineage, and releases only owned transaction pointers. Exact retries return already_applied.';
+  'Atomically restores supplier invoice payment state after one exact posted storno, retains allocation lineage, recovers a source-linked v1 payment only from an unambiguous 2440 debit and durable marker, and releases only owned transaction pointers.';
 
 REVOKE ALL ON FUNCTION public.apply_supplier_payment_reversal(uuid, uuid, uuid)
   FROM PUBLIC, anon;
@@ -1146,5 +1408,585 @@ $$;
 
 COMMENT ON FUNCTION public.is_transaction_booked(uuid) IS
   'Returns true if the transaction has an active journal anchor. Soft-reversed supplier allocations are retained history, not current booking links.';
+
+-- Physical deletion is the one supplier-payment reversal path without a
+-- storno row. Keep its supplier sub-ledger restoration in the same transaction
+-- as the voucher deletion. The narrow allocation-free compatibility paths
+-- below require an exact source invoice, current payment pointer, and journal
+-- line evidence. Retained allocations are never removed by this RPC.
+CREATE OR REPLACE FUNCTION public.delete_last_voucher(
+  p_company_id uuid,
+  p_entry_id uuid
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_entry                       record;
+  v_period                      record;
+  v_supplier_invoice            record;
+  v_max_voucher                 integer;
+  v_ref_count                   integer;
+  v_caller_role                 text;
+  v_snapshot                    jsonb;
+  v_lines_snapshot              jsonb;
+  v_is_period_ib                boolean := false;
+  v_supplier_allocation_count   integer;
+  v_supplier_line_count         integer;
+  v_supplier_malformed_count    integer;
+  v_supplier_2440_count         integer;
+  v_supplier_2440_debit_count   integer;
+  v_supplier_settlement_count   integer;
+  v_supplier_transaction_count  integer;
+  v_supplier_updated_count      integer;
+  v_supplier_released_count     integer;
+  v_supplier_total_debit        numeric;
+  v_supplier_total_credit       numeric;
+  v_supplier_payment_amount     numeric;
+  v_supplier_settlement_amount  numeric;
+  v_supplier_restored_paid      numeric;
+  v_supplier_restored_status    text;
+BEGIN
+  SELECT cm.role INTO v_caller_role
+  FROM public.company_members cm
+  WHERE cm.company_id = p_company_id
+    AND cm.user_id = auth.uid();
+
+  IF v_caller_role IS NULL OR v_caller_role NOT IN ('owner', 'admin') THEN
+    RAISE EXCEPTION 'Only company owners and admins can delete vouchers';
+  END IF;
+
+  SELECT * INTO v_entry
+  FROM public.journal_entries
+  WHERE id = p_entry_id
+    AND company_id = p_company_id
+  FOR UPDATE;
+
+  IF v_entry IS NULL THEN
+    RAISE EXCEPTION 'Journal entry not found';
+  END IF;
+
+  IF v_entry.status NOT IN ('posted', 'draft') THEN
+    RAISE EXCEPTION 'Only posted or draft entries can be deleted (current status: %)', v_entry.status;
+  END IF;
+
+  SELECT jsonb_agg(to_jsonb(l)) INTO v_lines_snapshot
+  FROM public.journal_entry_lines l
+  WHERE l.journal_entry_id = p_entry_id;
+
+  v_snapshot := to_jsonb(v_entry)
+    || jsonb_build_object('lines', COALESCE(v_lines_snapshot, '[]'::jsonb));
+
+  IF v_entry.status = 'draft' THEN
+    PERFORM set_config('gnubok.allow_delete', 'true', true);
+
+    UPDATE public.document_attachments
+    SET journal_entry_id = NULL
+    WHERE journal_entry_id = p_entry_id;
+
+    DELETE FROM public.journal_entries WHERE id = p_entry_id;
+
+    INSERT INTO public.audit_log (
+      user_id,
+      company_id,
+      action,
+      table_name,
+      record_id,
+      actor_id,
+      old_state,
+      description
+    )
+    VALUES (
+      v_entry.user_id,
+      p_company_id,
+      'DELETE',
+      'journal_entries',
+      p_entry_id,
+      auth.uid(),
+      v_snapshot,
+      'Deleted draft journal entry (delete_last_voucher RPC, caller: '
+        || auth.uid() || ')'
+    );
+
+    RETURN jsonb_build_object(
+      'deleted', true,
+      'voucher_series', v_entry.voucher_series,
+      'voucher_number', v_entry.voucher_number,
+      'was_draft', true
+    );
+  END IF;
+
+  SELECT * INTO v_period
+  FROM public.fiscal_periods
+  WHERE id = v_entry.fiscal_period_id
+  FOR UPDATE;
+
+  IF v_period.is_closed THEN
+    RAISE EXCEPTION 'Cannot delete voucher in a closed fiscal period';
+  END IF;
+
+  IF v_period.locked_at IS NOT NULL THEN
+    RAISE EXCEPTION 'Cannot delete voucher in a locked fiscal period';
+  END IF;
+
+  PERFORM 1 FROM public.voucher_sequences
+  WHERE company_id = p_company_id
+    AND fiscal_period_id = v_entry.fiscal_period_id
+    AND voucher_series = v_entry.voucher_series
+  FOR UPDATE;
+
+  SELECT MAX(voucher_number) INTO v_max_voucher
+  FROM public.journal_entries
+  WHERE company_id = p_company_id
+    AND fiscal_period_id = v_entry.fiscal_period_id
+    AND voucher_series = v_entry.voucher_series
+    AND status NOT IN ('cancelled', 'draft');
+
+  IF v_entry.voucher_number != v_max_voucher THEN
+    RAISE EXCEPTION
+      'Kan bara radera det sista verifikatet i serien. % har nummer % men senaste är %',
+      v_entry.voucher_series,
+      v_entry.voucher_number,
+      v_max_voucher;
+  END IF;
+
+  SELECT COUNT(*) INTO v_ref_count
+  FROM public.journal_entries
+  WHERE company_id = p_company_id
+    AND status != 'cancelled'
+    AND (reverses_id = p_entry_id OR correction_of_id = p_entry_id);
+
+  IF v_ref_count > 0 THEN
+    RAISE EXCEPTION 'Cannot delete: other entries reference this voucher (% references)',
+      v_ref_count;
+  END IF;
+
+  -- Allocation rows are retained audit evidence. Lock and reject them before
+  -- touching invoice or transaction state, including rows attached to manual
+  -- vouchers and malformed supplier source entries.
+  PERFORM sip.id
+  FROM public.supplier_invoice_payments sip
+  WHERE sip.journal_entry_id = p_entry_id
+  ORDER BY sip.id
+  FOR UPDATE;
+
+  SELECT count(*)::integer
+    INTO v_supplier_allocation_count
+  FROM public.supplier_invoice_payments sip
+  WHERE sip.journal_entry_id = p_entry_id;
+
+  IF v_supplier_allocation_count > 0 THEN
+    RAISE EXCEPTION
+      'Cannot delete allocation-backed supplier payment voucher'
+      USING ERRCODE = '55000';
+  END IF;
+
+  IF v_entry.source_type IN (
+    'supplier_invoice_cash_payment',
+    'supplier_invoice_paid'
+  ) THEN
+    IF v_entry.source_id IS NULL THEN
+      RAISE EXCEPTION 'Supplier payment voucher has no source invoice'
+        USING ERRCODE = '55000';
+    END IF;
+
+    SELECT
+      si.id,
+      si.company_id,
+      si.status,
+      si.paid_at,
+      si.paid_amount,
+      si.remaining_amount,
+      si.total,
+      si.due_date,
+      si.currency,
+      si.payment_journal_entry_id,
+      si.is_credit_note
+    INTO v_supplier_invoice
+    FROM public.supplier_invoices si
+    WHERE si.id = v_entry.source_id
+    FOR UPDATE;
+
+    IF NOT FOUND
+       OR v_supplier_invoice.company_id IS DISTINCT FROM p_company_id THEN
+      RAISE EXCEPTION 'Supplier payment source invoice ownership mismatch'
+        USING ERRCODE = '55000';
+    END IF;
+
+    SELECT
+      count(*)::integer,
+      count(*) FILTER (
+        WHERE jel.account_number IS NULL
+           OR btrim(jel.account_number) = ''
+           OR jel.debit_amount IS NULL
+           OR jel.credit_amount IS NULL
+           OR jel.debit_amount < 0
+           OR jel.credit_amount < 0
+           OR (
+             (round(jel.debit_amount, 2) > 0)::integer
+             + (round(jel.credit_amount, 2) > 0)::integer
+           ) <> 1
+      )::integer,
+      count(*) FILTER (
+        WHERE jel.account_number = '2440'
+      )::integer,
+      count(*) FILTER (
+        WHERE jel.account_number = '2440'
+          AND round(COALESCE(jel.debit_amount, 0), 2) > 0
+          AND round(COALESCE(jel.credit_amount, 0), 2) = 0
+      )::integer,
+      count(*) FILTER (
+        WHERE (
+          (
+            v_supplier_invoice.currency = 'SEK'
+            AND round(COALESCE(jel.credit_amount, 0), 2)
+                = round(v_supplier_invoice.total, 2)
+          )
+          OR jel.account_number ~ '^19[0-9]{2}$'
+          OR jel.account_number IN ('2018', '2893')
+        )
+          AND round(COALESCE(jel.debit_amount, 0), 2) = 0
+          AND round(COALESCE(jel.credit_amount, 0), 2) > 0
+      )::integer,
+      round(COALESCE(sum(jel.debit_amount), 0), 2),
+      round(COALESCE(sum(jel.credit_amount), 0), 2),
+      round(
+        COALESCE(
+          sum(jel.debit_amount) FILTER (
+            WHERE jel.account_number = '2440'
+          ),
+          0
+        ),
+        2
+      ),
+      round(
+        COALESCE(
+          sum(jel.credit_amount) FILTER (
+            WHERE (
+              (
+                v_supplier_invoice.currency = 'SEK'
+                AND round(COALESCE(jel.credit_amount, 0), 2)
+                    = round(v_supplier_invoice.total, 2)
+              )
+              OR jel.account_number ~ '^19[0-9]{2}$'
+              OR jel.account_number IN ('2018', '2893')
+            )
+              AND round(COALESCE(jel.debit_amount, 0), 2) = 0
+              AND round(COALESCE(jel.credit_amount, 0), 2) > 0
+          ),
+          0
+        ),
+        2
+      )
+    INTO
+      v_supplier_line_count,
+      v_supplier_malformed_count,
+      v_supplier_2440_count,
+      v_supplier_2440_debit_count,
+      v_supplier_settlement_count,
+      v_supplier_total_debit,
+      v_supplier_total_credit,
+      v_supplier_payment_amount,
+      v_supplier_settlement_amount
+    FROM public.journal_entry_lines jel
+    WHERE jel.journal_entry_id = p_entry_id;
+
+    IF v_supplier_line_count < 2
+       OR v_supplier_malformed_count <> 0
+       OR v_supplier_total_debit <= 0
+       OR v_supplier_total_debit IS DISTINCT FROM v_supplier_total_credit
+       OR v_supplier_invoice.is_credit_note IS DISTINCT FROM false
+       OR round(v_supplier_invoice.total, 2) <= 0 THEN
+      RAISE EXCEPTION 'Supplier payment voucher journal shape is ambiguous'
+        USING ERRCODE = '55000';
+    END IF;
+
+    IF v_entry.source_type = 'supplier_invoice_cash_payment' THEN
+      -- The established cash-method shape has exactly one settlement credit.
+      -- A legacy 2440-clearing shape is accepted only when its one debit is the
+      -- exact full invoice amount. For SEK invoices, the settlement leg must
+      -- also equal the full invoice amount. Foreign-currency invoices still
+      -- restore the full source invoice, while the balanced SEK lines prove
+      -- the concrete settlement amount.
+      IF v_supplier_2440_count > 1
+         OR (
+           v_supplier_2440_count = 1
+           AND (
+             v_supplier_2440_debit_count <> 1
+             OR v_supplier_payment_amount
+                IS DISTINCT FROM round(v_supplier_invoice.total, 2)
+           )
+         )
+         OR v_supplier_settlement_count <> 1
+         OR v_supplier_settlement_amount <= 0
+         OR (
+           v_supplier_invoice.currency = 'SEK'
+           AND v_supplier_settlement_amount
+               IS DISTINCT FROM round(v_supplier_invoice.total, 2)
+         ) THEN
+        RAISE EXCEPTION 'Supplier cash payment voucher journal shape is ambiguous'
+          USING ERRCODE = '55000';
+      END IF;
+
+      IF v_supplier_invoice.payment_journal_entry_id
+           IS DISTINCT FROM p_entry_id
+         OR v_supplier_invoice.status IS DISTINCT FROM 'paid'
+         OR round(COALESCE(v_supplier_invoice.paid_amount, 0), 2)
+            IS DISTINCT FROM round(v_supplier_invoice.total, 2)
+         OR round(
+           COALESCE(
+             v_supplier_invoice.remaining_amount,
+             v_supplier_invoice.total
+           ),
+           2
+         ) IS DISTINCT FROM 0::numeric THEN
+        RAISE EXCEPTION 'Supplier cash payment invoice state conflicts with voucher'
+          USING ERRCODE = '55000';
+      END IF;
+
+      IF EXISTS (
+        SELECT 1
+        FROM public.supplier_invoice_payments sip
+        WHERE sip.supplier_invoice_id = v_supplier_invoice.id
+          AND sip.reversed_at IS NULL
+      ) THEN
+        RAISE EXCEPTION 'Supplier cash payment invoice has conflicting active allocations'
+          USING ERRCODE = '55000';
+      END IF;
+
+      v_supplier_restored_paid := 0;
+    ELSE
+      -- Compatibility for the v1 mark-paid ordering that could leave no
+      -- allocation row. One exact 2440 debit is the payment amount.
+      IF v_supplier_2440_count <> 1
+         OR v_supplier_2440_debit_count <> 1
+         OR v_supplier_payment_amount <= 0 THEN
+        RAISE EXCEPTION 'Supplier payment voucher 2440 evidence is ambiguous'
+          USING ERRCODE = '55000';
+      END IF;
+
+      IF v_supplier_invoice.payment_journal_entry_id
+           IS DISTINCT FROM p_entry_id
+         OR v_supplier_invoice.status NOT IN ('paid', 'partially_paid')
+         OR round(COALESCE(v_supplier_invoice.paid_amount, 0), 2)
+            < v_supplier_payment_amount
+         OR round(COALESCE(v_supplier_invoice.paid_amount, 0), 2)
+            > round(v_supplier_invoice.total, 2)
+         OR round(
+           COALESCE(
+             v_supplier_invoice.remaining_amount,
+             v_supplier_invoice.total
+           ),
+           2
+         ) IS DISTINCT FROM round(
+           v_supplier_invoice.total
+             - COALESCE(v_supplier_invoice.paid_amount, 0),
+           2
+         )
+         OR (
+           v_supplier_invoice.status = 'paid'
+           AND (
+             round(COALESCE(v_supplier_invoice.remaining_amount, 0), 2) <> 0
+             OR v_supplier_invoice.paid_at IS NULL
+           )
+         )
+         OR (
+           v_supplier_invoice.status = 'partially_paid'
+           AND (
+             round(COALESCE(v_supplier_invoice.paid_amount, 0), 2) <= 0
+             OR round(COALESCE(v_supplier_invoice.remaining_amount, 0), 2) <= 0
+             OR v_supplier_invoice.paid_at IS NOT NULL
+           )
+         ) THEN
+        RAISE EXCEPTION 'Supplier payment invoice state conflicts with voucher'
+          USING ERRCODE = '55000';
+      END IF;
+
+      v_supplier_restored_paid := round(
+        v_supplier_invoice.paid_amount - v_supplier_payment_amount,
+        2
+      );
+      IF v_supplier_restored_paid < 0 THEN
+        RAISE EXCEPTION 'Supplier payment amount exceeds invoice paid state'
+          USING ERRCODE = '55000';
+      END IF;
+
+      IF EXISTS (
+        SELECT 1
+        FROM public.supplier_invoice_payments sip
+        WHERE sip.supplier_invoice_id = v_supplier_invoice.id
+          AND sip.reversed_at IS NULL
+          AND (
+            sip.journal_entry_id IS NULL
+            OR sip.amount IS NULL
+            OR round(sip.amount, 2) <= 0
+          )
+      ) OR (
+        SELECT round(COALESCE(sum(sip.amount), 0), 2)
+        FROM public.supplier_invoice_payments sip
+        WHERE sip.supplier_invoice_id = v_supplier_invoice.id
+          AND sip.reversed_at IS NULL
+      ) > v_supplier_restored_paid THEN
+        RAISE EXCEPTION 'Supplier payment invoice has conflicting active allocations'
+          USING ERRCODE = '55000';
+      END IF;
+    END IF;
+
+    v_supplier_restored_status := CASE
+      WHEN v_supplier_restored_paid > 0 THEN 'partially_paid'
+      WHEN v_supplier_invoice.due_date IS NOT NULL
+       AND v_supplier_invoice.due_date < current_date THEN 'overdue'
+      ELSE 'approved'
+    END;
+
+    -- Only direct pointers to this voucher are eligible for release. A pointer
+    -- to another invoice, tenant, or active allocation is conflicting state.
+    PERFORM t.id
+    FROM public.transactions t
+    WHERE t.journal_entry_id = p_entry_id
+    ORDER BY t.id
+    FOR UPDATE;
+
+    SELECT count(*)::integer
+      INTO v_supplier_transaction_count
+    FROM public.transactions t
+    WHERE t.journal_entry_id = p_entry_id;
+
+    IF EXISTS (
+      SELECT 1
+      FROM public.transactions t
+      WHERE t.journal_entry_id = p_entry_id
+        AND (
+          t.company_id IS DISTINCT FROM p_company_id
+          OR t.invoice_id IS NOT NULL
+          OR (
+            t.supplier_invoice_id IS NOT NULL
+            AND t.supplier_invoice_id
+                IS DISTINCT FROM v_supplier_invoice.id
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM public.invoice_payments ip
+            WHERE ip.transaction_id = t.id
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM public.supplier_invoice_payments sip
+            WHERE sip.transaction_id = t.id
+              AND sip.reversed_at IS NULL
+          )
+        )
+    ) THEN
+      RAISE EXCEPTION 'Supplier payment transaction ownership conflicts with voucher'
+        USING ERRCODE = '55000';
+    END IF;
+
+    UPDATE public.supplier_invoices si
+    SET status = v_supplier_restored_status,
+        paid_amount = v_supplier_restored_paid,
+        remaining_amount = round(si.total - v_supplier_restored_paid, 2),
+        paid_at = NULL,
+        payment_journal_entry_id = NULL
+    WHERE si.id = v_supplier_invoice.id
+      AND si.company_id = p_company_id
+      AND si.payment_journal_entry_id = p_entry_id;
+    GET DIAGNOSTICS v_supplier_updated_count = ROW_COUNT;
+
+    IF v_supplier_updated_count <> 1 THEN
+      RAISE EXCEPTION 'Supplier payment deletion did not restore its invoice'
+        USING ERRCODE = '55000';
+    END IF;
+
+    UPDATE public.transactions t
+    SET journal_entry_id = NULL,
+        supplier_invoice_id = NULL,
+        is_business = NULL,
+        category = NULL
+    WHERE t.company_id = p_company_id
+      AND t.journal_entry_id = p_entry_id
+      AND t.invoice_id IS NULL
+      AND (
+        t.supplier_invoice_id IS NULL
+        OR t.supplier_invoice_id = v_supplier_invoice.id
+      );
+    GET DIAGNOSTICS v_supplier_released_count = ROW_COUNT;
+
+    IF v_supplier_released_count
+         IS DISTINCT FROM v_supplier_transaction_count THEN
+      RAISE EXCEPTION 'Supplier payment deletion did not release every owned transaction'
+        USING ERRCODE = '55000';
+    END IF;
+  END IF;
+
+  IF v_entry.reverses_id IS NOT NULL THEN
+    PERFORM set_config('gnubok.allow_delete', 'true', true);
+    UPDATE public.journal_entries
+    SET status = 'posted', reversed_by_id = NULL
+    WHERE id = v_entry.reverses_id
+      AND company_id = p_company_id;
+  END IF;
+
+  v_is_period_ib := (v_period.opening_balance_entry_id = p_entry_id);
+  IF v_is_period_ib THEN
+    UPDATE public.fiscal_periods
+    SET opening_balances_set = false
+    WHERE id = v_entry.fiscal_period_id;
+
+    UPDATE public.fiscal_periods
+    SET opening_balance_entry_id = NULL
+    WHERE id = v_entry.fiscal_period_id;
+  END IF;
+
+  UPDATE public.sie_imports
+  SET opening_balance_entry_id = NULL
+  WHERE opening_balance_entry_id = p_entry_id;
+
+  PERFORM set_config('gnubok.allow_delete', 'true', true);
+
+  UPDATE public.document_attachments
+  SET journal_entry_id = NULL
+  WHERE journal_entry_id = p_entry_id;
+
+  DELETE FROM public.journal_entries WHERE id = p_entry_id;
+
+  UPDATE public.voucher_sequences
+  SET last_number = GREATEST(last_number - 1, 0)
+  WHERE company_id = p_company_id
+    AND fiscal_period_id = v_entry.fiscal_period_id
+    AND voucher_series = v_entry.voucher_series;
+
+  INSERT INTO public.audit_log (
+    user_id,
+    company_id,
+    action,
+    table_name,
+    record_id,
+    actor_id,
+    old_state,
+    description
+  )
+  VALUES (
+    v_entry.user_id,
+    p_company_id,
+    'DELETE',
+    'journal_entries',
+    p_entry_id,
+    auth.uid(),
+    v_snapshot,
+    'Deleted voucher ' || v_entry.voucher_series || v_entry.voucher_number
+      || CASE WHEN v_is_period_ib THEN ' (was period IB)' ELSE '' END
+      || ' (delete_last_voucher RPC, caller: ' || auth.uid() || ')'
+  );
+
+  RETURN jsonb_build_object(
+    'deleted', true,
+    'voucher_series', v_entry.voucher_series,
+    'voucher_number', v_entry.voucher_number,
+    'was_period_ib', v_is_period_ib
+  );
+END;
+$function$;
 
 NOTIFY pgrst, 'reload schema';

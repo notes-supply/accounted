@@ -45,11 +45,10 @@ export const DELETE = withRouteContext<{ params: Promise<{ id: string }> }>(
   async (_request, { supabase, companyId, user }, { params }) => {
     const { id } = await params
 
-  // Read source_type/source_id BEFORE deleting so we can revert the linked
-  // invoice/supplier_invoice status afterwards. The GL row gets cancelled by
-  // delete_last_voucher but the invoice's paid status lives outside the GL
-  // and would otherwise stay stuck on "paid" after the user deletes the
-  // payment voucher.
+  // Read source_type/source_id before deleting. Customer payment cleanup remains
+  // in TypeScript. Supplier payment cleanup is validated and committed inside
+  // delete_last_voucher so invoice state cannot diverge from the physical
+  // voucher deletion.
   const { data: entryBefore } = await supabase
     .from('journal_entries')
     .select('id, source_type, source_id')
@@ -83,7 +82,7 @@ export const DELETE = withRouteContext<{ params: Promise<{ id: string }> }>(
     )
   }
 
-  if (entryBefore) {
+  if (entryBefore && !entryBefore.source_type?.startsWith('supplier_invoice')) {
     try {
       await syncInvoiceStatusFromPaymentEntry(supabase, companyId, entryBefore)
     } catch (syncError) {

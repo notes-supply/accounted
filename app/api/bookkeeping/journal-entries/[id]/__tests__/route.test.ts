@@ -37,6 +37,7 @@ vi.mock('@/lib/core/documents/supplier-invoice-underlag', () => ({
 }))
 
 import { reanchorOrphanedSupplierInvoiceDocuments } from '@/lib/core/documents/supplier-invoice-underlag'
+import { syncInvoiceStatusFromPaymentEntry } from '@/lib/bookkeeping/payment-sync'
 
 import { DELETE } from '../route'
 
@@ -103,6 +104,43 @@ describe('DELETE /api/bookkeeping/journal-entries/[id]', () => {
       expect.anything(),
       'company-1',
       [],
+    )
+  })
+
+  it('does not run storno-only supplier sync after database-owned deletion', async () => {
+    enqueue({
+      data: {
+        id: 'je-1',
+        source_type: 'supplier_invoice_cash_payment',
+        source_id: 'supplier-invoice-1',
+      },
+    })
+    enqueue({ data: [] })
+    enqueue({ data: { deleted: true, voucher_series: 'A', voucher_number: 4 } })
+
+    const { status } = await parseJsonResponse(await run())
+
+    expect(status).toBe(200)
+    expect(syncInvoiceStatusFromPaymentEntry).not.toHaveBeenCalled()
+  })
+
+  it('keeps customer payment cleanup after a physical delete', async () => {
+    const entryBefore = {
+      id: 'je-1',
+      source_type: 'invoice_paid',
+      source_id: 'invoice-1',
+    }
+    enqueue({ data: entryBefore })
+    enqueue({ data: [] })
+    enqueue({ data: { deleted: true, voucher_series: 'A', voucher_number: 5 } })
+
+    const { status } = await parseJsonResponse(await run())
+
+    expect(status).toBe(200)
+    expect(syncInvoiceStatusFromPaymentEntry).toHaveBeenCalledWith(
+      expect.anything(),
+      'company-1',
+      entryBefore,
     )
   })
 })

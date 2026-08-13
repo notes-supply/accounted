@@ -17,9 +17,26 @@ export interface PaymentsAsOf {
 }
 
 interface PaymentRow {
+  id: string
   amount: number | string | null
   payment_date: string
 }
+
+interface SupplierPaymentRow extends PaymentRow {
+  journal_entry_id: string | null
+  reversed_at: string | null
+  reversed_by_journal_entry_id: string | null
+}
+
+interface ReversalJournalRow {
+  id: string
+  entry_date: string
+  status: string
+  source_type: string | null
+  reverses_id: string | null
+}
+
+const JOURNAL_ID_CHUNK_SIZE = 100
 
 /**
  * Fetch the company's payment rows for one of the two invoice ledgers and
@@ -34,30 +51,102 @@ export async function fetchPaymentsAsOf(
   companyId: string,
   asOfDate: string
 ): Promise<PaymentsAsOf> {
-  const rows = await fetchAllRows<PaymentRow & Record<string, unknown>>(({ from, to }) => {
-    const query = supabase
-      .from(table)
-      .select(`${invoiceIdColumn}, amount, payment_date`)
-      .eq('company_id', companyId)
-    const activeQuery = table === 'supplier_invoice_payments'
-      ? query.is('reversed_at', null)
-      : query
-    return activeQuery
-      // Stable total order for correct paging (see fetch-all.ts).
-      .order('id', { ascending: true })
-      .range(from, to)
-  })
+  const isSupplierLedger = table === 'supplier_invoice_payments'
+  let rows: Array<PaymentRow & Record<string, unknown>>
+  if (isSupplierLedger) {
+    rows = await fetchAllRows<SupplierPaymentRow & Record<string, unknown>>(({ from, to }) =>
+      supabase
+        .from('supplier_invoice_payments')
+        .select(
+          'supplier_invoice_id, id, amount, payment_date, journal_entry_id, reversed_at, reversed_by_journal_entry_id',
+        )
+        .eq('company_id', companyId)
+        // Stable total order for correct paging (see fetch-all.ts).
+        .order('id', { ascending: true })
+        .range(from, to),
+    )
+  } else {
+    rows = await fetchAllRows<PaymentRow & Record<string, unknown>>(({ from, to }) =>
+      supabase
+        .from('invoice_payments')
+        .select('invoice_id, id, amount, payment_date')
+        .eq('company_id', companyId)
+        // Stable total order for correct paging (see fetch-all.ts).
+        .order('id', { ascending: true })
+        .range(from, to),
+    )
+  }
+
+  const reversals = new Map<string, ReversalJournalRow>()
+  if (isSupplierLedger) {
+    const reversalIds = new Set<string>()
+    for (const rawRow of rows) {
+      const row = rawRow as SupplierPaymentRow & Record<string, unknown>
+      const hasReversalTimestamp = row.reversed_at !== null
+      const hasReversalLink = row.reversed_by_journal_entry_id !== null
+      if (hasReversalTimestamp !== hasReversalLink) {
+        throw new Error(`Malformed supplier payment reversal metadata for ${row.id}`)
+      }
+      if (hasReversalLink) {
+        if (!row.journal_entry_id) {
+          throw new Error(`Missing original journal lineage for supplier payment ${row.id}`)
+        }
+        reversalIds.add(row.reversed_by_journal_entry_id as string)
+      }
+    }
+
+    const uniqueIds = Array.from(reversalIds)
+    for (let i = 0; i < uniqueIds.length; i += JOURNAL_ID_CHUNK_SIZE) {
+      const chunk = uniqueIds.slice(i, i + JOURNAL_ID_CHUNK_SIZE)
+      const journalRows = await fetchAllRows<ReversalJournalRow>(({ from, to }) =>
+        supabase
+          .from('journal_entries')
+          .select('id, entry_date, status, source_type, reverses_id')
+          .eq('company_id', companyId)
+          .in('id', chunk)
+          .order('id', { ascending: true })
+          .range(from, to),
+      )
+      for (const journalRow of journalRows) reversals.set(journalRow.id, journalRow)
+    }
+
+    const unresolved = uniqueIds.filter((id) => !reversals.has(id))
+    if (unresolved.length > 0) {
+      throw new Error(
+        `Could not resolve ${unresolved.length} supplier payment reversal journal entries`,
+      )
+    }
+  }
 
   const paidThrough = new Map<string, number>()
   const hasRows = new Set<string>()
 
-  for (const row of rows) {
-    const invoiceId = row[invoiceIdColumn] as string | null
+  for (const rawRow of rows) {
+    const invoiceId = rawRow[invoiceIdColumn] as string | null
     if (!invoiceId) continue
     hasRows.add(invoiceId)
-    if (row.payment_date && row.payment_date <= asOfDate) {
+
+    let liveAtCutoff = true
+    if (isSupplierLedger) {
+      const row = rawRow as SupplierPaymentRow & Record<string, unknown>
+      if (row.reversed_by_journal_entry_id) {
+        const reversal = reversals.get(row.reversed_by_journal_entry_id)
+        if (
+          !reversal ||
+          !reversal.entry_date ||
+          reversal.status !== 'posted' ||
+          reversal.source_type !== 'storno' ||
+          reversal.reverses_id !== row.journal_entry_id
+        ) {
+          throw new Error(`Malformed supplier payment reversal lineage for ${row.id}`)
+        }
+        liveAtCutoff = reversal.entry_date > asOfDate
+      }
+    }
+
+    if (liveAtCutoff && rawRow.payment_date && rawRow.payment_date <= asOfDate) {
       const prev = paidThrough.get(invoiceId) ?? 0
-      paidThrough.set(invoiceId, roundOre(prev + (Number(row.amount) || 0)))
+      paidThrough.set(invoiceId, roundOre(prev + (Number(rawRow.amount) || 0)))
     }
   }
 
