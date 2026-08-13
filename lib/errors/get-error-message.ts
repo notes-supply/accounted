@@ -111,28 +111,16 @@ const ERROR_PATTERN_MAP: [RegExp, string | null][] = [
     'Datumet ligger utanför det valda räkenskapsåret.',
   ],
   [
-    /Only company owners and admins can delete vouchers/i,
-    'Endast ägare och administratörer kan radera verifikationer.',
+    /Only company owners and admins can delete draft vouchers/i,
+    'Endast ägare och administratörer kan radera utkast.',
   ],
   [
     /Journal entry not found/i,
     'Verifikationen kunde inte hittas.',
   ],
   [
-    /Only posted entries can be deleted/i,
-    'Endast bokförda verifikationer kan raderas.',
-  ],
-  [
-    /Cannot delete voucher in a closed fiscal period/i,
-    'Verifikationen kan inte raderas: räkenskapsåret är stängt.',
-  ],
-  [
-    /Cannot delete voucher in a locked fiscal period/i,
-    'Verifikationen kan inte raderas: perioden är låst.',
-  ],
-  [
-    /Cannot delete: other entries reference this voucher/i,
-    'Verifikationen kan inte raderas eftersom andra verifikationer (t.ex. storno eller rättelse) refererar till den.',
+    /Only genuine draft journal entries can be physically deleted/i,
+    'Endast obokförda utkast kan raderas. Bokförda verifikationer återförs med storno.',
   ],
   [
     /timed out after \d+m?s/i,

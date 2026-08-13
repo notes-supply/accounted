@@ -18,15 +18,9 @@ const log = createLogger('supplier-invoice-underlag')
  * the invoice PDF, and the user has no way to resolve it: the nag is supposed
  * to get the document anchored, but nothing anchored it.
  *
- * Documents end up floating two ways, both seen in production:
- *   1. delete_last_voucher clears journal_entry_id on every document hanging
- *      on the deleted voucher (it has to: the FK is ON DELETE RESTRICT). When
- *      that voucher was a rättelse the invoice's PDF had been relinked onto,
- *      the invoice is left holding an unanchored document while its payment
- *      verifikat is still posted.
- *   2. Payment/cash verifikat booked for an invoice whose document was never
- *      anchored at registration (attached after the fact, or booked through a
- *      path that did not link it).
+ * Documents end up floating when a payment/cash verifikat is booked for an
+ * invoice whose document was never anchored at registration, for example when
+ * it was attached after the fact or booked through a path that did not link it.
  *
  * Anchoring is strictly an improvement: it puts the document behind the
  * deletion guard and makes the hänvisning (BFL 5 kap 7 §) legally solid, and
@@ -178,44 +172,4 @@ async function pickAnchorEntry(
     return id
   }
   return null
-}
-
-/**
- * Re-anchor the supplier-invoice documents that a just-deleted voucher left
- * floating. Takes the document ids that hung on the voucher before it was torn
- * down (delete_last_voucher nulls their journal_entry_id), and re-points those
- * that are a supplier invoice's retained source document at another posted
- * verifikat of the same invoice.
- *
- * Documents that belong to no supplier invoice are left floating on purpose:
- * a receipt uploaded straight to the deleted voucher SHOULD return to the
- * unlinked pool so the user can attach it to the replacement booking.
- *
- * Returns the number of documents re-anchored.
- */
-export async function reanchorOrphanedSupplierInvoiceDocuments(
-  supabase: SupabaseClient,
-  companyId: string,
-  documentIds: string[],
-): Promise<number> {
-  if (documentIds.length === 0) return 0
-  try {
-    const { data: invoices } = await supabase
-      .from('supplier_invoices')
-      .select('id')
-      .eq('company_id', companyId)
-      .in('document_id', documentIds)
-
-    let anchored = 0
-    for (const invoice of ((invoices ?? []) as { id: string }[])) {
-      if (await anchorSupplierInvoiceDocument(supabase, companyId, invoice.id)) anchored++
-    }
-    return anchored
-  } catch (err) {
-    log.warn('reanchorOrphanedSupplierInvoiceDocuments threw', {
-      companyId,
-      reason: err instanceof Error ? err.message : String(err),
-    })
-    return 0
-  }
 }

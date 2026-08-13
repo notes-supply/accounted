@@ -3,15 +3,10 @@ import { describe, expect, it } from 'vitest'
 import { getPool, runAsServiceRole } from '@/tests/pg/setup'
 import { seedCompany, insertDraftJournalEntry } from '@/tests/pg/fixtures'
 
-// Migration 20260702154500_dimension_import_provenance_undo_lockstep.sql:
-// SIE import creates dimensions/dimension_values rows carrying
-// created_by_import_id; undo_sie_import deletes the rows the undone import
-// introduced, but ONLY when no remaining posted/reversed line references
-// them, and NEVER user-created rows (created_by_import_id IS NULL).
-//
-// The registry guard triggers (enforce_dimension_registry_guards /
-// enforce_dimension_value_retention) fire on these deletes as a backstop, so
-// these tests also prove the lockstep deletes are trigger-compatible.
+// Completed SIE imports may no longer hard-delete committed verifikationer.
+// These regressions preserve the prior dimension-lineage coverage by asserting
+// that every import-created or user-created registry row survives the rejected
+// undo together with its posted references.
 
 async function insertCompletedImport(params: {
   companyId: string
@@ -108,6 +103,16 @@ async function callUndo(companyId: string, importId: string, actor: string) {
   )
 }
 
+async function expectUndoBlocked(
+  companyId: string,
+  importId: string,
+  actor: string,
+): Promise<void> {
+  await expect(callUndo(companyId, importId, actor)).rejects.toMatchObject({
+    code: '55000',
+  })
+}
+
 async function countRows(table: string, id: string): Promise<number> {
   const { rows } = await getPool().query(
     `SELECT 1 FROM public.${table} WHERE id = $1`,
@@ -117,28 +122,26 @@ async function countRows(table: string, id: string): Promise<number> {
 }
 
 describe('undo_sie_import: dimension registry lockstep', () => {
-  it('deletes import-created values whose references vanish with the import', async () => {
+  it('preserves import-created values and their committed references', async () => {
     const { companyId, userId, fiscalPeriodId } = await seedCompany()
     const importId = await insertCompletedImport({ companyId, userId, fiscalPeriodId })
 
     const dimId = await insertDimension({ companyId, sieDimNo: 6, name: 'Projekt' })
     const valueId = await insertDimensionValue({ companyId, dimensionId: dimId, code: 'P001', importId })
-    await insertPostedTaggedEntry({
+    const entryId = await insertPostedTaggedEntry({
       companyId, userId, fiscalPeriodId,
       sourceType: 'import', voucherNumber: 1,
       dimensions: { '6': 'P001' },
     })
 
-    const res = await callUndo(companyId, importId, userId)
-    expect(res.rows[0].deleted).toBe(1)
+    await expectUndoBlocked(companyId, importId, userId)
 
-    // The import's value is gone; the dimension itself (not import-created)
-    // survives.
-    expect(await countRows('dimension_values', valueId)).toBe(0)
+    expect(await countRows('journal_entries', entryId)).toBe(1)
+    expect(await countRows('dimension_values', valueId)).toBe(1)
     expect(await countRows('dimensions', dimId)).toBe(1)
   })
 
-  it('keeps import-created values that other posted bookkeeping still references', async () => {
+  it('preserves import-created values also referenced by other bookkeeping', async () => {
     const { companyId, userId, fiscalPeriodId } = await seedCompany()
     const importId = await insertCompletedImport({ companyId, userId, fiscalPeriodId })
 
@@ -149,17 +152,13 @@ describe('undo_sie_import: dimension registry lockstep', () => {
       sourceType: 'import', voucherNumber: 1,
       dimensions: { '6': 'P002' },
     })
-    // A MANUAL posted entry tagged with the same code: survives the undo and
-    // must keep its registry row (retention trigger would block the delete;
-    // the lockstep's own WHERE avoids even attempting it).
     await insertPostedTaggedEntry({
       companyId, userId, fiscalPeriodId,
       sourceType: 'manual', voucherNumber: 2,
       dimensions: { '6': 'P002' },
     })
 
-    const res = await callUndo(companyId, importId, userId)
-    expect(res.rows[0].deleted).toBe(1) // only the import entry
+    await expectUndoBlocked(companyId, importId, userId)
 
     expect(await countRows('dimension_values', valueId)).toBe(1)
   })
@@ -176,13 +175,13 @@ describe('undo_sie_import: dimension registry lockstep', () => {
       dimensions: { '6': 'EGEN' },
     })
 
-    await callUndo(companyId, importId, userId)
+    await expectUndoBlocked(companyId, importId, userId)
 
-    // Unreferenced now, but user-created → stays.
+    // User-created provenance and the posted reference both remain.
     expect(await countRows('dimension_values', userValueId)).toBe(1)
   })
 
-  it('deletes an import-created custom dimension once empty and unreferenced', async () => {
+  it('preserves an import-created custom dimension and value', async () => {
     const { companyId, userId, fiscalPeriodId } = await seedCompany()
     const importId = await insertCompletedImport({ companyId, userId, fiscalPeriodId })
 
@@ -194,10 +193,10 @@ describe('undo_sie_import: dimension registry lockstep', () => {
       dimensions: { '7': 'ANNA' },
     })
 
-    await callUndo(companyId, importId, userId)
+    await expectUndoBlocked(companyId, importId, userId)
 
-    expect(await countRows('dimension_values', valueId)).toBe(0)
-    expect(await countRows('dimensions', dimId)).toBe(0)
+    expect(await countRows('dimension_values', valueId)).toBe(1)
+    expect(await countRows('dimensions', dimId)).toBe(1)
   })
 
   it('keeps an import-created dimension that still has user-created values', async () => {
@@ -212,7 +211,7 @@ describe('undo_sie_import: dimension registry lockstep', () => {
       dimensions: { '8': 'KUND1' },
     })
 
-    await callUndo(companyId, importId, userId)
+    await expectUndoBlocked(companyId, importId, userId)
 
     // The user's value anchors the dimension.
     expect(await countRows('dimension_values', userValueId)).toBe(1)

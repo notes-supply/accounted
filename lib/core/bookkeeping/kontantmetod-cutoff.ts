@@ -7,14 +7,14 @@
  * räkenskapsårets utgång, so the year-end needs a cut-off entry that puts every
  * still-outstanding invoice onto the balance sheet.
  *
- * Moms is the part that is easy to get wrong. Under bokslutsmetoden moms is
- * reported at payment, so the cut-off must NOT push moms into the current
- * momsdeklaration. BAS provides "vilande" (dormant) moms accounts for exactly
- * this: 2618/2628/2638 for utgående and 2648 for ingående. They are absent from
- * ACCOUNT_RUTA / ACCOUNT_TO_BOX by design, so anything parked there stays out
- * of the declaration until the invoice is actually paid. Booking cut-off moms
- * to 2611/2641 instead would claim it a period early, which is the real error
- * this module exists to avoid.
+ * Moms is the part that is easy to get wrong. Bokslutsmetoden normally reports
+ * moms at payment, but ML 7 kap. 33 § requires unpaid invoices to enter the
+ * final VAT return for the accounting year. BAS provides "vilande" accounts
+ * for the year-end cut-off: 2618/2628/2638 for output VAT and 2648 for input
+ * VAT. Dormant 2648 is not globally deductible: the VAT declaration admits it
+ * only for this module's exact cutoff/vändning metadata and verified stornos.
+ * The 1 January reversal and later 2641 payment then net the temporary input
+ * VAT contribution to zero without making arbitrary 2648 activity deductible.
  *
  * Shape: two aggregate verifikat (one for fordringar, one for skulder), each
  * reversed on the first day of the following period. Deliberately NOT
@@ -563,9 +563,7 @@ async function fetchJournalLineage(
 ): Promise<JournalLineage> {
   const correctionsByParent = new Map<string, JournalLineageRow[]>()
   const reversalsByParent = new Map<string, JournalLineageRow[]>()
-  let frontier = roots
-    .filter((entry) => entry.status === 'reversed')
-    .map((entry) => entry.id)
+  let frontier = roots.map((entry) => entry.id)
   const expanded = new Set<string>()
 
   while (frontier.length > 0) {
@@ -594,9 +592,7 @@ async function fetchJournalLineage(
       siblings.push(child)
       reversalsByParent.set(child.reverses_id, siblings)
     }
-    frontier = corrections
-      .filter((entry) => entry.status === 'reversed')
-      .map((entry) => entry.id)
+    frontier = corrections.map((entry) => entry.id)
   }
 
   return { correctionsByParent, reversalsByParent }
@@ -609,15 +605,20 @@ function hasLiveEffectAtCutoff(
   visiting: Set<string> = new Set(),
 ): boolean {
   assertCommittedLineageEntry(entry)
-  if (entry.status === 'posted') return entry.entry_date <= periodEnd
+  const corrections = lineage.correctionsByParent.get(entry.id) ?? []
+  const reversals = lineage.reversalsByParent.get(entry.id) ?? []
+  if (entry.status === 'posted') {
+    if (corrections.length > 0 || reversals.length > 0) {
+      throw new Error(`Contradictory partial journal lineage for posted entry ${entry.id}`)
+    }
+    return entry.entry_date <= periodEnd
+  }
   if (visiting.has(entry.id)) {
     throw new Error(`Cyclic journal lineage at entry ${entry.id}`)
   }
 
   const nextVisiting = new Set(visiting)
   nextVisiting.add(entry.id)
-  const corrections = lineage.correctionsByParent.get(entry.id) ?? []
-  const reversals = lineage.reversalsByParent.get(entry.id) ?? []
 
   if (corrections.length > 1) {
     throw new Error(`Ambiguous correction lineage for entry ${entry.id}`)
@@ -653,14 +654,10 @@ function hasLiveEffectAtCutoff(
     throw new Error(`Malformed correction lineage for entry ${entry.id}`)
   }
 
-  // Traverse first even when the immediate replacement is future-dated: that
-  // child may itself have been corrected back into the cutoff period. If no
-  // descendant has a live effect yet, the parent remains represented until
-  // the immediate replacement's accounting date.
-  if (hasLiveEffectAtCutoff(correction, lineage, periodEnd, nextVisiting)) {
-    return true
-  }
-  return correction.entry_date > periodEnd && entry.entry_date <= periodEnd
+  // The original and same-date storno net to zero immediately. Only the live
+  // correction branch represents the entry, even when its first child is
+  // future-dated and a later correction moves the effect back before cutoff.
+  return hasLiveEffectAtCutoff(correction, lineage, periodEnd, nextVisiting)
 }
 
 async function fetchJournalEntriesByIds(
@@ -744,9 +741,26 @@ async function fetchSupplierPaymentTotalsAtCutoff(
     payments.push(...rows)
   }
 
-  const linkedIds = payments.flatMap((payment) =>
-    payment.journal_entry_id ? [payment.journal_entry_id] : []
-  )
+  const linkedAllocationsByRoot = new Map<string, Map<string, number>>()
+  const unlinkedPayments: SupplierPaymentRow[] = []
+  for (const payment of payments) {
+    if (!payment.journal_entry_id) {
+      unlinkedPayments.push(payment)
+      continue
+    }
+    const invoiceAmounts = linkedAllocationsByRoot.get(payment.journal_entry_id)
+      ?? new Map<string, number>()
+    invoiceAmounts.set(
+      payment.supplier_invoice_id,
+      roundOre(
+        (invoiceAmounts.get(payment.supplier_invoice_id) ?? 0)
+        + Number(payment.amount),
+      ),
+    )
+    linkedAllocationsByRoot.set(payment.journal_entry_id, invoiceAmounts)
+  }
+
+  const linkedIds = Array.from(linkedAllocationsByRoot.keys())
   const [linkedRoots, paymentVoucherRoots] = await Promise.all([
     linkedIds.length > 0
       ? fetchJournalEntriesByIds(supabase, companyId, linkedIds)
@@ -763,37 +777,45 @@ async function fetchSupplierPaymentTotalsAtCutoff(
     )
     : { correctionsByParent: new Map(), reversalsByParent: new Map() }
 
+  const liveRootsAtCutoff = new Map<string, boolean>()
+  for (const [rootId, root] of allRoots) {
+    liveRootsAtCutoff.set(
+      rootId,
+      hasLiveEffectAtCutoff(root, lineage, periodEnd),
+    )
+  }
+
   const totals = new Map<string, number>()
   const durablePaymentLinks = new Set<string>()
-  for (const payment of payments) {
-    if (payment.journal_entry_id) {
-      durablePaymentLinks.add(
-        `${payment.journal_entry_id}:${payment.supplier_invoice_id}`,
-      )
-    }
+  for (const payment of unlinkedPayments) {
     // The column has been nullable since supplier_invoice_payments was
     // introduced. Early mark-paid flows could legitimately write a row after
     // the journal helper returned null, so an unlinked row remains a documented
     // compatibility case. Every non-null link must resolve and prove a live
     // company-scoped ledger effect.
-    const countsAtCutoff = payment.journal_entry_id === null
-      ? payment.payment_date <= periodEnd
-      : hasLiveEffectAtCutoff(
-        linkedRoots.get(payment.journal_entry_id)!,
-        lineage,
-        periodEnd,
-      )
-    if (!countsAtCutoff) continue
+    if (payment.payment_date > periodEnd) continue
     totals.set(
       payment.supplier_invoice_id,
-      (totals.get(payment.supplier_invoice_id) ?? 0) + Number(payment.amount),
+      roundOre(
+        (totals.get(payment.supplier_invoice_id) ?? 0)
+        + Number(payment.amount),
+      ),
     )
+  }
+  for (const [rootId, invoiceAmounts] of linkedAllocationsByRoot) {
+    for (const [invoiceId, amount] of invoiceAmounts) {
+      durablePaymentLinks.add(`${rootId}:${invoiceId}`)
+      if (!liveRootsAtCutoff.get(rootId)) continue
+      totals.set(
+        invoiceId,
+        roundOre((totals.get(invoiceId) ?? 0) + amount),
+      )
+    }
   }
 
   for (const root of paymentVoucherRoots) {
     if (
-      root.source_id &&
-      hasLiveEffectAtCutoff(root, lineage, periodEnd) &&
+      liveRootsAtCutoff.get(root.id) === true &&
       !durablePaymentLinks.has(`${root.id}:${root.source_id}`)
     ) {
       // Successful plain-reversal cleanup deletes this row. The immutable

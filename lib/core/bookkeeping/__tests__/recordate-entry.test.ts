@@ -14,19 +14,31 @@ import {
 let resultIdx: number
 let results: Array<{ data?: unknown; error?: unknown }>
 let inserts: Array<{ table: string; payload: unknown }>
+let supplierPaymentLinks: Array<{ id: string }>
 
 function makeBuilder(table: string) {
   const b: Record<string, unknown> = {}
-  for (const m of ['select', 'eq', 'in', 'update', 'delete']) {
+  let selected = ''
+  for (const m of ['eq', 'in', 'update', 'delete', 'limit']) {
     b[m] = vi.fn().mockReturnValue(b)
   }
+  b.select = vi.fn().mockImplementation((columns: string) => {
+    selected = columns
+    return b
+  })
   b.insert = vi.fn().mockImplementation((payload: unknown) => {
     inserts.push({ table, payload })
     return b
   })
   b.single = vi.fn().mockImplementation(async () => results[resultIdx++] ?? { data: null, error: null })
   b.maybeSingle = vi.fn().mockImplementation(async () => results[resultIdx++] ?? { data: null, error: null })
-  b.then = (resolve: (v: unknown) => void) => resolve(results[resultIdx++] ?? { data: null, error: null })
+  b.then = (resolve: (v: unknown) => void) => resolve(
+    table === 'supplier_invoice_payments'
+      ? { data: supplierPaymentLinks, error: null }
+      : table === 'journal_entries' && selected === 'id, correction_of_id'
+        ? { data: [], error: null }
+        : results[resultIdx++] ?? { data: null, error: null },
+  )
   return b
 }
 
@@ -77,6 +89,7 @@ beforeEach(() => {
   resultIdx = 0
   results = []
   inserts = []
+  supplierPaymentLinks = []
   vi.mocked(validateBalance).mockReturnValue({ valid: true, totalDebit: 1008.75, totalCredit: 1008.75 })
   let v = 0
   vi.mocked(getNextVoucherNumber).mockImplementation(async () => ++v)
@@ -128,7 +141,8 @@ describe('recordateEntry', () => {
     ).rejects.toBeInstanceOf(NoOpenPeriodForDateError)
   })
 
-  it('moves the entry: storno in the original period, corrected in the target period with the new date', async () => {
+  it('re-dates a supplier-payment-linked entry with economically identical lines', async () => {
+    supplierPaymentLinks = [{ id: 'supplier-payment-1' }]
     mockResolve.mockResolvedValue({ status: 'open', period_id: 'fp-2025', lock_date: null })
     const reversalEntry = makeJournalEntry({ id: 'reversal-1', reverses_id: 'orig-1' })
     const correctedEntry = makeJournalEntry({ id: 'corrected-1', correction_of_id: 'orig-1' })

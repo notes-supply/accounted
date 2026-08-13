@@ -21,11 +21,10 @@ interface VoucherRow {
 /**
  * Highest POSTED voucher number per series within a reported window.
  *
- * Reads `journal_entries`, never `voucher_sequences`. The sequence table holds
- * an allocation high-water mark that drifts from reality in both directions:
- * `next_voucher_number` burns a number when the follow-up insert fails,
- * `delete_last_voucher` decrements blindly by one rather than resetting to the
- * new MAX, and pre-RPC SIE imports left it behind. Since the whole point of
+ * Reads `journal_entries`, never `voucher_sequences`. The sequence table is an
+ * allocation high-water mark rather than a ledger projection:
+ * `next_voucher_number` can burn a number when a follow-up insert fails, and
+ * pre-RPC SIE imports could leave it behind. Since the whole point of
  * this figure is reconciliation, only a number the user can actually look up in
  * the books is worth printing.
  *

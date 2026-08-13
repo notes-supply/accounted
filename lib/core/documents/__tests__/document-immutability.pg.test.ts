@@ -208,7 +208,7 @@ describe('document-immutability.pg: BFL retention bypass guards', () => {
     ).rejects.toThrow(/Bokföringslagen/i)
   })
 
-  it('respects gnubok.allow_delete bypass: delete_last_voucher RPC keeps working', async () => {
+  it('keeps the transaction-local document bypass available for verified draft deletion', async () => {
     const { userId, companyId, fiscalPeriodId } = await seedCompany()
     const entryId = await insertEntryAtStatus({
       userId, companyId, fiscalPeriodId, voucherNumber: 1,

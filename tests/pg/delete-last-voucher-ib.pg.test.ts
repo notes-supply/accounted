@@ -10,15 +10,10 @@ import {
 import { getPool, withUserContext } from '@/tests/pg/setup'
 
 /**
- * Covers 20260528120000_delete_last_voucher_clears_ib_link:
- *   - delete_last_voucher RPC succeeds when the target is the period's
- *     opening_balance_entry (A1 from SIE import).
- *   - fiscal_periods.opening_balance_entry_id is cleared and
- *     opening_balances_set is flipped to false.
- *   - sie_imports.opening_balance_entry_id is also cleared so the import
- *     row stays consistent.
- *   - audit_log has a DELETE entry with the "(was period IB)" marker.
- *   - The RPC still rejects non-last vouchers and locked periods.
+ * Regression for the draft-only delete_last_voucher contract. A posted
+ * opening-balance voucher is committed accounting evidence even when it is
+ * last in its series. Physical deletion must fail before period, SIE-import,
+ * voucher-sequence, or audit state changes.
  */
 
 async function commitPostedEntryAsIB(params: {
@@ -67,66 +62,8 @@ async function linkAsIB(periodId: string, entryId: string): Promise<void> {
   )
 }
 
-describe('delete_last_voucher with IB link', () => {
-  it('deletes an IB entry and clears the period FK + sets opening_balances_set=false', async () => {
-    const userId = await insertAuthUser()
-    const companyId = await insertCompany({ createdBy: userId })
-    await insertCompanyMember({ companyId, userId, role: 'owner' })
-    const fiscalPeriodId = await insertFiscalPeriod({ userId, companyId })
-
-    const ibEntryId = await commitPostedEntryAsIB({ userId, companyId, fiscalPeriodId })
-    await linkAsIB(fiscalPeriodId, ibEntryId)
-
-    // Sanity check pre-state
-    const pre = await getPool().query<{ ob_id: string | null; ob_set: boolean }>(
-      `SELECT opening_balance_entry_id AS ob_id, opening_balances_set AS ob_set
-         FROM public.fiscal_periods WHERE id = $1`,
-      [fiscalPeriodId],
-    )
-    expect(pre.rows[0]!.ob_id).toBe(ibEntryId)
-    expect(pre.rows[0]!.ob_set).toBe(true)
-
-    // withUserContext rolls back at the end, so all assertions about the
-    // RPC's effects must be observed inside the same transaction: a fresh
-    // getPool() connection would only see pre-RPC state.
-    await withUserContext(userId, async (client) => {
-      const r = await client.query<{ delete_last_voucher: { deleted: boolean; was_period_ib: boolean } }>(
-        `SELECT delete_last_voucher($1, $2)`,
-        [companyId, ibEntryId],
-      )
-      const result = r.rows[0]!.delete_last_voucher
-      expect(result.deleted).toBe(true)
-      expect(result.was_period_ib).toBe(true)
-
-      const after = await client.query<{ count: string }>(
-        `SELECT COUNT(*)::text AS count FROM public.journal_entries WHERE id = $1`,
-        [ibEntryId],
-      )
-      expect(after.rows[0]!.count).toBe('0')
-
-      const post = await client.query<{ ob_id: string | null; ob_set: boolean }>(
-        `SELECT opening_balance_entry_id AS ob_id, opening_balances_set AS ob_set
-           FROM public.fiscal_periods WHERE id = $1`,
-        [fiscalPeriodId],
-      )
-      expect(post.rows[0]!.ob_id).toBeNull()
-      expect(post.rows[0]!.ob_set).toBe(false)
-
-      // Two audit rows land on the DELETE: the generic one from the
-      // write_audit_log() trigger and the RPC's explicit "was period IB"
-      // entry. They share statement_timestamp(), so ordering by created_at
-      // is non-deterministic: assert against the specific marker directly.
-      const audit = await client.query<{ count: string }>(
-        `SELECT COUNT(*)::text AS count FROM public.audit_log
-           WHERE table_name = 'journal_entries' AND record_id = $1 AND action = 'DELETE'
-             AND description LIKE '%was period IB%'`,
-        [ibEntryId],
-      )
-      expect(Number(audit.rows[0]!.count)).toBeGreaterThanOrEqual(1)
-    })
-  })
-
-  it('also clears sie_imports.opening_balance_entry_id when present', async () => {
+describe('delete_last_voucher with a committed opening-balance link', () => {
+  it('rejects physical deletion and preserves every committed pointer and number', async () => {
     const userId = await insertAuthUser()
     const companyId = await insertCompany({ createdBy: userId })
     await insertCompanyMember({ companyId, userId, role: 'owner' })
@@ -144,14 +81,48 @@ describe('delete_last_voucher with IB link', () => {
       [importId, userId, companyId, randomUUID().replace(/-/g, ''), fiscalPeriodId, ibEntryId],
     )
 
-    // Same caveat as the previous test: assert inside the tx, not after.
     await withUserContext(userId, async (client) => {
-      await client.query(`SELECT delete_last_voucher($1, $2)`, [companyId, ibEntryId])
-      const imp = await client.query<{ ob_id: string | null }>(
-        `SELECT opening_balance_entry_id AS ob_id FROM public.sie_imports WHERE id = $1`,
-        [importId],
+      await expect(client.query(
+        `SELECT delete_last_voucher($1, $2)`,
+        [companyId, ibEntryId],
+      )).rejects.toThrow(/Only genuine draft journal entries/i)
+
+      const state = await client.query<{
+        entry_count: number
+        period_entry_id: string | null
+        opening_balances_set: boolean
+        import_entry_id: string | null
+        last_number: number
+        delete_audit_count: number
+      }>(
+        `SELECT
+           (SELECT count(*)::integer FROM public.journal_entries
+             WHERE id = $1) AS entry_count,
+           (SELECT opening_balance_entry_id FROM public.fiscal_periods
+             WHERE id = $2) AS period_entry_id,
+           (SELECT opening_balances_set FROM public.fiscal_periods
+             WHERE id = $2) AS opening_balances_set,
+           (SELECT opening_balance_entry_id FROM public.sie_imports
+             WHERE id = $3) AS import_entry_id,
+           (SELECT last_number FROM public.voucher_sequences
+             WHERE company_id = $4
+               AND fiscal_period_id = $2
+               AND voucher_series = 'A') AS last_number,
+           (SELECT count(*)::integer FROM public.audit_log
+             WHERE table_name = 'journal_entries'
+               AND record_id = $1
+               AND action = 'DELETE') AS delete_audit_count`,
+        [ibEntryId, fiscalPeriodId, importId, companyId],
       )
-      expect(imp.rows[0]!.ob_id).toBeNull()
+
+      expect(state.rows).toEqual([{
+        entry_count: 1,
+        period_entry_id: ibEntryId,
+        opening_balances_set: true,
+        import_entry_id: ibEntryId,
+        last_number: 1,
+        delete_audit_count: 0,
+      }])
     })
   })
 })

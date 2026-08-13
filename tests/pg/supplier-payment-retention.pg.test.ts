@@ -1,4 +1,6 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import type { PoolClient } from 'pg'
 import { describe, expect, it } from 'vitest'
 import { getPool, withUserContext } from './setup'
@@ -11,6 +13,42 @@ import {
 } from './fixtures'
 
 let arrivalSequence = 0
+
+const SHIPPED_MIGRATION =
+  '20260813120000_supplier_payment_reversal_retention.sql'
+const HARDENING_MIGRATION =
+  '20260813130000_harden_journal_delete_and_supplier_lineage.sql'
+const SHIPPED_MIGRATION_BLOB = '18a353108a36012e92a0efaf97f2d6c27f287241'
+const MAX_LINEAGE_DEPTH = 32
+const MAX_LINEAGE_ROWS = 20000
+
+function migration(name: string): string {
+  return readFileSync(
+    resolve(process.cwd(), 'supabase/migrations', name),
+    'utf8',
+  )
+}
+
+function gitBlobHash(contents: string): string {
+  const body = Buffer.from(contents)
+  return createHash('sha1')
+    .update(`blob ${body.byteLength}\0`)
+    .update(body)
+    .digest('hex')
+}
+
+function sqlFunction(
+  contents: string,
+  signature: string,
+  endMarker: string,
+): string {
+  const start = contents.indexOf(signature)
+  const end = contents.indexOf(endMarker, start)
+  if (start < 0 || end < 0) {
+    throw new Error(`Cannot extract migration function: ${signature}`)
+  }
+  return contents.slice(start, end)
+}
 
 async function insertSupplierInvoice(params: {
   userId: string
@@ -61,6 +99,7 @@ async function insertPostedStorno(params: {
   fiscalPeriodId: string
   originalJournalEntryId: string
   amount?: number
+  entryDate?: string
 }): Promise<string> {
   const stornoId = randomUUID()
   const amount = params.amount ?? 1000
@@ -71,14 +110,15 @@ async function insertPostedStorno(params: {
       `INSERT INTO public.journal_entries
          (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
           entry_date, description, source_type, reverses_id, status, committed_at)
-       VALUES ($1, $2, $3, $4, 0, 'A', '2026-06-02', 'Payment storno',
-               'storno', $5, 'posted', '2026-06-02T10:00:00Z')`,
+       VALUES ($1, $2, $3, $4, 0, 'A', $6, 'Payment storno',
+               'storno', $5, 'posted', ($6::date + time '10:00')::timestamptz)`,
       [
         stornoId,
         params.userId,
         params.companyId,
         params.fiscalPeriodId,
         params.originalJournalEntryId,
+        params.entryDate ?? '2026-06-02',
       ],
     )
     await client.query(
@@ -104,6 +144,52 @@ async function insertPostedStorno(params: {
     [stornoId, params.originalJournalEntryId],
   )
   return stornoId
+}
+
+async function insertPostedCorrection(params: {
+  userId: string
+  companyId: string
+  fiscalPeriodId: string
+  originalJournalEntryId: string
+  entryDate: string
+  amount?: number
+}): Promise<string> {
+  const correctionId = randomUUID()
+  const amount = params.amount ?? 1000
+  const client = await getPool().connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(
+      `INSERT INTO public.journal_entries
+         (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
+          entry_date, description, source_type, correction_of_id, status, committed_at)
+       VALUES ($1, $2, $3, $4, 0, 'A', $5, 'Payment correction',
+               'correction', $6, 'posted', ($5::date + time '10:00')::timestamptz)`,
+      [
+        correctionId,
+        params.userId,
+        params.companyId,
+        params.fiscalPeriodId,
+        params.entryDate,
+        params.originalJournalEntryId,
+      ],
+    )
+    await client.query(
+      `INSERT INTO public.journal_entry_lines
+         (journal_entry_id, account_number, debit_amount, credit_amount, currency, sort_order)
+       VALUES ($1, '2440', $2, 0, 'SEK', 0),
+              ($1, '1930', 0, $2, 'SEK', 1)`,
+      [correctionId, amount],
+    )
+    await client.query('SET CONSTRAINTS check_balance_on_posted_insert IMMEDIATE')
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
+  return correctionId
 }
 
 async function insertPayment(params: {
@@ -174,6 +260,35 @@ async function applySupplierPaymentReversal(
     ],
   )
   return result.rows[0].result as Record<string, unknown>
+}
+
+function getEventOutboxIds(result: Record<string, unknown>): string[] {
+  const publication = result.event_publication
+  if (
+    publication === null
+    || typeof publication !== 'object'
+    || !('event_outbox_ids' in publication)
+    || !Array.isArray(publication.event_outbox_ids)
+    || publication.event_outbox_ids.some((id) => typeof id !== 'string')
+  ) {
+    throw new Error('supplier reversal result omitted event outbox IDs')
+  }
+  return publication.event_outbox_ids
+}
+
+async function getSupplierPaymentLineage(
+  client: QueryClient,
+  companyId: string,
+  rootIds: string[],
+): Promise<{
+  requested_root_count: number
+  rows: Array<Record<string, unknown>>
+}> {
+  const result = await client.query(
+    `SELECT public.get_supplier_payment_lineage($1, $2::uuid[]) AS result`,
+    [companyId, rootIds],
+  )
+  return result.rows[0].result
 }
 
 async function deleteLastVoucher(
@@ -290,76 +405,218 @@ async function seedV1PaymentWithoutAllocation(params: {
   }
 }
 
-async function seedAllocationFreeDeleteVoucher(params: {
-  sourceType?: 'supplier_invoice_cash_payment' | 'supplier_invoice_paid'
-  total?: number
-  paidAmount?: number
-  voucherNumber?: number
-  lines?: Array<{
-    accountNumber: string
-    debitAmount: number
-    creditAmount: number
-  }>
-}) {
-  const tenant = await seedCompany()
-  const total = params.total ?? 750
-  const paidAmount = params.paidAmount ?? total
-  const remainingAmount = Math.round((total - paidAmount) * 100) / 100
-  const sourceType = params.sourceType ?? 'supplier_invoice_cash_payment'
-  const supplierInvoiceId = await insertSupplierInvoice({
-    userId: tenant.userId,
-    companyId: tenant.companyId,
-    total,
-    initiallyPaid: false,
-  })
-  const journalEntryId = await insertPostedJournalEntry({
-    ...tenant,
-    sourceType,
-    sourceId: supplierInvoiceId,
-    voucherNumber: params.voucherNumber,
-    entryDate: '2026-06-01',
-    committedAt: '2026-06-01T10:00:00Z',
-    lines: params.lines ?? (
-      sourceType === 'supplier_invoice_paid'
-        ? [
-            { accountNumber: '2440', debitAmount: total - remainingAmount, creditAmount: 0 },
-            { accountNumber: '1930', debitAmount: 0, creditAmount: total - remainingAmount },
-          ]
-        : [
-            { accountNumber: '6000', debitAmount: total, creditAmount: 0 },
-            { accountNumber: '1930', debitAmount: 0, creditAmount: total },
-          ]
-    ),
-  })
-  await getPool().query(
-    `UPDATE public.supplier_invoices
-        SET status = $1,
-            paid_amount = $2,
-            remaining_amount = $3,
-            paid_at = $4,
-            due_date = '2099-12-31',
-            payment_journal_entry_id = $5
-      WHERE id = $6`,
-    [
-      remainingAmount === 0 ? 'paid' : 'partially_paid',
-      paidAmount,
-      remainingAmount,
-      remainingAmount === 0 ? '2026-06-01T12:00:00Z' : null,
-      journalEntryId,
-      supplierInvoiceId,
-    ],
-  )
-  return {
-    ...tenant,
-    supplierInvoiceId,
-    journalEntryId,
-    total,
-    paidAmount,
-    remainingAmount,
-  }
-}
 
 describe('supplier payment reversal retention migration', () => {
+  it('applies the later migration over the exact shipped release shape', async () => {
+    const shipped = migration(SHIPPED_MIGRATION)
+    const hardening = migration(HARDENING_MIGRATION)
+    const priorTriggerMigration = migration(
+      '20260723210000_verifikat_inline_rattelse.sql',
+    )
+    const priorDocumentLinkMigration = migration(
+      '20260705100000_fix_correction_relink_role_detection.sql',
+    )
+    const priorDocumentMetadataMigration = migration(
+      '20260704103000_allow_correction_document_relink.sql',
+    )
+    const priorReplaceMigration = migration(
+      '20260727120000_replace_sie_import_authorize_actor.sql',
+    )
+    const priorUndoMigration = migration(
+      '20260727121000_undo_sie_import_caller_guard.sql',
+    )
+
+    expect(gitBlobHash(shipped)).toBe(SHIPPED_MIGRATION_BLOB)
+    expect(shipped).not.toContain('get_supplier_payment_lineage')
+    expect(shipped).toContain(
+      'Cannot delete allocation-backed supplier payment voucher',
+    )
+    expect(hardening).toContain(
+      'Only genuine draft journal entries can be physically deleted',
+    )
+    expect(hardening).toContain('get_supplier_payment_lineage')
+    expect(hardening).toContain(
+      'uq_journal_entries_committed_correction_child',
+    )
+
+    const shippedDelete = sqlFunction(
+      shipped,
+      'CREATE OR REPLACE FUNCTION public.delete_last_voucher(',
+      '\n\nNOTIFY pgrst',
+    )
+    const priorTrigger = sqlFunction(
+      priorTriggerMigration,
+      'CREATE OR REPLACE FUNCTION public.enforce_journal_entry_immutability()',
+      '\n\nALTER FUNCTION public.enforce_journal_entry_immutability()',
+    )
+    const priorLineTrigger = sqlFunction(
+      priorTriggerMigration,
+      'CREATE OR REPLACE FUNCTION public.enforce_journal_entry_line_immutability()',
+      '\n\nALTER FUNCTION public.enforce_journal_entry_line_immutability()',
+    )
+    const priorDocumentLink = sqlFunction(
+      priorDocumentLinkMigration,
+      'CREATE OR REPLACE FUNCTION public.enforce_document_journal_entry_immutability()',
+      '\n\n-- The trigger fired only',
+    )
+    const priorDocumentMetadata = sqlFunction(
+      priorDocumentMetadataMigration,
+      'CREATE OR REPLACE FUNCTION public.enforce_document_metadata_immutability()',
+      '\n\n-- ── 3.',
+    )
+    const priorReplace = sqlFunction(
+      priorReplaceMigration,
+      'CREATE OR REPLACE FUNCTION public.replace_sie_import(',
+      '\n\n-- Least privilege.',
+    )
+    const priorUndo = sqlFunction(
+      priorUndoMigration,
+      'CREATE OR REPLACE FUNCTION public.undo_sie_import(',
+      '\n\n-- Least privilege,',
+    )
+    const shippedEventRecorder = sqlFunction(
+      shipped,
+      'CREATE OR REPLACE FUNCTION public.record_supplier_payment_reversal_events(',
+      '\n\nREVOKE ALL ON FUNCTION public.record_supplier_payment_reversal_events(',
+    )
+
+    const client = await getPool().connect()
+    try {
+      await client.query('BEGIN')
+      await client.query(priorTrigger)
+      await client.query(shippedDelete)
+      await client.query(priorLineTrigger)
+      await client.query(priorDocumentLink)
+      await client.query(priorDocumentMetadata)
+      await client.query(priorReplace)
+      await client.query(priorUndo)
+      await client.query(shippedEventRecorder)
+      await client.query(
+        'DROP FUNCTION IF EXISTS public.get_supplier_payment_lineage(uuid, uuid[])',
+      )
+      await client.query(hardening)
+      const definitions = await client.query<{
+        delete_definition: string
+        lineage_definition: string
+        trigger_definition: string
+        line_trigger_definition: string
+        document_link_definition: string
+        document_metadata_definition: string
+        undo_definition: string
+        replace_definition: string
+        event_definition: string
+      }>(
+        `SELECT
+           pg_get_functiondef(
+             'public.delete_last_voucher(uuid,uuid)'::regprocedure
+           ) AS delete_definition,
+           pg_get_functiondef(
+             'public.get_supplier_payment_lineage(uuid,uuid[])'::regprocedure
+           ) AS lineage_definition,
+           pg_get_functiondef(
+             'public.enforce_journal_entry_immutability()'::regprocedure
+           ) AS trigger_definition,
+           pg_get_functiondef(
+             'public.enforce_journal_entry_line_immutability()'::regprocedure
+           ) AS line_trigger_definition,
+           pg_get_functiondef(
+             'public.enforce_document_journal_entry_immutability()'::regprocedure
+           ) AS document_link_definition,
+           pg_get_functiondef(
+             'public.enforce_document_metadata_immutability()'::regprocedure
+           ) AS document_metadata_definition,
+           pg_get_functiondef(
+             'public.undo_sie_import(uuid,uuid,uuid)'::regprocedure
+           ) AS undo_definition,
+           pg_get_functiondef(
+             'public.replace_sie_import(uuid,uuid,uuid)'::regprocedure
+           ) AS replace_definition,
+           pg_get_functiondef(
+             'public.record_supplier_payment_reversal_events(uuid,uuid,uuid)'::regprocedure
+           ) AS event_definition`,
+      )
+      const installed = definitions.rows[0]!
+      expect(installed.delete_definition).toContain(
+        'Only genuine draft journal entries can be physically deleted',
+      )
+      expect(installed.lineage_definition).toContain(
+        `v_max_depth constant integer := ${MAX_LINEAGE_DEPTH}`,
+      )
+      expect(installed.lineage_definition).toContain(
+        `v_max_rows constant integer := ${MAX_LINEAGE_ROWS}`,
+      )
+      for (const guardDefinition of [
+        installed.trigger_definition,
+        installed.line_trigger_definition,
+        installed.document_link_definition,
+        installed.document_metadata_definition,
+      ]) {
+        expect(guardDefinition).toContain('v_trusted_delete_context')
+      }
+      expect(installed.undo_definition).toContain(
+        'Cannot undo a completed SIE import with committed journal entries',
+      )
+      expect(installed.replace_definition).toContain(
+        'Cannot replace a completed SIE import by deleting committed journal entries',
+      )
+      expect(installed.undo_definition).not.toContain(
+        'DELETE FROM public.journal_entries',
+      )
+      expect(installed.replace_definition).not.toContain(
+        'DELETE FROM public.journal_entries',
+      )
+      expect(installed.event_definition).toContain(
+        'v_event_log_total_count',
+      )
+      expect(installed.event_definition).toContain(
+        'projection integrity mismatch',
+      )
+      const correctionConstraint = await client.query<{ present: boolean }>(
+        `SELECT to_regclass(
+           'public.uq_journal_entries_committed_correction_child'
+         ) IS NOT NULL AS present`,
+      )
+      expect(correctionConstraint.rows).toEqual([{ present: true }])
+    } finally {
+      await client.query('ROLLBACK').catch(() => {})
+      client.release()
+    }
+  })
+
+  it('allows only one committed correction child per parent', async () => {
+    const tenant = await seedCompany()
+    const originalId = await insertPostedJournalEntry({
+      ...tenant,
+      sourceType: 'manual',
+      entryDate: '2026-06-01',
+      lines: [
+        { accountNumber: '2440', debitAmount: 1000, creditAmount: 0 },
+        { accountNumber: '1930', debitAmount: 0, creditAmount: 1000 },
+      ],
+    })
+
+    await insertPostedCorrection({
+      ...tenant,
+      originalJournalEntryId: originalId,
+      entryDate: '2026-06-02',
+    })
+    await expect(insertPostedCorrection({
+      ...tenant,
+      originalJournalEntryId: originalId,
+      entryDate: '2026-06-03',
+    })).rejects.toMatchObject({ code: '23505' })
+
+    const children = await getPool().query<{ count: number }>(
+      `SELECT count(*)::integer AS count
+         FROM public.journal_entries
+        WHERE correction_of_id = $1
+          AND source_type = 'correction'
+          AND status IN ('posted', 'reversed')`,
+      [originalId],
+    )
+    expect(children.rows).toEqual([{ count: 1 }])
+  })
+
   it('keeps an existing-shaped row active after upgrade', async () => {
     const seeded = await seedPaymentVoucher()
     const paymentId = await insertPayment(seeded)
@@ -905,9 +1162,7 @@ describe('supplier payment reversal retention migration', () => {
         },
       })
 
-      const publication = first.event_publication as {
-        event_outbox_ids: string[]
-      }
+      const eventOutboxIds = getEventOutboxIds(first)
       const events = await client.query<{
         event_type: string
         entity_id: string
@@ -917,7 +1172,7 @@ describe('supplier payment reversal retention migration', () => {
            FROM public.event_log
           WHERE outbox_event_id = ANY($1::uuid[])
           ORDER BY event_type`,
-        [publication.event_outbox_ids],
+        [eventOutboxIds],
       )
       expect(events.rows).toHaveLength(2)
       expect(events.rows[0]).toMatchObject({
@@ -939,7 +1194,7 @@ describe('supplier payment reversal retention migration', () => {
            FROM public.webhook_deliveries
           WHERE outbox_event_id = ANY($1::uuid[])
           ORDER BY event_type`,
-        [publication.event_outbox_ids],
+        [eventOutboxIds],
       )
       expect(deliveries.rows.map((row) => row.webhook_id)).toEqual([
         committedWebhookId,
@@ -974,7 +1229,7 @@ describe('supplier payment reversal retention migration', () => {
         originalJournalEntryId: seeded.journalEntryId,
         stornoJournalEntryId: stornoId,
       })
-      outboxIds = (first.event_publication as { event_outbox_ids: string[] }).event_outbox_ids
+      outboxIds = getEventOutboxIds(first)
     }, { commit: true })
 
     // Mirrors the privileged daily retention job, not an authenticated user.
@@ -1023,6 +1278,84 @@ describe('supplier payment reversal retention migration', () => {
       outbox_count: 2,
       published_count: 2,
       delivery_count: 2,
+    }])
+  })
+
+  it('rejects a retry when an outbox projection row is contradictory', async () => {
+    const seeded = await seedPaymentVoucher()
+    await insertPayment(seeded)
+    const stornoId = await insertPostedStorno({
+      ...seeded,
+      originalJournalEntryId: seeded.journalEntryId,
+    })
+
+    let outboxIds: string[] = []
+    await withUserContext(seeded.userId, async (client) => {
+      const first = await applySupplierPaymentReversal(client, {
+        companyId: seeded.companyId,
+        originalJournalEntryId: seeded.journalEntryId,
+        stornoJournalEntryId: stornoId,
+      })
+      outboxIds = getEventOutboxIds(first)
+    }, { commit: true })
+
+    await getPool().query(
+      `UPDATE public.event_log
+          SET entity_id = $1
+        WHERE outbox_event_id = $2`,
+      [seeded.journalEntryId, outboxIds[0]],
+    )
+
+    await withUserContext(seeded.userId, async (client) => {
+      await expect(
+        applySupplierPaymentReversal(client, {
+          companyId: seeded.companyId,
+          originalJournalEntryId: seeded.journalEntryId,
+          stornoJournalEntryId: stornoId,
+        }),
+      ).rejects.toMatchObject({
+        code: '55000',
+        message: expect.stringMatching(/projection integrity mismatch/i),
+      })
+    })
+
+    const projection = await getPool().query<{
+      total_count: number
+      exact_count: number
+    }>(
+      `SELECT
+         count(*)::integer AS total_count,
+         count(*) FILTER (
+           WHERE e.company_id = o.company_id
+             AND e.user_id = o.user_id
+             AND e.event_type = o.event_type
+             AND e.entity_id = o.reversal_journal_entry_id
+             AND e.data = o.payload - 'userId' - 'companyId'
+         )::integer AS exact_count
+       FROM public.event_log e
+       JOIN public.supplier_payment_reversal_event_outbox o
+         ON o.id = e.outbox_event_id
+       WHERE o.id = ANY($1::uuid[])`,
+      [outboxIds],
+    )
+    expect(projection.rows).toEqual([{ total_count: 2, exact_count: 1 }])
+
+    const state = await getPool().query<{
+      status: string
+      paid_amount: number
+      remaining_amount: number
+    }>(
+      `SELECT status,
+              paid_amount::double precision AS paid_amount,
+              remaining_amount::double precision AS remaining_amount
+         FROM public.supplier_invoices
+        WHERE id = $1`,
+      [seeded.supplierInvoiceId],
+    )
+    expect(state.rows).toEqual([{
+      status: 'overdue',
+      paid_amount: 0,
+      remaining_amount: 1000,
     }])
   })
 
@@ -1521,121 +1854,14 @@ describe('supplier payment reversal retention migration', () => {
     })
   })
 
-  it('atomically restores an allocation-free cash payment during physical delete', async () => {
-    const seeded = await seedAllocationFreeDeleteVoucher({})
-    const transactionId = await insertTransaction({
-      ...seeded,
-      amount: -seeded.total,
-      journalEntryId: seeded.journalEntryId,
-    })
-    await getPool().query(
-      `UPDATE public.transactions
-          SET supplier_invoice_id = $1,
-              is_business = true,
-              category = 'expense_other'
-        WHERE id = $2`,
-      [seeded.supplierInvoiceId, transactionId],
-    )
-
-    const deleted = await withUserContext(
-      seeded.userId,
-      (client) => deleteLastVoucher(
-        client,
-        seeded.companyId,
-        seeded.journalEntryId,
-      ),
-      { commit: true },
-    )
-
-    expect(deleted).toEqual({
-      deleted: true,
-      voucher_series: 'A',
-      voucher_number: 0,
-      was_period_ib: null,
-    })
-    const state = await getPool().query(
-      `SELECT si.status,
-              si.paid_at,
-              si.paid_amount::double precision AS paid_amount,
-              si.remaining_amount::double precision AS remaining_amount,
-              si.payment_journal_entry_id,
-              t.journal_entry_id AS transaction_journal_entry_id,
-              t.supplier_invoice_id AS transaction_supplier_invoice_id,
-              t.is_business,
-              t.category,
-              (
-                SELECT count(*)::integer
-                  FROM public.journal_entries je
-                 WHERE je.id = $1
-              ) AS journal_count
-         FROM public.supplier_invoices si
-         JOIN public.transactions t ON t.id = $2
-        WHERE si.id = $3`,
-      [seeded.journalEntryId, transactionId, seeded.supplierInvoiceId],
-    )
-    expect(state.rows).toEqual([{
-      status: 'approved',
-      paid_at: null,
-      paid_amount: 0,
-      remaining_amount: seeded.total,
-      payment_journal_entry_id: null,
-      transaction_journal_entry_id: null,
-      transaction_supplier_invoice_id: null,
-      is_business: null,
-      category: null,
-      journal_count: 0,
-    }])
-  })
-
-  it('restores an unambiguous allocation-free v1 final payment during delete', async () => {
-    const seeded = await seedAllocationFreeDeleteVoucher({
-      sourceType: 'supplier_invoice_paid',
-      total: 1000,
-      paidAmount: 1000,
-      lines: [
-        { accountNumber: '2440', debitAmount: 700, creditAmount: 0 },
-        { accountNumber: '1930', debitAmount: 0, creditAmount: 700 },
-      ],
-    })
-
-    const deleted = await withUserContext(
-      seeded.userId,
-      (client) => deleteLastVoucher(
-        client,
-        seeded.companyId,
-        seeded.journalEntryId,
-      ),
-      { commit: true },
-    )
-    expect(deleted).toMatchObject({ deleted: true })
-
-    const state = await getPool().query(
-      `SELECT status,
-              paid_at,
-              paid_amount::double precision AS paid_amount,
-              remaining_amount::double precision AS remaining_amount,
-              payment_journal_entry_id,
-              (
-                SELECT count(*)::integer
-                  FROM public.journal_entries je
-                 WHERE je.id = $1
-              ) AS journal_count
-         FROM public.supplier_invoices
-        WHERE id = $2`,
-      [seeded.journalEntryId, seeded.supplierInvoiceId],
-    )
-    expect(state.rows).toEqual([{
-      status: 'partially_paid',
-      paid_at: null,
-      paid_amount: 300,
-      remaining_amount: 700,
-      payment_journal_entry_id: null,
-      journal_count: 0,
-    }])
-  })
-
-  it('rejects allocation-backed physical deletion without cleaning business state', async () => {
+  it('rejects an admin physically deleting a posted supplier payment before any state mutation', async () => {
     const seeded = await seedPaymentVoucher()
+    const adminId = await insertAuthUser()
+    await insertCompanyMember({
+      companyId: seeded.companyId,
+      userId: adminId,
+      role: 'admin',
+    })
     await getPool().query(
       `UPDATE public.supplier_invoices
           SET payment_journal_entry_id = $1,
@@ -1659,12 +1885,12 @@ describe('supplier payment reversal retention migration', () => {
     )
     const paymentId = await insertPayment({ ...seeded, transactionId })
 
-    await withUserContext(seeded.userId, async (client) => {
+    await withUserContext(adminId, async (client) => {
       await expect(deleteLastVoucher(
         client,
         seeded.companyId,
         seeded.journalEntryId,
-      )).rejects.toThrow(/allocation-backed supplier payment voucher/i)
+      )).rejects.toThrow(/Only genuine draft journal entries/i)
     }, { commit: true })
 
     const state = await getPool().query(
@@ -1676,11 +1902,20 @@ describe('supplier payment reversal retention migration', () => {
               sip.reversed_at,
               t.journal_entry_id AS transaction_journal_entry_id,
               t.supplier_invoice_id AS transaction_supplier_invoice_id,
+              t.is_business,
+              t.category,
               (
                 SELECT count(*)::integer
                   FROM public.journal_entries je
                  WHERE je.id = $1
-              ) AS journal_count
+              ) AS journal_count,
+              (
+                SELECT count(*)::integer
+                  FROM public.audit_log audit
+                 WHERE audit.table_name = 'journal_entries'
+                   AND audit.record_id = $1
+                   AND audit.action = 'DELETE'
+              ) AS delete_audit_count
          FROM public.supplier_invoices si
          JOIN public.supplier_invoice_payments sip ON sip.id = $2
          JOIN public.transactions t ON t.id = $3
@@ -1701,167 +1936,10 @@ describe('supplier payment reversal retention migration', () => {
       reversed_at: null,
       transaction_journal_entry_id: seeded.journalEntryId,
       transaction_supplier_invoice_id: seeded.supplierInvoiceId,
+      is_business: true,
+      category: 'expense_other',
       journal_count: 1,
-    }])
-  })
-
-  it('leaves supplier state untouched when the last-in-series rule refuses delete', async () => {
-    const seeded = await seedAllocationFreeDeleteVoucher({ voucherNumber: 1 })
-    const transactionId = await insertTransaction({
-      ...seeded,
-      amount: -seeded.total,
-      journalEntryId: seeded.journalEntryId,
-    })
-    await getPool().query(
-      `UPDATE public.transactions
-          SET supplier_invoice_id = $1,
-              is_business = true,
-              category = 'expense_other'
-        WHERE id = $2`,
-      [seeded.supplierInvoiceId, transactionId],
-    )
-    const laterJournalEntryId = await insertPostedJournalEntry({
-      ...seeded,
-      voucherNumber: 2,
-      sourceType: 'manual',
-    })
-
-    await withUserContext(seeded.userId, async (client) => {
-      await expect(deleteLastVoucher(
-        client,
-        seeded.companyId,
-        seeded.journalEntryId,
-      )).rejects.toThrow(/sista verifikatet i serien/i)
-    }, { commit: true })
-
-    const state = await getPool().query(
-      `SELECT si.status,
-              si.paid_amount::double precision AS paid_amount,
-              si.remaining_amount::double precision AS remaining_amount,
-              si.payment_journal_entry_id,
-              t.journal_entry_id AS transaction_journal_entry_id,
-              t.supplier_invoice_id AS transaction_supplier_invoice_id,
-              (
-                SELECT count(*)::integer
-                  FROM public.journal_entries je
-                 WHERE je.id = ANY($1::uuid[])
-              ) AS journal_count
-         FROM public.supplier_invoices si
-         JOIN public.transactions t ON t.id = $2
-        WHERE si.id = $3`,
-      [
-        [seeded.journalEntryId, laterJournalEntryId],
-        transactionId,
-        seeded.supplierInvoiceId,
-      ],
-    )
-    expect(state.rows).toEqual([{
-      status: 'paid',
-      paid_amount: seeded.total,
-      remaining_amount: 0,
-      payment_journal_entry_id: seeded.journalEntryId,
-      transaction_journal_entry_id: seeded.journalEntryId,
-      transaction_supplier_invoice_id: seeded.supplierInvoiceId,
-      journal_count: 2,
-    }])
-  })
-
-  it('rejects ambiguous allocation-free 2440 evidence without deleting', async () => {
-    const seeded = await seedAllocationFreeDeleteVoucher({
-      sourceType: 'supplier_invoice_paid',
-      total: 500,
-      lines: [
-        { accountNumber: '2440', debitAmount: 250, creditAmount: 0 },
-        { accountNumber: '2440', debitAmount: 250, creditAmount: 0 },
-        { accountNumber: '1930', debitAmount: 0, creditAmount: 500 },
-      ],
-    })
-
-    await withUserContext(seeded.userId, async (client) => {
-      await expect(deleteLastVoucher(
-        client,
-        seeded.companyId,
-        seeded.journalEntryId,
-      )).rejects.toThrow(/2440 evidence is ambiguous/i)
-    }, { commit: true })
-
-    const state = await getPool().query(
-      `SELECT si.status,
-              si.paid_amount::double precision AS paid_amount,
-              si.remaining_amount::double precision AS remaining_amount,
-              si.payment_journal_entry_id,
-              (
-                SELECT count(*)::integer
-                  FROM public.journal_entries je
-                 WHERE je.id = $1
-              ) AS journal_count
-         FROM public.supplier_invoices si
-        WHERE si.id = $2`,
-      [seeded.journalEntryId, seeded.supplierInvoiceId],
-    )
-    expect(state.rows).toEqual([{
-      status: 'paid',
-      paid_amount: 500,
-      remaining_amount: 0,
-      payment_journal_entry_id: seeded.journalEntryId,
-      journal_count: 1,
-    }])
-  })
-
-  it('rejects conflicting transaction ownership without releasing any pointer', async () => {
-    const seeded = await seedAllocationFreeDeleteVoucher({})
-    const conflictingInvoiceId = await insertSupplierInvoice({
-      userId: seeded.userId,
-      companyId: seeded.companyId,
-      initiallyPaid: false,
-    })
-    const transactionId = await insertTransaction({
-      ...seeded,
-      amount: -seeded.total,
-      journalEntryId: seeded.journalEntryId,
-    })
-    await getPool().query(
-      `UPDATE public.transactions
-          SET supplier_invoice_id = $1,
-              is_business = true,
-              category = 'expense_other'
-        WHERE id = $2`,
-      [conflictingInvoiceId, transactionId],
-    )
-
-    await withUserContext(seeded.userId, async (client) => {
-      await expect(deleteLastVoucher(
-        client,
-        seeded.companyId,
-        seeded.journalEntryId,
-      )).rejects.toThrow(/transaction ownership conflicts with voucher/i)
-    }, { commit: true })
-
-    const state = await getPool().query(
-      `SELECT si.status,
-              si.paid_amount::double precision AS paid_amount,
-              si.remaining_amount::double precision AS remaining_amount,
-              si.payment_journal_entry_id,
-              t.journal_entry_id AS transaction_journal_entry_id,
-              t.supplier_invoice_id AS transaction_supplier_invoice_id,
-              (
-                SELECT count(*)::integer
-                  FROM public.journal_entries je
-                 WHERE je.id = $1
-              ) AS journal_count
-         FROM public.supplier_invoices si
-         JOIN public.transactions t ON t.id = $2
-        WHERE si.id = $3`,
-      [seeded.journalEntryId, transactionId, seeded.supplierInvoiceId],
-    )
-    expect(state.rows).toEqual([{
-      status: 'paid',
-      paid_amount: seeded.total,
-      remaining_amount: 0,
-      payment_journal_entry_id: seeded.journalEntryId,
-      transaction_journal_entry_id: seeded.journalEntryId,
-      transaction_supplier_invoice_id: conflictingInvoiceId,
-      journal_count: 1,
+      delete_audit_count: 0,
     }])
   })
 
@@ -1941,6 +2019,427 @@ describe('supplier payment reversal retention migration', () => {
     )
     expect(remaining.rows).toEqual([{ payment_count: '0', user_count: '0' }])
   })
+  it('returns only authenticated company roots and preserves requested-root evidence', async () => {
+    const first = await seedCompany()
+    const second = await seedCompany()
+    const firstRoot = await insertPostedJournalEntry({
+      ...first,
+      sourceType: 'supplier_invoice_paid',
+      entryDate: '2026-06-01',
+    })
+    const secondRoot = await insertPostedJournalEntry({
+      ...second,
+      sourceType: 'supplier_invoice_paid',
+      entryDate: '2026-06-01',
+    })
+
+    await withUserContext(first.userId, async (client) => {
+      const lineage = await getSupplierPaymentLineage(
+        client,
+        first.companyId,
+        [firstRoot, secondRoot],
+      )
+      expect(lineage.requested_root_count).toBe(2)
+      expect(lineage.rows).toEqual([
+        expect.objectContaining({
+          root_id: firstRoot,
+          id: firstRoot,
+          edge_kind: 'root',
+          depth: 0,
+          cycle: false,
+        }),
+      ])
+
+      const otherCompany = await getSupplierPaymentLineage(
+        client,
+        second.companyId,
+        [secondRoot],
+      )
+      expect(otherCompany).toEqual({
+        requested_root_count: 1,
+        rows: [],
+      })
+    })
+  })
+
+  it('returns correction-of-correction and exact storno lineage', async () => {
+    const tenant = await seedCompany()
+    const rootId = await insertPostedJournalEntry({
+      ...tenant,
+      sourceType: 'supplier_invoice_paid',
+      entryDate: '2026-06-01',
+    })
+    const firstStornoId = await insertPostedStorno({
+      ...tenant,
+      originalJournalEntryId: rootId,
+      entryDate: '2026-06-01',
+    })
+    const firstCorrectionId = await insertPostedCorrection({
+      ...tenant,
+      originalJournalEntryId: rootId,
+      entryDate: '2026-06-03',
+    })
+    const secondStornoId = await insertPostedStorno({
+      ...tenant,
+      originalJournalEntryId: firstCorrectionId,
+      entryDate: '2026-06-03',
+    })
+    const secondCorrectionId = await insertPostedCorrection({
+      ...tenant,
+      originalJournalEntryId: firstCorrectionId,
+      entryDate: '2026-06-04',
+    })
+
+    await withUserContext(tenant.userId, async (client) => {
+      const lineage = await getSupplierPaymentLineage(
+        client,
+        tenant.companyId,
+        [rootId],
+      )
+      expect(lineage.rows).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          id: rootId,
+          edge_kind: 'root',
+          parent_id: null,
+          depth: 0,
+        }),
+        expect.objectContaining({
+          id: firstStornoId,
+          edge_kind: 'storno',
+          parent_id: rootId,
+          depth: 1,
+        }),
+        expect.objectContaining({
+          id: firstCorrectionId,
+          edge_kind: 'correction',
+          parent_id: rootId,
+          depth: 1,
+        }),
+        expect.objectContaining({
+          id: secondStornoId,
+          edge_kind: 'storno',
+          parent_id: firstCorrectionId,
+          depth: 2,
+        }),
+        expect.objectContaining({
+          id: secondCorrectionId,
+          edge_kind: 'correction',
+          parent_id: firstCorrectionId,
+          depth: 2,
+        }),
+      ]))
+      expect(lineage.rows).toHaveLength(5)
+    })
+  })
+
+  it('returns a plain storno as a leaf without inventing a correction', async () => {
+    const tenant = await seedCompany()
+    const rootId = await insertPostedJournalEntry({
+      ...tenant,
+      sourceType: 'supplier_invoice_paid',
+      entryDate: '2026-06-01',
+    })
+    const stornoId = await insertPostedStorno({
+      ...tenant,
+      originalJournalEntryId: rootId,
+    })
+
+    await withUserContext(tenant.userId, async (client) => {
+      const lineage = await getSupplierPaymentLineage(
+        client,
+        tenant.companyId,
+        [rootId],
+      )
+      expect(lineage.rows).toEqual([
+        expect.objectContaining({
+          id: rootId,
+          edge_kind: 'root',
+          cycle: false,
+        }),
+        expect.objectContaining({
+          id: stornoId,
+          edge_kind: 'storno',
+          parent_id: rootId,
+          cycle: false,
+        }),
+      ])
+    })
+  })
+
+  it('exposes cycles and correction ambiguity without recursive overflow', async () => {
+    const tenant = await seedCompany()
+    const cycleRootId = randomUUID()
+    const cycleChildId = randomUUID()
+    await getPool().query(
+      `INSERT INTO public.journal_entries
+         (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
+          entry_date, description, source_type, status)
+       VALUES ($1, $2, $3, $4, 0, 'A', '2026-06-01', 'Cycle root',
+               'supplier_invoice_paid', 'draft'),
+              ($5, $2, $3, $4, 0, 'A', '2026-06-02', 'Cycle child',
+               'correction', 'draft')`,
+      [
+        cycleRootId,
+        tenant.userId,
+        tenant.companyId,
+        tenant.fiscalPeriodId,
+        cycleChildId,
+      ],
+    )
+    await getPool().query(
+      `UPDATE public.journal_entries
+          SET correction_of_id = CASE
+            WHEN id = $1 THEN $2::uuid
+            ELSE $1::uuid
+          END
+        WHERE id IN ($1, $2)`,
+      [cycleRootId, cycleChildId],
+    )
+
+    const ambiguousRootId = await insertPostedJournalEntry({
+      ...tenant,
+      sourceType: 'supplier_invoice_paid',
+      entryDate: '2026-06-05',
+    })
+    const firstCorrectionId = await insertPostedCorrection({
+      ...tenant,
+      originalJournalEntryId: ambiguousRootId,
+      entryDate: '2026-06-06',
+    })
+    const secondCorrectionId = await insertPostedCorrection({
+      ...tenant,
+      originalJournalEntryId: ambiguousRootId,
+      entryDate: '2026-06-07',
+    })
+
+    await withUserContext(tenant.userId, async (client) => {
+      const cycle = await getSupplierPaymentLineage(
+        client,
+        tenant.companyId,
+        [cycleRootId],
+      )
+      expect(cycle.rows.some((row) =>
+        row.id === cycleRootId && row.cycle === true
+      )).toBe(true)
+
+      const ambiguous = await getSupplierPaymentLineage(
+        client,
+        tenant.companyId,
+        [ambiguousRootId],
+      )
+      expect(ambiguous.rows.filter((row) =>
+        row.edge_kind === 'correction' && row.parent_id === ambiguousRootId
+      ).map((row) => row.id).sort()).toEqual(
+        [firstCorrectionId, secondCorrectionId].sort(),
+      )
+    })
+  })
+
+  it('accepts depth 32 and rejects the same chain at depth 33', async () => {
+    const tenant = await seedCompany()
+    const ids = Array.from(
+      { length: MAX_LINEAGE_DEPTH + 2 },
+      () => randomUUID(),
+    )
+    await getPool().query(
+      `WITH nodes AS (
+         SELECT node.id, node.ordinality
+         FROM unnest($1::uuid[]) WITH ORDINALITY AS node(id, ordinality)
+       )
+       INSERT INTO public.journal_entries (
+         id,
+         user_id,
+         company_id,
+         fiscal_period_id,
+         voucher_number,
+         voucher_series,
+         entry_date,
+         description,
+         source_type,
+         status,
+         correction_of_id
+       )
+       SELECT
+         nodes.id,
+         $2,
+         $3,
+         $4,
+         0,
+         'A',
+         '2026-06-01',
+         'Lineage depth fixture',
+         CASE WHEN nodes.ordinality = 1
+           THEN 'supplier_invoice_paid'
+           ELSE 'correction'
+         END,
+         'draft',
+         CASE WHEN nodes.ordinality = 1
+           THEN NULL
+           ELSE ($1::uuid[])[(nodes.ordinality - 1)::integer]
+         END
+       FROM nodes`,
+      [ids, tenant.userId, tenant.companyId, tenant.fiscalPeriodId],
+    )
+
+    await withUserContext(tenant.userId, async (client) => {
+      const accepted = await getSupplierPaymentLineage(
+        client,
+        tenant.companyId,
+        [ids[1]!],
+      )
+      expect(accepted.rows).toHaveLength(MAX_LINEAGE_DEPTH + 1)
+      expect(Math.max(...accepted.rows.map((row) => row.depth as number)))
+        .toBe(MAX_LINEAGE_DEPTH)
+
+      await expect(getSupplierPaymentLineage(
+        client,
+        tenant.companyId,
+        [ids[0]!],
+      )).rejects.toThrow(
+        `supplier payment lineage exceeds maximum correction depth of ${MAX_LINEAGE_DEPTH}`,
+      )
+    })
+  })
+
+  it('rejects a branching lineage above the emitted-row cap', async () => {
+    const tenant = await seedCompany()
+    const rootId = randomUUID()
+    const client = await getPool().connect()
+    try {
+      await client.query('BEGIN')
+      await client.query('SET LOCAL session_replication_role = replica')
+      await client.query(
+        `INSERT INTO public.journal_entries (
+           id,
+           user_id,
+           company_id,
+           fiscal_period_id,
+           voucher_number,
+           voucher_series,
+           entry_date,
+           description,
+           source_type,
+           status
+         )
+         VALUES (
+           $1, $2, $3, $4, 0, 'A', '2026-06-01',
+           'Lineage row-cap root', 'supplier_invoice_paid', 'draft'
+         )`,
+        [rootId, tenant.userId, tenant.companyId, tenant.fiscalPeriodId],
+      )
+      await client.query(
+        `INSERT INTO public.journal_entries (
+           id,
+           user_id,
+           company_id,
+           fiscal_period_id,
+           voucher_number,
+           voucher_series,
+           entry_date,
+           description,
+           source_type,
+           status,
+           correction_of_id
+         )
+         SELECT
+           gen_random_uuid(),
+           $1,
+           $2,
+           $3,
+           0,
+           'A',
+           '2026-06-02',
+           'Lineage row-cap branch',
+           'correction',
+           'draft',
+           $4
+         FROM generate_series(1, $5)`,
+        [
+          tenant.userId,
+          tenant.companyId,
+          tenant.fiscalPeriodId,
+          rootId,
+          MAX_LINEAGE_ROWS,
+        ],
+      )
+      await client.query('SET LOCAL session_replication_role = origin')
+      await client.query(
+        `SELECT set_config('request.jwt.claims', $1, true)`,
+        [JSON.stringify({ sub: tenant.userId, role: 'authenticated' })],
+      )
+      await client.query(
+        `SELECT set_config('request.jwt.claim.sub', $1, true)`,
+        [tenant.userId],
+      )
+      await client.query(
+        `SELECT set_config('request.jwt.claim.role', 'authenticated', true)`,
+      )
+      await client.query('SET LOCAL ROLE authenticated')
+      await client.query('SAVEPOINT lineage_row_cap')
+
+      await expect(client.query(
+        `SELECT public.get_supplier_payment_lineage($1, ARRAY[$2]::uuid[])`,
+        [tenant.companyId, rootId],
+      )).rejects.toThrow(
+        `supplier payment lineage exceeds maximum emitted row count of ${MAX_LINEAGE_ROWS}`,
+      )
+      await client.query('ROLLBACK TO SAVEPOINT lineage_row_cap')
+    } finally {
+      await client.query('ROLLBACK').catch(() => {})
+      client.release()
+    }
+  }, 30_000)
+
+  it('rejects null roots, null elements, and oversized root arrays', async () => {
+    const tenant = await seedCompany()
+    await expect(getPool().query(
+      `SELECT public.get_supplier_payment_lineage($1, NULL::uuid[])`,
+      [tenant.companyId],
+    )).rejects.toThrow(/roots are required/i)
+    await expect(getPool().query(
+      `SELECT public.get_supplier_payment_lineage(
+         $1,
+         ARRAY[NULL]::uuid[]
+       )`,
+      [tenant.companyId],
+    )).rejects.toThrow(/cannot contain null/i)
+    await expect(getPool().query(
+      `SELECT public.get_supplier_payment_lineage(
+         $1,
+         array_fill($2::uuid, ARRAY[20001])
+       )`,
+      [tenant.companyId, randomUUID()],
+    )).rejects.toThrow(/at most 20000 roots/i)
+  })
+
+  it('pins the lineage RPC invoker mode, search path, and grants', async () => {
+    const signature = 'public.get_supplier_payment_lineage(uuid,uuid[])'
+    const meta = await getPool().query(
+      `SELECT p.prosecdef,
+              p.proconfig,
+              has_function_privilege('anon', $1, 'EXECUTE') AS anon_exec,
+              has_function_privilege('authenticated', $1, 'EXECUTE') AS authenticated_exec,
+              has_function_privilege('service_role', $1, 'EXECUTE') AS service_exec,
+              EXISTS (
+                SELECT 1
+                  FROM aclexplode(COALESCE(p.proacl, acldefault('f', p.proowner))) acl
+                 WHERE acl.grantee = 0
+                   AND acl.privilege_type = 'EXECUTE'
+              ) AS public_exec
+         FROM pg_proc p
+        WHERE p.oid = $1::regprocedure`,
+      [signature],
+    )
+    expect(meta.rows).toEqual([{
+      prosecdef: false,
+      proconfig: ['search_path=pg_catalog, public'],
+      anon_exec: false,
+      authenticated_exec: true,
+      service_exec: true,
+      public_exec: false,
+    }])
+  })
+
 
   it('pins the exact atomic RPC signature, security mode, and grants', async () => {
     const signature =

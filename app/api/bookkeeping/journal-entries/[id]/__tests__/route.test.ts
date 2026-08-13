@@ -28,25 +28,14 @@ vi.mock('@/lib/events/bus', () => ({
   eventBus: { emit: vi.fn().mockResolvedValue(undefined) },
 }))
 
-vi.mock('@/lib/bookkeeping/payment-sync', () => ({
-  syncInvoiceStatusFromPaymentEntry: vi.fn().mockResolvedValue(undefined),
+vi.mock('@/lib/bookkeeping/engine', () => ({
+  updateDraftEntry: vi.fn(),
 }))
 
-vi.mock('@/lib/core/documents/supplier-invoice-underlag', () => ({
-  reanchorOrphanedSupplierInvoiceDocuments: vi.fn().mockResolvedValue(0),
-}))
-
-import { reanchorOrphanedSupplierInvoiceDocuments } from '@/lib/core/documents/supplier-invoice-underlag'
-import { syncInvoiceStatusFromPaymentEntry } from '@/lib/bookkeeping/payment-sync'
+import { eventBus } from '@/lib/events/bus'
 
 import { DELETE } from '../route'
 
-/**
- * The DELETE handler's `.from()` / `.rpc()` order, one queued result each:
- *   1. journal_entries      (source_type/source_id, read before the teardown)
- *   2. document_attachments (documents about to be orphaned by the RPC)
- *   3. rpc delete_last_voucher
- */
 describe('DELETE /api/bookkeeping/journal-entries/[id]', () => {
   const mockUser = { id: 'user-1', email: 'test@test.se' }
 
@@ -62,85 +51,170 @@ describe('DELETE /api/bookkeeping/journal-entries/[id]', () => {
       createMockRouteParams({ id: 'je-1' }),
     )
 
-  it('re-anchors the documents the deleted voucher orphaned', async () => {
-    // delete_last_voucher has to clear journal_entry_id on every attached
-    // document (the FK is ON DELETE RESTRICT). A supplier invoice's retained
-    // PDF must not be left floating: unanchored, it stops counting as underlag
-    // everywhere while still showing up on the invoice's other verifikat.
-    enqueue({ data: { id: 'je-1', source_type: 'correction', source_id: null } })
-    enqueue({ data: [{ id: 'doc-1' }, { id: 'doc-2' }] })
-    enqueue({ data: { deleted: true, voucher_series: 'A', voucher_number: 12 } })
-
-    const { status } = await parseJsonResponse(await run())
-
-    expect(status).toBe(200)
-    expect(reanchorOrphanedSupplierInvoiceDocuments).toHaveBeenCalledWith(
-      expect.anything(),
-      'company-1',
-      ['doc-1', 'doc-2'],
-    )
-  })
-
-  it('does not re-anchor when the RPC refused the delete', async () => {
-    enqueue({ data: { id: 'je-1', source_type: 'manual', source_id: null } })
-    enqueue({ data: [{ id: 'doc-1' }] })
-    enqueue({ error: { message: 'Kan bara radera det sista verifikatet i serien.' } })
-
-    const { status } = await parseJsonResponse(await run())
-
-    expect(status).toBe(400)
-    expect(reanchorOrphanedSupplierInvoiceDocuments).not.toHaveBeenCalled()
-  })
-
-  it('passes an empty list when the voucher had no documents', async () => {
-    enqueue({ data: { id: 'je-1', source_type: 'manual', source_id: null } })
-    enqueue({ data: [] })
-    enqueue({ data: { deleted: true, voucher_series: 'A', voucher_number: 3 } })
-
-    const { status } = await parseJsonResponse(await run())
-
-    expect(status).toBe(200)
-    expect(reanchorOrphanedSupplierInvoiceDocuments).toHaveBeenCalledWith(
-      expect.anything(),
-      'company-1',
-      [],
-    )
-  })
-
-  it('does not run storno-only supplier sync after database-owned deletion', async () => {
+  it('physically deletes a draft and emits only journal_entry.deleted', async () => {
     enqueue({
       data: {
         id: 'je-1',
-        source_type: 'supplier_invoice_cash_payment',
-        source_id: 'supplier-invoice-1',
+        status: 'draft',
+        source_type: 'manual',
       },
     })
-    enqueue({ data: [] })
-    enqueue({ data: { deleted: true, voucher_series: 'A', voucher_number: 4 } })
+    enqueue({
+      data: {
+        deleted: true,
+        voucher_series: 'A',
+        voucher_number: 0,
+        was_draft: true,
+      },
+    })
 
-    const { status } = await parseJsonResponse(await run())
+    const { status, body } = await parseJsonResponse<{
+      data: {
+        action: string
+        deleted: boolean
+        voucher_series: string
+        voucher_number: number
+        was_draft: boolean
+      }
+    }>(await run())
 
     expect(status).toBe(200)
-    expect(syncInvoiceStatusFromPaymentEntry).not.toHaveBeenCalled()
+    expect(body.data).toEqual({
+      action: 'deleted',
+      deleted: true,
+      voucher_series: 'A',
+      voucher_number: 0,
+      was_draft: true,
+    })
+    expect(mockSupabase.rpc).toHaveBeenCalledWith('delete_last_voucher', {
+      p_company_id: 'company-1',
+      p_entry_id: 'je-1',
+    })
+    expect(mockSupabase.rpc).toHaveBeenCalledTimes(1)
+    expect(eventBus.emit).toHaveBeenCalledTimes(1)
+    expect(eventBus.emit).toHaveBeenCalledWith({
+      type: 'journal_entry.deleted',
+      payload: {
+        entryId: 'je-1',
+        voucherSeries: 'A',
+        voucherNumber: 0,
+        userId: 'user-1',
+        companyId: 'company-1',
+      },
+    })
   })
 
-  it('keeps customer payment cleanup after a physical delete', async () => {
-    const entryBefore = {
-      id: 'je-1',
-      source_type: 'invoice_paid',
-      source_id: 'invoice-1',
-    }
-    enqueue({ data: entryBefore })
-    enqueue({ data: [] })
-    enqueue({ data: { deleted: true, voucher_series: 'A', voucher_number: 5 } })
+  it.each([
+    ['posted', 'manual'],
+    ['posted', 'invoice_paid'],
+    ['posted', 'supplier_invoice_paid'],
+    ['reversed', 'manual'],
+    ['cancelled', 'manual'],
+    ['void', 'manual'],
+  ] as const)(
+    'rejects status %s and source %s without any mutation',
+    async (entryStatus, sourceType) => {
+      enqueue({
+        data: {
+          id: 'je-1',
+          status: entryStatus,
+          source_type: sourceType,
+        },
+      })
 
-    const { status } = await parseJsonResponse(await run())
+      const { status, body } = await parseJsonResponse<{
+        error: {
+          code: string
+          message: string
+          message_en: string
+          remediation: { description: string }
+          requestId: string
+          details: {
+            currentStatus: string
+            reversalEndpoint: string
+          }
+        }
+      }>(await run())
 
-    expect(status).toBe(200)
-    expect(syncInvoiceStatusFromPaymentEntry).toHaveBeenCalledWith(
-      expect.anything(),
-      'company-1',
-      entryBefore,
-    )
+      expect(status).toBe(409)
+      const { requestId, ...error } = body.error
+      expect(requestId).toEqual(expect.any(String))
+      expect(error).toEqual({
+        code: 'CANNOT_DELETE_NON_DRAFT',
+        message:
+          'Endast utkast kan raderas. Bokförda verifikationer återförs via den separata stornoåtgärden.',
+        message_en:
+          'Only draft entries can be deleted. Use the explicit reversal endpoint for a posted entry.',
+        remediation: {
+          description:
+            'Do not retry DELETE. For a posted entry, use POST /api/bookkeeping/journal-entries/{id}/reverse; reversed and cancelled entries remain retained.',
+        },
+        details: {
+          currentStatus: entryStatus,
+          reversalEndpoint: '/api/bookkeeping/journal-entries/je-1/reverse',
+        },
+      })
+      expect(mockSupabase.rpc).not.toHaveBeenCalled()
+      expect(eventBus.emit).not.toHaveBeenCalled()
+    },
+  )
+
+  it('returns the exact structured not-found error before mutation', async () => {
+    enqueue({ data: null, error: { message: 'no rows' } })
+
+    const { status, body } = await parseJsonResponse<{
+      error: {
+        code: string
+        message: string
+        message_en: string
+        requestId: string
+      }
+    }>(await run())
+
+    expect(status).toBe(404)
+    const { requestId, ...error } = body.error
+    expect(requestId).toEqual(expect.any(String))
+    expect(error).toEqual({
+      code: 'JOURNAL_ENTRY_NOT_FOUND',
+      message: 'Verifikationen kunde inte hittas.',
+      message_en: 'Journal entry not found.',
+    })
+    expect(mockSupabase.rpc).not.toHaveBeenCalled()
+    expect(eventBus.emit).not.toHaveBeenCalled()
+  })
+
+  it('returns the exact structured database error when draft deletion fails', async () => {
+    enqueue({
+      data: {
+        id: 'je-1',
+        status: 'draft',
+      },
+    })
+    enqueue({
+      data: null,
+      error: { message: 'draft deletion failed' },
+    })
+
+    const { status, body } = await parseJsonResponse<{
+      error: {
+        code: string
+        message: string
+        message_en: string
+        requestId: string
+        details: { operation: string }
+      }
+    }>(await run())
+
+    expect(status).toBe(500)
+    const { requestId, ...error } = body.error
+    expect(requestId).toEqual(expect.any(String))
+    expect(error).toEqual({
+      code: 'BOOKKEEPING_DATABASE_ERROR',
+      message: 'Verifikationen kunde inte sparas. Försök igen.',
+      message_en: 'Bookkeeping database operation failed.',
+      details: { operation: 'delete_draft_entry' },
+    })
+    expect(mockSupabase.rpc).toHaveBeenCalledTimes(1)
+    expect(eventBus.emit).not.toHaveBeenCalled()
   })
 })

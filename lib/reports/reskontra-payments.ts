@@ -26,17 +26,285 @@ interface SupplierPaymentRow extends PaymentRow {
   journal_entry_id: string | null
   reversed_at: string | null
   reversed_by_journal_entry_id: string | null
+  supplier_invoice_id: string
 }
 
-interface ReversalJournalRow {
+interface JournalLineageRow {
   id: string
   entry_date: string
   status: string
   source_type: string | null
+  correction_of_id: string | null
   reverses_id: string | null
+  committed_at: string | null
 }
 
-const JOURNAL_ID_CHUNK_SIZE = 100
+interface JournalLineageRpcRow extends JournalLineageRow {
+  root_id: string
+  parent_id: string | null
+  edge_kind: 'root' | 'correction' | 'storno'
+  depth: number
+  path: string[]
+  cycle: boolean
+}
+
+interface JournalLineage {
+  roots: Map<string, JournalLineageRow>
+  correctionsByParent: Map<string, JournalLineageRow[]>
+  reversalsByParent: Map<string, JournalLineageRow[]>
+}
+
+function assertCommittedLineageEntry(entry: JournalLineageRow): void {
+  if (!entry.id || !entry.entry_date) {
+    throw new Error(
+      `Could not prove supplier payment journal lineage for entry ${entry.id || '<missing id>'}`,
+    )
+  }
+  if (entry.status !== 'posted' && entry.status !== 'reversed') {
+    throw new Error(
+      `Unexpected supplier payment journal lineage status ${entry.status} for entry ${entry.id}`,
+    )
+  }
+}
+
+function parseLineageRow(value: unknown): JournalLineageRpcRow {
+  if (!value || typeof value !== 'object') {
+    throw new Error('Malformed supplier payment journal lineage response')
+  }
+  const row = value as Record<string, unknown>
+  const edgeKind = row.edge_kind
+  if (
+    typeof row.root_id !== 'string'
+    || typeof row.id !== 'string'
+    || typeof row.entry_date !== 'string'
+    || typeof row.status !== 'string'
+    || (row.source_type !== null && typeof row.source_type !== 'string')
+    || (row.correction_of_id !== null && typeof row.correction_of_id !== 'string')
+    || (row.reverses_id !== null && typeof row.reverses_id !== 'string')
+    || (row.parent_id !== null && typeof row.parent_id !== 'string')
+    || (row.committed_at !== null && typeof row.committed_at !== 'string')
+    || (edgeKind !== 'root' && edgeKind !== 'correction' && edgeKind !== 'storno')
+    || !Number.isInteger(row.depth)
+    || !Array.isArray(row.path)
+    || !row.path.every((id) => typeof id === 'string')
+    || typeof row.cycle !== 'boolean'
+  ) {
+    throw new Error('Malformed supplier payment journal lineage response')
+  }
+  return row as unknown as JournalLineageRpcRow
+}
+
+async function fetchSupplierJournalLineage(
+  supabase: SupabaseClient,
+  companyId: string,
+  rootIds: string[],
+): Promise<JournalLineage> {
+  const requestedRootIds = Array.from(new Set(rootIds))
+  const empty = {
+    roots: new Map<string, JournalLineageRow>(),
+    correctionsByParent: new Map<string, JournalLineageRow[]>(),
+    reversalsByParent: new Map<string, JournalLineageRow[]>(),
+  }
+  if (requestedRootIds.length === 0) return empty
+
+  const { data, error } = await supabase.rpc('get_supplier_payment_lineage', {
+    p_company_id: companyId,
+    p_root_ids: requestedRootIds,
+  })
+  if (error) {
+    throw new Error(`Could not fetch supplier payment journal lineage: ${error.message}`)
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('Malformed supplier payment journal lineage response')
+  }
+
+  const payload = data as Record<string, unknown>
+  if (
+    payload.requested_root_count !== requestedRootIds.length
+    || !Array.isArray(payload.rows)
+  ) {
+    throw new Error('Malformed supplier payment journal lineage response')
+  }
+
+  const requested = new Set(requestedRootIds)
+  const roots = new Map<string, JournalLineageRow>()
+  const entriesById = new Map<string, JournalLineageRow>()
+  const corrections = new Map<string, Map<string, JournalLineageRow>>()
+  const reversals = new Map<string, Map<string, JournalLineageRow>>()
+  const rows = payload.rows.map(parseLineageRow)
+
+  for (const row of rows) {
+    assertCommittedLineageEntry(row)
+    if (
+      !requested.has(row.root_id)
+      || row.path[0] !== row.root_id
+      || row.path.at(-1) !== row.id
+      || row.path.length !== row.depth + 1
+    ) {
+      throw new Error(`Malformed supplier payment journal lineage for entry ${row.id}`)
+    }
+    if (row.cycle) {
+      throw new Error(`Cyclic supplier payment journal lineage at entry ${row.id}`)
+    }
+
+    const existing = entriesById.get(row.id)
+    if (existing && (
+      existing.entry_date !== row.entry_date
+      || existing.status !== row.status
+      || existing.source_type !== row.source_type
+      || existing.correction_of_id !== row.correction_of_id
+      || existing.committed_at !== row.committed_at
+      || existing.reverses_id !== row.reverses_id
+    )) {
+      throw new Error(`Conflicting supplier payment journal lineage for entry ${row.id}`)
+    }
+    entriesById.set(row.id, row)
+
+    if (row.edge_kind === 'root') {
+      if (
+        row.parent_id !== null
+        || row.depth !== 0
+        || row.id !== row.root_id
+        || roots.has(row.root_id)
+      ) {
+        throw new Error(`Malformed supplier payment journal root ${row.root_id}`)
+      }
+      roots.set(row.root_id, row)
+      continue
+    }
+
+    if (!row.parent_id || row.depth < 1) {
+      throw new Error(`Malformed supplier payment journal lineage for entry ${row.id}`)
+    }
+    const target = row.edge_kind === 'correction' ? corrections : reversals
+    const siblings = target.get(row.parent_id) ?? new Map<string, JournalLineageRow>()
+    siblings.set(row.id, row)
+    target.set(row.parent_id, siblings)
+  }
+
+  for (const row of rows) {
+    if (row.edge_kind === 'root') continue
+    if (!row.parent_id || !entriesById.has(row.parent_id)) {
+      throw new Error(`Orphaned supplier payment journal lineage at entry ${row.id}`)
+    }
+    if (
+      row.edge_kind === 'correction'
+      && (
+        row.source_type !== 'correction'
+        || row.correction_of_id !== row.parent_id
+        || row.reverses_id !== null
+      )
+    ) {
+      throw new Error(`Malformed correction lineage for supplier payment entry ${row.parent_id}`)
+    }
+    if (
+      row.edge_kind === 'storno'
+      && (
+        row.source_type !== 'storno'
+        || row.status !== 'posted'
+        || row.reverses_id !== row.parent_id
+        || row.correction_of_id !== null
+      )
+    ) {
+      throw new Error(`Malformed storno lineage for supplier payment entry ${row.parent_id}`)
+    }
+  }
+
+  for (const [parentId, children] of corrections) {
+    if (children.size > 1) {
+      throw new Error(`Ambiguous supplier payment correction lineage for entry ${parentId}`)
+    }
+  }
+  for (const [parentId, children] of reversals) {
+    if (children.size > 1) {
+      throw new Error(`Ambiguous supplier payment storno lineage for entry ${parentId}`)
+    }
+  }
+
+  const unresolved = requestedRootIds.filter((id) => !roots.has(id))
+  if (unresolved.length > 0) {
+    throw new Error(
+      `Could not resolve ${unresolved.length} supplier payment journal entries`,
+    )
+  }
+
+  return {
+    roots,
+    correctionsByParent: new Map(
+      Array.from(corrections, ([parentId, children]) => [parentId, Array.from(children.values())]),
+    ),
+    reversalsByParent: new Map(
+      Array.from(reversals, ([parentId, children]) => [parentId, Array.from(children.values())]),
+    ),
+  }
+}
+
+function effectiveAccountingDateAtCutoff(
+  entry: JournalLineageRow,
+  lineage: JournalLineage,
+  asOfDate: string,
+  visiting: Set<string> = new Set(),
+): string | null {
+  assertCommittedLineageEntry(entry)
+  const corrections = lineage.correctionsByParent.get(entry.id) ?? []
+  const reversals = lineage.reversalsByParent.get(entry.id) ?? []
+  if (entry.status === 'posted') {
+    if (corrections.length > 0 || reversals.length > 0) {
+      throw new Error(
+        `Contradictory partial supplier payment journal lineage for posted entry ${entry.id}`,
+      )
+    }
+    return entry.entry_date <= asOfDate ? entry.entry_date : null
+  }
+  if (visiting.has(entry.id)) {
+    throw new Error(`Cyclic supplier payment journal lineage at entry ${entry.id}`)
+  }
+
+  const nextVisiting = new Set(visiting)
+  nextVisiting.add(entry.id)
+  if (corrections.length > 1) {
+    throw new Error(`Ambiguous supplier payment correction lineage for entry ${entry.id}`)
+  }
+  if (reversals.length !== 1) {
+    throw new Error(`Could not resolve storno lineage for supplier payment entry ${entry.id}`)
+  }
+
+  const reversal = reversals[0]
+  assertCommittedLineageEntry(reversal)
+  if (
+    reversal.source_type !== 'storno'
+    || reversal.reverses_id !== entry.id
+    || reversal.status !== 'posted'
+  ) {
+    throw new Error(`Malformed storno lineage for supplier payment entry ${entry.id}`)
+  }
+
+  const correction = corrections[0]
+  if (!correction) {
+    return entry.entry_date <= asOfDate && reversal.entry_date > asOfDate
+      ? entry.entry_date
+      : null
+  }
+
+  assertCommittedLineageEntry(correction)
+  if (
+    correction.source_type !== 'correction'
+    || correction.correction_of_id !== entry.id
+    || reversal.entry_date !== entry.entry_date
+  ) {
+    throw new Error(`Malformed correction lineage for supplier payment entry ${entry.id}`)
+  }
+
+  // The original and same-date storno net to zero immediately. Only the live
+  // correction branch represents the payment, even when its first child is
+  // future-dated and a later correction moves the effect back before cutoff.
+  return effectiveAccountingDateAtCutoff(
+    correction,
+    lineage,
+    asOfDate,
+    nextVisiting,
+  )
+}
 
 /**
  * Fetch the company's payment rows for one of the two invoice ledgers and
@@ -77,9 +345,15 @@ export async function fetchPaymentsAsOf(
     )
   }
 
-  const reversals = new Map<string, ReversalJournalRow>()
+  let supplierRoots = new Map<string, JournalLineageRow>()
+  let supplierLineage: JournalLineage = {
+    roots: supplierRoots,
+    correctionsByParent: new Map(),
+    reversalsByParent: new Map(),
+  }
+  const supplierAllocationsByRoot = new Map<string, Map<string, number>>()
   if (isSupplierLedger) {
-    const reversalIds = new Set<string>()
+    const rootIds = new Set<string>()
     for (const rawRow of rows) {
       const row = rawRow as SupplierPaymentRow & Record<string, unknown>
       const hasReversalTimestamp = row.reversed_at !== null
@@ -87,35 +361,92 @@ export async function fetchPaymentsAsOf(
       if (hasReversalTimestamp !== hasReversalLink) {
         throw new Error(`Malformed supplier payment reversal metadata for ${row.id}`)
       }
-      if (hasReversalLink) {
-        if (!row.journal_entry_id) {
-          throw new Error(`Missing original journal lineage for supplier payment ${row.id}`)
-        }
-        reversalIds.add(row.reversed_by_journal_entry_id as string)
+      if (
+        row.reversed_at !== null
+        && !Number.isFinite(Date.parse(row.reversed_at))
+      ) {
+        throw new Error(`Malformed supplier payment reversal timestamp for ${row.id}`)
+      }
+      if (hasReversalLink && !row.journal_entry_id) {
+        throw new Error(`Missing original journal lineage for supplier payment ${row.id}`)
+      }
+      if (row.journal_entry_id) {
+        const invoiceAmounts = supplierAllocationsByRoot.get(row.journal_entry_id)
+          ?? new Map<string, number>()
+        invoiceAmounts.set(
+          row.supplier_invoice_id,
+          roundOre(
+            (invoiceAmounts.get(row.supplier_invoice_id) ?? 0)
+            + (Number(row.amount) || 0),
+          ),
+        )
+        supplierAllocationsByRoot.set(row.journal_entry_id, invoiceAmounts)
+        rootIds.add(row.journal_entry_id)
       }
     }
 
-    const uniqueIds = Array.from(reversalIds)
-    for (let i = 0; i < uniqueIds.length; i += JOURNAL_ID_CHUNK_SIZE) {
-      const chunk = uniqueIds.slice(i, i + JOURNAL_ID_CHUNK_SIZE)
-      const journalRows = await fetchAllRows<ReversalJournalRow>(({ from, to }) =>
-        supabase
-          .from('journal_entries')
-          .select('id, entry_date, status, source_type, reverses_id')
-          .eq('company_id', companyId)
-          .in('id', chunk)
-          .order('id', { ascending: true })
-          .range(from, to),
-      )
-      for (const journalRow of journalRows) reversals.set(journalRow.id, journalRow)
+    supplierLineage = await fetchSupplierJournalLineage(
+      supabase,
+      companyId,
+      Array.from(rootIds),
+    )
+    supplierRoots = supplierLineage.roots
+
+    for (const rawRow of rows) {
+      const row = rawRow as SupplierPaymentRow & Record<string, unknown>
+      if (!row.reversed_by_journal_entry_id || !row.journal_entry_id) continue
+      const root = supplierRoots.get(row.journal_entry_id)
+      const reversal = (supplierLineage.reversalsByParent.get(row.journal_entry_id) ?? [])
+        .find((entry) => entry.id === row.reversed_by_journal_entry_id)
+      if (
+        root?.status !== 'reversed'
+        || !reversal
+        || reversal.status !== 'posted'
+        || reversal.source_type !== 'storno'
+        || reversal.reverses_id !== row.journal_entry_id
+        || (
+          reversal.committed_at !== null
+          && Date.parse(reversal.committed_at) !== Date.parse(row.reversed_at!)
+        )
+      ) {
+        throw new Error(`Malformed supplier payment reversal lineage for ${row.id}`)
+      }
     }
 
-    const unresolved = uniqueIds.filter((id) => !reversals.has(id))
-    if (unresolved.length > 0) {
-      throw new Error(
-        `Could not resolve ${unresolved.length} supplier payment reversal journal entries`,
+    const accountingDatesByRoot = new Map<string, string | null>()
+    for (const [rootId, root] of supplierRoots) {
+      accountingDatesByRoot.set(
+        rootId,
+        effectiveAccountingDateAtCutoff(root, supplierLineage, asOfDate),
       )
     }
+
+    const paidThrough = new Map<string, number>()
+    const hasRows = new Set<string>()
+    for (const rawRow of rows) {
+      const row = rawRow as SupplierPaymentRow & Record<string, unknown>
+      hasRows.add(row.supplier_invoice_id)
+      if (row.journal_entry_id !== null) continue
+      if (row.payment_date <= asOfDate) {
+        paidThrough.set(
+          row.supplier_invoice_id,
+          roundOre(
+            (paidThrough.get(row.supplier_invoice_id) ?? 0)
+            + (Number(row.amount) || 0),
+          ),
+        )
+      }
+    }
+    for (const [rootId, invoiceAmounts] of supplierAllocationsByRoot) {
+      if (!accountingDatesByRoot.get(rootId)) continue
+      for (const [invoiceId, amount] of invoiceAmounts) {
+        paidThrough.set(
+          invoiceId,
+          roundOre((paidThrough.get(invoiceId) ?? 0) + amount),
+        )
+      }
+    }
+    return { paidThrough, hasRows }
   }
 
   const paidThrough = new Map<string, number>()
@@ -126,25 +457,9 @@ export async function fetchPaymentsAsOf(
     if (!invoiceId) continue
     hasRows.add(invoiceId)
 
-    let liveAtCutoff = true
-    if (isSupplierLedger) {
-      const row = rawRow as SupplierPaymentRow & Record<string, unknown>
-      if (row.reversed_by_journal_entry_id) {
-        const reversal = reversals.get(row.reversed_by_journal_entry_id)
-        if (
-          !reversal ||
-          !reversal.entry_date ||
-          reversal.status !== 'posted' ||
-          reversal.source_type !== 'storno' ||
-          reversal.reverses_id !== row.journal_entry_id
-        ) {
-          throw new Error(`Malformed supplier payment reversal lineage for ${row.id}`)
-        }
-        liveAtCutoff = reversal.entry_date > asOfDate
-      }
-    }
+    const accountingDate = rawRow.payment_date
 
-    if (liveAtCutoff && rawRow.payment_date && rawRow.payment_date <= asOfDate) {
+    if (accountingDate && accountingDate <= asOfDate) {
       const prev = paidThrough.get(invoiceId) ?? 0
       paidThrough.set(invoiceId, roundOre(prev + (Number(rawRow.amount) || 0)))
     }

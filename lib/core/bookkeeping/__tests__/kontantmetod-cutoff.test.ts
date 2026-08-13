@@ -3,6 +3,7 @@ import type { Mock } from 'vitest'
 
 vi.mock('@/lib/bookkeeping/engine', () => ({
   createJournalEntry: vi.fn(),
+  findFiscalPeriod: vi.fn(),
   reverseEntry: vi.fn(),
 }))
 
@@ -27,9 +28,12 @@ import {
 } from '../kontantmetod-cutoff'
 import type { CutoffPayable, CutoffReceivable } from '../kontantmetod-cutoff'
 import { roundOre } from '@/lib/money'
-import { createJournalEntry, reverseEntry } from '@/lib/bookkeeping/engine'
+import { createJournalEntry, findFiscalPeriod, reverseEntry } from '@/lib/bookkeeping/engine'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import { fetchPaymentTotalsByParent } from '@/lib/invoices/payment-totals'
+import { rutorFromTotals } from '@/lib/reports/vat-declaration'
+import { createSupplierInvoiceCashEntry } from '@/lib/bookkeeping/supplier-invoice-entries'
+import { makeSupplierInvoice } from '@/tests/helpers'
 
 const sum = (lines: Array<{ debit_amount: number; credit_amount: number }>) => ({
   debit: roundOre(lines.reduce((s, l) => s + l.debit_amount, 0)),
@@ -113,6 +117,7 @@ const stornoEntry = (
 beforeEach(() => {
   vi.mocked(fetchAllRows).mockReset().mockResolvedValue([])
   vi.mocked(fetchPaymentTotalsByParent).mockReset().mockResolvedValue(new Map())
+  vi.mocked(findFiscalPeriod).mockReset().mockResolvedValue('period-2026')
 })
 
 function mockSupplierCollection(
@@ -483,13 +488,33 @@ describe('collectKontantmetodCutoff: supplier credits', () => {
     expect(sourceQuery.in).toHaveBeenCalledWith('status', ['posted', 'reversed'])
     expect(sourceQuery.lte).not.toHaveBeenCalledWith('entry_date', '2025-12-31')
     expect(sourceQuery.order).toHaveBeenCalledWith('id', { ascending: true })
-    const supplierPaymentQuery = vi.mocked(fetchAllRows).mock.calls[3][0]
+    const supplierPaymentQuery = vi.mocked(fetchAllRows).mock.calls[5][0]
     supplierPaymentQuery({ from: 0, to: 999 })
     expect(sourceQuery.in).toHaveBeenCalledWith('supplier_invoice_id', ['si-original'])
     expect(sourceQuery.in).not.toHaveBeenCalledWith('supplier_invoice_id', [
       'si-original',
       'si-credit',
     ])
+  })
+
+  it('rejects a posted December source root with visible storno and January correction children', async () => {
+    const root = sourceJournalEntry('si-original', {
+      status: 'posted',
+      entry_date: '2025-12-15',
+    })
+    vi.mocked(fetchAllRows)
+      .mockResolvedValueOnce([]) // customer documents
+      .mockResolvedValueOnce([supplierDocument()])
+      .mockResolvedValueOnce([root])
+      .mockResolvedValueOnce([correctionEntry(root.id, '2026-01-15')])
+      .mockResolvedValueOnce([stornoEntry(root.id, '2025-12-15')])
+
+    await expect(collectKontantmetodCutoff(
+      {} as never,
+      'co-1',
+      '2025-01-01',
+      '2025-12-31',
+    )).rejects.toThrow(`Contradictory partial journal lineage for posted entry ${root.id}`)
   })
 
   it('keeps a currently reversed credit live when its uncredit lineage is after cutoff', async () => {
@@ -637,7 +662,7 @@ describe('collectKontantmetodCutoff: supplier credits', () => {
     expect(result.payables.map((row) => row.id)).toEqual(['si-original'])
   })
 
-  it('keeps the parent document effect before a future corrected child', async () => {
+  it('removes the parent document effect before a future corrected child', async () => {
     const root = sourceJournalEntry('si-original', { status: 'reversed' })
     mockSupplierLineage({
       sourceRoots: [root],
@@ -654,7 +679,43 @@ describe('collectKontantmetodCutoff: supplier credits', () => {
       '2025-12-31',
     )
 
-    expect(result.payables).toEqual([])
+    expect(result.payables.map((row) => row.id)).toEqual(['si-original'])
+  })
+
+  it('removes the parent customer document effect before a future corrected child', async () => {
+    const root = sourceJournalEntry('inv-future-correction', {
+      id: 'je-inv-future-correction',
+      source_type: 'invoice_created',
+      status: 'reversed',
+    })
+    vi.mocked(fetchAllRows)
+      .mockResolvedValueOnce([{
+        id: 'inv-future-correction',
+        invoice_number: 'F-FUTURE',
+        total: 1250,
+        total_sek: 1250,
+        vat_amount: 250,
+        vat_amount_sek: 250,
+        vat_treatment: 'standard_25',
+        credited_invoice_id: null,
+        document_type: 'invoice',
+        items: [{ sort_order: 0, line_total: 1000, vat_rate: 25, vat_amount: 250 }],
+      }])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([root])
+      .mockResolvedValueOnce([correctionEntry(root.id, '2026-01-15')])
+      .mockResolvedValueOnce([stornoEntry(root.id, root.entry_date)])
+
+    const result = await collectKontantmetodCutoff(
+      {} as never,
+      'co-1',
+      '2025-01-01',
+      '2025-12-31',
+    )
+
+    expect(result.receivables.map((row) => row.id)).toEqual([
+      'inv-future-correction',
+    ])
   })
 
   it('uses a corrected document child dated on cutoff', async () => {
@@ -894,6 +955,125 @@ describe('collectKontantmetodCutoff: supplier credits', () => {
     expect(result.payables[0]?.outstanding).toBe(outstanding)
   })
 
+  it('aggregates an active duplicate linked allocation pair with öre rounding', async () => {
+    const root = sourceJournalEntry('si-original', {
+      id: 'je-duplicate-payment',
+      source_type: 'supplier_invoice_paid',
+    })
+    mockSupplierLineage({
+      paymentRows: [
+        {
+          id: 'payment-1',
+          supplier_invoice_id: 'si-original',
+          payment_date: '2025-06-30',
+          amount: 100.005,
+          journal_entry_id: root.id,
+        },
+        {
+          id: 'payment-duplicate',
+          supplier_invoice_id: 'si-original',
+          payment_date: '2025-06-30',
+          amount: 100.005,
+          journal_entry_id: root.id,
+        },
+      ],
+      linkedRoots: [root],
+      paymentVoucherRoots: [root],
+    })
+
+    const result = await collectKontantmetodCutoff(
+      {} as never,
+      'co-1',
+      '2025-01-01',
+      '2025-12-31',
+    )
+
+    expect(result.payables[0]?.outstanding).toBe(1049.98)
+  })
+
+  it('collapses a duplicate linked allocation pair before applying its reversal', async () => {
+    const root = sourceJournalEntry('si-original', {
+      id: 'je-duplicate-payment',
+      source_type: 'supplier_invoice_paid',
+      status: 'reversed',
+    })
+    mockSupplierLineage({
+      paymentRows: [
+        {
+          id: 'payment-1',
+          supplier_invoice_id: 'si-original',
+          payment_date: '2025-06-30',
+          amount: 100.005,
+          journal_entry_id: root.id,
+        },
+        {
+          id: 'payment-duplicate',
+          supplier_invoice_id: 'si-original',
+          payment_date: '2025-06-30',
+          amount: 100.005,
+          journal_entry_id: root.id,
+        },
+      ],
+      linkedRoots: [root],
+      paymentVoucherRoots: [root],
+      lineageWaves: [{
+        corrections: [],
+        reversals: [stornoEntry(root.id, '2025-12-31')],
+      }],
+    })
+
+    const result = await collectKontantmetodCutoff(
+      {} as never,
+      'co-1',
+      '2025-01-01',
+      '2025-12-31',
+    )
+
+    expect(result.payables[0]?.outstanding).toBe(1250)
+  })
+
+  it('collapses a duplicate linked allocation pair before following its correction', async () => {
+    const root = sourceJournalEntry('si-original', {
+      id: 'je-duplicate-payment',
+      source_type: 'supplier_invoice_paid',
+      status: 'reversed',
+      entry_date: '2026-01-15',
+    })
+    mockSupplierLineage({
+      paymentRows: [
+        {
+          id: 'payment-1',
+          supplier_invoice_id: 'si-original',
+          payment_date: '2026-01-15',
+          amount: 100.005,
+          journal_entry_id: root.id,
+        },
+        {
+          id: 'payment-duplicate',
+          supplier_invoice_id: 'si-original',
+          payment_date: '2026-01-15',
+          amount: 100.005,
+          journal_entry_id: root.id,
+        },
+      ],
+      linkedRoots: [root],
+      paymentVoucherRoots: [root],
+      lineageWaves: [{
+        corrections: [correctionEntry(root.id, '2025-12-15')],
+        reversals: [stornoEntry(root.id, root.entry_date)],
+      }],
+    })
+
+    const result = await collectKontantmetodCutoff(
+      {} as never,
+      'co-1',
+      '2025-01-01',
+      '2025-12-31',
+    )
+
+    expect(result.payables[0]?.outstanding).toBe(1049.98)
+  })
+
   it.each([
     {
       label: 'on cutoff',
@@ -968,10 +1148,19 @@ describe('collectKontantmetodCutoff: supplier credits', () => {
   })
 
   it.each([
-    { label: 'after cutoff', correctionDate: '2026-01-15' },
-    { label: 'on cutoff', correctionDate: '2025-12-31' },
-  ])('counts a linked payment correction child dated $label', async ({
+    {
+      label: 'after cutoff',
+      correctionDate: '2026-01-15',
+      outstanding: 1250,
+    },
+    {
+      label: 'on cutoff',
+      correctionDate: '2025-12-31',
+      outstanding: 750,
+    },
+  ])('uses a linked payment correction child dated $label', async ({
     correctionDate,
+    outstanding,
   }) => {
     const root = sourceJournalEntry('si-original', {
       id: 'je-payment',
@@ -1003,7 +1192,7 @@ describe('collectKontantmetodCutoff: supplier credits', () => {
       '2025-12-31',
     )
 
-    expect(result.payables[0]?.outstanding).toBe(750)
+    expect(result.payables[0]?.outstanding).toBe(outstanding)
   })
 
   it.each([
@@ -1343,8 +1532,8 @@ describe('buildCutoffLines: fordringar', () => {
     expect(debit?.account_number).toBe('1510')
     expect(debit?.debit_amount).toBe(1250)
 
-    // The whole point: moms parks on 2618, NOT 2611, so it stays out of the
-    // momsdeklaration until the invoice is actually paid.
+    // The final-period cut-off uses 2618, not the ordinary 2611 account. The
+    // declaration map still reports it in ruta 10 for the accounting year.
     const vatLine = receivableLines.find((l) => l.account_number === '2618')
     expect(vatLine?.credit_amount).toBe(250)
     expect(receivableLines.some((l) => l.account_number === '2611')).toBe(false)
@@ -1443,11 +1632,101 @@ describe('buildCutoffLines: skulder', () => {
     expect(credit?.account_number).toBe('2440')
     expect(credit?.credit_amount).toBe(1250)
 
-    // 2648, not 2641: the deduction is not claimable until payment.
+    // 2648, not 2641: the final-period cut-off enters ruta 48 once.
     expect(payableLines.find((l) => l.account_number === VILANDE_INPUT_VAT_ACCOUNT)?.debit_amount).toBe(250)
     expect(payableLines.some((l) => l.account_number === '2641')).toBe(false)
 
     expect(payableLines.find((l) => l.account_number === '5410')?.debit_amount).toBe(1000)
+  })
+
+  it('reports deferred input VAT once across cutoff, reversal, and cash payment', async () => {
+    const toTotals = (
+      lines: Array<{ account_number: string; debit_amount: number; credit_amount: number }>,
+    ) => {
+      const totals = new Map<string, { debit: number; credit: number }>()
+      for (const line of lines) {
+        const current = totals.get(line.account_number) ?? { debit: 0, credit: 0 }
+        current.debit = roundOre(current.debit + line.debit_amount)
+        current.credit = roundOre(current.credit + line.credit_amount)
+        totals.set(line.account_number, current)
+      }
+      return totals
+    }
+
+    const { payableLines: cutoffLines } = buildCutoffLines([], [payable()])
+    const reversalLines = reverseLines(cutoffLines)
+    const invoice = makeSupplierInvoice({
+      id: 'si-1',
+      subtotal: 1000,
+      vat_amount: 250,
+      total: 1250,
+    })
+    vi.mocked(createJournalEntry).mockReset().mockResolvedValue({ id: 'je-payment' } as never)
+    await createSupplierInvoiceCashEntry(
+      null as never,
+      'co-1',
+      'user-1',
+      invoice,
+      [{
+        id: 'si-item-1',
+        supplier_invoice_id: invoice.id,
+        sort_order: 0,
+        description: 'Kontorsmaterial',
+        quantity: 1,
+        unit: 'st',
+        unit_price: 1000,
+        line_total: 1000,
+        account_number: '5410',
+        vat_code: null,
+        vat_rate: 0.25,
+        vat_amount: 250,
+        reverse_charge_rate: null,
+        created_at: '2025-12-15T00:00:00Z',
+      }],
+      '2026-01-15',
+      'swedish_business',
+    )
+    const paymentLines = vi.mocked(createJournalEntry).mock.calls[0][3].lines
+    const controlled2648Contribution = (
+      lines: Array<{ account_number: string; debit_amount: number; credit_amount: number }>,
+    ) => roundOre(lines
+      .filter((line) => line.account_number === VILANDE_INPUT_VAT_ACCOUNT)
+      .reduce((sum, line) => sum + line.debit_amount - line.credit_amount, 0))
+    const decemberContribution = controlled2648Contribution(cutoffLines)
+    const januaryReversalContribution = controlled2648Contribution(reversalLines)
+    const laterPaymentContribution = rutorFromTotals(toTotals(paymentLines)).ruta48
+
+    expect(cutoffLines).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        account_number: '2648',
+        debit_amount: 250,
+        credit_amount: 0,
+      }),
+    ]))
+    expect(reversalLines).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        account_number: '2648',
+        debit_amount: 0,
+        credit_amount: 250,
+      }),
+    ]))
+    expect(paymentLines).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        account_number: '2641',
+        debit_amount: 250,
+        credit_amount: 0,
+      }),
+      expect.objectContaining({
+        account_number: '1930',
+        debit_amount: 0,
+        credit_amount: 1250,
+      }),
+    ]))
+    expect(paymentLines.some((line) => line.account_number === '2440')).toBe(false)
+    expect(decemberContribution).toBe(250)
+    expect(januaryReversalContribution).toBe(-250)
+    expect(laterPaymentContribution).toBe(250)
+    expect(roundOre(januaryReversalContribution + laterPaymentContribution)).toBe(0)
   })
 
   it('splits the net across several expense accounts and still balances', () => {

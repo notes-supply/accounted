@@ -1,5 +1,9 @@
-import { describe, it, expect } from 'vitest'
-import { getStructuredError } from '../get-structured-error'
+import { describe, it, expect, vi } from 'vitest'
+import { errorResponse, getStructuredError } from '../get-structured-error'
+import {
+  CannotDeleteNonDraftError,
+  SupplierPaymentAccountingChangeError,
+} from '@/lib/bookkeeping/errors'
 
 describe('getStructuredError', () => {
   it('extracts code from structured bookkeeping error', () => {
@@ -82,6 +86,53 @@ describe('getStructuredError', () => {
     const result = getStructuredError(new Error('Random gibberish XYZ'))
     expect(result.message_sv).toBeTruthy()
     expect(result.message_sv.length).toBeGreaterThan(0)
+  })
+})
+
+describe('errorResponse', () => {
+  it('returns the exact canonical 409 for retained supplier-payment accounting changes', async () => {
+    const log = { error: vi.fn(), warn: vi.fn() }
+    const response = errorResponse(new SupplierPaymentAccountingChangeError(), log)
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: 'SUPPLIER_PAYMENT_ACCOUNTING_CHANGE_FORBIDDEN',
+        message:
+          'En leverantörsbetalning med sparade betalningsfördelningar kan bara'
+          + ' rättas med ekonomiskt identiska konteringsrader.',
+        message_en:
+          'A supplier payment with retained allocations can only be corrected'
+          + ' with economically identical accounting lines.',
+      },
+    })
+  })
+
+  it('returns the exact canonical 409 for non-draft journal deletion', async () => {
+    const log = { error: vi.fn(), warn: vi.fn() }
+    const response = errorResponse(
+      new CannotDeleteNonDraftError('posted', 'entry-1'),
+      log,
+    )
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: 'CANNOT_DELETE_NON_DRAFT',
+        message:
+          'Endast utkast kan raderas. Bokförda verifikationer återförs via den separata stornoåtgärden.',
+        message_en:
+          'Only draft entries can be deleted. Use the explicit reversal endpoint for a posted entry.',
+        remediation: {
+          description:
+            'Do not retry DELETE. For a posted entry, use POST /api/bookkeeping/journal-entries/{id}/reverse; reversed and cancelled entries remain retained.',
+        },
+        details: {
+          currentStatus: 'posted',
+          reversalEndpoint: '/api/bookkeeping/journal-entries/entry-1/reverse',
+        },
+      },
+    })
   })
 })
 

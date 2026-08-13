@@ -71,6 +71,17 @@ function settingsBuilder(vatLiabilityStartDate: string | null = null) {
   return b
 }
 
+function controlledCutoffBuilder() {
+  const result = { data: [], error: null }
+  const b: Record<string, unknown> = {}
+  for (const m of ['select', 'eq', 'in', 'gte', 'lte', 'order']) {
+    b[m] = vi.fn().mockReturnValue(b)
+  }
+  b.range = vi.fn().mockResolvedValue(result)
+  b.then = (resolve: (v: unknown) => void) => resolve(result)
+  return b
+}
+
 describe('GET /api/reports/vat-declaration', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -80,9 +91,11 @@ describe('GET /api/reports/vat-declaration', () => {
       error: null,
     })
     mockSupabase.rpc.mockResolvedValue({ data: rpcPayload(), error: null })
-    mockSupabase.from.mockImplementation((table: string) => (
-      table === 'company_settings' ? settingsBuilder() : chartBuilder()
-    ))
+    mockSupabase.from.mockImplementation((table: string) => {
+      if (table === 'company_settings') return settingsBuilder()
+      if (table === 'journal_entries') return controlledCutoffBuilder()
+      return chartBuilder()
+    })
   })
 
   it('returns 401 when not authenticated', async () => {
@@ -175,6 +188,7 @@ describe('GET /api/reports/vat-declaration', () => {
     expect(mockSupabase.from.mock.calls.map(([t]) => t)).toEqual([
       'company_settings',
       'chart_of_accounts',
+      'journal_entries',
     ])
     expect(mockSupabase.rpc).toHaveBeenCalledTimes(1)
     expect(mockSupabase.rpc).toHaveBeenCalledWith(

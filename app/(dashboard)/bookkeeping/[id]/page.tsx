@@ -90,7 +90,6 @@ export default function JournalEntryDetailPage({ params }: { params: Promise<{ i
   // action; the detail page used to fire the commit straight from the button.
   const [showCommitConfirm, setShowCommitConfirm] = useState(false)
   const [commitVoucherPreview, setCommitVoucherPreview] = useState<string | null>(null)
-  const [isLastInSeries, setIsLastInSeries] = useState(false)
   const [attachmentCount, setAttachmentCount] = useState(0)
   const [references, setReferences] = useState<UnderlagReference[]>([])
   const [editingNotes, setEditingNotes] = useState(false)
@@ -151,7 +150,6 @@ export default function JournalEntryDetailPage({ params }: { params: Promise<{ i
       const { data } = await chainRes.json()
       setEntry(data.entry)
       setChain(data.chain)
-      setIsLastInSeries(data.is_last_in_series ?? false)
       // Underlag references (linked invoices), best-effort; the verifikat still
       // renders if this fails, it just falls back to documents-only.
       if (refsRes.ok) {
@@ -230,12 +228,9 @@ export default function JournalEntryDetailPage({ params }: { params: Promise<{ i
       const res = await fetch(`/api/bookkeeping/journal-entries/${id}`, { method: 'DELETE' })
       const result = await res.json()
       if (res.ok) {
-        const wasDraft = result.data?.was_draft === true
         toast({
-          title: wasDraft ? t('toast_delete_draft_title') : t('toast_delete_entry_title'),
-          description: wasDraft
-            ? t('toast_delete_draft_description')
-            : t('toast_delete_entry_description', { voucher: formatVoucher(result.data ?? {}) }),
+          title: t('toast_delete_draft_title'),
+          description: t('toast_delete_draft_description'),
         })
         router.push('/bookkeeping')
       } else {
@@ -470,7 +465,7 @@ export default function JournalEntryDetailPage({ params }: { params: Promise<{ i
                 {t('post')}
               </Button>
             )}
-            {(entry.status === 'draft' || isLastInSeries) && (
+            {entry.status === 'draft' && (
               <Button
                 variant="destructive"
                 size="sm"
@@ -480,7 +475,7 @@ export default function JournalEntryDetailPage({ params }: { params: Promise<{ i
                 title={!canWrite ? t('read_only_tooltip') : undefined}
               >
                 {!canWrite && <Lock className="mr-2 h-4 w-4" />}
-                {entry.status === 'draft' ? t('delete_draft') : t('delete_entry')}
+                {t('delete_draft')}
               </Button>
             )}
             {canCorrect && !isOpeningBalance && (
@@ -1172,27 +1167,21 @@ export default function JournalEntryDetailPage({ params }: { params: Promise<{ i
         onConfirm={handleCommit}
       />
 
-      {/* Delete confirmation dialog */}
+      {/* Draft deletion confirmation. Posted entries use the storno dialog. */}
       <ConfirmationDialog
         open={showDeleteConfirm}
         onOpenChange={setShowDeleteConfirm}
         onConfirm={handleDelete}
         isSubmitting={isDeleting}
-        title={entry?.status === 'draft' ? t('delete_draft') : t('delete_entry')}
-        warningText={
-          entry?.status === 'draft'
-            ? t('delete_warning_draft')
-            : t('delete_warning_entry', { voucher: entry ? formatVoucher(entry) : '' })
-        }
+        title={t('delete_draft')}
+        warningText={t('delete_warning_draft')}
         confirmLabel={t('delete_confirm_label')}
       >
         <div className="flex items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/10 p-4">
           <AlertTriangle className="h-5 w-5 text-destructive mt-0.5 shrink-0" />
           <div className="text-sm">
             <p className="font-medium mb-1">{t('delete_dialog_heading')}</p>
-            <p className="text-muted-foreground">
-              {entry?.status === 'draft' ? t('delete_dialog_draft_body') : t('delete_dialog_entry_body')}
-            </p>
+            <p className="text-muted-foreground">{t('delete_dialog_draft_body')}</p>
           </div>
         </div>
       </ConfirmationDialog>

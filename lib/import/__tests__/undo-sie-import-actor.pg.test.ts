@@ -9,25 +9,11 @@ import {
   insertBalancedLines,
 } from '@/tests/pg/fixtures'
 
-// Migration 20260624120000_undo_sie_import_explicit_actor.sql makes
-// undo_sie_import accept the authorising user as p_user_id.
-//
-// Why: the RPC runs on the service-role client (to escape the 8s
-// statement_timeout on large imports). That client is cookie-less, so inside
-// the RPC auth.uid() is NULL: before that fix the role lookup matched nothing
-// and the function ALWAYS raised "Only company owners and admins can undo SIE
-// imports", breaking undo entirely on hosted.
-//
-// Migration 20260727121000_undo_sie_import_caller_guard.sql then closes the
-// hole the COALESCE(p_user_id, auth.uid()) shape opened: EXECUTE is granted
-// to `authenticated`, so any signed-in PostgREST caller could pass an owner's
-// UUID as p_user_id and impersonate them into the gate. p_user_id is now
-// honored ONLY when auth.role() = 'service_role'; every other caller is
-// pinned to its own auth.uid().
-//
-// These tests call the function under a simulated service-role context
-// (runAsServiceRole), which is how the app's service client presents:
-// auth.uid() NULL, auth.role() = 'service_role'.
+// The actor resolution and least-privilege grants remain part of the contract,
+// but completed imports may no longer hard-delete committed bookkeeping.
+// Both the service-role 3-argument call and authenticated 2-argument call must
+// now fail with SQLSTATE 55000 while preserving the import and journal rows.
+// Unauthorized callers still fail earlier with SQLSTATE 42501.
 
 async function insertCompletedImport(params: {
   companyId: string
@@ -82,25 +68,49 @@ async function callUndo(companyId: string, importId: string, actor: string | nul
 }
 
 describe('undo_sie_import: explicit actor (service-client path)', () => {
-  it('succeeds with an owner p_user_id even when auth.uid() is NULL', async () => {
+  it('rejects committed undo for an owner on the service-role path', async () => {
     const { companyId, userId, fiscalPeriodId } = await seedCompany()
     const importId = await insertCompletedImport({ companyId, userId, fiscalPeriodId })
     const jeId = await insertPostedImportEntry({ companyId, userId, fiscalPeriodId })
 
-    const res = await callUndo(companyId, importId, userId)
-    expect(res.rows[0].deleted).toBe(1)
+    await expect(callUndo(companyId, importId, userId)).rejects.toMatchObject({
+      code: '55000',
+    })
 
-    const { rows: jeRows } = await getPool().query(
-      `SELECT 1 FROM public.journal_entries WHERE id = $1`,
+    const { rows: jeRows } = await getPool().query<{ status: string }>(
+      `SELECT status FROM public.journal_entries WHERE id = $1`,
       [jeId],
     )
-    expect(jeRows).toHaveLength(0)
+    expect(jeRows).toEqual([{ status: 'posted' }])
 
     const { rows: impRows } = await getPool().query<{ status: string }>(
       `SELECT status FROM public.sie_imports WHERE id = $1`,
       [importId],
     )
-    expect(impRows[0].status).toBe('undone')
+    expect(impRows[0].status).toBe('completed')
+  })
+
+  it('rejects a completed import whose candidate entry is reversed', async () => {
+    const { companyId, userId, fiscalPeriodId } = await seedCompany()
+    const importId = await insertCompletedImport({ companyId, userId, fiscalPeriodId })
+    const entryId = await insertPostedImportEntry({
+      companyId,
+      userId,
+      fiscalPeriodId,
+    })
+    await getPool().query(
+      `UPDATE public.journal_entries SET status = 'reversed' WHERE id = $1`,
+      [entryId],
+    )
+
+    await expect(callUndo(companyId, importId, userId)).rejects.toMatchObject({
+      code: '55000',
+    })
+    const entry = await getPool().query<{ status: string }>(
+      `SELECT status FROM public.journal_entries WHERE id = $1`,
+      [entryId],
+    )
+    expect(entry.rows).toEqual([{ status: 'reversed' }])
   })
 
   it('raises when no authorising identity is supplied (auth.uid() NULL, p_user_id NULL)', async () => {
@@ -195,29 +205,29 @@ describe('undo_sie_import: explicit actor (service-client path)', () => {
     expect(rows[0].service_role_can).toBe(true)
   })
 
-  it('still resolves the actor from auth.uid() when p_user_id is omitted (backward compat)', async () => {
+  it('rejects committed undo for an authenticated owner using the 2-arg signature', async () => {
     const { companyId, userId, fiscalPeriodId } = await seedCompany()
     const importId = await insertCompletedImport({ companyId, userId, fiscalPeriodId })
-    // Seed a posted import verifikat so undo has something to delete. Without it
-    // the returned count is 0 regardless of behaviour, so the assertion would
-    // pass even if the function deleted nothing: making the count meaningless.
-    await insertPostedImportEntry({ companyId, userId, fiscalPeriodId })
+    const entryId = await insertPostedImportEntry({ companyId, userId, fiscalPeriodId })
 
-    // 2-arg shape: p_user_id defaults to NULL, so the gate falls back to
-    // auth.uid(). withUserContext sets the JWT sub to the owner and runs in a
-    // transaction; assert inside it (the helper rolls back on return).
-    const deleted = await withUserContext(userId, async (client) => {
-      const res = await client.query<{ deleted: number }>(
-        `SELECT public.undo_sie_import($1::uuid, $2::uuid) AS deleted`,
-        [companyId, importId],
-      )
-      const imp = await client.query<{ status: string }>(
-        `SELECT status FROM public.sie_imports WHERE id = $1`,
-        [importId],
-      )
-      expect(imp.rows[0].status).toBe('undone')
-      return res.rows[0].deleted
+    await withUserContext(userId, async (client) => {
+      await expect(
+        client.query(
+          `SELECT public.undo_sie_import($1::uuid, $2::uuid)`,
+          [companyId, importId],
+        ),
+      ).rejects.toMatchObject({ code: '55000' })
     })
-    expect(deleted).toBe(1)
+
+    const importRow = await getPool().query<{ status: string }>(
+      `SELECT status FROM public.sie_imports WHERE id = $1`,
+      [importId],
+    )
+    expect(importRow.rows).toEqual([{ status: 'completed' }])
+    const entryRow = await getPool().query<{ status: string }>(
+      `SELECT status FROM public.journal_entries WHERE id = $1`,
+      [entryId],
+    )
+    expect(entryRow.rows).toEqual([{ status: 'posted' }])
   })
 })

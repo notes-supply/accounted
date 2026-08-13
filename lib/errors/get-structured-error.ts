@@ -26,6 +26,7 @@ import {
   AccountsNotInChartError,
   BookkeepingDatabaseError,
   CannotCorrectNonPostedError,
+  CannotDeleteNonDraftError,
   CannotReverseNonPostedError,
   CannotReverseStornoError,
   DimensionValidationError,
@@ -40,6 +41,7 @@ import {
   NoOpenPeriodForDateError,
   TargetPeriodClosedError,
   TargetPeriodLockedError,
+  SupplierPaymentAccountingChangeError,
   PostCommitReadbackError,
   isBookkeepingError,
 } from '../bookkeeping/errors'
@@ -432,6 +434,16 @@ function extractBookkeepingDetails(err: unknown): { code: string; details?: unkn
   if (err instanceof CannotCorrectNonPostedError) {
     return { code: err.code, details: { currentStatus: err.currentStatus } }
   }
+  if (err instanceof CannotDeleteNonDraftError) {
+    return {
+      code: err.code,
+      details: {
+        currentStatus: err.currentStatus,
+        reversalEndpoint: err.reversalEndpoint,
+      },
+    }
+  }
+  if (err instanceof SupplierPaymentAccountingChangeError) return { code: err.code }
   if (err instanceof EntryAlreadyReversedError) return { code: err.code }
   if (err instanceof CurrencyRevaluationAlreadyExistsError) return { code: err.code }
   if (err instanceof InvalidMappingResultError) {

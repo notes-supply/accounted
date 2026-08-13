@@ -3,29 +3,12 @@ import { describe, expect, it } from 'vitest'
 import { getClient, getPool, runAsServiceRole, withUserContext } from '@/tests/pg/setup'
 import { seedCompany, insertAuthUser, insertCompanyMember } from '@/tests/pg/fixtures'
 
-// Covers the Fortnox re-sync flow:
-//  1. The partial unique index `sie_imports_company_id_file_hash_active_idx`
-//     (added in migration 20260517150000) blocks duplicate (company_id,
-//     file_hash) rows for active statuses but allows them once a prior row
-//     is marked 'replaced' or 'failed'.
-//  2. The replace_sie_import RPC hard-deletes journal entries with
-//     source_type='import' (since 20260526120000), detaches user-attached
-//     documents from them, clears the fiscal-period opening-balance
-//     pointer if it came from the import, and resets voucher_sequences
-//     so the next re-import restarts the series. User-created entries
-//     (source_type='manual', 'bank_transaction', etc.) are left intact.
-//  3. Since 20260727120000 the RPC takes a third argument, p_user_id, and
-//     gates on owner/admin membership. Before that migration the function was
-//     SECURITY DEFINER with EXECUTE held by `anon` and no authorization check
-//     at all, while it set gnubok.allow_delete: an unauthenticated caller
-//     could hard-delete any tenant's imported verifikationer.
-//  4. p_user_id is honored ONLY when auth.role() = 'service_role' (the
-//     cookieless server client); every other caller is pinned to its own
-//     auth.uid(). A plain COALESCE(p_user_id, auth.uid()) would have let any
-//     authenticated PostgREST caller pass an owner's UUID and impersonate
-//     them into the gate. These tests therefore run the RPC under a simulated
-//     service-role context (runAsServiceRole), which is how the app's
-//     rpcClientForBulkDelete path presents.
+// Covers the Fortnox re-sync storage and authorization contracts.
+// Completed imports no longer hard-delete period-wide committed bookkeeping:
+// owner/admin calls fail with SQLSTATE 55000 and preserve entries, lines,
+// documents, pointers, sequences, dimensions, and import state. The existing
+// service-role actor resolution, authenticated fallback, unique-index behavior,
+// statement timeout, overload shape, and least-privilege grants remain covered.
 
 async function insertSIEImport(params: {
   companyId: string
@@ -213,7 +196,7 @@ describe('sie_imports: partial unique index + replace flow', () => {
     expect(newId).toBeTruthy()
   })
 
-  it('replace_sie_import deletes source_type=import entries, leaves manual/bank_transaction posted, and resets voucher_sequences to MAX of remaining', async () => {
+  it('rejects committed replacement and preserves entries, lines, pointers, sequence, and import', async () => {
     const { companyId, userId, fiscalPeriodId } = await seedCompany()
 
     const obEntry = await insertPostedEntry({
@@ -232,20 +215,15 @@ describe('sie_imports: partial unique index + replace flow', () => {
       userId, companyId, fiscalPeriodId, sourceType: 'bank_transaction', voucherNumber: 5,
     })
 
-    // Voucher_sequences advanced past the imports (5 total inserted in series A)
     await insertVoucherSequence({
       companyId, userId, fiscalPeriodId, series: 'A', lastNumber: 5,
     })
-
-    // The fiscal period has its opening_balance_entry_id set to the OB entry,
-    // matching what a real SIE import would have produced.
     await getPool().query(
       `UPDATE public.fiscal_periods
-         SET opening_balance_entry_id = $1, opening_balances_set = true
-       WHERE id = $2`,
+          SET opening_balance_entry_id = $1, opening_balances_set = true
+        WHERE id = $2`,
       [obEntry, fiscalPeriodId],
     )
-
     const importId = await insertSIEImport({
       companyId,
       userId,
@@ -255,64 +233,90 @@ describe('sie_imports: partial unique index + replace flow', () => {
       openingBalanceEntryId: obEntry,
     })
 
-    const { rows } = await callReplace(companyId, importId, userId)
-    expect(rows[0]!.deleted).toBe(3) // OB + 2 import entries
-
-    // The import entries (and their lines) are gone
-    const entries = await getPool().query<{ id: string; status: string }>(
-      `SELECT id, status FROM public.journal_entries WHERE id = ANY($1)`,
-      [[obEntry, importEntry1, importEntry2, manualEntry, txnEntry]],
-    )
-    const statusById = Object.fromEntries(entries.rows.map(r => [r.id, r.status]))
-    expect(statusById[obEntry]).toBeUndefined()
-    expect(statusById[importEntry1]).toBeUndefined()
-    expect(statusById[importEntry2]).toBeUndefined()
-    expect(statusById[manualEntry]).toBe('posted')
-    expect(statusById[txnEntry]).toBe('posted')
-
-    const lines = await getPool().query<{ count: string }>(
-      `SELECT count(*)::text FROM public.journal_entry_lines
-        WHERE journal_entry_id = ANY($1)`,
+    const auditBefore = await getPool().query<{ count: string }>(
+      `SELECT count(*)::text
+         FROM public.audit_log
+        WHERE record_id = ANY($1::uuid[])`,
       [[obEntry, importEntry1, importEntry2]],
     )
-    expect(lines.rows[0]!.count).toBe('0')
 
-    // voucher_sequences reset to max of remaining entries in series A (5, the bank tx)
-    const vs = await getPool().query<{ last_number: number }>(
-      `SELECT last_number FROM public.voucher_sequences
-        WHERE company_id = $1 AND fiscal_period_id = $2 AND voucher_series = 'A'`,
+    await expect(
+      callReplace(companyId, importId, userId),
+    ).rejects.toMatchObject({ code: '55000' })
+
+    const entries = await getPool().query<{ id: string; status: string }>(
+      `SELECT id, status
+         FROM public.journal_entries
+        WHERE id = ANY($1::uuid[])
+        ORDER BY voucher_number`,
+      [[obEntry, importEntry1, importEntry2, manualEntry, txnEntry]],
+    )
+    expect(entries.rows).toEqual([
+      { id: obEntry, status: 'posted' },
+      { id: importEntry1, status: 'posted' },
+      { id: importEntry2, status: 'posted' },
+      { id: manualEntry, status: 'posted' },
+      { id: txnEntry, status: 'posted' },
+    ])
+
+    const lines = await getPool().query<{ count: string }>(
+      `SELECT count(*)::text
+         FROM public.journal_entry_lines
+        WHERE journal_entry_id = ANY($1::uuid[])`,
+      [[obEntry, importEntry1, importEntry2]],
+    )
+    expect(lines.rows[0]!.count).toBe('6')
+
+    const sequence = await getPool().query<{ last_number: number }>(
+      `SELECT last_number
+         FROM public.voucher_sequences
+        WHERE company_id = $1
+          AND fiscal_period_id = $2
+          AND voucher_series = 'A'`,
       [companyId, fiscalPeriodId],
     )
-    expect(vs.rows[0]?.last_number).toBe(5)
+    expect(sequence.rows[0]?.last_number).toBe(5)
 
-    // fiscal_periods OB pointer cleared
-    const fp = await getPool().query<{
+    const period = await getPool().query<{
       opening_balance_entry_id: string | null
       opening_balances_set: boolean
     }>(
       `SELECT opening_balance_entry_id, opening_balances_set
-         FROM public.fiscal_periods WHERE id = $1`,
+         FROM public.fiscal_periods
+        WHERE id = $1`,
       [fiscalPeriodId],
     )
-    expect(fp.rows[0]?.opening_balance_entry_id).toBeNull()
-    expect(fp.rows[0]?.opening_balances_set).toBe(false)
+    expect(period.rows).toEqual([{
+      opening_balance_entry_id: obEntry,
+      opening_balances_set: true,
+    }])
 
-    // sie_imports OB FK cleared, status replaced
     const importRow = await getPool().query<{
       status: string
       replaced_at: string | null
       opening_balance_entry_id: string | null
     }>(
       `SELECT status, replaced_at, opening_balance_entry_id
-         FROM public.sie_imports WHERE id = $1`,
+         FROM public.sie_imports
+        WHERE id = $1`,
       [importId],
     )
-    expect(importRow.rows[0]?.status).toBe('replaced')
-    expect(importRow.rows[0]?.replaced_at).not.toBeNull()
-    expect(importRow.rows[0]?.opening_balance_entry_id).toBeNull()
+    expect(importRow.rows).toEqual([{
+      status: 'completed',
+      replaced_at: null,
+      opening_balance_entry_id: obEntry,
+    }])
+
+    const auditAfter = await getPool().query<{ count: string }>(
+      `SELECT count(*)::text
+         FROM public.audit_log
+        WHERE record_id = ANY($1::uuid[])`,
+      [[obEntry, importEntry1, importEntry2]],
+    )
+    expect(auditAfter.rows).toEqual(auditBefore.rows)
   })
 
-  it('replace_sie_import resets voucher_sequences.last_number to 0 when no entries remain in the series', async () => {
+  it('does not rewind voucher_sequences when committed replacement is rejected', async () => {
     const { companyId, userId, fiscalPeriodId } = await seedCompany()
 
     await insertPostedEntry({
@@ -321,11 +325,9 @@ describe('sie_imports: partial unique index + replace flow', () => {
     await insertPostedEntry({
       userId, companyId, fiscalPeriodId, sourceType: 'import', voucherNumber: 2,
     })
-
     await insertVoucherSequence({
       companyId, userId, fiscalPeriodId, series: 'A', lastNumber: 2,
     })
-
     const importId = await insertSIEImport({
       companyId,
       userId,
@@ -334,17 +336,49 @@ describe('sie_imports: partial unique index + replace flow', () => {
       fiscalPeriodId,
     })
 
-    await callReplace(companyId, importId, userId)
+    await expect(
+      callReplace(companyId, importId, userId),
+    ).rejects.toMatchObject({ code: '55000' })
 
-    const vs = await getPool().query<{ last_number: number }>(
-      `SELECT last_number FROM public.voucher_sequences
-        WHERE company_id = $1 AND fiscal_period_id = $2 AND voucher_series = 'A'`,
+    const sequence = await getPool().query<{ last_number: number }>(
+      `SELECT last_number
+         FROM public.voucher_sequences
+        WHERE company_id = $1
+          AND fiscal_period_id = $2
+          AND voucher_series = 'A'`,
       [companyId, fiscalPeriodId],
     )
-    expect(vs.rows[0]?.last_number).toBe(0)
+    expect(sequence.rows[0]?.last_number).toBe(2)
   })
 
-  it('replace_sie_import detaches documents from deleted entries without losing the document rows', async () => {
+  it('rejects a completed import whose candidate entry is cancelled', async () => {
+    const { companyId, userId, fiscalPeriodId } = await seedCompany()
+    const entryId = await insertPostedEntry({
+      userId, companyId, fiscalPeriodId, sourceType: 'import', voucherNumber: 1,
+    })
+    await getPool().query(
+      `UPDATE public.journal_entries SET status = 'cancelled' WHERE id = $1`,
+      [entryId],
+    )
+    const importId = await insertSIEImport({
+      companyId,
+      userId,
+      fileHash: `hash-${randomUUID()}`,
+      status: 'completed',
+      fiscalPeriodId,
+    })
+
+    await expect(
+      callReplace(companyId, importId, userId),
+    ).rejects.toMatchObject({ code: '55000' })
+    const entry = await getPool().query<{ status: string }>(
+      `SELECT status FROM public.journal_entries WHERE id = $1`,
+      [entryId],
+    )
+    expect(entry.rows).toEqual([{ status: 'cancelled' }])
+  })
+
+  it('does not detach documents when committed replacement is rejected', async () => {
     const { companyId, userId, fiscalPeriodId } = await seedCompany()
 
     const importEntry = await insertPostedEntry({
@@ -353,14 +387,12 @@ describe('sie_imports: partial unique index + replace flow', () => {
     const manualEntry = await insertPostedEntry({
       userId, companyId, fiscalPeriodId, sourceType: 'manual', voucherNumber: 2,
     })
-
     const attachedDoc = await insertDocumentAttachment({
       userId, companyId, journalEntryId: importEntry,
     })
     const manualDoc = await insertDocumentAttachment({
       userId, companyId, journalEntryId: manualEntry,
     })
-
     const importId = await insertSIEImport({
       companyId,
       userId,
@@ -369,30 +401,26 @@ describe('sie_imports: partial unique index + replace flow', () => {
       fiscalPeriodId,
     })
 
-    await callReplace(companyId, importId, userId)
+    await expect(
+      callReplace(companyId, importId, userId),
+    ).rejects.toMatchObject({ code: '55000' })
 
-    // The document attached to the deleted import entry is detached but preserved
-    const detached = await getPool().query<{
+    const documents = await getPool().query<{
       id: string
       journal_entry_id: string | null
-      storage_path: string
-      file_name: string
     }>(
-      `SELECT id, journal_entry_id, storage_path, file_name
-         FROM public.document_attachments WHERE id = $1`,
-      [attachedDoc],
+      `SELECT id, journal_entry_id
+         FROM public.document_attachments
+        WHERE id = ANY($1::uuid[])
+        ORDER BY id`,
+      [[attachedDoc, manualDoc]],
     )
-    expect(detached.rows[0]).toBeTruthy()
-    expect(detached.rows[0]?.journal_entry_id).toBeNull()
-    expect(detached.rows[0]?.storage_path).toBeTruthy()
-    expect(detached.rows[0]?.file_name).toBeTruthy()
-
-    // The document attached to the surviving manual entry is left alone
-    const untouched = await getPool().query<{ journal_entry_id: string | null }>(
-      `SELECT journal_entry_id FROM public.document_attachments WHERE id = $1`,
-      [manualDoc],
-    )
-    expect(untouched.rows[0]?.journal_entry_id).toBe(manualEntry)
+    expect(Object.fromEntries(
+      documents.rows.map((row) => [row.id, row.journal_entry_id]),
+    )).toEqual({
+      [attachedDoc]: importEntry,
+      [manualDoc]: manualEntry,
+    })
   })
 
   it('replace_sie_import and undo_sie_import carry a raised statement_timeout', async () => {
@@ -418,7 +446,6 @@ describe('sie_imports: partial unique index + replace flow', () => {
 
   it('replace_sie_import on an already-replaced import raises', async () => {
     const { companyId, userId, fiscalPeriodId } = await seedCompany()
-
     const importId = await insertSIEImport({
       companyId,
       userId,
@@ -426,8 +453,12 @@ describe('sie_imports: partial unique index + replace flow', () => {
       status: 'completed',
       fiscalPeriodId,
     })
-
-    await callReplace(companyId, importId, userId)
+    await getPool().query(
+      `UPDATE public.sie_imports
+          SET status = 'replaced', replaced_at = now()
+        WHERE id = $1`,
+      [importId],
+    )
 
     await expect(callReplace(companyId, importId, userId)).rejects.toThrow(
       /not found or not in completed status/,
@@ -435,28 +466,19 @@ describe('sie_imports: partial unique index + replace flow', () => {
   })
 })
 
-// Migration 20260727120000_replace_sie_import_authorize_actor.sql.
-//
-// Before it, replace_sie_import was a SECURITY DEFINER function with EXECUTE
-// held by PUBLIC and by `anon`, no company_members lookup, no auth.uid() and
-// no raise, while it called set_config('gnubok.allow_delete', 'true', true) to
-// disarm the BFL immutability and retention triggers. That combination made it
-// an unauthenticated cross-tenant data-destruction primitive over PostgREST.
-//
-// The gate mirrors undo_sie_import (20260624120000) and must fail CLOSED: a
-// NULL role (no membership at all, which is what an anon caller has) is
-// rejected just like a member/viewer role.
+// The owner/admin gate still fails closed before the committed-bookkeeping
+// fence: missing, member, viewer, and spoofed identities get SQLSTATE 42501.
+// Authorized service-role and authenticated calls reach the fence and get
+// SQLSTATE 55000 without mutation.
 describe('replace_sie_import: owner/admin authorization gate', () => {
-  it('succeeds for an owner actor and still deletes the import entries', async () => {
+  it('rejects an owner actor and preserves committed import entries', async () => {
     const { companyId, userId, fiscalPeriodId } = await seedCompany()
-
     const importEntry = await insertPostedEntry({
       userId, companyId, fiscalPeriodId, sourceType: 'import', voucherNumber: 1,
     })
     const manualEntry = await insertPostedEntry({
       userId, companyId, fiscalPeriodId, sourceType: 'manual', voucherNumber: 2,
     })
-
     const importId = await insertSIEImport({
       companyId,
       userId,
@@ -465,28 +487,22 @@ describe('replace_sie_import: owner/admin authorization gate', () => {
       fiscalPeriodId,
     })
 
-    const { rows } = await callReplace(companyId, importId, userId)
-    expect(rows[0]!.deleted).toBe(1)
-
-    const surviving = await getPool().query<{ id: string }>(
-      `SELECT id FROM public.journal_entries WHERE id = ANY($1)`,
-      [[importEntry, manualEntry]],
+    await expect(
+      callReplace(companyId, importId, userId),
+    ).rejects.toMatchObject({ code: '55000' })
+    await expectUntouched(companyId, importId, importEntry)
+    const manual = await getPool().query<{ status: string }>(
+      `SELECT status FROM public.journal_entries WHERE id = $1`,
+      [manualEntry],
     )
-    expect(surviving.rows.map(r => r.id)).toEqual([manualEntry])
-
-    const importRow = await getPool().query<{ status: string }>(
-      `SELECT status FROM public.sie_imports WHERE id = $1`,
-      [importId],
-    )
-    expect(importRow.rows[0]?.status).toBe('replaced')
+    expect(manual.rows).toEqual([{ status: 'posted' }])
   })
 
-  it('succeeds for an admin actor', async () => {
+  it('rejects an admin actor at the committed-bookkeeping fence', async () => {
     const { companyId, userId, fiscalPeriodId } = await seedCompany()
     const adminId = await insertAuthUser()
     await insertCompanyMember({ companyId, userId: adminId, role: 'admin' })
-
-    await insertPostedEntry({
+    const importEntry = await insertPostedEntry({
       userId, companyId, fiscalPeriodId, sourceType: 'import', voucherNumber: 1,
     })
     const importId = await insertSIEImport({
@@ -497,8 +513,10 @@ describe('replace_sie_import: owner/admin authorization gate', () => {
       fiscalPeriodId,
     })
 
-    const { rows } = await callReplace(companyId, importId, adminId)
-    expect(rows[0]!.deleted).toBe(1)
+    await expect(
+      callReplace(companyId, importId, adminId),
+    ).rejects.toMatchObject({ code: '55000' })
+    await expectUntouched(companyId, importId, importEntry)
   })
 
   it('raises for an actor with no membership in the company', async () => {
@@ -650,9 +668,9 @@ describe('replace_sie_import: owner/admin authorization gate', () => {
     await expectUntouched(companyId, importId, importEntry)
   })
 
-  it('still resolves the actor from auth.uid() when p_user_id is omitted', async () => {
+  it('rejects an authenticated owner using the 2-arg signature', async () => {
     const { companyId, userId, fiscalPeriodId } = await seedCompany()
-    await insertPostedEntry({
+    const importEntry = await insertPostedEntry({
       userId, companyId, fiscalPeriodId, sourceType: 'import', voucherNumber: 1,
     })
     const importId = await insertSIEImport({
@@ -663,34 +681,29 @@ describe('replace_sie_import: owner/admin authorization gate', () => {
       fiscalPeriodId,
     })
 
-    // withUserContext sets the JWT sub to the owner and rolls back on return,
-    // so assert inside the callback.
-    const deleted = await withUserContext(userId, async (client) => {
-      const res = await client.query<{ deleted: number }>(
-        `SELECT public.replace_sie_import($1::uuid, $2::uuid) AS deleted`,
-        [companyId, importId],
-      )
-      const imp = await client.query<{ status: string }>(
-        `SELECT status FROM public.sie_imports WHERE id = $1`,
-        [importId],
-      )
-      expect(imp.rows[0]!.status).toBe('replaced')
-      return res.rows[0]!.deleted
+    await withUserContext(userId, async (client) => {
+      await expect(
+        client.query(
+          `SELECT public.replace_sie_import($1::uuid, $2::uuid)`,
+          [companyId, importId],
+        ),
+      ).rejects.toMatchObject({ code: '55000' })
     })
-    expect(deleted).toBe(1)
+    await expectUntouched(companyId, importId, importEntry)
   })
 
-  it('exposes exactly one signature and does not grant EXECUTE to anon', async () => {
-    // The 2-arg overload is dropped by the migration: leaving it in place
-    // would keep an unguarded, unrevoked entry point alive and would make the
-    // 2-arg PostgREST call ambiguous against the new DEFAULT NULL parameter.
+  it('exposes only the guarded undo and replace signatures', async () => {
     const { rows: overloads } = await getPool().query<{ signature: string }>(
       `SELECT p.oid::regprocedure::text AS signature
-         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-        WHERE n.nspname = 'public' AND p.proname = 'replace_sie_import'`,
+         FROM pg_proc p
+         JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public'
+          AND p.proname IN ('replace_sie_import', 'undo_sie_import')
+        ORDER BY p.proname`,
     )
-    expect(overloads.map(r => r.signature)).toEqual([
+    expect(overloads.map((row) => row.signature)).toEqual([
       'replace_sie_import(uuid,uuid,uuid)',
+      'undo_sie_import(uuid,uuid,uuid)',
     ])
 
     const { rows } = await getPool().query<{

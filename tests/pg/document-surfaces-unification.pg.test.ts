@@ -533,10 +533,9 @@ describe('floating supplier-invoice document backfill (migration 20260727180000)
   }
 
   it('anchors a floating doc to the payment verifikat when registration was reversed', async () => {
-    // The reported shape: the invoice PDF was orphaned when the rättelse it
-    // had been relinked onto was deleted (delete_last_voucher has to clear
-    // journal_entry_id), leaving the posted payment verifikat flagged while
-    // the verifikat view still displayed the PDF.
+    // Legacy fixture for the historical production shape: before physical
+    // deletion was restricted to drafts, deleting a corrected voucher could
+    // leave its invoice PDF floating while a payment voucher stayed posted.
     const s = await seedCompany()
     const mkJe = async (n: number, status: 'posted' | 'reversed', sourceType: string) => {
       if (status === 'posted') {

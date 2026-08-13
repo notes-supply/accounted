@@ -43,11 +43,12 @@ describe('ACCOUNT_TO_BOX', () => {
     expect(ACCOUNT_TO_BOX['2634']).toBe('32')
   })
 
-  it('maps all input VAT accounts including parent and domestic RC', () => {
+  it('maps deductible input VAT accounts but not dormant 2648 globally', () => {
     expect(ACCOUNT_TO_BOX['2640']).toBe('48')
     expect(ACCOUNT_TO_BOX['2641']).toBe('48')
     expect(ACCOUNT_TO_BOX['2645']).toBe('48')
     expect(ACCOUNT_TO_BOX['2647']).toBe('48')
+    expect(ACCOUNT_TO_BOX['2648']).toBeUndefined()
     expect(ACCOUNT_TO_BOX['2649']).toBe('48')
   })
 

@@ -8,17 +8,13 @@ import type { VatCheckAccountTotals } from './vat-declaration-checks'
 import { rcBasisTotalsByRate } from './vat-filing-gate'
 import { fetchDynamicRuta05Accounts } from './vat-revenue-accounts'
 import { parseVatPeriodInput } from '@/lib/vat/period-input'
+import { fetchAllRows } from '@/lib/supabase/fetch-all'
 
 /**
- * Calculate VAT declaration (Momsdeklaration) for a given period.
- *
- * Reads directly from the general ledger: sums posted journal entry lines
- * on 26xx (VAT) and 3xxx (revenue) accounts for the period. This makes the
- * momsdeklaration a pure projection from the double-entry bookkeeping ledger.
- *
- * The accounting method (accrual vs cash) is already reflected in when
- * journal entries were created by the entry generators, so no separate
- * filtering logic is needed here.
+ * Reads posted journal entry lines for the period. Static BAS mappings cover
+ * ordinary VAT and revenue accounts. Account 2648 is the deliberate exception:
+ * only app-created cash-method year-end cutoff entries and their verified
+ * reversals contribute, because arbitrary dormant input VAT is not deductible.
  */
 
 /**
@@ -35,7 +31,8 @@ import { parseVatPeriodInput } from '@/lib/vat/period-input'
  *   used by cash-method bookkeepers for invoices not yet paid.
  * Reverse charge output (2614/2624/2634) → ruta 30/31/32 (credit)
  * Import VAT (2615/2625/2635) → ruta 60/61/62 (credit)
- * Input VAT (2640-2649) → ruta 48 (debit), incl. parent 2640
+ * Statically deductible input VAT accounts → ruta 48 (debit), incl. parent 2640
+ *   Account 2648 is source-aware and deliberately absent from this map.
  * Domestic taxable sales (3000-3003) → ruta 05 (credit)
  *   The company's OWN class 3 accounts marked with a moms-sats join ruta 05 on
  *   top of this fixed list: see fetchDynamicRuta05Accounts (#1261). This map
@@ -137,6 +134,20 @@ export const ACCOUNT_RUTA: Record<string, { box: keyof VatDeclarationRutor; side
   '4547': { box: 'ruta50', side: 'debit' },   // Beskattningsunderlag import 6%
 }
 
+/**
+ * Private projection key for the verified 2648 exception. It is intentionally
+ * not a BAS account and never appears in ACCOUNT_RUTA, VAT_ACCOUNTS, or the
+ * exported input-account list.
+ */
+const CONTROLLED_CUTOFF_INPUT_VAT_KEY = '__controlled_cash_method_cutoff_input_vat__'
+const RUTA_PROJECTION: Record<string, {
+  box: keyof VatDeclarationRutor
+  side: 'credit' | 'debit'
+}> = {
+  ...ACCOUNT_RUTA,
+  [CONTROLLED_CUTOFF_INPUT_VAT_KEY]: { box: 'ruta48', side: 'debit' },
+}
+
 const VAT_ACCOUNTS = Object.keys(ACCOUNT_RUTA)
 
 /**
@@ -148,7 +159,7 @@ export const VAT_OUTPUT_ACCOUNTS = Object.entries(ACCOUNT_RUTA)
   .filter(([account, mapping]) => account.startsWith('26') && mapping.side === 'credit')
   .map(([account]) => account)
 
-/** Input VAT accounts feeding ruta 48 (2640-2649 series). */
+/** Statically mapped input VAT accounts feeding ruta 48. */
 export const VAT_INPUT_ACCOUNTS = Object.entries(ACCOUNT_RUTA)
   .filter(([, mapping]) => mapping.box === 'ruta48')
   .map(([account]) => account)
@@ -157,9 +168,9 @@ export const VAT_INPUT_ACCOUNTS = Object.entries(ACCOUNT_RUTA)
  * The reverse-charge INPUT VAT accounts the momsdeklaration completeness check
  * compares rutor 30-32 against: 2645 (beräknad ingående moms på förvärv från
  * utlandet, EU and non-EU) and 2647 (ingående moms, omvänd betalningsskyldighet
- * i Sverige). The other five ruta 48 accounts are not reverse charge and stay
- * out, 2649 (blandad verksamhet) above all: counting it would reintroduce the
- * aggregation the sharpened check exists to remove.
+ * i Sverige). The other five statically mapped ruta 48 accounts are not
+ * reverse charge and stay out, especially 2649 (mixed activities): counting
+ * them would reintroduce the aggregation the sharpened check exists to remove.
  *
  * Mirrors RC_INPUT_ACCOUNTS in ./vat-declaration-checks, which keeps its copy
  * private. The two lists are pinned together behaviourally in
@@ -415,6 +426,326 @@ interface VatTotalsRpcPayload {
   source_type_counts: Record<string, number>
 }
 
+const CUTOFF_PAYABLE_DESCRIPTION = 'Leverantörsskulder vid bokslut (kontantmetoden)'
+const CUTOFF_PAYABLE_REVERSAL_DESCRIPTION =
+  'Vändning leverantörsskulder bokslut (kontantmetoden)'
+
+interface ControlledCutoffLine {
+  account_number: string
+  debit_amount: number
+  credit_amount: number
+}
+
+interface ControlledCutoffRelatedEntry {
+  id: string
+  company_id: string
+  status: string
+  entry_date: string
+  description: string
+  source_type: string | null
+  source_id: string | null
+  reverses_id: string | null
+  reversed_by_id: string | null
+  lines: ControlledCutoffLine[] | null
+}
+
+interface ControlledCutoffQueryEntry extends ControlledCutoffRelatedEntry {
+  reversed_entry?: ControlledCutoffRelatedEntry | ControlledCutoffRelatedEntry[] | null
+  reversal_entry?: ControlledCutoffRelatedEntry | ControlledCutoffRelatedEntry[] | null
+}
+
+function relatedEntry(
+  value: ControlledCutoffRelatedEntry | ControlledCutoffRelatedEntry[] | null | undefined,
+): ControlledCutoffRelatedEntry | null {
+  return value && !Array.isArray(value) ? value : null
+}
+
+function shiftedIsoDate(date: string, days: number): string {
+  const shifted = new Date(`${date}T00:00:00Z`)
+  shifted.setUTCDate(shifted.getUTCDate() + days)
+  return shifted.toISOString().slice(0, 10)
+}
+
+function lineEffectKey(
+  line: ControlledCutoffLine,
+  reverse: boolean,
+): string | null {
+  const debit = Number(reverse ? line.credit_amount : line.debit_amount)
+  const credit = Number(reverse ? line.debit_amount : line.credit_amount)
+  if (
+    !line.account_number
+    || !Number.isFinite(debit)
+    || !Number.isFinite(credit)
+    || debit < 0
+    || credit < 0
+    || (debit === 0) === (credit === 0)
+  ) {
+    return null
+  }
+  return JSON.stringify([
+    line.account_number,
+    Math.round(debit * 100),
+    Math.round(credit * 100),
+  ])
+}
+
+/**
+ * Compare complete line multiplicities, not just the 2648 balance. A forged
+ * reverses_id with an unrelated balancing entry must not inherit cutoff status.
+ */
+function hasExactReversedEffect(
+  original: ControlledCutoffLine[] | null,
+  reversal: ControlledCutoffLine[] | null,
+): boolean {
+  if (!original?.length || !reversal?.length || original.length !== reversal.length) {
+    return false
+  }
+
+  const expected = new Map<string, number>()
+  for (const line of original) {
+    const key = lineEffectKey(line, true)
+    if (!key) return false
+    expected.set(key, (expected.get(key) ?? 0) + 1)
+  }
+  for (const line of reversal) {
+    const key = lineEffectKey(line, false)
+    const remaining = key ? expected.get(key) : undefined
+    if (!key || !remaining) return false
+    if (remaining === 1) expected.delete(key)
+    else expected.set(key, remaining - 1)
+  }
+  return expected.size === 0
+}
+
+function hasAccount(
+  entry: ControlledCutoffRelatedEntry,
+  accounts: readonly string[],
+): boolean {
+  return Boolean(entry.lines?.some((line) => accounts.includes(line.account_number)))
+}
+
+function controlledYearEndKind(
+  entry: ControlledCutoffRelatedEntry,
+): 'cutoff' | 'scheduled_reversal' | null {
+  if (entry.description === CUTOFF_PAYABLE_DESCRIPTION) return 'cutoff'
+  if (entry.description === CUTOFF_PAYABLE_REVERSAL_DESCRIPTION) {
+    return 'scheduled_reversal'
+  }
+  return null
+}
+
+function hasControlledYearEndShape(
+  entry: ControlledCutoffRelatedEntry,
+  companyId: string,
+): boolean {
+  return (
+    entry.company_id === companyId
+    && entry.source_type === 'year_end'
+    && entry.source_id === null
+    && entry.reverses_id === null
+    && controlledYearEndKind(entry) !== null
+    && hasAccount(entry, ['2648'])
+    && !hasAccount(entry, VAT_SETTLEMENT_NET_ACCOUNTS)
+  )
+}
+
+function isExactCutoffStorno(
+  storno: ControlledCutoffRelatedEntry,
+  original: ControlledCutoffRelatedEntry,
+  companyId: string,
+): boolean {
+  return (
+    hasControlledYearEndShape(original, companyId)
+    && original.status === 'reversed'
+    && original.reversed_by_id === storno.id
+    && storno.company_id === companyId
+    && storno.status === 'posted'
+    && storno.source_type === 'storno'
+    && storno.source_id === null
+    && storno.reverses_id === original.id
+    && storno.reversed_by_id === null
+    && storno.description === `Makulering: ${original.description}`
+    && hasAccount(storno, ['2648'])
+    && !hasAccount(storno, VAT_SETTLEMENT_NET_ACCOUNTS)
+    && hasExactReversedEffect(original.lines, storno.lines)
+  )
+}
+
+function hasValidYearEndStatusLineage(
+  entry: ControlledCutoffQueryEntry,
+  companyId: string,
+): boolean {
+  if (entry.status === 'posted') return entry.reversed_by_id === null
+  if (entry.status !== 'reversed' || !entry.reversed_by_id) return false
+  const reversal = relatedEntry(entry.reversal_entry)
+  return Boolean(reversal && isExactCutoffStorno(reversal, entry, companyId))
+}
+
+function verifiedScheduledPairIds(
+  entries: ControlledCutoffQueryEntry[],
+  companyId: string,
+): Set<string> {
+  const controlled = entries.filter((entry) =>
+    entry.company_id === companyId
+    && entry.source_type === 'year_end'
+    && controlledYearEndKind(entry) !== null,
+  )
+  for (const entry of controlled) {
+    if (
+      !hasControlledYearEndShape(entry, companyId)
+      || !hasValidYearEndStatusLineage(entry, companyId)
+    ) {
+      throw new Error(
+        `malformed controlled cash-method cutoff entry ${entry.id}`,
+      )
+    }
+  }
+  const cutoffs = controlled.filter((entry) => controlledYearEndKind(entry) === 'cutoff')
+  const reversals = controlled.filter(
+    (entry) => controlledYearEndKind(entry) === 'scheduled_reversal',
+  )
+  const matchesByCutoff = new Map<string, ControlledCutoffQueryEntry[]>()
+  const matchesByReversal = new Map<string, ControlledCutoffQueryEntry[]>()
+
+  for (const cutoff of cutoffs) {
+    for (const reversal of reversals) {
+      if (
+        reversal.entry_date === shiftedIsoDate(cutoff.entry_date, 1)
+        && hasExactReversedEffect(cutoff.lines, reversal.lines)
+      ) {
+        const cutoffMatches = matchesByCutoff.get(cutoff.id) ?? []
+        cutoffMatches.push(reversal)
+        matchesByCutoff.set(cutoff.id, cutoffMatches)
+        const reversalMatches = matchesByReversal.get(reversal.id) ?? []
+        reversalMatches.push(cutoff)
+        matchesByReversal.set(reversal.id, reversalMatches)
+      }
+    }
+  }
+
+  const verified = new Set<string>()
+  for (const cutoff of cutoffs) {
+    const matches = matchesByCutoff.get(cutoff.id) ?? []
+    if (matches.length !== 1) {
+      throw new Error(
+        `ambiguous controlled cash-method cutoff reversal for ${cutoff.id}`,
+      )
+    }
+    const reversal = matches[0]
+    if ((matchesByReversal.get(reversal.id) ?? []).length !== 1) {
+      throw new Error(
+        `ambiguous controlled cash-method cutoff source for ${reversal.id}`,
+      )
+    }
+    verified.add(cutoff.id)
+    verified.add(reversal.id)
+  }
+  for (const reversal of reversals) {
+    if (!verified.has(reversal.id)) {
+      throw new Error(
+        `orphan controlled cash-method cutoff reversal ${reversal.id}`,
+      )
+    }
+  }
+  return verified
+}
+
+function sumControlledCutoffInputVat(
+  entries: ControlledCutoffQueryEntry[],
+  companyId: string,
+  start: string,
+  end: string,
+): { debit: number; credit: number } {
+  const verifiedPairs = verifiedScheduledPairIds(entries, companyId)
+  let debit = 0
+  let credit = 0
+
+  for (const entry of entries) {
+    if (entry.entry_date < start || entry.entry_date > end) continue
+
+    let include = false
+    if (entry.source_type === 'year_end') {
+      include = (
+        hasControlledYearEndShape(entry, companyId)
+        && hasValidYearEndStatusLineage(entry, companyId)
+        && (verifiedPairs.has(entry.id) || entry.status === 'reversed')
+      )
+    } else if (entry.source_type === 'storno') {
+      const original = relatedEntry(entry.reversed_entry)
+      const claimsControlledStorno = (
+        entry.description === `Makulering: ${CUTOFF_PAYABLE_DESCRIPTION}`
+        || entry.description === `Makulering: ${CUTOFF_PAYABLE_REVERSAL_DESCRIPTION}`
+        || Boolean(original && controlledYearEndKind(original) !== null)
+      )
+      if (
+        claimsControlledStorno
+        && (!original || !isExactCutoffStorno(entry, original, companyId))
+      ) {
+        throw new Error(`malformed controlled cash-method cutoff storno ${entry.id}`)
+      }
+      include = Boolean(original && isExactCutoffStorno(entry, original, companyId))
+    }
+    if (!include) continue
+
+    for (const line of entry.lines ?? []) {
+      if (line.account_number !== '2648') continue
+      debit = round(debit + Number(line.debit_amount))
+      credit = round(credit + Number(line.credit_amount))
+    }
+  }
+
+  return { debit, credit }
+}
+
+/**
+ * Read only 2648-bearing year-end/storno candidates in the requested company
+ * and period, plus one adjacent day for the app-created cutoff pair. Related
+ * storno rows are embedded in the same bounded paginated query, avoiding N+1.
+ */
+async function fetchControlledCutoffInputVat(
+  supabase: SupabaseClient,
+  companyId: string,
+  start: string,
+  end: string,
+): Promise<{ debit: number; credit: number }> {
+  try {
+    const entries = await fetchAllRows<ControlledCutoffQueryEntry>(
+      ({ from, to }) =>
+        supabase
+          .from('journal_entries')
+          .select(`
+            id, company_id, status, entry_date, description,
+            source_type, source_id, reverses_id, reversed_by_id,
+            lines:journal_entry_lines(account_number, debit_amount, credit_amount),
+            vat_lines:journal_entry_lines!inner(id),
+            reversed_entry:journal_entries!journal_entries_reverses_id_fkey(
+              id, company_id, status, entry_date, description,
+              source_type, source_id, reverses_id, reversed_by_id,
+              lines:journal_entry_lines(account_number, debit_amount, credit_amount)
+            ),
+            reversal_entry:journal_entries!journal_entries_reversed_by_id_fkey(
+              id, company_id, status, entry_date, description,
+              source_type, source_id, reverses_id, reversed_by_id,
+              lines:journal_entry_lines(account_number, debit_amount, credit_amount)
+            )
+          `)
+          .eq('company_id', companyId)
+          .in('status', ['posted', 'reversed'])
+          .in('source_type', ['year_end', 'storno'])
+          .gte('entry_date', shiftedIsoDate(start, -1))
+          .lte('entry_date', shiftedIsoDate(end, 1))
+          .eq('vat_lines.account_number', '2648')
+          .order('id', { ascending: true })
+          .range(from, to),
+      { dedupeBy: (entry) => entry.id },
+    )
+    return sumControlledCutoffInputVat(entries, companyId, start, end)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new Error(`controlled cutoff 2648 lookup failed: ${message}`)
+  }
+}
+
 /**
  * Fetch and aggregate debit/credit totals per VAT-relevant account
  * (ACCOUNT_RUTA) for a period. Shared by the declaration calculation and the
@@ -490,8 +821,8 @@ export async function fetchVatAccountTotals(
 
 /**
  * Map aggregated per-account totals to the momsdeklaration boxes, including
- * the recomputed ruta 49 net (FK009). Pure projection over ACCOUNT_RUTA plus
- * the company's own ruta 05 accounts (fetchDynamicRuta05Accounts).
+ * the recomputed ruta 49 net (FK009). Pure projection over the private
+ * RUTA_PROJECTION plus the company's own ruta 05 accounts.
  *
  * `dynamicRuta05Accounts` is optional so callers that only need the 26xx boxes
  * keep working untouched: ruta 05 is a beskattningsunderlag, not moms, so it
@@ -512,7 +843,7 @@ export function rutorFromTotals(
     ruta50: 0, ruta60: 0, ruta61: 0, ruta62: 0,
   }
 
-  for (const [account, mapping] of Object.entries(ACCOUNT_RUTA)) {
+  for (const [account, mapping] of Object.entries(RUTA_PROJECTION)) {
     const t = totals.get(account)
     if (!t) continue
     const balance = mapping.side === 'credit'
@@ -578,9 +909,10 @@ export function rcInputTotalsFromDeclaration(
 /**
  * Calculate VAT declaration from the general ledger.
  *
- * Sums posted journal entry lines on the BAS accounts in ACCOUNT_RUTA per the
- * SKV 4700 form mapping. Pure ledger projection: no supplier classification
- * or other side-channel signals.
+ * Sums posted journal entry lines on the statically mapped BAS accounts.
+ * Account 2648 is admitted only through verified journal metadata and exact
+ * reversal lineage; supplier classification and accounting-method settings
+ * remain irrelevant.
  *
  *   - ruta 49 = (10 + 11 + 12 + 30 + 31 + 32 + 60 + 61 + 62) - 48
  *
@@ -618,13 +950,21 @@ export async function calculateVatDeclaration(
   // konto is user-added and would otherwise never be fetched at all (#1261).
   const dynamicRuta05 = await fetchDynamicRuta05Accounts(supabase, companyId)
 
-  // Fetch and aggregate posted VAT-account activity for the period. The same
-  // RPC round trip carries the per-source_type entry counts for the metadata.
-  const { totals, sourceTypeCounts } = await fetchVatAccountTotals(
-    supabase, companyId, start, end, dynamicRuta05.accounts
-  )
+  // Aggregate statically mapped accounts and resolve the controlled 2648
+  // exception independently. The second query is bounded to this company and
+  // period, pages by entry id, and embeds reversal relations instead of N+1.
+  const [
+    { totals, sourceTypeCounts },
+    controlledCutoffInputVat,
+  ] = await Promise.all([
+    fetchVatAccountTotals(
+      supabase, companyId, start, end, dynamicRuta05.accounts,
+    ),
+    fetchControlledCutoffInputVat(supabase, companyId, start, end),
+  ])
+  totals.set(CONTROLLED_CUTOFF_INPUT_VAT_KEY, controlledCutoffInputVat)
 
-  // Map account balances to momsdeklaration boxes
+  // Map account balances to momsdeklaration boxes.
   const rutor = rutorFromTotals(totals, dynamicRuta05.accounts)
 
   // Compute per-rate base amounts from individual revenue accounts. The

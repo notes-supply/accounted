@@ -216,6 +216,14 @@ const BOOKKEEPING: Record<string, StructuredErrorEntry> = {
     message_sv: 'Endast bokförda verifikationer kan rättas.',
     message_en: 'Only posted entries can be corrected.',
   },
+  SUPPLIER_PAYMENT_ACCOUNTING_CHANGE_FORBIDDEN: {
+    httpStatus: 409,
+    message_sv:
+      'En leverantörsbetalning med sparade betalningsfördelningar kan bara rättas med ekonomiskt identiska konteringsrader.',
+    message_en:
+      'A supplier payment with retained allocations can only be corrected with economically identical accounting lines.',
+    retryable: false,
+  },
   CANNOT_EDIT_NON_DRAFT: {
     httpStatus: 409,
     message_sv: 'Endast utkast kan redigeras. Bokförda verifikationer rättas med storno.',
@@ -223,6 +231,18 @@ const BOOKKEEPING: Record<string, StructuredErrorEntry> = {
     remediation: {
       description: 'Use the correction (storno) flow to change a posted entry instead of editing it.',
     },
+  },
+  CANNOT_DELETE_NON_DRAFT: {
+    httpStatus: 409,
+    message_sv:
+      'Endast utkast kan raderas. Bokförda verifikationer återförs via den separata stornoåtgärden.',
+    message_en:
+      'Only draft entries can be deleted. Use the explicit reversal endpoint for a posted entry.',
+    remediation: {
+      description:
+        'Do not retry DELETE. For a posted entry, use POST /api/bookkeeping/journal-entries/{id}/reverse; reversed and cancelled entries remain retained.',
+    },
+    retryable: false,
   },
   ENTRY_ALREADY_REVERSED: {
     httpStatus: 409,

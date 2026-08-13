@@ -20,6 +20,12 @@ For Swedish accounting-law questions, use the domain skills (`swedish-vat`, `swe
 - `audit/audit-service.ts`: Audit trail and compliance logging
 - `documents/document-service.ts`: Document attachment lifecycle (WORM storage with version chains)
 
+## Journal Deletion and Reversal
+
+- `DELETE /api/bookkeeping/journal-entries/[id]` physically deletes genuine drafts only.
+- Posted entries are never deleted through `DELETE`. Use `POST /api/bookkeeping/journal-entries/[id]/reverse` for the explicit storno flow.
+- Reversed, cancelled, and other non-draft entries remain retained. The delete route must not call `reverseEntry`, emit reversal events, or mutate linked documents, invoices, payments, or transactions.
+
 ## Key BAS Accounts
 
 `1510` Accounts receivable | `1930` Business bank account | `2013` Private withdrawals (EF) | `2440` Accounts payable | `2611`/`2621`/`2631` Output VAT 25%/12%/6% | `2641` Input VAT | `2645` Calculated input VAT (EU) | `2893` Shareholder loan (AB) | `3001`/`3002`/`3003` Revenue 25%/12%/6% | `3305`/`3308` Export/EU service revenue
@@ -41,5 +47,5 @@ Ruta assignment is driven by **BAS account number**, never by a per-line tax cod
 - **Ruta 06/07**: Unused, always 0
 - **Ruta 10/11/12**: Output VAT 25%/12%/6% (2611/2621/2631)
 - **Ruta 39/40**: EU services / Export (3308/3305)
-- **Ruta 48**: Input VAT (2641/2645)
+- **Ruta 48**: Input VAT (2641/2645/2648, where 2648 carries unpaid supplier input VAT in the cash-method final return)
 - **Ruta 49**: Moms att betala/återfå = (10+11+12+30+31+32+60+61+62) − 48

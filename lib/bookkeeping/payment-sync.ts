@@ -12,6 +12,87 @@ export const PAYMENT_SOURCE_TYPES = [
   'supplier_invoice_cash_payment',
 ] as const
 
+type SupplierPaymentReversalCompletionStatus =
+  | 'applied'
+  | 'already_applied'
+  | 'applied_legacy'
+  | 'already_applied_legacy'
+  | 'applied_v1_recovery'
+  | 'already_applied_v1_recovery'
+
+const SUPPLIER_PAYMENT_REVERSAL_COMPLETION_STATUSES: readonly SupplierPaymentReversalCompletionStatus[] = [
+  'applied',
+  'already_applied',
+  'applied_legacy',
+  'already_applied_legacy',
+  'applied_v1_recovery',
+  'already_applied_v1_recovery',
+]
+
+const SUPPLIER_PAYMENT_REVERSAL_RETRY_STATUSES: readonly SupplierPaymentReversalCompletionStatus[] = [
+  'already_applied',
+  'already_applied_legacy',
+  'already_applied_v1_recovery',
+]
+
+function isSupplierPaymentReversalCompletionStatus(
+  status: unknown,
+): status is SupplierPaymentReversalCompletionStatus {
+  return SUPPLIER_PAYMENT_REVERSAL_COMPLETION_STATUSES.includes(
+    status as SupplierPaymentReversalCompletionStatus,
+  )
+}
+
+function hasVerifiedSupplierEventPublication(
+  result: {
+    ok?: unknown
+    status?: unknown
+    event_publication?: {
+      status?: unknown
+      event_outbox_ids?: unknown
+      event_log_count?: unknown
+      webhook_delivery_count?: unknown
+    }
+  } | null,
+): result is {
+  ok: true
+  status: SupplierPaymentReversalCompletionStatus
+  event_publication: {
+    status: 'published' | 'already_published'
+    event_outbox_ids: [string, string]
+    event_log_count: 0 | 2
+    webhook_delivery_count: number
+  }
+} {
+  if (result?.ok !== true || !isSupplierPaymentReversalCompletionStatus(result.status)) {
+    return false
+  }
+
+  const publication = result.event_publication
+  if (
+    !publication
+    || !Array.isArray(publication.event_outbox_ids)
+    || publication.event_outbox_ids.length !== 2
+    || !publication.event_outbox_ids.every(
+      (id) => typeof id === 'string' && id.trim().length > 0,
+    )
+    || publication.event_outbox_ids[0] === publication.event_outbox_ids[1]
+    || typeof publication.webhook_delivery_count !== 'number'
+    || !Number.isInteger(publication.webhook_delivery_count)
+    || publication.webhook_delivery_count < 0
+  ) {
+    return false
+  }
+
+  if (publication.status === 'published') {
+    return publication.event_log_count === 2
+  }
+
+  return publication.status === 'already_published'
+    && SUPPLIER_PAYMENT_REVERSAL_RETRY_STATUSES.includes(result.status)
+    && (publication.event_log_count === 0 || publication.event_log_count === 2)
+}
+
 export function isPaymentSourceType(sourceType: string | null | undefined): boolean {
   if (!sourceType) return false
   return (PAYMENT_SOURCE_TYPES as readonly string[]).includes(sourceType)
@@ -99,29 +180,19 @@ export async function syncInvoiceStatusFromPaymentEntry(
     }
 
     const result = data as {
-      ok?: boolean
-      status?: string
+      ok?: unknown
+      status?: unknown
       event_publication?: {
-        status?: string
-        event_outbox_ids?: unknown[]
-        event_log_count?: number
-        webhook_delivery_count?: number
+        status?: unknown
+        event_outbox_ids?: unknown
+        event_log_count?: unknown
+        webhook_delivery_count?: unknown
       }
     } | null
-    const publication = result?.event_publication
-    if (
-      !result?.ok
-      || !publication
-      || !['published', 'already_published'].includes(publication.status ?? '')
-      || !Array.isArray(publication.event_outbox_ids)
-      || publication.event_outbox_ids.length !== 2
-      || publication.event_outbox_ids[0] === publication.event_outbox_ids[1]
-      || publication.event_log_count !== 2
-      || typeof publication.webhook_delivery_count !== 'number'
-    ) {
+    if (!hasVerifiedSupplierEventPublication(result)) {
       throw new Error(`Supplier payment reversal ${entryId} returned an invalid result`)
     }
-    return publication.status === 'published' ? 'published' : 'already_published'
+    return result.event_publication.status
   } else {
     // Scoped like the supplier branch: filter by invoice_id + company_id so a
     // batch voucher's sibling payment rows don't break the .single().

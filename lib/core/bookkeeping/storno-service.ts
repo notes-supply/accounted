@@ -9,6 +9,7 @@ import { validateBalance, getNextVoucherNumber } from '@/lib/bookkeeping/engine'
 import { normalizeLineDimensions } from '@/lib/bookkeeping/dimension-resolver'
 import { backfillStandardBASAccounts } from '@/lib/bookkeeping/account-backfill'
 import { resolvePeriodStatusForDate } from '@/lib/core/bookkeeping/period-service'
+import { roundOre } from '@/lib/money'
 import {
   AccountsNotInChartError,
   BookkeepingDatabaseError,
@@ -21,15 +22,12 @@ import {
   MeaninglessCorrectionError,
   NoOpenPeriodForDateError,
   TargetPeriodClosedError,
+  SupplierPaymentAccountingChangeError,
   TargetPeriodLockedError,
 } from '@/lib/bookkeeping/errors'
 
-/**
- * Round to 2dp using cents-integer math to avoid 0.1+0.2 drift.
- */
-function round2(n: number): number {
-  return Math.round(n * 100) / 100
-}
+const CORRECTION_ANCESTRY_COLUMNS =
+  'id, company_id, status, source_type, correction_of_id, lines:journal_entry_lines(*)'
 
 /**
  * True when every account's (debit − credit) sum across the proposed lines is
@@ -40,8 +38,8 @@ function round2(n: number): number {
 function netsToZeroPerAccount(lines: CreateJournalEntryLineInput[]): boolean {
   const nets = new Map<string, number>()
   for (const line of lines) {
-    const delta = round2(line.debit_amount || 0) - round2(line.credit_amount || 0)
-    nets.set(line.account_number, (nets.get(line.account_number) || 0) + delta)
+    const delta = roundOre(line.debit_amount || 0) - roundOre(line.credit_amount || 0)
+    nets.set(line.account_number, roundOre((nets.get(line.account_number) || 0) + delta))
   }
   return Array.from(nets.values()).every((n) => Math.abs(n) < 0.005)
 }
@@ -55,15 +53,48 @@ function isIdenticalToOriginal(
   original: JournalEntryLine[]
 ): boolean {
   if (proposed.length !== original.length) return false
-  const key = (acc: string, d: number, c: number) =>
-    `${acc}|${round2(d).toFixed(2)}|${round2(c).toFixed(2)}`
   const proposedKeys = proposed
-    .map((l) => key(l.account_number, l.debit_amount || 0, l.credit_amount || 0))
+    .map((line) => JSON.stringify([
+      line.account_number,
+      roundOre(line.debit_amount || 0),
+      roundOre(line.credit_amount || 0),
+    ]))
     .sort()
   const originalKeys = original
-    .map((l) => key(l.account_number, Number(l.debit_amount) || 0, Number(l.credit_amount) || 0))
+    .map((line) => JSON.stringify([
+      line.account_number,
+      roundOre(Number(line.debit_amount) || 0),
+      roundOre(Number(line.credit_amount) || 0),
+    ]))
     .sort()
   return proposedKeys.every((k, i) => k === originalKeys[i])
+}
+
+function hasIdenticalAccountingEffect(
+  proposed: Array<CreateJournalEntryLineInput | JournalEntryLine>,
+  original: Array<CreateJournalEntryLineInput | JournalEntryLine>,
+): boolean {
+  if (proposed.length !== original.length) return false
+  const key = (line: CreateJournalEntryLineInput | JournalEntryLine) => {
+    const dimensions = Object.entries(normalizeLineDimensions(line))
+      .sort(([left], [right]) => left.localeCompare(right))
+    const amountInCurrency = line.amount_in_currency
+      ? roundOre(Number(line.amount_in_currency))
+      : null
+    return JSON.stringify([
+      line.account_number,
+      roundOre(Number(line.debit_amount) || 0),
+      roundOre(Number(line.credit_amount) || 0),
+      line.currency || 'SEK',
+      amountInCurrency,
+      line.exchange_rate ? Number(line.exchange_rate) : null,
+      line.tax_code || null,
+      dimensions,
+    ])
+  }
+  const proposedKeys = proposed.map(key).sort()
+  const originalKeys = original.map(key).sort()
+  return proposedKeys.every((value, index) => value === originalKeys[index])
 }
 
 /**
@@ -100,6 +131,151 @@ async function cancelEntry(supabase: SupabaseClient, entryId: string): Promise<v
 
 /** Journal entry row fetched together with its lines (the embedded select). */
 type OriginalWithLines = JournalEntry & { lines?: JournalEntryLine[] | null }
+
+type CorrectionAncestryEntry = OriginalWithLines
+
+type SupplierPaymentLink = {
+  id: string
+  journal_entry_id: string
+}
+
+function correctionAncestryError(reason: string): Error {
+  return new Error(`Could not verify supplier payment correction ancestry: ${reason}`)
+}
+
+/**
+ * Resolve the requested entry's company-scoped correction ancestry before any
+ * correction mutation. If the chain originates at a supplier payment with
+ * retained allocations, every committed correction and the proposed
+ * correction must preserve the root's accounting effect.
+ */
+async function assertSupplierPaymentAccountingUnchangedAcrossAncestry(
+  supabase: SupabaseClient,
+  companyId: string,
+  requested: CorrectionAncestryEntry,
+  proposedLines: CreateJournalEntryLineInput[],
+): Promise<void> {
+  const requestedToRoot: CorrectionAncestryEntry[] = []
+  const visited = new Set<string>()
+  let current = requested
+
+  while (true) {
+    if (visited.has(current.id)) {
+      throw correctionAncestryError(`cyclic lineage at entry ${current.id}`)
+    }
+    visited.add(current.id)
+    requestedToRoot.push(current)
+
+    const ancestorId = current.correction_of_id
+    if (!ancestorId) {
+      if (current.source_type === 'correction') {
+        throw correctionAncestryError(`correction ${current.id} has no ancestor`)
+      }
+      break
+    }
+    if (current.source_type !== 'correction') {
+      throw correctionAncestryError(`malformed correction entry ${current.id}`)
+    }
+
+    const { data: ancestor, error } = await supabase
+      .from('journal_entries')
+      .select(CORRECTION_ANCESTRY_COLUMNS)
+      .eq('company_id', companyId)
+      .eq('id', ancestorId)
+      .maybeSingle()
+    if (visited.has(ancestorId)) {
+      throw correctionAncestryError(`cyclic lineage at entry ${ancestorId}`)
+    }
+
+    if (error || !ancestor) {
+      throw correctionAncestryError(`missing or cross-company ancestor ${ancestorId}`)
+    }
+
+    const scopedAncestor = ancestor as CorrectionAncestryEntry
+    if (scopedAncestor.company_id !== companyId) {
+      throw correctionAncestryError(`cross-company ancestor ${ancestorId}`)
+    }
+    if (scopedAncestor.status !== 'reversed') {
+      throw correctionAncestryError(`non-reversed ancestor ${ancestorId}`)
+    }
+    current = scopedAncestor
+  }
+
+  const rootToRequested = requestedToRoot.reverse()
+  const root = rootToRequested[0]
+  const ancestryIds = rootToRequested.map((entry) => entry.id)
+
+  const { data: correctionChildren, error } = await supabase
+    .from('journal_entries')
+    .select('id, correction_of_id')
+    .eq('company_id', companyId)
+    .eq('source_type', 'correction')
+    .in('status', ['posted', 'reversed'])
+    .in('correction_of_id', ancestryIds)
+
+  if (error || !correctionChildren) {
+    throw correctionAncestryError('could not resolve correction children')
+  }
+
+  const childrenByParent = new Map<string, Set<string>>()
+  for (const child of correctionChildren) {
+    if (!child.correction_of_id) {
+      throw correctionAncestryError(`correction ${child.id} has no parent`)
+    }
+    const children = childrenByParent.get(child.correction_of_id) ?? new Set<string>()
+    children.add(child.id)
+    childrenByParent.set(child.correction_of_id, children)
+  }
+
+  for (let index = 0; index < rootToRequested.length - 1; index += 1) {
+    const parent = rootToRequested[index]
+    const expectedChild = rootToRequested[index + 1]
+    const children = childrenByParent.get(parent.id)
+    if (!children || children.size !== 1 || !children.has(expectedChild.id)) {
+      throw correctionAncestryError(`ambiguous lineage at entry ${parent.id}`)
+    }
+  }
+
+  if ((childrenByParent.get(requested.id)?.size ?? 0) !== 0) {
+    throw correctionAncestryError(`ambiguous lineage at entry ${requested.id}`)
+  }
+
+  const { data: supplierPaymentLinks, error: supplierPaymentLinkError } = await supabase
+    .from('supplier_invoice_payments')
+    .select('id, journal_entry_id')
+    .eq('company_id', companyId)
+    .in('journal_entry_id', ancestryIds)
+
+  if (supplierPaymentLinkError || !supplierPaymentLinks) {
+    throw new Error(
+      `Could not verify supplier payment allocations before correction:`
+      + ` ${supplierPaymentLinkError?.message || 'missing allocation result'}`,
+    )
+  }
+
+  const allocationEntryIds = new Set(
+    (supplierPaymentLinks as SupplierPaymentLink[]).map((link) =>
+      link.journal_entry_id || (ancestryIds.length === 1 ? root.id : ''),
+    ),
+  )
+  if (allocationEntryIds.size === 0) return
+  if (allocationEntryIds.size !== 1 || !allocationEntryIds.has(root.id)) {
+    throw correctionAncestryError('allocation-bearing root is ambiguous')
+  }
+
+  for (let index = 1; index < rootToRequested.length; index += 1) {
+    const parentLines = (rootToRequested[index - 1].lines as JournalEntryLine[]) || []
+    const childLines = (rootToRequested[index].lines as JournalEntryLine[]) || []
+    if (!hasIdenticalAccountingEffect(childLines, parentLines)) {
+      throw new SupplierPaymentAccountingChangeError()
+    }
+  }
+
+  const requestedLines = (requested.lines as JournalEntryLine[]) || []
+  if (!hasIdenticalAccountingEffect(proposedLines, requestedLines)) {
+    throw new SupplierPaymentAccountingChangeError()
+  }
+}
 
 /**
  * Correct an existing posted journal entry using the storno method.
@@ -167,6 +343,9 @@ export async function correctEntry(
     }
     original = data as OriginalWithLines
   }
+  if (original.id !== originalEntryId || original.company_id !== companyId) {
+    throw new JournalEntryNotFoundError()
+  }
 
   if (original.status !== 'posted') {
     throw new CannotCorrectNonPostedError(original.status)
@@ -181,6 +360,17 @@ export async function correctEntry(
   const correctedPeriodId = options?.newFiscalPeriodId ?? original.fiscal_period_id
   const dateOrPeriodChanged =
     correctedDate !== original.entry_date || correctedPeriodId !== original.fiscal_period_id
+
+  // Resolve the full company-scoped correction lineage before period/account
+  // backfills or any storno state is created. Supplier allocations stay on
+  // the payment root, so every correction on its live branch must remain
+  // economically identical to that root.
+  await assertSupplierPaymentAccountingUnchangedAcrossAncestry(
+    supabase,
+    companyId,
+    original,
+    correctedLines,
+  )
 
   // Reject when the proposed lines are identical to the original entry: a
   // rättelse must actually change something. Skip this when the date/period is

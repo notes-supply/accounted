@@ -75,14 +75,14 @@ export type VatCheckAccountTotals = ReadonlyMap<string, { debit: number; credit:
  *   2647 Ingående moms, omvänd betalningsskyldighet i Sverige (ML 16 kap:
  *        byggtjänster, skrot, guld, mobiler/datorer över 100 000 kr)
  *
- * The other five accounts ACCOUNT_RUTA maps to ruta 48 are NOT reverse charge
+ * The other six accounts ACCOUNT_RUTA maps to ruta 48 are NOT reverse charge
  * and are deliberately excluded: 2641 (debiterad ingående moms, i.e. VAT
  * actually invoiced to us, which a reverse-charge invoice by definition never
  * carries; also where the import flow books its deductible import VAT), 2640
- * (the summary parent), 2642 (frivillig betalningsskyldighet), 2646 (uthyrning)
- * and 2649 (blandad verksamhet, the deductible portion of shared costs in
- * general). Counting 2649 as RC input would reintroduce exactly the aggregation
- * this check exists to remove.
+ * (the summary parent), 2642 (frivillig betalningsskyldighet), 2646 (uthyrning),
+ * 2648 (cash-method year-end input VAT), and 2649 (blandad verksamhet, the
+ * deductible portion of shared costs in general). Counting 2648 or 2649 as RC
+ * input would reintroduce exactly the aggregation this check exists to remove.
  */
 const RC_INPUT_ACCOUNTS = ['2645', '2647'] as const
 

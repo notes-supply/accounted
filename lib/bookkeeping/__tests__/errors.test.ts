@@ -12,6 +12,8 @@ import {
   InvalidMappingResultError,
   JournalEntryNotBalancedError,
   JournalEntryNotFoundError,
+  SupplierPaymentAccountingChangeError,
+  SUPPLIER_PAYMENT_ACCOUNTING_CHANGE_FORBIDDEN,
   accountsNotInChartResponse,
   bookkeepingErrorResponse,
   isAccountsNotInChartError,
@@ -122,6 +124,16 @@ describe('Typed bookkeeping errors', () => {
     expect(err.currentStatus).toBe('reversed')
   })
 
+  it('SupplierPaymentAccountingChangeError keeps its stable correction contract', () => {
+    const err = new SupplierPaymentAccountingChangeError()
+    expect(err.code).toBe(SUPPLIER_PAYMENT_ACCOUNTING_CHANGE_FORBIDDEN)
+    expect(err.name).toBe('SupplierPaymentAccountingChangeError')
+    expect(err.message).toBe(
+      'A journal entry linked to supplier payment allocations can only be corrected'
+      + ' with economically identical accounting lines',
+    )
+  })
+
   it('EntryAlreadyReversedError has fixed message', () => {
     const err = new EntryAlreadyReversedError()
     expect(err.code).toBe('ENTRY_ALREADY_REVERSED')
@@ -198,6 +210,7 @@ describe('isBookkeepingError', () => {
     expect(isBookkeepingError(new CannotCorrectNonPostedError('draft'))).toBe(true)
     expect(isBookkeepingError(new EntryAlreadyReversedError())).toBe(true)
     expect(isBookkeepingError(new CurrencyRevaluationAlreadyExistsError())).toBe(true)
+    expect(isBookkeepingError(new SupplierPaymentAccountingChangeError())).toBe(true)
     expect(isBookkeepingError(new InvalidMappingResultError('1930', '3001'))).toBe(true)
     expect(isBookkeepingError(new BookkeepingDatabaseError('commit_entry', 'x'))).toBe(true)
     expect(
@@ -293,6 +306,19 @@ describe('bookkeepingErrorResponse', () => {
     const body = await response.json()
     expect(body.error.code).toBe('CANNOT_CORRECT_NON_POSTED')
     expect(body.error.details).toEqual({ currentStatus: 'reversed' })
+  })
+
+  it('returns an exact structured 409 for supplier payment accounting changes', async () => {
+    const response = bookkeepingErrorResponse(new SupplierPaymentAccountingChangeError())!
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: 'SUPPLIER_PAYMENT_ACCOUNTING_CHANGE_FORBIDDEN',
+        message:
+          'En leverantörsbetalning med sparade betalningsfördelningar kan bara'
+          + ' rättas med ekonomiskt identiska konteringsrader.',
+      },
+    })
   })
 
   it('returns 409 for EntryAlreadyReversedError (concurrent conflict)', async () => {

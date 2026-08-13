@@ -69,59 +69,63 @@ async function insertDocumentLinkedToEntry(params: {
 }
 
 describe('delete_last_voucher.pg: RPC + immutability trigger interaction', () => {
-  it('deletes the last posted voucher in a series', async () => {
+  it('rejects an owner deleting an ordinary posted voucher without reusing its number', async () => {
     const { userId, companyId, fiscalPeriodId } = await seedCompany()
     const entryId = await insertPostedEntryWithLines({
       userId, companyId, fiscalPeriodId, voucherNumber: 1,
     })
+    await getPool().query(
+      `INSERT INTO public.voucher_sequences
+         (company_id, user_id, fiscal_period_id, voucher_series, last_number)
+       VALUES ($1, $2, $3, 'A', 1)
+       ON CONFLICT (company_id, fiscal_period_id, voucher_series)
+       DO UPDATE SET last_number = EXCLUDED.last_number`,
+      [companyId, userId, fiscalPeriodId],
+    )
 
     await withUserContext(userId, async (client) => {
-      await client.query(
+      await expect(client.query(
         `SELECT public.delete_last_voucher($1::uuid, $2::uuid)`,
         [companyId, entryId],
+      )).rejects.toThrow(/Only genuine draft journal entries/i)
+
+      const state = await client.query<{ entry_count: number; last_number: number }>(
+        `SELECT
+           (SELECT count(*)::integer FROM public.journal_entries WHERE id = $1) AS entry_count,
+           (SELECT last_number FROM public.voucher_sequences
+             WHERE company_id = $2
+               AND fiscal_period_id = $3
+               AND voucher_series = 'A') AS last_number`,
+        [entryId, companyId, fiscalPeriodId],
       )
-      // Verify inside the txn: withUserContext rolls back on exit, so an
-      // outer pool query would see the row again.
+      expect(state.rows).toEqual([{ entry_count: 1, last_number: 1 }])
+    })
+  })
+
+  it.each([
+    { label: 'a numbered draft', voucherNumber: 7, committedAt: null },
+    { label: 'a draft carrying commit evidence', voucherNumber: 0, committedAt: '2026-06-01T12:00:00Z' },
+  ])('rejects $label as not a genuine draft', async ({ voucherNumber, committedAt }) => {
+    const { userId, companyId, fiscalPeriodId } = await seedCompany()
+    const entryId = await insertDraftJournalEntry({
+      userId,
+      companyId,
+      fiscalPeriodId,
+      voucherNumber,
+      committedAt,
+    })
+    await insertBalancedLines(entryId)
+
+    await withUserContext(userId, async (client) => {
+      await expect(client.query(
+        `SELECT public.delete_last_voucher($1::uuid, $2::uuid)`,
+        [companyId, entryId],
+      )).rejects.toThrow(/Only genuine draft journal entries/i)
       const after = await client.query(
         `SELECT 1 FROM public.journal_entries WHERE id = $1`,
         [entryId],
       )
-      expect(after.rowCount).toBe(0)
-    })
-  })
-
-  it('flips original from reversed back to posted when its storno is deleted', async () => {
-    const { userId, companyId, fiscalPeriodId } = await seedCompany()
-
-    const originalId = await insertPostedEntryWithLines({
-      userId, companyId, fiscalPeriodId, voucherNumber: 1,
-    })
-
-    // Storno: insert with reverses_id already set so the immutability trigger
-    // never sees an UPDATE that adds it after the fact.
-    const stornoId = await insertPostedEntryWithLines({
-      userId, companyId, fiscalPeriodId, voucherNumber: 2,
-      sourceType: 'storno', reversesId: originalId,
-    })
-
-    // Mark original as reversed: posted → reversed is allowed by the state
-    // machine as long as no other fields change.
-    await getPool().query(
-      `UPDATE public.journal_entries SET status = 'reversed', reversed_by_id = $1 WHERE id = $2`,
-      [stornoId, originalId],
-    )
-
-    await withUserContext(userId, async (client) => {
-      await client.query(
-        `SELECT public.delete_last_voucher($1::uuid, $2::uuid)`,
-        [companyId, stornoId],
-      )
-      const restored = await client.query<{ status: string; reversed_by_id: string | null }>(
-        `SELECT status, reversed_by_id FROM public.journal_entries WHERE id = $1`,
-        [originalId],
-      )
-      expect(restored.rows[0]!.status).toBe('posted')
-      expect(restored.rows[0]!.reversed_by_id).toBeNull()
+      expect(after.rowCount).toBe(1)
     })
   })
 
@@ -134,6 +138,80 @@ describe('delete_last_voucher.pg: RPC + immutability trigger interaction', () =>
     await expect(
       getPool().query(`DELETE FROM public.journal_entries WHERE id = $1`, [entryId]),
     ).rejects.toThrow(/Cannot delete journal entries/i)
+  })
+
+  it('rejects a caller-set delete GUC and retains every posted artifact', async () => {
+    const { userId, companyId, fiscalPeriodId } = await seedCompany()
+    const entryId = await insertPostedEntryWithLines({
+      userId, companyId, fiscalPeriodId, voucherNumber: 1,
+    })
+    const documentId = await insertDocumentLinkedToEntry({
+      userId,
+      companyId,
+      journalEntryId: entryId,
+    })
+    await getPool().query(
+      `INSERT INTO public.voucher_sequences
+         (company_id, user_id, fiscal_period_id, voucher_series, last_number)
+       VALUES ($1, $2, $3, 'A', 1)
+       ON CONFLICT (company_id, fiscal_period_id, voucher_series)
+       DO UPDATE SET last_number = EXCLUDED.last_number`,
+      [companyId, userId, fiscalPeriodId],
+    )
+    const beforeAudit = await getPool().query<{ count: number }>(
+      `SELECT count(*)::integer AS count
+         FROM public.audit_log
+        WHERE record_id = $1`,
+      [entryId],
+    )
+
+    await withUserContext(userId, async (client) => {
+      await client.query('SAVEPOINT caller_guc_attack')
+      await client.query(
+        `SELECT set_config('gnubok.allow_delete', 'true', true)`,
+      )
+      await expect(client.query(
+        `DELETE FROM public.journal_entries WHERE id = $1`,
+        [entryId],
+      )).rejects.toThrow(/Cannot delete journal entries/i)
+      await client.query('ROLLBACK TO SAVEPOINT caller_guc_attack')
+
+      const state = await client.query<{
+        entry_count: number
+        line_count: number
+        linked_document_count: number
+        last_number: number
+        audit_count: number
+      }>(
+        `SELECT
+           (SELECT count(*)::integer
+              FROM public.journal_entries
+             WHERE id = $1) AS entry_count,
+           (SELECT count(*)::integer
+              FROM public.journal_entry_lines
+             WHERE journal_entry_id = $1) AS line_count,
+           (SELECT count(*)::integer
+              FROM public.document_attachments
+             WHERE id = $2
+               AND journal_entry_id = $1) AS linked_document_count,
+           (SELECT last_number
+              FROM public.voucher_sequences
+             WHERE company_id = $3
+               AND fiscal_period_id = $4
+               AND voucher_series = 'A') AS last_number,
+           (SELECT count(*)::integer
+              FROM public.audit_log
+             WHERE record_id = $1) AS audit_count`,
+        [entryId, documentId, companyId, fiscalPeriodId],
+      )
+      expect(state.rows).toEqual([{
+        entry_count: 1,
+        line_count: 2,
+        linked_document_count: 1,
+        last_number: 1,
+        audit_count: beforeAudit.rows[0]!.count,
+      }])
+    })
   })
 
   it('blocks UPDATE of arbitrary fields on a posted entry even when bypass flag is set', async () => {
@@ -156,47 +234,42 @@ describe('delete_last_voucher.pg: RPC + immutability trigger interaction', () =>
     }
   })
 
-  it('clears journal_entry_id on attached documents and deletes the voucher', async () => {
-    // Regression for the document-immutability triggers ignoring the
-    // gnubok.allow_delete bypass. delete_last_voucher unlinks documents
-    // (UPDATE document_attachments SET journal_entry_id = NULL) before
-    // deleting the entry; if the trigger refused the unlink the whole RPC
-    // would fail and the entry would remain.
+  it('unlinks an attached document only when deleting a genuine draft', async () => {
     const { userId, companyId, fiscalPeriodId } = await seedCompany()
-    const entryId = await insertPostedEntryWithLines({
-      userId, companyId, fiscalPeriodId, voucherNumber: 1,
+    const entryId = await insertDraftJournalEntry({
+      userId, companyId, fiscalPeriodId,
     })
-    const docId = randomUUID()
-    await getPool().query(
-      `INSERT INTO public.document_attachments
-         (id, user_id, company_id, storage_path, file_name, file_size_bytes,
-          mime_type, sha256_hash, journal_entry_id)
-       VALUES ($1, $2, $3, $4, 'underlag.pdf', 1024, 'application/pdf', $5, $6)`,
-      [
-        docId,
-        userId,
-        companyId,
-        `documents/${userId}/${docId}.pdf`,
-        'a'.repeat(64),
-        entryId,
-      ],
-    )
+    await insertBalancedLines(entryId)
+    const docId = await insertDocumentLinkedToEntry({
+      userId,
+      companyId,
+      journalEntryId: entryId,
+    })
 
     await withUserContext(userId, async (client) => {
       await client.query(
         `SELECT public.delete_last_voucher($1::uuid, $2::uuid)`,
         [companyId, entryId],
       )
-      const entryAfter = await client.query(
-        `SELECT 1 FROM public.journal_entries WHERE id = $1`,
-        [entryId],
+      const state = await client.query<{
+        entry_count: number
+        journal_entry_id: string | null
+        audit_count: number
+      }>(
+        `SELECT
+           (SELECT count(*)::integer FROM public.journal_entries WHERE id = $1) AS entry_count,
+           (SELECT journal_entry_id FROM public.document_attachments WHERE id = $2) AS journal_entry_id,
+           (SELECT count(*)::integer FROM public.audit_log
+             WHERE table_name = 'journal_entries'
+               AND record_id = $1
+               AND action = 'DELETE') AS audit_count`,
+        [entryId, docId],
       )
-      expect(entryAfter.rowCount).toBe(0)
-      const docAfter = await client.query<{ journal_entry_id: string | null }>(
-        `SELECT journal_entry_id FROM public.document_attachments WHERE id = $1`,
-        [docId],
-      )
-      expect(docAfter.rows[0]!.journal_entry_id).toBeNull()
+      expect(state.rows[0]).toMatchObject({
+        entry_count: 0,
+        journal_entry_id: null,
+      })
+      expect(state.rows[0]!.audit_count).toBeGreaterThanOrEqual(1)
     })
   })
 
@@ -289,5 +362,52 @@ describe('delete_last_voucher.pg: RPC + immutability trigger interaction', () =>
       )
       expect(after.rowCount).toBe(0)
     })
+  })
+
+  it('pins the draft-delete RPC and trusted trigger execution boundary', async () => {
+    const signature = 'public.delete_last_voucher(uuid,uuid)'
+    const meta = await getPool().query(
+      `SELECT delete_fn.prosecdef,
+              delete_fn.proconfig,
+              trigger_fn.prosecdef AS trigger_prosecdef,
+              trigger_fn.proconfig AS trigger_proconfig,
+              delete_fn.proowner = trigger_fn.proowner AS owners_match,
+              pg_get_functiondef(trigger_fn.oid)
+                LIKE '%current_user = v_guard_owner%' AS owner_guard,
+              has_function_privilege('anon', $1, 'EXECUTE') AS anon_exec,
+              has_function_privilege('authenticated', $1, 'EXECUTE')
+                AS authenticated_exec,
+              has_function_privilege('service_role', $1, 'EXECUTE')
+                AS service_exec,
+              EXISTS (
+                SELECT 1
+                FROM aclexplode(
+                  COALESCE(
+                    delete_fn.proacl,
+                    acldefault('f', delete_fn.proowner)
+                  )
+                ) acl
+                WHERE acl.grantee = 0
+                  AND acl.privilege_type = 'EXECUTE'
+              ) AS public_exec
+         FROM pg_proc delete_fn
+         CROSS JOIN pg_proc trigger_fn
+        WHERE delete_fn.oid = $1::regprocedure
+          AND trigger_fn.oid =
+            'public.enforce_journal_entry_immutability()'::regprocedure`,
+      [signature],
+    )
+    expect(meta.rows).toEqual([{
+      prosecdef: true,
+      proconfig: ['search_path=pg_catalog, public'],
+      trigger_prosecdef: false,
+      trigger_proconfig: ['search_path=pg_catalog, public'],
+      owners_match: true,
+      owner_guard: true,
+      anon_exec: false,
+      authenticated_exec: true,
+      service_exec: true,
+      public_exec: false,
+    }])
   })
 })

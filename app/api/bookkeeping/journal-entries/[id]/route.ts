@@ -1,15 +1,18 @@
 import { NextResponse } from 'next/server'
 import { ensureInitialized } from '@/lib/init'
 import { eventBus } from '@/lib/events/bus'
-import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { createLogger } from '@/lib/logger'
-import { syncInvoiceStatusFromPaymentEntry } from '@/lib/bookkeeping/payment-sync'
+import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { validateBody } from '@/lib/api/validate'
 import { CreateJournalEntrySchema } from '@/lib/api/schemas'
 import { updateDraftEntry } from '@/lib/bookkeeping/engine'
-import { bookkeepingErrorResponse } from '@/lib/bookkeeping/errors'
-import { reanchorOrphanedSupplierInvoiceDocuments } from '@/lib/core/documents/supplier-invoice-underlag'
+import {
+  BookkeepingDatabaseError,
+  CannotDeleteNonDraftError,
+  JournalEntryNotFoundError,
+  bookkeepingErrorResponse,
+} from '@/lib/bookkeeping/errors'
 
 const logger = createLogger('journal-entries')
 
@@ -45,76 +48,50 @@ export const DELETE = withRouteContext<{ params: Promise<{ id: string }> }>(
   async (_request, { supabase, companyId, user }, { params }) => {
     const { id } = await params
 
-  // Read source_type/source_id before deleting. Customer payment cleanup remains
-  // in TypeScript. Supplier payment cleanup is validated and committed inside
-  // delete_last_voucher so invoice state cannot diverge from the physical
-  // voucher deletion.
-  const { data: entryBefore } = await supabase
-    .from('journal_entries')
-    .select('id, source_type, source_id')
-    .eq('id', id)
-    .eq('company_id', companyId)
-    .single()
+    const { data: entry, error: entryError } = await supabase
+      .from('journal_entries')
+      .select('id, status')
+      .eq('id', id)
+      .eq('company_id', companyId)
+      .single()
 
-  // delete_last_voucher clears journal_entry_id on every document hanging on
-  // the voucher (the FK is ON DELETE RESTRICT, so it has no choice). Capture
-  // them first: a document that is a supplier invoice's retained source
-  // document must be re-anchored to another posted verifikat of that invoice
-  // afterwards, or the invoice's remaining verifikat is left showing the PDF
-  // while every missing-underlag surface (which requires an anchored doc)
-  // keeps warning "Underlag saknas" with no way for the user to resolve it.
-  const { data: linkedDocs } = await supabase
-    .from('document_attachments')
-    .select('id')
-    .eq('company_id', companyId)
-    .eq('journal_entry_id', id)
-
-  const { data, error } = await supabase.rpc('delete_last_voucher', {
-    p_company_id: companyId,
-    p_entry_id: id,
-  })
-
-  if (error) {
-    logger.error('delete_last_voucher failed', { entryId: id, error })
-    return NextResponse.json(
-      { error: getErrorMessage(error, { context: 'journal_entry', statusCode: 400 }) },
-      { status: 400 }
-    )
-  }
-
-  if (entryBefore && !entryBefore.source_type?.startsWith('supplier_invoice')) {
-    try {
-      await syncInvoiceStatusFromPaymentEntry(supabase, companyId, entryBefore)
-    } catch (syncError) {
-      logger.warn('payment status sync failed after delete', { entryId: id, error: syncError })
+    if (entryError || !entry) {
+      throw new JournalEntryNotFoundError()
     }
-  }
 
-  const orphanedDocIds = ((linkedDocs ?? []) as { id: string }[]).map((doc) => doc.id)
-  const reanchored = await reanchorOrphanedSupplierInvoiceDocuments(
-    supabase,
-    companyId,
-    orphanedDocIds,
-  )
-  if (reanchored > 0) {
-    logger.info('re-anchored supplier invoice documents after voucher delete', {
-      entryId: id,
-      count: reanchored,
-    })
-  }
+    if (entry.status === 'draft') {
+      const { data, error } = await supabase.rpc('delete_last_voucher', {
+        p_company_id: companyId,
+        p_entry_id: id,
+      })
 
-  await eventBus.emit({
-    type: 'journal_entry.deleted',
-    payload: {
-      entryId: id,
-      voucherSeries: data.voucher_series,
-      voucherNumber: data.voucher_number,
-      userId: user.id,
-      companyId,
-    },
-  })
+      if (error || !data) {
+        throw new BookkeepingDatabaseError(
+          'delete_draft_entry',
+          error?.message ?? 'The delete RPC returned no result',
+        )
+      }
 
-  return NextResponse.json({ data })
+      await eventBus.emit({
+        type: 'journal_entry.deleted',
+        payload: {
+          entryId: id,
+          voucherSeries: data.voucher_series,
+          voucherNumber: data.voucher_number,
+          userId: user.id,
+          companyId,
+        },
+      })
+
+      return NextResponse.json({
+        data: {
+          action: 'deleted',
+          ...data,
+        },
+      })
+    }
+
+    throw new CannotDeleteNonDraftError(entry.status, id)
   },
   { requireWrite: true },
 )

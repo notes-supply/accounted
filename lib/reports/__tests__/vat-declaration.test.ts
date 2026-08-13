@@ -20,6 +20,31 @@ let chartAccounts: Array<{
 }>
 let vatLiabilityStartDate: string | null
 
+interface ControlledTestLine {
+  account_number: string
+  debit_amount: number
+  credit_amount: number
+}
+
+interface ControlledTestEntry {
+  id: string
+  company_id: string
+  status: string
+  entry_date: string
+  description: string
+  source_type: string | null
+  source_id: string | null
+  reverses_id: string | null
+  reversed_by_id: string | null
+  lines: ControlledTestLine[]
+  reversed_entry?: ControlledTestEntry | null
+  reversal_entry?: ControlledTestEntry | null
+}
+
+let controlledEntries: ControlledTestEntry[]
+let controlledError: { message: string } | null
+let controlledQueries: Array<Record<string, unknown>>
+
 function makeBuilder() {
   const b: Record<string, unknown> = {}
   for (const m of ['select', 'eq', 'neq', 'in', 'gte', 'lte', 'lt', 'or', 'not', 'order', 'range', 'limit']) {
@@ -59,6 +84,17 @@ function makeSettingsBuilder() {
   return b
 }
 
+function makeControlledCutoffBuilder() {
+  const b: Record<string, unknown> = {}
+  for (const m of ['select', 'eq', 'in', 'gte', 'lte', 'order', 'range']) {
+    b[m] = vi.fn().mockReturnValue(b)
+  }
+  b.then = (resolve: (value: unknown) => void) =>
+    resolve({ data: controlledError ? null : controlledEntries, error: controlledError })
+  controlledQueries.push(b)
+  return b
+}
+
 function makeClient() {
   return {
     from: vi.fn().mockImplementation((table: string) =>
@@ -66,7 +102,9 @@ function makeClient() {
         ? makeChartBuilder()
         : table === 'company_settings'
           ? makeSettingsBuilder()
-          : makeBuilder()
+          : table === 'journal_entries'
+            ? makeControlledCutoffBuilder()
+            : makeBuilder()
     ),
     rpc: vi.fn().mockImplementation(async () => results[resultIdx++] ?? { data: null, error: null }),
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -107,6 +145,47 @@ function seedLedger(
   })
 }
 
+const CUTOFF_DESCRIPTION = 'Leverantörsskulder vid bokslut (kontantmetoden)'
+const SCHEDULED_REVERSAL_DESCRIPTION =
+  'Vändning leverantörsskulder bokslut (kontantmetoden)'
+
+function controlledCutoffPair(amount = 250): [ControlledTestEntry, ControlledTestEntry] {
+  const cutoffLines = [
+    { account_number: '5410', debit_amount: 1000, credit_amount: 0 },
+    { account_number: '2648', debit_amount: amount, credit_amount: 0 },
+    { account_number: '2440', debit_amount: 0, credit_amount: 1000 + amount },
+  ]
+  const cutoff: ControlledTestEntry = {
+    id: 'cutoff-1',
+    company_id: 'company-1',
+    status: 'posted',
+    entry_date: '2025-12-31',
+    description: CUTOFF_DESCRIPTION,
+    source_type: 'year_end',
+    source_id: null,
+    reverses_id: null,
+    reversed_by_id: null,
+    lines: cutoffLines,
+  }
+  const reversal: ControlledTestEntry = {
+    id: 'scheduled-reversal-1',
+    company_id: 'company-1',
+    status: 'posted',
+    entry_date: '2026-01-01',
+    description: SCHEDULED_REVERSAL_DESCRIPTION,
+    source_type: 'year_end',
+    source_id: null,
+    reverses_id: null,
+    reversed_by_id: null,
+    lines: cutoffLines.map((line) => ({
+      account_number: line.account_number,
+      debit_amount: line.credit_amount,
+      credit_amount: line.debit_amount,
+    })),
+  }
+  return [cutoff, reversal]
+}
+
 import {
   calculatePeriodDates,
   resolvePeriodDates,
@@ -127,6 +206,9 @@ beforeEach(() => {
   results = []
   chartAccounts = []
   vatLiabilityStartDate = null
+  controlledEntries = []
+  controlledError = null
+  controlledQueries = []
   supabase = makeClient()
 })
 
@@ -155,6 +237,16 @@ describe('rutorFromTotals: ruta 41 (omvänd skattskyldighet, sales side)', () =>
     const findings = runVatDeclarationChecks(rutor)
     expect(findings.map((f) => f.code)).not.toContain('TAXABLE_SALES_WITHOUT_OUTPUT')
     expect(findings.map((f) => f.code)).not.toContain('OUTPUT_VAT_WITHOUT_SALES_BASE')
+  })
+})
+
+describe('rutorFromTotals: dormant input VAT', () => {
+  it('does not assign arbitrary 2648 activity to ruta 48', () => {
+    const rutor = rutorFromTotals(new Map([
+      ['2648', { debit: 250, credit: 0 }],
+    ]))
+    expect(rutor.ruta48).toBe(0)
+    expect(rutor.ruta49).toBe(0)
   })
 })
 
@@ -512,6 +604,146 @@ describe('calculateVatDeclaration', () => {
     const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
 
     expect(result.rutor.ruta48).toBe(700)
+  })
+
+  it('reports the controlled 2648 lifecycle exactly once', async () => {
+    controlledEntries = controlledCutoffPair()
+
+    seedLedger([])
+    const december = await calculateVatDeclaration(
+      supabase, 'company-1', 'monthly', 2025, 12,
+    )
+
+    seedLedger([])
+    const januaryAfterReversal = await calculateVatDeclaration(
+      supabase, 'company-1', 'monthly', 2026, 1,
+    )
+
+    seedLedger([
+      { account_number: '2641', debit_amount: 250, credit_amount: 0 },
+    ])
+    const januaryAfterPayment = await calculateVatDeclaration(
+      supabase, 'company-1', 'monthly', 2026, 1,
+    )
+
+    expect(december.rutor.ruta48).toBe(250)
+    expect(januaryAfterReversal.rutor.ruta48).toBe(-250)
+    expect(januaryAfterPayment.rutor.ruta48).toBe(0)
+    expect(controlledQueries[0].eq).toHaveBeenCalledWith('company_id', 'company-1')
+    expect(controlledQueries[0].gte).toHaveBeenCalledWith('entry_date', '2025-11-30')
+    expect(controlledQueries[0].lte).toHaveBeenCalledWith('entry_date', '2026-01-01')
+  })
+
+  it('ignores manual and SIE-imported dormant 2648', async () => {
+    const [cutoff] = controlledCutoffPair()
+    controlledEntries = [
+      { ...cutoff, id: 'manual-2648', source_type: 'manual' },
+      { ...cutoff, id: 'sie-2648', source_type: 'sie_import' },
+    ]
+    seedLedger([
+      { account_number: '2648', debit_amount: 500, credit_amount: 0 },
+    ])
+
+    const result = await calculateVatDeclaration(
+      supabase, 'company-1', 'monthly', 2025, 12,
+    )
+
+    expect(result.rutor.ruta48).toBe(0)
+  })
+
+  it('ignores unrelated year_end activity on 2648', async () => {
+    const [cutoff] = controlledCutoffPair()
+    controlledEntries = [{
+      ...cutoff,
+      description: 'Skattemässig justering vid bokslut',
+    }]
+    seedLedger([])
+
+    const result = await calculateVatDeclaration(
+      supabase, 'company-1', 'monthly', 2025, 12,
+    )
+
+    expect(result.rutor.ruta48).toBe(0)
+  })
+
+  it('includes an exact storno and aborts on malformed reversal lineage', async () => {
+    const [cutoff] = controlledCutoffPair()
+    const reversedCutoff: ControlledTestEntry = {
+      ...cutoff,
+      status: 'reversed',
+      reversed_by_id: 'storno-1',
+    }
+    controlledEntries = [{
+      id: 'storno-1',
+      company_id: 'company-1',
+      status: 'posted',
+      entry_date: '2026-02-15',
+      description: `Makulering: ${CUTOFF_DESCRIPTION}`,
+      source_type: 'storno',
+      source_id: null,
+      reverses_id: reversedCutoff.id,
+      reversed_by_id: null,
+      lines: reversedCutoff.lines.map((line) => ({
+        account_number: line.account_number,
+        debit_amount: line.credit_amount,
+        credit_amount: line.debit_amount,
+      })),
+      reversed_entry: reversedCutoff,
+    }]
+    seedLedger([])
+
+    const result = await calculateVatDeclaration(
+      supabase, 'company-1', 'monthly', 2026, 2,
+    )
+
+    expect(result.rutor.ruta48).toBe(-250)
+
+    controlledEntries = [{
+      ...controlledEntries[0],
+      reverses_id: 'different-cutoff',
+    }]
+    seedLedger([])
+    await expect(calculateVatDeclaration(
+      supabase, 'company-1', 'monthly', 2026, 2,
+    )).rejects.toThrow(/malformed controlled cash-method cutoff storno/i)
+  })
+
+  it('fails closed on ambiguous scheduled reversal lineage', async () => {
+    const [cutoff, reversal] = controlledCutoffPair()
+    controlledEntries = [
+      cutoff,
+      reversal,
+      { ...reversal, id: 'scheduled-reversal-duplicate' },
+    ]
+    seedLedger([])
+
+    await expect(calculateVatDeclaration(
+      supabase, 'company-1', 'monthly', 2025, 12,
+    )).rejects.toThrow(/ambiguous controlled cash-method cutoff reversal/i)
+  })
+
+  it('aborts when a controlled cutoff pair has settlement-shaped lines', async () => {
+    const [cutoff, reversal] = controlledCutoffPair()
+    const settlementLine = {
+      account_number: '2650',
+      debit_amount: 0,
+      credit_amount: 10,
+    }
+    controlledEntries = [
+      { ...cutoff, lines: [...cutoff.lines, settlementLine] },
+      {
+        ...reversal,
+        lines: [
+          ...reversal.lines,
+          { account_number: '2650', debit_amount: 10, credit_amount: 0 },
+        ],
+      },
+    ]
+    seedLedger([])
+
+    await expect(calculateVatDeclaration(
+      supabase, 'company-1', 'monthly', 2025, 12,
+    )).rejects.toThrow(/malformed controlled cash-method cutoff entry/i)
   })
 
   it('maps EU/export revenue to ruta39/ruta40', async () => {

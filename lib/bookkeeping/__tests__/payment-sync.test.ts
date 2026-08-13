@@ -104,12 +104,12 @@ describe('syncInvoiceStatusFromPaymentEntry', () => {
       error: null,
     })
 
-    await syncInvoiceStatusFromPaymentEntry(
+    await expect(syncInvoiceStatusFromPaymentEntry(
       supabase as never,
       'co-1',
       entry(),
       'storno-1',
-    )
+    )).resolves.toBe('published')
 
     expect(supabase.rpc).toHaveBeenCalledTimes(1)
     expect(supabase.rpc).toHaveBeenCalledWith('apply_supplier_payment_reversal', {
@@ -182,6 +182,32 @@ describe('syncInvoiceStatusFromPaymentEntry', () => {
     })
   })
 
+  it('accepts an exact cleanup-safe retry after event_log retention cleanup', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({
+      data: {
+        ok: true,
+        status: 'already_applied',
+        allocation_count: 1,
+        invoice_count: 1,
+        transaction_count: 0,
+        event_publication: {
+          ...eventPublication,
+          status: 'already_published',
+          event_log_count: 0,
+        },
+      },
+      error: null,
+    })
+
+    await expect(syncInvoiceStatusFromPaymentEntry(
+      supabase as never,
+      'co-1',
+      entry(),
+      'storno-retry',
+    )).resolves.toBe('already_published')
+  })
+
   it('fails before the RPC when a supplier reversal lacks a storno id', async () => {
     const { supabase } = createQueuedMockSupabase()
 
@@ -230,6 +256,91 @@ describe('syncInvoiceStatusFromPaymentEntry', () => {
 
     expect(supabase.rpc).toHaveBeenCalledTimes(1)
     expect(supabase.from).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      label: 'missing outbox identities',
+      completionStatus: 'applied',
+      publication: { ...eventPublication, event_outbox_ids: undefined },
+    },
+    {
+      label: 'an empty outbox identity',
+      completionStatus: 'applied',
+      publication: { ...eventPublication, event_outbox_ids: ['', 'event-reversed'] },
+    },
+    {
+      label: 'a non-string outbox identity',
+      completionStatus: 'applied',
+      publication: { ...eventPublication, event_outbox_ids: [null, 'event-reversed'] },
+    },
+    {
+      label: 'duplicate outbox identities',
+      completionStatus: 'applied',
+      publication: { ...eventPublication, event_outbox_ids: ['same-event', 'same-event'] },
+    },
+    {
+      label: 'a newly published zero event_log count',
+      completionStatus: 'applied',
+      publication: { ...eventPublication, event_log_count: 0 },
+    },
+    {
+      label: 'a malformed event_log count',
+      completionStatus: 'applied',
+      publication: { ...eventPublication, event_log_count: '2' },
+    },
+    {
+      label: 'an already-published partial event_log count',
+      completionStatus: 'already_applied',
+      publication: {
+        ...eventPublication,
+        status: 'already_published',
+        event_log_count: 1,
+      },
+    },
+    {
+      label: 'an already-published unexpected event_log count',
+      completionStatus: 'already_applied',
+      publication: {
+        ...eventPublication,
+        status: 'already_published',
+        event_log_count: 3,
+      },
+    },
+    {
+      label: 'a newly applied completion claiming prior publication',
+      completionStatus: 'applied',
+      publication: {
+        ...eventPublication,
+        status: 'already_published',
+        event_log_count: 0,
+      },
+    },
+    {
+      label: 'an unknown completion state',
+      completionStatus: 'complete',
+      publication: eventPublication,
+    },
+  ])('rejects $label from the supplier reversal RPC', async ({
+    completionStatus,
+    publication,
+  }) => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({
+      data: {
+        ok: true,
+        status: completionStatus,
+        event_publication: publication,
+      },
+      error: null,
+    })
+
+    await expect(syncInvoiceStatusFromPaymentEntry(
+      supabase as never,
+      'co-1',
+      entry(),
+      'storno-invalid',
+    )).rejects.toThrow(/returned an invalid result/)
   })
 
   it('keeps legacy cash compatibility inside the same atomic RPC', async () => {

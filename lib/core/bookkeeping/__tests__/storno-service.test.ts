@@ -1,7 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { eventBus } from '@/lib/events/bus'
 import { makeJournalEntry, makeJournalEntryLine } from '@/tests/helpers'
-import { BookkeepingDatabaseError, MeaninglessCorrectionError } from '@/lib/bookkeeping/errors'
+import type { JournalEntry } from '@/types'
+import {
+  BookkeepingDatabaseError,
+  MeaninglessCorrectionError,
+  SupplierPaymentAccountingChangeError,
+} from '@/lib/bookkeeping/errors'
 
 // ============================================================
 // Mock: separate client (no .then) from query builder (thenable)
@@ -10,18 +15,53 @@ import { BookkeepingDatabaseError, MeaninglessCorrectionError } from '@/lib/book
 let resultIdx: number
 let results: Array<{ data?: unknown; error?: unknown }>
 let inserts: Array<{ table: string; payload: unknown }>
+let supplierPaymentLinks: Array<{ id: string; journal_entry_id: string }>
+let ancestryEntries: Map<string, JournalEntry>
+let correctionChildren: Array<{ id: string; correction_of_id: string; status?: string }>
 
 function makeBuilder(table: string) {
   const b: Record<string, unknown> = {}
-  for (const m of ['select', 'eq', 'in', 'update', 'delete']) {
+  const eqValues: Record<string, unknown> = {}
+  const inValues: Record<string, unknown[]> = {}
+  for (const m of ['select', 'update', 'delete', 'limit']) {
     b[m] = vi.fn().mockReturnValue(b)
   }
+  b.eq = vi.fn().mockImplementation((column: string, value: unknown) => {
+    eqValues[column] = value
+    return b
+  })
+  b.in = vi.fn().mockImplementation((column: string, values: unknown[]) => {
+    inValues[column] = values
+    return b
+  })
   b.insert = vi.fn().mockImplementation((payload: unknown) => {
     inserts.push({ table, payload })
     return b
   })
-  b.single = vi.fn().mockImplementation(async () => results[resultIdx++] ?? { data: null, error: null })
-  b.then = (resolve: (v: unknown) => void) => resolve(results[resultIdx++] ?? { data: null, error: null })
+  b.single = vi.fn().mockImplementation(
+    async () => results[resultIdx++] ?? { data: null, error: null },
+  )
+  b.maybeSingle = vi.fn().mockImplementation(async () => {
+    const entry = ancestryEntries.get(String(eqValues.id))
+    if (!entry || entry.company_id !== eqValues.company_id) {
+      return { data: null, error: null }
+    }
+    return { data: entry, error: null }
+  })
+  b.then = (resolve: (v: unknown) => void) => {
+    if (table === 'supplier_invoice_payments') {
+      return resolve({ data: supplierPaymentLinks, error: null })
+    }
+    if (table === 'journal_entries' && inValues.correction_of_id) {
+      return resolve({
+        data: correctionChildren.filter((child) =>
+          inValues.correction_of_id.includes(child.correction_of_id),
+        ),
+        error: null,
+      })
+    }
+    return resolve(results[resultIdx++] ?? { data: null, error: null })
+  }
   return b
 }
 
@@ -52,6 +92,9 @@ beforeEach(() => {
   resultIdx = 0
   results = []
   inserts = []
+  supplierPaymentLinks = []
+  ancestryEntries = new Map()
+  correctionChildren = []
 
   // Reset the mock implementations after clearAllMocks
   vi.mocked(validateBalance).mockReturnValue({ valid: true, totalDebit: 1000, totalCredit: 1000 })
@@ -143,6 +186,327 @@ describe('correctEntry', () => {
         { account_number: '1930', debit_amount: 0, credit_amount: 1000 },
       ])
     ).rejects.toThrow('not balanced')
+  })
+
+  it('rejects economic line changes for a supplier-payment-linked entry before mutation', async () => {
+    const linkedOriginal = makeJournalEntry({
+      ...originalEntry,
+      lines: [
+        makeJournalEntryLine({
+          account_number: '2440',
+          debit_amount: 500,
+          credit_amount: 0,
+        }),
+        makeJournalEntryLine({
+          account_number: '1930',
+          debit_amount: 0,
+          credit_amount: 500,
+        }),
+      ],
+    })
+    vi.mocked(validateBalance).mockReturnValue({
+      valid: true,
+      totalDebit: 300,
+      totalCredit: 300,
+    })
+    supplierPaymentLinks = [{
+      id: 'supplier-payment-1',
+      journal_entry_id: 'orig-1',
+    }]
+    results = [{ data: linkedOriginal, error: null }]
+    const supabase = makeClient()
+
+    const error = await correctEntry(
+      supabase as never,
+      'company-1',
+      'user-1',
+      'orig-1',
+      [
+        { account_number: '2440', debit_amount: 300, credit_amount: 0 },
+        { account_number: '1930', debit_amount: 0, credit_amount: 300 },
+      ],
+    ).catch((caught: unknown) => caught)
+
+    expect(error).toBeInstanceOf(SupplierPaymentAccountingChangeError)
+    expect(error).toMatchObject({
+      code: 'SUPPLIER_PAYMENT_ACCOUNTING_CHANGE_FORBIDDEN',
+      message:
+        'A journal entry linked to supplier payment allocations can only be corrected'
+        + ' with economically identical accounting lines',
+    })
+
+    expect(inserts).toEqual([])
+    expect(getNextVoucherNumber).not.toHaveBeenCalled()
+    expect(supabase.from.mock.calls.map(([table]) => table)).toEqual([
+      'journal_entries',
+      'journal_entries',
+      'supplier_invoice_payments',
+    ])
+  })
+
+  it('rejects an economic correction after a date-only correction of an allocated root', async () => {
+    const paymentLines = [
+      makeJournalEntryLine({ account_number: '2440', debit_amount: 500, credit_amount: 0 }),
+      makeJournalEntryLine({ account_number: '1930', debit_amount: 0, credit_amount: 500 }),
+    ]
+    const paymentRoot = makeJournalEntry({
+      id: 'payment-root',
+      status: 'reversed',
+      source_type: 'supplier_invoice_paid',
+      entry_date: '2026-01-15',
+      lines: paymentLines,
+    })
+    const dateCorrection = makeJournalEntry({
+      id: 'date-correction',
+      status: 'posted',
+      source_type: 'correction',
+      correction_of_id: paymentRoot.id,
+      entry_date: '2026-01-20',
+      lines: paymentLines,
+    })
+    ancestryEntries.set(paymentRoot.id, paymentRoot)
+    correctionChildren = [{ id: dateCorrection.id, correction_of_id: paymentRoot.id }]
+    supplierPaymentLinks = [{
+      id: 'supplier-payment-1',
+      journal_entry_id: paymentRoot.id,
+    }]
+    results = [{ data: dateCorrection, error: null }]
+    const supabase = makeClient()
+
+    await expect(
+      correctEntry(supabase as never, 'company-1', 'user-1', dateCorrection.id, [
+        { account_number: '2440', debit_amount: 300, credit_amount: 0 },
+        { account_number: '1930', debit_amount: 0, credit_amount: 300 },
+      ]),
+    ).rejects.toBeInstanceOf(SupplierPaymentAccountingChangeError)
+
+    expect(getNextVoucherNumber).not.toHaveBeenCalled()
+    expect(inserts).toEqual([])
+    expect(mockBackfill).not.toHaveBeenCalled()
+  })
+
+  it('allows a second date-only correction on the live chain of an allocated root', async () => {
+    const paymentLines = [
+      makeJournalEntryLine({ account_number: '2440', debit_amount: 500, credit_amount: 0 }),
+      makeJournalEntryLine({ account_number: '1930', debit_amount: 0, credit_amount: 500 }),
+    ]
+    const paymentRoot = makeJournalEntry({
+      id: 'payment-root',
+      status: 'reversed',
+      source_type: 'supplier_invoice_paid',
+      entry_date: '2026-01-15',
+      fiscal_period_id: 'fp-1',
+      lines: paymentLines,
+    })
+    const dateCorrection = makeJournalEntry({
+      id: 'date-correction',
+      status: 'posted',
+      source_type: 'correction',
+      correction_of_id: paymentRoot.id,
+      entry_date: '2026-01-20',
+      fiscal_period_id: 'fp-1',
+      lines: paymentLines,
+    })
+    const reversalEntry = makeJournalEntry({
+      id: 'reversal-2',
+      reverses_id: dateCorrection.id,
+    })
+    const correctedEntry = makeJournalEntry({
+      id: 'date-correction-2',
+      source_type: 'correction',
+      correction_of_id: dateCorrection.id,
+      entry_date: '2026-01-25',
+    })
+    ancestryEntries.set(paymentRoot.id, paymentRoot)
+    correctionChildren = [{ id: dateCorrection.id, correction_of_id: paymentRoot.id }]
+    supplierPaymentLinks = [{
+      id: 'supplier-payment-1',
+      journal_entry_id: paymentRoot.id,
+    }]
+    results = [
+      { data: dateCorrection, error: null },
+      {
+        data: {
+          name: '2026',
+          period_start: '2026-01-01',
+          period_end: '2026-12-31',
+        },
+        error: null,
+      },
+      {
+        data: [
+          { id: 'acc-2440', account_number: '2440' },
+          { id: 'acc-1930', account_number: '1930' },
+        ],
+        error: null,
+      },
+      { data: reversalEntry, error: null },
+      { data: null, error: null },
+      { data: null, error: null },
+      { data: correctedEntry, error: null },
+      { data: null, error: null },
+      { data: null, error: null },
+      { data: [{ id: dateCorrection.id }], error: null },
+      { data: null, error: null },
+      { data: null, error: null },
+      { data: { ...reversalEntry, lines: [] }, error: null },
+      { data: { ...correctedEntry, lines: paymentLines }, error: null },
+    ]
+    const supabase = makeClient()
+
+    const result = await correctEntry(
+      supabase as never,
+      'company-1',
+      'user-1',
+      dateCorrection.id,
+      paymentLines.map((line) => ({
+        account_number: line.account_number,
+        debit_amount: line.debit_amount,
+        credit_amount: line.credit_amount,
+      })),
+      { newEntryDate: '2026-01-25' },
+    )
+
+    expect(result.corrected.id).toBe('date-correction-2')
+    const entryInserts = inserts.filter(({ table }) => table === 'journal_entries')
+    expect(entryInserts[1].payload).toMatchObject({
+      correction_of_id: dateCorrection.id,
+      entry_date: '2026-01-25',
+    })
+    expect(getNextVoucherNumber).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([
+    ['missing ancestor', new Map<string, JournalEntry>()],
+    ['cross-company ancestor', new Map<string, JournalEntry>([
+      ['payment-root', makeJournalEntry({
+        id: 'payment-root',
+        company_id: 'company-2',
+        status: 'reversed',
+      })],
+    ])],
+  ])('fails closed on a %s before correction mutation', async (_case, ancestors) => {
+    const correction = makeJournalEntry({
+      id: 'date-correction',
+      source_type: 'correction',
+      correction_of_id: 'payment-root',
+      lines: originalEntry.lines,
+    })
+    ancestryEntries = ancestors
+    results = [{ data: correction, error: null }]
+    const supabase = makeClient()
+
+    await expect(
+      correctEntry(supabase as never, 'company-1', 'user-1', correction.id, correctedLines),
+    ).rejects.toThrow('Could not verify supplier payment correction ancestry')
+    expect(getNextVoucherNumber).not.toHaveBeenCalled()
+    expect(inserts).toEqual([])
+  })
+
+  it('fails closed on cyclic correction ancestry before correction mutation', async () => {
+    const first = makeJournalEntry({
+      id: 'correction-1',
+      status: 'posted',
+      source_type: 'correction',
+      correction_of_id: 'correction-2',
+      lines: originalEntry.lines,
+    })
+    const second = makeJournalEntry({
+      id: 'correction-2',
+      status: 'reversed',
+      source_type: 'correction',
+      correction_of_id: first.id,
+      lines: originalEntry.lines,
+    })
+    ancestryEntries.set(first.id, first)
+    ancestryEntries.set(second.id, second)
+    results = [{ data: first, error: null }]
+    const supabase = makeClient()
+
+    await expect(
+      correctEntry(supabase as never, 'company-1', 'user-1', first.id, correctedLines),
+    ).rejects.toThrow('cyclic lineage')
+    expect(getNextVoucherNumber).not.toHaveBeenCalled()
+    expect(inserts).toEqual([])
+  })
+
+  it('fails closed on ambiguous correction ancestry before correction mutation', async () => {
+    const root = makeJournalEntry({
+      id: 'payment-root',
+      status: 'reversed',
+      lines: originalEntry.lines,
+    })
+    const correction = makeJournalEntry({
+      id: 'date-correction',
+      source_type: 'correction',
+      correction_of_id: root.id,
+      lines: originalEntry.lines,
+    })
+    ancestryEntries.set(root.id, root)
+    correctionChildren = [
+      { id: correction.id, correction_of_id: root.id },
+      { id: 'sibling-correction', correction_of_id: root.id },
+    ]
+    results = [{ data: correction, error: null }]
+    const supabase = makeClient()
+
+    await expect(
+      correctEntry(supabase as never, 'company-1', 'user-1', correction.id, correctedLines),
+    ).rejects.toThrow('ambiguous lineage')
+    expect(getNextVoucherNumber).not.toHaveBeenCalled()
+    expect(inserts).toEqual([])
+  })
+
+  it('rejects correcting a root that already has a posted correction child', async () => {
+    correctionChildren = [{
+      id: 'existing-posted-correction',
+      correction_of_id: originalEntry.id,
+      status: 'posted',
+    }]
+    results = [{ data: originalEntry, error: null }]
+    const supabase = makeClient()
+
+    await expect(
+      correctEntry(supabase as never, 'company-1', 'user-1', originalEntry.id, correctedLines),
+    ).rejects.toThrow(`ambiguous lineage at entry ${originalEntry.id}`)
+
+    expect(mockBackfill).not.toHaveBeenCalled()
+    expect(getNextVoucherNumber).not.toHaveBeenCalled()
+    expect(inserts).toEqual([])
+  })
+
+  it('rejects correcting a chained leaf that already has a posted correction child', async () => {
+    const root = makeJournalEntry({
+      id: 'correction-root',
+      status: 'reversed',
+      lines: originalEntry.lines,
+    })
+    const requested = makeJournalEntry({
+      id: 'requested-correction',
+      status: 'posted',
+      source_type: 'correction',
+      correction_of_id: root.id,
+      lines: originalEntry.lines,
+    })
+    ancestryEntries.set(root.id, root)
+    correctionChildren = [
+      { id: requested.id, correction_of_id: root.id, status: 'reversed' },
+      {
+        id: 'existing-posted-leaf-child',
+        correction_of_id: requested.id,
+        status: 'posted',
+      },
+    ]
+    results = [{ data: requested, error: null }]
+    const supabase = makeClient()
+
+    await expect(
+      correctEntry(supabase as never, 'company-1', 'user-1', requested.id, correctedLines),
+    ).rejects.toThrow(`ambiguous lineage at entry ${requested.id}`)
+
+    expect(mockBackfill).not.toHaveBeenCalled()
+    expect(getNextVoucherNumber).not.toHaveBeenCalled()
+    expect(inserts).toEqual([])
   })
 
   it('cancels both entries on concurrent reversal (CAS guard)', async () => {
@@ -325,9 +689,9 @@ describe('correctEntry', () => {
   })
 
   it('accepts a source_type=correction entry as the original (chained correction, BFL 5 kap. 5 §)', async () => {
-    // The user just corrected entry A → got correction C. They now want to
-    // correct C. Service must not care about source_type of the original:
-    // status='posted' is the only constraint.
+    // The user just corrected entry A and got correction C. They now want to
+    // correct C. A valid company-scoped ancestry with no supplier allocations
+    // remains correctable.
     const correctionAsOriginal = makeJournalEntry({
       id: 'correction-1',
       status: 'posted',
@@ -341,6 +705,16 @@ describe('correctEntry', () => {
         makeJournalEntryLine({ account_number: '1930', debit_amount: 0, credit_amount: 1200 }),
       ],
     })
+    const correctionRoot = makeJournalEntry({
+      id: 'orig-A',
+      status: 'reversed',
+      lines: [
+        makeJournalEntryLine({ account_number: '5410', debit_amount: 1000, credit_amount: 0 }),
+        makeJournalEntryLine({ account_number: '1930', debit_amount: 0, credit_amount: 1000 }),
+      ],
+    })
+    ancestryEntries.set(correctionRoot.id, correctionRoot)
+    correctionChildren = [{ id: 'correction-1', correction_of_id: 'orig-A' }]
     const secondReversal = makeJournalEntry({ id: 'reversal-2', reverses_id: 'correction-1' })
     const secondCorrection = makeJournalEntry({
       id: 'correction-2',

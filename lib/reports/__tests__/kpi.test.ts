@@ -208,7 +208,7 @@ describe('VAT widget account lists (derived from ACCOUNT_RUTA)', () => {
     ])
   })
 
-  it('input accounts cover ruta 48', () => {
+  it('input accounts cover statically deductible ruta 48 accounts', () => {
     expect([...VAT_INPUT_ACCOUNTS].sort()).toEqual([
       '2640', '2641', '2642', '2645', '2646', '2647', '2649',
     ])

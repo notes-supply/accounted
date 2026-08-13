@@ -38,6 +38,7 @@ export const CANNOT_REVERSE_NON_POSTED = 'CANNOT_REVERSE_NON_POSTED' as const
 export const CANNOT_REVERSE_STORNO = 'CANNOT_REVERSE_STORNO' as const
 export const CANNOT_CORRECT_NON_POSTED = 'CANNOT_CORRECT_NON_POSTED' as const
 export const CANNOT_EDIT_NON_DRAFT = 'CANNOT_EDIT_NON_DRAFT' as const
+export const CANNOT_DELETE_NON_DRAFT = 'CANNOT_DELETE_NON_DRAFT' as const
 export const ENTRY_ALREADY_REVERSED = 'ENTRY_ALREADY_REVERSED' as const
 export const CURRENCY_REVALUATION_ALREADY_EXISTS = 'CURRENCY_REVALUATION_ALREADY_EXISTS' as const
 export const INVALID_MAPPING_RESULT = 'INVALID_MAPPING_RESULT' as const
@@ -47,6 +48,8 @@ export const MEANINGLESS_CORRECTION = 'MEANINGLESS_CORRECTION' as const
 export const NO_OPEN_PERIOD_FOR_DATE = 'NO_OPEN_PERIOD_FOR_DATE' as const
 export const TARGET_PERIOD_CLOSED = 'TARGET_PERIOD_CLOSED' as const
 export const TARGET_PERIOD_LOCKED = 'TARGET_PERIOD_LOCKED' as const
+export const SUPPLIER_PAYMENT_ACCOUNTING_CHANGE_FORBIDDEN =
+  'SUPPLIER_PAYMENT_ACCOUNTING_CHANGE_FORBIDDEN' as const
 
 // ============================================================================
 // AccountsNotInChartError: kept for back-compat (many existing call sites)
@@ -173,6 +176,24 @@ export class CannotCorrectNonPostedError extends Error {
 }
 
 /**
+ * Retained supplier-payment allocations describe the exact economic split of
+ * their voucher. A generic correction may move the entry to another date, but
+ * it must not change those accounting lines without also rewriting retained
+ * payment history.
+ */
+export class SupplierPaymentAccountingChangeError extends Error {
+  readonly code = SUPPLIER_PAYMENT_ACCOUNTING_CHANGE_FORBIDDEN
+
+  constructor() {
+    super(
+      'A journal entry linked to supplier payment allocations can only be corrected'
+      + ' with economically identical accounting lines',
+    )
+    this.name = 'SupplierPaymentAccountingChangeError'
+  }
+}
+
+/**
  * Raised when an edit is attempted on a committed entry. Only drafts are
  * editable in place; posted/reversed/cancelled entries are immutable per BFL
  * 5 kap. (corrections go through storno). The DB immutability trigger is the
@@ -183,6 +204,24 @@ export class CannotEditNonDraftError extends Error {
   constructor(public readonly currentStatus: string) {
     super('Only draft entries can be edited')
     this.name = 'CannotEditNonDraftError'
+  }
+}
+
+/**
+ * Physical journal deletion is limited to drafts. Committed entries remain in
+ * the voucher series and are cancelled through the explicit reversal endpoint.
+ */
+export class CannotDeleteNonDraftError extends Error {
+  readonly code = CANNOT_DELETE_NON_DRAFT
+  readonly reversalEndpoint: string
+
+  constructor(
+    public readonly currentStatus: string,
+    entryId: string,
+  ) {
+    super('Only draft entries can be deleted')
+    this.name = 'CannotDeleteNonDraftError'
+    this.reversalEndpoint = `/api/bookkeeping/journal-entries/${entryId}/reverse`
   }
 }
 
@@ -296,6 +335,7 @@ export type BookkeepingOperation =
   | 'create_reversal_lines'
   | 'post_reversal_entry'
   | 'read_existing_supplier_payment_reversal'
+  | 'delete_draft_entry'
   | 'replace_opening_balance'
   | 'create_corrected_entry'
   | 'create_corrected_lines'
@@ -366,7 +406,9 @@ export function isBookkeepingError(err: unknown): boolean {
     err instanceof CannotReverseNonPostedError ||
     err instanceof CannotReverseStornoError ||
     err instanceof CannotCorrectNonPostedError ||
+    err instanceof SupplierPaymentAccountingChangeError ||
     err instanceof CannotEditNonDraftError ||
+    err instanceof CannotDeleteNonDraftError ||
     err instanceof EntryAlreadyReversedError ||
     err instanceof CurrencyRevaluationAlreadyExistsError ||
     err instanceof InvalidMappingResultError ||
@@ -510,6 +552,20 @@ export function bookkeepingErrorResponse(err: unknown): NextResponse | null {
     )
   }
 
+  if (err instanceof SupplierPaymentAccountingChangeError) {
+    return NextResponse.json(
+      {
+        error: {
+          code: err.code,
+          message:
+            'En leverantörsbetalning med sparade betalningsfördelningar kan bara'
+            + ' rättas med ekonomiskt identiska konteringsrader.',
+        },
+      },
+      { status: 409 }
+    )
+  }
+
   if (err instanceof CannotEditNonDraftError) {
     return NextResponse.json(
       {
@@ -517,6 +573,22 @@ export function bookkeepingErrorResponse(err: unknown): NextResponse | null {
           code: err.code,
           message: err.message,
           details: { currentStatus: err.currentStatus },
+        },
+      },
+      { status: 409 }
+    )
+  }
+
+  if (err instanceof CannotDeleteNonDraftError) {
+    return NextResponse.json(
+      {
+        error: {
+          code: err.code,
+          message: err.message,
+          details: {
+            currentStatus: err.currentStatus,
+            reversalEndpoint: err.reversalEndpoint,
+          },
         },
       },
       { status: 409 }
