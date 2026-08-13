@@ -306,8 +306,23 @@ describe('supplier payment reversal retention migration', () => {
     const seeded = await seedPaymentVoucher()
     const transactionId = await insertTransaction(seeded)
     await insertPayment({ ...seeded, transactionId })
+    const rematchJournalEntryId = await insertPostedJournalEntry({
+      ...seeded,
+      sourceType: 'supplier_invoice_paid',
+      sourceId: seeded.supplierInvoiceId,
+      entryDate: '2026-06-03',
+      committedAt: '2026-06-03T10:00:00Z',
+      lines: [
+        { accountNumber: '2440', debitAmount: 1000, creditAmount: 0 },
+        { accountNumber: '1930', debitAmount: 0, creditAmount: 1000 },
+      ],
+    })
 
-    await expect(insertPayment({ ...seeded, transactionId })).rejects.toThrow(/unique/i)
+    await expect(insertPayment({
+      ...seeded,
+      journalEntryId: rematchJournalEntryId,
+      transactionId,
+    })).rejects.toThrow(/duplicate active supplier payment transaction allocation/i)
 
     const stornoId = await insertPostedStorno({
       ...seeded,
@@ -321,17 +336,6 @@ describe('supplier payment reversal retention migration', () => {
       })
     }, { commit: true })
 
-    const rematchJournalEntryId = await insertPostedJournalEntry({
-      ...seeded,
-      sourceType: 'supplier_invoice_paid',
-      sourceId: seeded.supplierInvoiceId,
-      entryDate: '2026-06-03',
-      committedAt: '2026-06-03T10:00:00Z',
-      lines: [
-        { accountNumber: '2440', debitAmount: 1000, creditAmount: 0 },
-        { accountNumber: '1930', debitAmount: 0, creditAmount: 1000 },
-      ],
-    })
     await expect(insertPayment({
       ...seeded,
       journalEntryId: rematchJournalEntryId,

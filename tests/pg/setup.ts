@@ -41,17 +41,24 @@ export async function withUserContext<T>(
       JSON.stringify({ sub: userId, role: 'authenticated' }),
     ])
     await client.query(`SELECT set_config('request.jwt.claim.sub', $1, true)`, [userId])
+    await client.query(
+      `SELECT set_config('request.jwt.claim.role', 'authenticated', true)`,
+    )
     await client.query(`SET LOCAL ROLE authenticated`)
     // Fail loudly and early if the JWT context did not land the way we
     // expect: otherwise RLS policies return empty and the real test
     // failure points at an unrelated assertion.
-    const authCheck = await client.query<{ uid: string | null }>(
-      `SELECT auth.uid()::text AS uid`,
+    const authCheck = await client.query<{ uid: string | null; role: string | null }>(
+      `SELECT auth.uid()::text AS uid, auth.role()::text AS role`,
     )
-    if (authCheck.rows[0]?.uid !== userId) {
+    if (
+      authCheck.rows[0]?.uid !== userId
+      || authCheck.rows[0]?.role !== 'authenticated'
+    ) {
       throw new Error(
-        `withUserContext: auth.uid() resolved to ${authCheck.rows[0]?.uid ?? 'NULL'}, ` +
-          `expected ${userId}. Check request.jwt.claims setup.`,
+        `withUserContext: auth.uid() resolved to ${authCheck.rows[0]?.uid ?? 'NULL'} ` +
+          `and auth.role() to ${authCheck.rows[0]?.role ?? 'NULL'}; ` +
+          `expected ${userId}/authenticated. Check which GUCs this harness auth shim reads.`,
       )
     }
     const result = await fn(client)
