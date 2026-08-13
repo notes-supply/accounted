@@ -60,6 +60,11 @@ describe('gnubok.allow_delete trusted execution context', () => {
 
       await expectStatementRejected(
         client,
+        `DELETE FROM public.journal_entries WHERE id = $1`,
+        [entryId],
+      )
+      await expectStatementRejected(
+        client,
         `DELETE FROM public.journal_entry_lines WHERE id = $1`,
         [lineId],
       )
@@ -123,11 +128,10 @@ describe('gnubok.allow_delete trusted execution context', () => {
 
   it('pins guard ownership, invoker identity, search paths, and ACLs', async () => {
     const signatures = [
-      'public.enforce_journal_entry_immutability()',
-      'public.enforce_journal_entry_line_immutability()',
+      'public.guard_trusted_journal_delete_context()',
+      'public.guard_trusted_journal_line_delete_context()',
       'public.enforce_document_journal_entry_immutability()',
       'public.enforce_document_metadata_immutability()',
-      'public.enforce_retention_journal_entries()',
     ]
     const { rows } = await getPool().query<{
       signature: string

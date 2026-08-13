@@ -419,6 +419,9 @@ describe('supplier payment reversal retention migration', () => {
     const priorDocumentMetadataMigration = migration(
       '20260704103000_allow_correction_document_relink.sql',
     )
+    const priorRetentionMigration = migration(
+      '20260415000000_schema_sync.sql',
+    )
     const priorReplaceMigration = migration(
       '20260727120000_replace_sie_import_authorize_actor.sql',
     )
@@ -441,6 +444,13 @@ describe('supplier payment reversal retention migration', () => {
     expect(hardening).toContain(
       'supplier payment reversal blocked by live correction child',
     )
+    for (const controlledSignature of [
+      'CREATE OR REPLACE FUNCTION public.enforce_journal_entry_immutability()',
+      'CREATE OR REPLACE FUNCTION public.enforce_journal_entry_line_immutability()',
+      'CREATE OR REPLACE FUNCTION public.enforce_retention_journal_entries()',
+    ]) {
+      expect(hardening).not.toContain(controlledSignature)
+    }
 
     const shippedDelete = sqlFunction(
       shipped,
@@ -456,6 +466,11 @@ describe('supplier payment reversal retention migration', () => {
       priorTriggerMigration,
       'CREATE OR REPLACE FUNCTION public.enforce_journal_entry_line_immutability()',
       '\n\nALTER FUNCTION public.enforce_journal_entry_line_immutability()',
+    )
+    const priorRetentionTrigger = sqlFunction(
+      priorRetentionMigration,
+      'CREATE OR REPLACE FUNCTION public.enforce_retention_journal_entries()',
+      '\n\n-- 4f.',
     )
     const priorDocumentLink = sqlFunction(
       priorDocumentLinkMigration,
@@ -494,6 +509,7 @@ describe('supplier payment reversal retention migration', () => {
       await client.query(priorTrigger)
       await client.query(shippedDelete)
       await client.query(priorLineTrigger)
+      await client.query(priorRetentionTrigger)
       await client.query(priorDocumentLink)
       await client.query(priorDocumentMetadata)
       await client.query(priorReplace)
@@ -503,12 +519,29 @@ describe('supplier payment reversal retention migration', () => {
       await client.query(
         'DROP FUNCTION IF EXISTS public.get_supplier_payment_lineage(uuid, uuid[])',
       )
+      const controlledBefore = await client.query<{
+        trigger_definition: string
+        line_trigger_definition: string
+        retention_trigger_definition: string
+      }>(
+        `SELECT
+           pg_get_functiondef(
+             'public.enforce_journal_entry_immutability()'::regprocedure
+           ) AS trigger_definition,
+           pg_get_functiondef(
+             'public.enforce_journal_entry_line_immutability()'::regprocedure
+           ) AS line_trigger_definition,
+           pg_get_functiondef(
+             'public.enforce_retention_journal_entries()'::regprocedure
+           ) AS retention_trigger_definition`,
+      )
       await client.query(hardening)
       const definitions = await client.query<{
         delete_definition: string
         lineage_definition: string
         trigger_definition: string
         line_trigger_definition: string
+        retention_trigger_definition: string
         document_link_definition: string
         document_metadata_definition: string
         undo_definition: string
@@ -530,6 +563,9 @@ describe('supplier payment reversal retention migration', () => {
            pg_get_functiondef(
              'public.enforce_journal_entry_line_immutability()'::regprocedure
            ) AS line_trigger_definition,
+           pg_get_functiondef(
+             'public.enforce_retention_journal_entries()'::regprocedure
+           ) AS retention_trigger_definition,
            pg_get_functiondef(
              'public.enforce_document_journal_entry_immutability()'::regprocedure
            ) AS document_link_definition,
@@ -553,6 +589,11 @@ describe('supplier payment reversal retention migration', () => {
            ) AS payment_retention_definition`,
       )
       const installed = definitions.rows[0]!
+      expect({
+        trigger_definition: installed.trigger_definition,
+        line_trigger_definition: installed.line_trigger_definition,
+        retention_trigger_definition: installed.retention_trigger_definition,
+      }).toEqual(controlledBefore.rows[0])
       expect(installed.delete_definition).toContain(
         'Only genuine draft journal entries can be physically deleted',
       )
@@ -569,8 +610,6 @@ describe('supplier payment reversal retention migration', () => {
         `child.status IN ('posted', 'reversed')`,
       )
       for (const guardDefinition of [
-        installed.trigger_definition,
-        installed.line_trigger_definition,
         installed.document_link_definition,
         installed.document_metadata_definition,
       ]) {
@@ -3059,8 +3098,9 @@ describe('supplier payment reversal retention migration', () => {
     })
   })
 
-  it('accepts depth 32 and rejects the same chain at depth 33', async () => {
+  it('accepts 32 corrections plus storno and rejects a 33rd correction', async () => {
     const tenant = await seedCompany()
+    const terminalStornoId = randomUUID()
     const ids = Array.from(
       { length: MAX_LINEAGE_DEPTH + 2 },
       () => randomUUID(),
@@ -3110,6 +3150,33 @@ describe('supplier payment reversal retention migration', () => {
          FROM nodes`,
         [ids, tenant.userId, tenant.companyId, tenant.fiscalPeriodId],
       )
+      await seedClient.query(
+        `INSERT INTO public.journal_entries (
+           id,
+           user_id,
+           company_id,
+           fiscal_period_id,
+           voucher_number,
+           voucher_series,
+           entry_date,
+           description,
+           source_type,
+           status,
+           reverses_id,
+           committed_at
+         ) VALUES (
+           $1, $2, $3, $4, 0, 'A', '2026-06-02',
+           'Terminal storno after maximum correction depth',
+           'storno', 'posted', $5, '2026-06-02T10:00:00Z'
+         )`,
+        [
+          terminalStornoId,
+          tenant.userId,
+          tenant.companyId,
+          tenant.fiscalPeriodId,
+          ids.at(-1),
+        ],
+      )
       await seedClient.query('COMMIT')
     } catch (error) {
       await seedClient.query('ROLLBACK').catch(() => {})
@@ -3124,9 +3191,17 @@ describe('supplier payment reversal retention migration', () => {
         tenant.companyId,
         [ids[1]!],
       )
-      expect(accepted.rows).toHaveLength(MAX_LINEAGE_DEPTH + 1)
+      expect(accepted.rows).toHaveLength(MAX_LINEAGE_DEPTH + 2)
       expect(Math.max(...accepted.rows.map((row) => row.depth as number)))
-        .toBe(MAX_LINEAGE_DEPTH)
+        .toBe(MAX_LINEAGE_DEPTH + 1)
+      expect(accepted.rows).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          id: terminalStornoId,
+          parent_id: ids.at(-1),
+          edge_kind: 'storno',
+          depth: MAX_LINEAGE_DEPTH + 1,
+        }),
+      ]))
 
       await expect(getSupplierPaymentLineage(
         client,

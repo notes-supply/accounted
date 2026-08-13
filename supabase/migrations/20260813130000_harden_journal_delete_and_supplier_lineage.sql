@@ -4,11 +4,11 @@
 -- pg-test: covered-by lib/bookkeeping/__tests__/delete-last-voucher.pg.test.ts
 -- pg-test: covered-by tests/pg/supplier-payment-retention.pg.test.ts
 
--- A caller can set a custom GUC, so gnubok.allow_delete alone is not an
--- authorization boundary. The trigger owner is the trusted migration role.
--- SECURITY DEFINER maintenance functions execute as that owner, while direct
--- authenticated SQL continues to execute as authenticated.
-CREATE OR REPLACE FUNCTION public.enforce_journal_entry_immutability()
+-- Migration 017 enforcement functions are legally controlled definitions and
+-- must remain unchanged. Add a separate guard ahead of them to prevent a direct
+-- caller from forging the broad maintenance GUC. SECURITY DEFINER maintenance
+-- executes trigger DML as the trusted function owner; ordinary callers do not.
+CREATE OR REPLACE FUNCTION public.guard_trusted_journal_delete_context()
 RETURNS trigger
 LANGUAGE plpgsql
 SECURITY INVOKER
@@ -19,84 +19,35 @@ DECLARE
     (
       SELECT p.proowner
       FROM pg_catalog.pg_proc p
-      WHERE p.oid = 'public.enforce_journal_entry_immutability()'::pg_catalog.regprocedure
+      WHERE p.oid =
+        'public.guard_trusted_journal_delete_context()'::pg_catalog.regprocedure
     )
   );
-  v_trusted_delete_context boolean :=
-    pg_catalog.current_setting('gnubok.allow_delete', true) = 'true'
-    AND current_user = v_guard_owner;
 BEGIN
+  IF pg_catalog.current_setting('gnubok.allow_delete', true) = 'true'
+     AND current_user IS DISTINCT FROM v_guard_owner THEN
+    RAISE EXCEPTION 'untrusted journal maintenance context'
+      USING ERRCODE = '42501';
+  END IF;
+
   IF TG_OP = 'DELETE' THEN
-    IF v_trusted_delete_context THEN
-      RETURN OLD;
-    END IF;
-    RAISE EXCEPTION 'Cannot delete journal entries (id: %, status: %). Use cancelled status instead.',
-      OLD.id, OLD.status;
+    RETURN OLD;
   END IF;
-
-  IF OLD.status = 'draft' AND NEW.status IN ('draft', 'posted', 'cancelled') THEN
-    RETURN NEW;
-  END IF;
-
-  IF OLD.status = 'posted' AND NEW.status IN ('reversed', 'cancelled') THEN
-    IF NEW.status = 'reversed' THEN
-      IF NEW.description != OLD.description OR NEW.entry_date != OLD.entry_date
-         OR NEW.fiscal_period_id != OLD.fiscal_period_id
-         OR NEW.voucher_number != OLD.voucher_number
-         OR NEW.commit_method IS DISTINCT FROM OLD.commit_method
-         OR NEW.rubric_version IS DISTINCT FROM OLD.rubric_version
-         OR NEW.source_voucher_series IS DISTINCT FROM OLD.source_voucher_series
-         OR NEW.source_voucher_number IS DISTINCT FROM OLD.source_voucher_number THEN
-        RAISE EXCEPTION 'Cannot modify fields of a posted entry during reversal (id: %)', OLD.id;
-      END IF;
-    END IF;
-    RETURN NEW;
-  END IF;
-
-  IF OLD.status = 'reversed' AND NEW.status = 'posted'
-     AND v_trusted_delete_context THEN
-    IF NEW.description != OLD.description OR NEW.entry_date != OLD.entry_date
-       OR NEW.fiscal_period_id != OLD.fiscal_period_id
-       OR NEW.voucher_number != OLD.voucher_number THEN
-      RAISE EXCEPTION 'Cannot modify fields during un-reversal (id: %)', OLD.id;
-    END IF;
-    RETURN NEW;
-  END IF;
-
-  IF OLD.status = NEW.status
-     AND OLD.status IN ('posted', 'reversed', 'cancelled')
-     AND (pg_catalog.to_jsonb(NEW) - 'notes' - 'updated_at')
-       = (pg_catalog.to_jsonb(OLD) - 'notes' - 'updated_at') THEN
-    RETURN NEW;
-  END IF;
-
-  IF OLD.status = NEW.status
-     AND OLD.status = 'posted'
-     AND pg_catalog.current_setting('gnubok.allow_source_type_retag', true) = 'true'
-     AND OLD.source_type IN ('manual', 'import')
-     AND NEW.source_type = 'opening_balance'
-     AND (pg_catalog.to_jsonb(NEW) - 'source_type' - 'updated_at')
-       = (pg_catalog.to_jsonb(OLD) - 'source_type' - 'updated_at') THEN
-    RETURN NEW;
-  END IF;
-
-  IF OLD.status = NEW.status
-     AND OLD.status = 'posted'
-     AND pg_catalog.current_setting('gnubok.allow_metadata_rattelse', true) = 'true'
-     AND (pg_catalog.to_jsonb(NEW) - 'description' - 'entry_date' - 'updated_at')
-       = (pg_catalog.to_jsonb(OLD) - 'description' - 'entry_date' - 'updated_at') THEN
-    RETURN NEW;
-  END IF;
-
-  RAISE EXCEPTION 'Cannot modify a % journal entry (id: %). Committed entries are immutable per Bokforingslagen.',
-    OLD.status, OLD.id;
+  RETURN NEW;
 END;
 $function$;
 
-ALTER FUNCTION public.enforce_journal_entry_immutability()
+ALTER FUNCTION public.guard_trusted_journal_delete_context()
   OWNER TO postgres;
-REVOKE ALL ON FUNCTION public.enforce_journal_entry_immutability()
+REVOKE ALL ON FUNCTION public.guard_trusted_journal_delete_context()
   FROM PUBLIC, anon, authenticated, service_role;
+
+DROP TRIGGER IF EXISTS a_guard_trusted_journal_delete_context
+  ON public.journal_entries;
+CREATE TRIGGER a_guard_trusted_journal_delete_context
+  BEFORE UPDATE OR DELETE ON public.journal_entries
+  FOR EACH ROW
+  EXECUTE FUNCTION public.guard_trusted_journal_delete_context();
 
 -- Physical deletion is limited to entries that never entered a voucher series
 -- and carry no commit evidence. Posted, reversed, and cancelled entries use
@@ -268,6 +219,7 @@ BEGIN
       entry.reverses_id,
       entry.committed_at,
       0 AS depth,
+      0 AS correction_depth,
       ARRAY[entry.id]::uuid[] AS path,
       false AS cycle
     FROM requested_roots requested
@@ -293,6 +245,10 @@ BEGIN
       child.reverses_id,
       child.committed_at,
       parent.depth + 1,
+      parent.correction_depth + CASE
+        WHEN child.correction_of_id = parent.id THEN 1
+        ELSE 0
+      END,
       parent.path || child.id,
       child.id = ANY(parent.path) AS cycle
     FROM lineage parent
@@ -305,7 +261,7 @@ BEGIN
      )
      AND child.status IN ('posted', 'reversed')
     WHERE NOT parent.cycle
-      AND parent.depth < v_max_depth + 1
+      AND parent.correction_depth < v_max_depth + 1
   ),
   bounded_lineage AS (
     SELECT *
@@ -315,7 +271,12 @@ BEGIN
   SELECT
     (SELECT pg_catalog.count(*)::integer FROM requested_roots),
     pg_catalog.count(*)::integer,
-    COALESCE(pg_catalog.bool_or(bounded_lineage.depth > v_max_depth), false),
+    COALESCE(
+      pg_catalog.bool_or(
+        bounded_lineage.correction_depth > v_max_depth
+      ),
+      false
+    ),
     COALESCE(
       pg_catalog.jsonb_agg(
         pg_catalog.jsonb_build_object(
@@ -372,87 +333,49 @@ GRANT EXECUTE ON FUNCTION public.get_supplier_payment_lineage(uuid, uuid[])
   TO authenticated, service_role;
 
 
--- The child line guard must use the same two-part trust decision as the
--- parent journal guard. SECURITY INVOKER is required so current_user remains
--- the authenticated caller for direct DML and becomes the migration owner
--- only when DML originates inside a trusted SECURITY DEFINER maintenance RPC.
-CREATE OR REPLACE FUNCTION public.enforce_journal_entry_line_immutability()
+-- Preserve the migration-017 line enforcement function unchanged. This
+-- companion rejects only forged uses of the broad maintenance GUC; ordinary
+-- line writes continue to be decided by the established enforcement trigger.
+CREATE OR REPLACE FUNCTION public.guard_trusted_journal_line_delete_context()
 RETURNS trigger
 LANGUAGE plpgsql
 SECURITY INVOKER
 SET search_path TO 'pg_catalog', 'public'
 AS $function$
 DECLARE
-  v_status text;
   v_guard_owner name := pg_catalog.pg_get_userbyid(
     (
       SELECT p.proowner
       FROM pg_catalog.pg_proc p
       WHERE p.oid =
-        'public.enforce_journal_entry_line_immutability()'::pg_catalog.regprocedure
+        'public.guard_trusted_journal_line_delete_context()'::pg_catalog.regprocedure
     )
   );
-  v_trusted_delete_context boolean :=
-    pg_catalog.current_setting('gnubok.allow_delete', true) = 'true'
-    AND current_user = v_guard_owner;
 BEGIN
-  IF v_trusted_delete_context THEN
-    IF TG_OP = 'DELETE' THEN
-      RETURN OLD;
-    END IF;
-    RETURN NEW;
+  IF pg_catalog.current_setting('gnubok.allow_delete', true) = 'true'
+     AND current_user IS DISTINCT FROM v_guard_owner THEN
+    RAISE EXCEPTION 'untrusted journal line maintenance context'
+      USING ERRCODE = '42501';
   END IF;
 
-  SELECT je.status
-    INTO v_status
-    FROM public.journal_entries je
-   WHERE je.id = COALESCE(OLD.journal_entry_id, NEW.journal_entry_id);
-
-  IF TG_OP = 'UPDATE'
-     AND v_status = 'posted'
-     AND pg_catalog.current_setting(
-       'gnubok.allow_dimension_retag',
-       true
-     ) = 'true'
-     AND (
-       pg_catalog.to_jsonb(NEW) - 'dimensions' - 'cost_center' - 'project'
-     ) = (
-       pg_catalog.to_jsonb(OLD) - 'dimensions' - 'cost_center' - 'project'
-     ) THEN
-    RETURN NEW;
-  END IF;
-
-  IF TG_OP = 'DELETE'
-     AND v_status = 'posted'
-     AND pg_catalog.current_setting(
-       'gnubok.allow_line_rattelse',
-       true
-     ) = 'true' THEN
+  IF TG_OP = 'DELETE' THEN
     RETURN OLD;
   END IF;
-
-  IF v_status = 'draft' THEN
-    IF TG_OP = 'DELETE' THEN
-      RETURN OLD;
-    END IF;
-    RETURN NEW;
-  END IF;
-
-  IF v_status = 'cancelled' THEN
-    IF TG_OP = 'DELETE' THEN
-      RETURN OLD;
-    END IF;
-    RAISE EXCEPTION 'Cannot % lines of a cancelled journal entry.', TG_OP;
-  END IF;
-
-  RAISE EXCEPTION 'Cannot % lines of a % journal entry.', TG_OP, v_status;
+  RETURN NEW;
 END;
 $function$;
 
-ALTER FUNCTION public.enforce_journal_entry_line_immutability()
+ALTER FUNCTION public.guard_trusted_journal_line_delete_context()
   OWNER TO postgres;
-REVOKE ALL ON FUNCTION public.enforce_journal_entry_line_immutability()
+REVOKE ALL ON FUNCTION public.guard_trusted_journal_line_delete_context()
   FROM PUBLIC, anon, authenticated, service_role;
+
+DROP TRIGGER IF EXISTS a_guard_trusted_journal_line_delete_context
+  ON public.journal_entry_lines;
+CREATE TRIGGER a_guard_trusted_journal_line_delete_context
+  BEFORE UPDATE OR DELETE ON public.journal_entry_lines
+  FOR EACH ROW
+  EXECUTE FUNCTION public.guard_trusted_journal_line_delete_context();
 
 -- Both document UPDATE guards are SECURITY INVOKER so their current_user
 -- checks observe the DML origin. The narrow supersede and correction-relink
@@ -639,69 +562,9 @@ ALTER FUNCTION public.enforce_document_metadata_immutability()
 REVOKE ALL ON FUNCTION public.enforce_document_metadata_immutability()
   FROM PUBLIC, anon, authenticated, service_role;
 
--- This retention trigger is a second deletion fence behind the parent
--- immutability guard. Keep its allow_delete handling convergent with the same
--- trusted-owner decision rather than leaving a weaker duplicate consumer.
-CREATE OR REPLACE FUNCTION public.enforce_retention_journal_entries()
-RETURNS trigger
-LANGUAGE plpgsql
-SECURITY INVOKER
-SET search_path TO 'pg_catalog', 'public'
-AS $function$
-DECLARE
-  v_retention_expires date;
-  v_guard_owner name := pg_catalog.pg_get_userbyid(
-    (
-      SELECT p.proowner
-      FROM pg_catalog.pg_proc p
-      WHERE p.oid =
-        'public.enforce_retention_journal_entries()'::pg_catalog.regprocedure
-    )
-  );
-  v_trusted_delete_context boolean :=
-    pg_catalog.current_setting('gnubok.allow_delete', true) = 'true'
-    AND current_user = v_guard_owner;
-BEGIN
-  IF v_trusted_delete_context THEN
-    RETURN OLD;
-  END IF;
-
-  SELECT fp.retention_expires_at
-    INTO v_retention_expires
-    FROM public.fiscal_periods fp
-   WHERE fp.id = OLD.fiscal_period_id;
-
-  IF v_retention_expires IS NOT NULL
-     AND v_retention_expires > CURRENT_DATE THEN
-    INSERT INTO public.audit_log (
-      user_id,
-      action,
-      table_name,
-      record_id,
-      description
-    )
-    VALUES (
-      OLD.user_id,
-      'RETENTION_BLOCK',
-      'journal_entries',
-      OLD.id,
-      'Attempted deletion within retention period (expires '
-        || v_retention_expires || ')'
-    );
-
-    RAISE EXCEPTION
-      'Cannot delete journal entry within 7-year retention period (expires %)',
-      v_retention_expires;
-  END IF;
-
-  RETURN OLD;
-END;
-$function$;
-
-ALTER FUNCTION public.enforce_retention_journal_entries()
-  OWNER TO postgres;
-REVOKE ALL ON FUNCTION public.enforce_retention_journal_entries()
-  FROM PUBLIC, anon, authenticated, service_role;
+-- Keep the migration-017 retention enforcement function unchanged. The
+-- additive journal guard above closes forged broad-GUC access before either
+-- legally controlled journal trigger executes.
 
 -- cleanup_sandbox_user is the remaining broad-GUC maintenance path after the
 -- SIE hard-delete functions are disabled. Pin it to the same trusted owner;
