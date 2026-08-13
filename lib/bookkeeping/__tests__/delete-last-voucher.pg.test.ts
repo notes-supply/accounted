@@ -179,7 +179,7 @@ describe('delete_last_voucher.pg: RPC + immutability trigger interaction', () =>
       await expect(client.query(
         `DELETE FROM public.journal_entries WHERE id = $1`,
         [entryId],
-      )).rejects.toThrow(/Cannot delete journal entries/i)
+      )).rejects.toThrow(/untrusted journal maintenance context/i)
       await client.query('ROLLBACK TO SAVEPOINT caller_guc_attack')
 
       const state = await client.query<{
@@ -375,11 +375,12 @@ describe('delete_last_voucher.pg: RPC + immutability trigger interaction', () =>
     const meta = await getPool().query(
       `SELECT delete_fn.prosecdef,
               delete_fn.proconfig,
-              trigger_fn.prosecdef AS trigger_prosecdef,
-              trigger_fn.proconfig AS trigger_proconfig,
-              delete_fn.proowner = trigger_fn.proowner AS owners_match,
-              pg_get_functiondef(trigger_fn.oid)
-                LIKE '%current_user = v_guard_owner%' AS owner_guard,
+              guard_fn.prosecdef AS trigger_prosecdef,
+              guard_fn.proconfig AS trigger_proconfig,
+              delete_fn.proowner = guard_fn.proowner AS owners_match,
+              pg_get_functiondef(guard_fn.oid)
+                LIKE '%current_user IS DISTINCT FROM v_guard_owner%'
+                AS owner_guard,
               has_function_privilege('anon', $1, 'EXECUTE') AS anon_exec,
               has_function_privilege('authenticated', $1, 'EXECUTE')
                 AS authenticated_exec,
@@ -397,10 +398,10 @@ describe('delete_last_voucher.pg: RPC + immutability trigger interaction', () =>
                   AND acl.privilege_type = 'EXECUTE'
               ) AS public_exec
          FROM pg_proc delete_fn
-         CROSS JOIN pg_proc trigger_fn
+         CROSS JOIN pg_proc guard_fn
         WHERE delete_fn.oid = $1::regprocedure
-          AND trigger_fn.oid =
-            'public.enforce_journal_entry_immutability()'::regprocedure`,
+          AND guard_fn.oid =
+            'public.guard_trusted_journal_delete_context()'::regprocedure`,
       [signature],
     )
     expect(meta.rows).toEqual([{
