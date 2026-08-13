@@ -219,9 +219,9 @@ const BOOKKEEPING: Record<string, StructuredErrorEntry> = {
   SUPPLIER_PAYMENT_ACCOUNTING_CHANGE_FORBIDDEN: {
     httpStatus: 409,
     message_sv:
-      'En leverantörsbetalning med sparade betalningsfördelningar kan bara rättas med ekonomiskt identiska konteringsrader.',
+      'En leverantörsbetalning med sparad betalningshistorik kan bara rättas med ekonomiskt identiska konteringsrader.',
     message_en:
-      'A supplier payment with retained allocations can only be corrected with economically identical accounting lines.',
+      'A supplier payment with retained payment history can only be corrected with economically identical accounting lines.',
     retryable: false,
   },
   CANNOT_EDIT_NON_DRAFT: {

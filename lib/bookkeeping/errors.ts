@@ -176,17 +176,17 @@ export class CannotCorrectNonPostedError extends Error {
 }
 
 /**
- * Retained supplier-payment allocations describe the exact economic split of
- * their voucher. A generic correction may move the entry to another date, but
- * it must not change those accounting lines without also rewriting retained
- * payment history.
+ * Supplier-payment state and retained allocations describe the exact economic
+ * effect of their voucher. A generic correction may move the entry to another
+ * date, but it must not change those accounting lines without also rewriting
+ * supplier payment history.
  */
 export class SupplierPaymentAccountingChangeError extends Error {
   readonly code = SUPPLIER_PAYMENT_ACCOUNTING_CHANGE_FORBIDDEN
 
   constructor() {
     super(
-      'A journal entry linked to supplier payment allocations can only be corrected'
+      'A journal entry linked to supplier payment history can only be corrected'
       + ' with economically identical accounting lines',
     )
     this.name = 'SupplierPaymentAccountingChangeError'
@@ -558,7 +558,7 @@ export function bookkeepingErrorResponse(err: unknown): NextResponse | null {
         error: {
           code: err.code,
           message:
-            'En leverantörsbetalning med sparade betalningsfördelningar kan bara'
+            'En leverantörsbetalning med sparad betalningshistorik kan bara'
             + ' rättas med ekonomiskt identiska konteringsrader.',
         },
       },

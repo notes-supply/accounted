@@ -99,10 +99,10 @@ describe('errorResponse', () => {
       error: {
         code: 'SUPPLIER_PAYMENT_ACCOUNTING_CHANGE_FORBIDDEN',
         message:
-          'En leverantörsbetalning med sparade betalningsfördelningar kan bara'
+          'En leverantörsbetalning med sparad betalningshistorik kan bara'
           + ' rättas med ekonomiskt identiska konteringsrader.',
         message_en:
-          'A supplier payment with retained allocations can only be corrected'
+          'A supplier payment with retained payment history can only be corrected'
           + ' with economically identical accounting lines.',
       },
     })

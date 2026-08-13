@@ -231,7 +231,7 @@ describe('correctEntry', () => {
     expect(error).toMatchObject({
       code: 'SUPPLIER_PAYMENT_ACCOUNTING_CHANGE_FORBIDDEN',
       message:
-        'A journal entry linked to supplier payment allocations can only be corrected'
+        'A journal entry linked to supplier payment history can only be corrected'
         + ' with economically identical accounting lines',
     })
 
@@ -242,6 +242,36 @@ describe('correctEntry', () => {
       'journal_entries',
       'supplier_invoice_payments',
     ])
+  })
+
+  it('rejects economic line changes for allocation-free typed supplier payments', async () => {
+    const typedPayment = makeJournalEntry({
+      ...originalEntry,
+      source_type: 'supplier_invoice_paid',
+      source_id: 'supplier-invoice-1',
+      lines: [
+        makeJournalEntryLine({ account_number: '2440', debit_amount: 500, credit_amount: 0 }),
+        makeJournalEntryLine({ account_number: '1930', debit_amount: 0, credit_amount: 500 }),
+      ],
+    })
+    vi.mocked(validateBalance).mockReturnValue({
+      valid: true,
+      totalDebit: 300,
+      totalCredit: 300,
+    })
+    results = [{ data: typedPayment, error: null }]
+    const supabase = makeClient()
+
+    await expect(
+      correctEntry(supabase as never, 'company-1', 'user-1', typedPayment.id, [
+        { account_number: '2440', debit_amount: 300, credit_amount: 0 },
+        { account_number: '1930', debit_amount: 0, credit_amount: 300 },
+      ]),
+    ).rejects.toBeInstanceOf(SupplierPaymentAccountingChangeError)
+
+    expect(inserts).toEqual([])
+    expect(getNextVoucherNumber).not.toHaveBeenCalled()
+    expect(mockBackfill).not.toHaveBeenCalled()
   })
 
   it('rejects an economic correction after a date-only correction of an allocated root', async () => {

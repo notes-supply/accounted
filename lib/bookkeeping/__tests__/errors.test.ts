@@ -129,7 +129,7 @@ describe('Typed bookkeeping errors', () => {
     expect(err.code).toBe(SUPPLIER_PAYMENT_ACCOUNTING_CHANGE_FORBIDDEN)
     expect(err.name).toBe('SupplierPaymentAccountingChangeError')
     expect(err.message).toBe(
-      'A journal entry linked to supplier payment allocations can only be corrected'
+      'A journal entry linked to supplier payment history can only be corrected'
       + ' with economically identical accounting lines',
     )
   })
@@ -315,7 +315,7 @@ describe('bookkeepingErrorResponse', () => {
       error: {
         code: 'SUPPLIER_PAYMENT_ACCOUNTING_CHANGE_FORBIDDEN',
         message:
-          'En leverantörsbetalning med sparade betalningsfördelningar kan bara'
+          'En leverantörsbetalning med sparad betalningshistorik kan bara'
           + ' rättas med ekonomiskt identiska konteringsrader.',
       },
     })

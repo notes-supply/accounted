@@ -145,9 +145,9 @@ function correctionAncestryError(reason: string): Error {
 
 /**
  * Resolve the requested entry's company-scoped correction ancestry before any
- * correction mutation. If the chain originates at a supplier payment with
- * retained allocations, every committed correction and the proposed
- * correction must preserve the root's accounting effect.
+ * correction mutation. If the chain originates at a typed supplier payment
+ * or has retained allocation evidence, every committed correction and the
+ * proposed correction must preserve the root's accounting effect.
  */
 async function assertSupplierPaymentAccountingUnchangedAcrossAncestry(
   supabase: SupabaseClient,
@@ -258,8 +258,12 @@ async function assertSupplierPaymentAccountingUnchangedAcrossAncestry(
       link.journal_entry_id || (ancestryIds.length === 1 ? root.id : ''),
     ),
   )
-  if (allocationEntryIds.size === 0) return
-  if (allocationEntryIds.size !== 1 || !allocationEntryIds.has(root.id)) {
+  const isTypedSupplierPaymentRoot =
+    root.source_type === 'supplier_invoice_paid'
+    || root.source_type === 'supplier_invoice_cash_payment'
+  if (allocationEntryIds.size === 0 && !isTypedSupplierPaymentRoot) return
+  if (allocationEntryIds.size > 0
+      && (allocationEntryIds.size !== 1 || !allocationEntryIds.has(root.id))) {
     throw correctionAncestryError('allocation-bearing root is ambiguous')
   }
 

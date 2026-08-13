@@ -2105,6 +2105,71 @@ BEGIN
     );
   END IF;
 
+  -- Lock every transaction retained by this payment before either an exact
+  -- retry return or active-state validation. The lock is held through invoice
+  -- restoration, transaction release, and allocation reversal, so a concurrent
+  -- relink cannot pass validation and then escape the release UPDATE.
+  PERFORM t.id
+    FROM public.transactions t
+   WHERE t.id IN (
+     SELECT sip.transaction_id
+       FROM public.supplier_invoice_payments sip
+      WHERE sip.journal_entry_id = v_root_journal_entry_id
+        AND sip.transaction_id IS NOT NULL
+   )
+   ORDER BY t.id
+   FOR UPDATE;
+
+  IF EXISTS (
+    SELECT 1
+      FROM public.supplier_invoice_payments sip
+      LEFT JOIN public.transactions t ON t.id = sip.transaction_id
+     WHERE sip.journal_entry_id = v_root_journal_entry_id
+       AND sip.transaction_id IS NOT NULL
+       AND (
+         t.id IS NULL
+         OR t.company_id IS DISTINCT FROM p_company_id
+         OR (
+           v_active_count > 0
+           AND (
+             (
+               t.journal_entry_id IS NOT NULL
+               AND t.journal_entry_id IS DISTINCT FROM v_root_journal_entry_id
+               AND t.journal_entry_id IS DISTINCT FROM p_original_journal_entry_id
+             )
+             OR t.invoice_id IS NOT NULL
+             OR (
+               t.supplier_invoice_id IS NOT NULL
+               AND t.supplier_invoice_id IS DISTINCT FROM sip.supplier_invoice_id
+             )
+           )
+         )
+         OR (
+           v_active_count = 0
+           AND (
+             t.journal_entry_id IS NOT NULL
+             OR t.invoice_id IS NOT NULL
+             OR t.supplier_invoice_id IS NOT NULL
+             OR t.is_business IS NOT NULL
+             OR t.category IS NOT NULL
+           )
+         )
+       )
+  ) OR EXISTS (
+    SELECT 1
+      FROM public.supplier_invoice_payments selected
+      JOIN public.supplier_invoice_payments current_allocation
+        ON current_allocation.transaction_id = selected.transaction_id
+       AND current_allocation.reversed_at IS NULL
+       AND current_allocation.journal_entry_id
+          IS DISTINCT FROM v_root_journal_entry_id
+     WHERE selected.journal_entry_id = v_root_journal_entry_id
+       AND selected.transaction_id IS NOT NULL
+  ) THEN
+    RAISE EXCEPTION 'supplier payment reversal transaction ownership conflict'
+      USING ERRCODE = '55000';
+  END IF;
+
   IF v_active_count = 0 AND v_matching_reversed_count = v_total_count THEN
     v_event_publication := public.record_supplier_payment_reversal_events(
       p_company_id,
@@ -2188,42 +2253,6 @@ BEGIN
     END IF;
   END LOOP;
 
-  -- Allocation-linked transaction IDs must still be owned by this original
-  -- payment state. A rematched/current pointer is a conflict, never something
-  -- this reversal may clear.
-  IF EXISTS (
-    SELECT 1
-      FROM public.supplier_invoice_payments sip
-      JOIN public.transactions t ON t.id = sip.transaction_id
-     WHERE sip.journal_entry_id = v_root_journal_entry_id
-       AND sip.reversed_at IS NULL
-       AND (
-         t.company_id IS DISTINCT FROM p_company_id
-         OR (
-           t.journal_entry_id IS NOT NULL
-           AND t.journal_entry_id IS DISTINCT FROM v_root_journal_entry_id
-         )
-         OR t.invoice_id IS NOT NULL
-         OR (
-           t.supplier_invoice_id IS NOT NULL
-           AND t.supplier_invoice_id IS DISTINCT FROM sip.supplier_invoice_id
-         )
-       )
-  ) OR EXISTS (
-    SELECT 1
-      FROM public.supplier_invoice_payments selected
-      JOIN public.supplier_invoice_payments current_allocation
-        ON current_allocation.transaction_id = selected.transaction_id
-       AND current_allocation.reversed_at IS NULL
-       AND current_allocation.journal_entry_id
-          IS DISTINCT FROM v_root_journal_entry_id
-     WHERE selected.journal_entry_id = v_root_journal_entry_id
-       AND selected.reversed_at IS NULL
-  ) THEN
-    RAISE EXCEPTION 'supplier payment reversal transaction ownership conflict'
-      USING ERRCODE = '55000';
-  END IF;
-
   WITH amounts AS (
     SELECT sip.supplier_invoice_id,
            round(sum(sip.amount), 2) AS payment_amount
@@ -2280,7 +2309,10 @@ BEGIN
               AND sip.reversed_at IS NULL
               AND sip.transaction_id IS NOT NULL
          )
-         AND t.journal_entry_id IS NULL
+         AND (
+          t.journal_entry_id IS NULL
+          OR t.journal_entry_id = p_original_journal_entry_id
+        )
          AND t.invoice_id IS NULL
          AND (
            t.supplier_invoice_id IS NULL

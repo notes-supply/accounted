@@ -605,6 +605,12 @@ describe('supplier payment reversal retention migration', () => {
       expect(installed.apply_definition).toContain(
         'v_root_journal_entry_id',
       )
+      expect(installed.apply_definition).toContain(
+        't.journal_entry_id IS DISTINCT FROM p_original_journal_entry_id',
+      )
+      expect(installed.apply_definition).toContain(
+        't.journal_entry_id = p_original_journal_entry_id',
+      )
       expect(installed.payment_retention_definition).toContain(
         'supplier invoice payment reversal correction ancestry is cyclic',
       )
@@ -1253,6 +1259,12 @@ describe('supplier payment reversal retention migration', () => {
       originalJournalEntryId: seeded.journalEntryId,
       entryDate: '2026-06-03',
     })
+    await getPool().query(
+      `UPDATE public.transactions
+          SET journal_entry_id = $1
+        WHERE id = $2`,
+      [correctionId, transactionId],
+    )
     const draftSiblingId = randomUUID()
     await getPool().query(
       `INSERT INTO public.journal_entries
@@ -1312,7 +1324,7 @@ describe('supplier payment reversal retention migration', () => {
       payment_journal_entry_id: seeded.journalEntryId,
       reversed_at: null,
       reversed_by_journal_entry_id: null,
-      transaction_journal_entry_id: seeded.journalEntryId,
+      transaction_journal_entry_id: correctionId,
     })])
 
     await getPool().query(
@@ -1320,6 +1332,52 @@ describe('supplier payment reversal retention migration', () => {
           SET status = 'cancelled'
         WHERE id = $1 AND status = 'draft'`,
       [draftSiblingId],
+    )
+
+    await getPool().query(
+      `UPDATE public.transactions
+          SET journal_entry_id = $1
+        WHERE id = $2`,
+      [rootStornoId, transactionId],
+    )
+    await withUserContext(seeded.userId, async (client) => {
+      await expect(withErrorSavepoint(
+        client,
+        () => applySupplierPaymentReversal(client, {
+          companyId: seeded.companyId,
+          originalJournalEntryId: correctionId,
+          stornoJournalEntryId: descendantStornoId,
+        }),
+      )).rejects.toMatchObject({
+        code: '55000',
+        message: 'supplier payment reversal transaction ownership conflict',
+      })
+    })
+    const rejectedPointerState = await getPool().query(
+      `SELECT si.status,
+              si.paid_amount::double precision AS paid_amount,
+              sip.reversed_at,
+              sip.reversed_by_journal_entry_id,
+              t.journal_entry_id AS transaction_journal_entry_id
+         FROM public.supplier_invoices si
+         JOIN public.supplier_invoice_payments sip
+           ON sip.supplier_invoice_id = si.id
+         JOIN public.transactions t ON t.id = $3
+        WHERE si.id = $1 AND sip.id = $2`,
+      [seeded.supplierInvoiceId, paymentId, transactionId],
+    )
+    expect(rejectedPointerState.rows).toEqual([expect.objectContaining({
+      status: 'paid',
+      paid_amount: 1000,
+      reversed_at: null,
+      reversed_by_journal_entry_id: null,
+      transaction_journal_entry_id: rootStornoId,
+    })])
+    await getPool().query(
+      `UPDATE public.transactions
+          SET journal_entry_id = $1
+        WHERE id = $2`,
+      [correctionId, transactionId],
     )
 
     await withUserContext(seeded.userId, async (client) => {
@@ -1427,6 +1485,43 @@ describe('supplier payment reversal retention migration', () => {
     expect(restored.rows[0].reversed_at.toISOString()).toBe(
       '2026-06-03T10:00:00.000Z',
     )
+
+    await getPool().query(
+      `UPDATE public.transactions
+          SET journal_entry_id = $1
+        WHERE id = $2`,
+      [rootStornoId, transactionId],
+    )
+    await withUserContext(seeded.userId, async (client) => {
+      await expect(withErrorSavepoint(
+        client,
+        () => applySupplierPaymentReversal(client, {
+          companyId: seeded.companyId,
+          originalJournalEntryId: correctionId,
+          stornoJournalEntryId: descendantStornoId,
+        }),
+      )).rejects.toMatchObject({
+        code: '55000',
+        message: 'supplier payment reversal transaction ownership conflict',
+      })
+    })
+
+    const poisonedRetryState = await getPool().query(
+      `SELECT si.paid_amount::double precision AS paid_amount,
+              sip.reversed_by_journal_entry_id,
+              t.journal_entry_id AS transaction_journal_entry_id
+         FROM public.supplier_invoices si
+         JOIN public.supplier_invoice_payments sip
+           ON sip.supplier_invoice_id = si.id
+         JOIN public.transactions t ON t.id = $3
+        WHERE si.id = $1 AND sip.id = $2`,
+      [seeded.supplierInvoiceId, paymentId, transactionId],
+    )
+    expect(poisonedRetryState.rows).toEqual([expect.objectContaining({
+      paid_amount: 0,
+      reversed_by_journal_entry_id: descendantStornoId,
+      transaction_journal_entry_id: rootStornoId,
+    })])
   })
 
   it('rejects cross-company correction ancestry before touching the foreign root', async () => {
@@ -1572,6 +1667,130 @@ describe('supplier payment reversal retention migration', () => {
       allocation_count: 1,
       exact_reversal_count: 1,
     }])
+  })
+
+  it('locks allocation-linked transactions through descendant reversal', async () => {
+    const seeded = await seedPaymentVoucher()
+    const transactionId = await insertTransaction({
+      ...seeded,
+      amount: -seeded.total,
+      journalEntryId: seeded.journalEntryId,
+    })
+    await insertPayment({ ...seeded, transactionId })
+    await getPool().query(
+      `UPDATE public.supplier_invoices
+          SET paid_at = '2026-06-01T12:00:00Z',
+              payment_journal_entry_id = $1
+        WHERE id = $2`,
+      [seeded.journalEntryId, seeded.supplierInvoiceId],
+    )
+    await getPool().query(
+      `UPDATE public.transactions
+          SET supplier_invoice_id = $1,
+              is_business = true,
+              category = 'expense_other'
+        WHERE id = $2`,
+      [seeded.supplierInvoiceId, transactionId],
+    )
+    const rootStornoId = await insertPostedStorno({
+      ...seeded,
+      originalJournalEntryId: seeded.journalEntryId,
+      entryDate: '2026-06-01',
+    })
+    const correctionId = await insertPostedCorrection({
+      ...seeded,
+      originalJournalEntryId: seeded.journalEntryId,
+      entryDate: '2026-06-03',
+    })
+    await getPool().query(
+      `UPDATE public.transactions
+          SET journal_entry_id = $1
+        WHERE id = $2`,
+      [correctionId, transactionId],
+    )
+    const descendantStornoId = await insertPostedStorno({
+      ...seeded,
+      originalJournalEntryId: correctionId,
+      entryDate: '2026-06-03',
+    })
+
+    const relinkClient = await getPool().connect()
+    const reversalClient = await getPool().connect()
+    try {
+      await relinkClient.query('BEGIN')
+      await relinkClient.query(
+        `UPDATE public.transactions
+            SET journal_entry_id = $1
+          WHERE id = $2`,
+        [rootStornoId, transactionId],
+      )
+
+      await reversalClient.query('BEGIN')
+      await reversalClient.query(
+        `SELECT set_config(
+           'request.jwt.claims',
+           '{"role":"service_role"}',
+           true
+         )`,
+      )
+      await reversalClient.query(
+        `SELECT set_config(
+           'request.jwt.claim.role',
+           'service_role',
+           true
+         )`,
+      )
+      await reversalClient.query('SET LOCAL ROLE service_role')
+
+      const reversalPromise = applySupplierPaymentReversal(reversalClient, {
+        companyId: seeded.companyId,
+        originalJournalEntryId: correctionId,
+        stornoJournalEntryId: descendantStornoId,
+      })
+      const whileLocked = await Promise.race([
+        reversalPromise.then(() => 'completed'),
+        new Promise<'blocked'>((resolveBlocked) =>
+          setTimeout(() => resolveBlocked('blocked'), 150),
+        ),
+      ])
+      expect(whileLocked).toBe('blocked')
+
+      await relinkClient.query('ROLLBACK')
+      const result = await reversalPromise
+      await reversalClient.query('COMMIT')
+      expect(result).toMatchObject({
+        ok: true,
+        status: 'applied',
+        transaction_count: 1,
+      })
+    } catch (error) {
+      await relinkClient.query('ROLLBACK').catch(() => {})
+      await reversalClient.query('ROLLBACK').catch(() => {})
+      throw error
+    } finally {
+      relinkClient.release()
+      reversalClient.release()
+    }
+
+    const lockedState = await getPool().query(
+      `SELECT si.paid_amount::double precision AS paid_amount,
+              sip.reversed_by_journal_entry_id,
+              t.journal_entry_id,
+              t.supplier_invoice_id
+         FROM public.supplier_invoices si
+         JOIN public.supplier_invoice_payments sip
+           ON sip.supplier_invoice_id = si.id
+         JOIN public.transactions t ON t.id = $3
+        WHERE si.id = $1
+          AND sip.journal_entry_id = $2`,
+      [seeded.supplierInvoiceId, seeded.journalEntryId, transactionId],
+    )
+    expect(lockedState.rows).toEqual([expect.objectContaining({
+      paid_amount: 0,
+      reversed_by_journal_entry_id: descendantStornoId,
+      journal_entry_id: null,
+      supplier_invoice_id: null,
+    })])
   })
 
   it('reverses a sanctioned allocation-backed manual voucher exactly once', async () => {
