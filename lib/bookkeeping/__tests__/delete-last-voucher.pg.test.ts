@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
-import { getPool, withUserContext } from '@/tests/pg/setup'
+import { getPool, withErrorSavepoint, withUserContext } from '@/tests/pg/setup'
 import {
   insertBalancedLines,
   insertDraftJournalEntry,
@@ -84,9 +84,12 @@ describe('delete_last_voucher.pg: RPC + immutability trigger interaction', () =>
     )
 
     await withUserContext(userId, async (client) => {
-      await expect(client.query(
-        `SELECT public.delete_last_voucher($1::uuid, $2::uuid)`,
-        [companyId, entryId],
+      await expect(withErrorSavepoint(
+        client,
+        () => client.query(
+          `SELECT public.delete_last_voucher($1::uuid, $2::uuid)`,
+          [companyId, entryId],
+        ),
       )).rejects.toThrow(/Only genuine draft journal entries/i)
 
       const state = await client.query<{ entry_count: number; last_number: number }>(
@@ -117,9 +120,12 @@ describe('delete_last_voucher.pg: RPC + immutability trigger interaction', () =>
     await insertBalancedLines(entryId)
 
     await withUserContext(userId, async (client) => {
-      await expect(client.query(
-        `SELECT public.delete_last_voucher($1::uuid, $2::uuid)`,
-        [companyId, entryId],
+      await expect(withErrorSavepoint(
+        client,
+        () => client.query(
+          `SELECT public.delete_last_voucher($1::uuid, $2::uuid)`,
+          [companyId, entryId],
+        ),
       )).rejects.toThrow(/Only genuine draft journal entries/i)
       const after = await client.query(
         `SELECT 1 FROM public.journal_entries WHERE id = $1`,

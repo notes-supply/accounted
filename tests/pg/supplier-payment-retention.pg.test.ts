@@ -583,7 +583,7 @@ describe('supplier payment reversal retention migration', () => {
     }
   })
 
-  it('allows only one committed correction child per parent', async () => {
+  it('rejects a second committed correction child before lineage becomes ambiguous', async () => {
     const tenant = await seedCompany()
     const originalId = await insertPostedJournalEntry({
       ...tenant,
@@ -604,7 +604,10 @@ describe('supplier payment reversal retention migration', () => {
       ...tenant,
       originalJournalEntryId: originalId,
       entryDate: '2026-06-03',
-    })).rejects.toMatchObject({ code: '23505' })
+    })).rejects.toMatchObject({
+      code: '23505',
+      constraint: 'uq_journal_entries_committed_correction_child',
+    })
 
     const children = await getPool().query<{ count: number }>(
       `SELECT count(*)::integer AS count
@@ -1299,12 +1302,27 @@ describe('supplier payment reversal retention migration', () => {
       outboxIds = getEventOutboxIds(first)
     }, { commit: true })
 
-    await getPool().query(
-      `UPDATE public.event_log
-          SET entity_id = $1
-        WHERE outbox_event_id = $2`,
+    // event_log rows are append-only but intentionally deletable by the
+    // privileged retention job. Recreate one removed projection incorrectly
+    // through that legitimate delete-and-insert boundary, without disabling
+    // the production immutability trigger.
+    const corruptedProjection = await getPool().query(
+      `WITH removed AS (
+         DELETE FROM public.event_log
+          WHERE outbox_event_id = $2
+          RETURNING user_id, company_id, event_type, data, created_at,
+                    outbox_event_id
+       )
+       INSERT INTO public.event_log (
+         user_id, company_id, event_type, entity_id, data, created_at,
+         outbox_event_id
+       )
+       SELECT user_id, company_id, event_type, $1::uuid, data, created_at,
+              outbox_event_id
+       FROM removed`,
       [seeded.journalEntryId, outboxIds[0]],
     )
+    expect(corruptedProjection.rowCount).toBe(1)
 
     await withUserContext(seeded.userId, async (client) => {
       await expect(
@@ -2166,7 +2184,7 @@ describe('supplier payment reversal retention migration', () => {
     })
   })
 
-  it('exposes cycles and correction ambiguity without recursive overflow', async () => {
+  it('exposes a malformed correction cycle without recursive overflow', async () => {
     const tenant = await seedCompany()
     const cycleRootId = randomUUID()
     const cycleChildId = randomUUID()
@@ -2196,42 +2214,22 @@ describe('supplier payment reversal retention migration', () => {
       [cycleRootId, cycleChildId],
     )
 
-    const ambiguousRootId = await insertPostedJournalEntry({
-      ...tenant,
-      sourceType: 'supplier_invoice_paid',
-      entryDate: '2026-06-05',
-    })
-    const firstCorrectionId = await insertPostedCorrection({
-      ...tenant,
-      originalJournalEntryId: ambiguousRootId,
-      entryDate: '2026-06-06',
-    })
-    const secondCorrectionId = await insertPostedCorrection({
-      ...tenant,
-      originalJournalEntryId: ambiguousRootId,
-      entryDate: '2026-06-07',
-    })
-
     await withUserContext(tenant.userId, async (client) => {
       const cycle = await getSupplierPaymentLineage(
         client,
         tenant.companyId,
         [cycleRootId],
       )
-      expect(cycle.rows.some((row) =>
-        row.id === cycleRootId && row.cycle === true
-      )).toBe(true)
-
-      const ambiguous = await getSupplierPaymentLineage(
-        client,
-        tenant.companyId,
-        [ambiguousRootId],
-      )
-      expect(ambiguous.rows.filter((row) =>
-        row.edge_kind === 'correction' && row.parent_id === ambiguousRootId
-      ).map((row) => row.id).sort()).toEqual(
-        [firstCorrectionId, secondCorrectionId].sort(),
-      )
+      expect(cycle.rows).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          id: cycleRootId,
+          parent_id: cycleChildId,
+          edge_kind: 'correction',
+          depth: 2,
+          cycle: true,
+        }),
+      ]))
+      expect(cycle.rows).toHaveLength(3)
     })
   })
 

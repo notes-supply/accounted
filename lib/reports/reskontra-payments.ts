@@ -48,6 +48,12 @@ interface JournalLineageRpcRow extends JournalLineageRow {
   cycle: boolean
 }
 
+// A valid maximum-depth correction chain emits the root, up to 32
+// corrections, and one exact storno for every reversed entry: at most 65
+// rows per root. 300 roots therefore leave 500 rows of headroom below the
+// RPC's 20,000-row cap.
+const SUPPLIER_LINEAGE_ROOT_BATCH_SIZE = 300
+
 interface JournalLineage {
   roots: Map<string, JournalLineageRow>
   correctionsByParent: Map<string, JournalLineageRow[]>
@@ -99,7 +105,7 @@ async function fetchSupplierJournalLineage(
   companyId: string,
   rootIds: string[],
 ): Promise<JournalLineage> {
-  const requestedRootIds = Array.from(new Set(rootIds))
+  const requestedRootIds = Array.from(new Set(rootIds)).sort()
   const empty = {
     roots: new Map<string, JournalLineageRow>(),
     correctionsByParent: new Map<string, JournalLineageRow[]>(),
@@ -107,23 +113,42 @@ async function fetchSupplierJournalLineage(
   }
   if (requestedRootIds.length === 0) return empty
 
-  const { data, error } = await supabase.rpc('get_supplier_payment_lineage', {
-    p_company_id: companyId,
-    p_root_ids: requestedRootIds,
-  })
-  if (error) {
-    throw new Error(`Could not fetch supplier payment journal lineage: ${error.message}`)
-  }
-  if (!data || typeof data !== 'object' || Array.isArray(data)) {
-    throw new Error('Malformed supplier payment journal lineage response')
-  }
-
-  const payload = data as Record<string, unknown>
-  if (
-    payload.requested_root_count !== requestedRootIds.length
-    || !Array.isArray(payload.rows)
+  const rows: JournalLineageRpcRow[] = []
+  for (
+    let offset = 0;
+    offset < requestedRootIds.length;
+    offset += SUPPLIER_LINEAGE_ROOT_BATCH_SIZE
   ) {
-    throw new Error('Malformed supplier payment journal lineage response')
+    const batchRootIds = requestedRootIds.slice(
+      offset,
+      offset + SUPPLIER_LINEAGE_ROOT_BATCH_SIZE,
+    )
+    const { data, error } = await supabase.rpc('get_supplier_payment_lineage', {
+      p_company_id: companyId,
+      p_root_ids: batchRootIds,
+    })
+    if (error) {
+      throw new Error(`Could not fetch supplier payment journal lineage: ${error.message}`)
+    }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      throw new Error('Malformed supplier payment journal lineage response')
+    }
+
+    const payload = data as Record<string, unknown>
+    if (
+      payload.requested_root_count !== batchRootIds.length
+      || !Array.isArray(payload.rows)
+    ) {
+      throw new Error('Malformed supplier payment journal lineage response')
+    }
+    const batchRoots = new Set(batchRootIds)
+    for (const value of payload.rows) {
+      const row = parseLineageRow(value)
+      if (!batchRoots.has(row.root_id)) {
+        throw new Error(`Malformed supplier payment journal lineage for entry ${row.id}`)
+      }
+      rows.push(row)
+    }
   }
 
   const requested = new Set(requestedRootIds)
@@ -131,7 +156,6 @@ async function fetchSupplierJournalLineage(
   const entriesById = new Map<string, JournalLineageRow>()
   const corrections = new Map<string, Map<string, JournalLineageRow>>()
   const reversals = new Map<string, Map<string, JournalLineageRow>>()
-  const rows = payload.rows.map(parseLineageRow)
 
   for (const row of rows) {
     assertCommittedLineageEntry(row)

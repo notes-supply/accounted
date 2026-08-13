@@ -444,22 +444,39 @@ interface ControlledCutoffRelatedEntry {
   description: string
   source_type: string | null
   source_id: string | null
+  correction_of_id: string | null
   reverses_id: string | null
   reversed_by_id: string | null
   lines: ControlledCutoffLine[] | null
 }
 
-interface ControlledCutoffQueryEntry extends ControlledCutoffRelatedEntry {
-  reversed_entry?: ControlledCutoffRelatedEntry | ControlledCutoffRelatedEntry[] | null
-  reversal_entry?: ControlledCutoffRelatedEntry | ControlledCutoffRelatedEntry[] | null
+interface ControlledCutoffLineageRow {
+  root_id: string
+  parent_id: string | null
+  edge_kind: 'root' | 'correction' | 'storno'
+  id: string
+  entry_date: string
+  status: string
+  source_type: string | null
+  correction_of_id: string | null
+  reverses_id: string | null
+  depth: number
+  path: string[]
+  cycle: boolean
 }
 
-function relatedEntry(
-  value: ControlledCutoffRelatedEntry | ControlledCutoffRelatedEntry[] | null | undefined,
-): ControlledCutoffRelatedEntry | null {
-  return value && !Array.isArray(value) ? value : null
+interface ControlledCutoffLineage {
+  entries: Map<string, ControlledCutoffRelatedEntry>
+  correctionsByParent: Map<string, ControlledCutoffRelatedEntry[]>
+  reversalsByParent: Map<string, ControlledCutoffRelatedEntry[]>
 }
 
+const CONTROLLED_CUTOFF_MAX_DEPTH = 32
+const CONTROLLED_CUTOFF_MAX_ENTRIES = 20_000
+const CONTROLLED_CUTOFF_ID_BATCH_SIZE = 100
+// Same 65-row maximum valid chain as supplier payment lineage. 300 roots
+// leave 500 rows of headroom under the RPC's 20,000 emitted-row limit.
+const CONTROLLED_CUTOFF_ROOT_BATCH_SIZE = 300
 function shiftedIsoDate(date: string, days: number): string {
   const shifted = new Date(`${date}T00:00:00Z`)
   shifted.setUTCDate(shifted.getUTCDate() + days)
@@ -542,6 +559,7 @@ function hasControlledYearEndShape(
     entry.company_id === companyId
     && entry.source_type === 'year_end'
     && entry.source_id === null
+    && entry.correction_of_id === null
     && entry.reverses_id === null
     && controlledYearEndKind(entry) !== null
     && hasAccount(entry, ['2648'])
@@ -549,40 +567,56 @@ function hasControlledYearEndShape(
   )
 }
 
-function isExactCutoffStorno(
+function hasWellFormedControlledLines(
+  entry: ControlledCutoffRelatedEntry,
+): boolean {
+  return Boolean(
+    entry.lines?.length
+    && entry.lines.every((line) => lineEffectKey(line, false) !== null),
+  )
+}
+
+function isExactControlledStorno(
   storno: ControlledCutoffRelatedEntry,
   original: ControlledCutoffRelatedEntry,
   companyId: string,
 ): boolean {
   return (
-    hasControlledYearEndShape(original, companyId)
+    original.company_id === companyId
     && original.status === 'reversed'
     && original.reversed_by_id === storno.id
     && storno.company_id === companyId
     && storno.status === 'posted'
     && storno.source_type === 'storno'
     && storno.source_id === null
+    && storno.correction_of_id === null
     && storno.reverses_id === original.id
     && storno.reversed_by_id === null
     && storno.description === `Makulering: ${original.description}`
-    && hasAccount(storno, ['2648'])
     && !hasAccount(storno, VAT_SETTLEMENT_NET_ACCOUNTS)
     && hasExactReversedEffect(original.lines, storno.lines)
   )
 }
 
-function hasValidYearEndStatusLineage(
-  entry: ControlledCutoffQueryEntry,
+function isControlledCorrection(
+  correction: ControlledCutoffRelatedEntry,
+  parent: ControlledCutoffRelatedEntry,
   companyId: string,
 ): boolean {
-  if (entry.status === 'posted') return entry.reversed_by_id === null
-  if (entry.status !== 'reversed' || !entry.reversed_by_id) return false
-  const reversal = relatedEntry(entry.reversal_entry)
-  return Boolean(reversal && isExactCutoffStorno(reversal, entry, companyId))
+  return (
+    correction.company_id === companyId
+    && (correction.status === 'posted' || correction.status === 'reversed')
+    && correction.source_type === 'correction'
+    && correction.source_id === null
+    && correction.correction_of_id === parent.id
+    && correction.reverses_id === null
+    && !hasAccount(correction, VAT_SETTLEMENT_NET_ACCOUNTS)
+    && hasWellFormedControlledLines(correction)
+  )
 }
 
 function verifiedScheduledPairIds(
-  entries: ControlledCutoffQueryEntry[],
+  entries: ControlledCutoffRelatedEntry[],
   companyId: string,
 ): Set<string> {
   const controlled = entries.filter((entry) =>
@@ -593,7 +627,8 @@ function verifiedScheduledPairIds(
   for (const entry of controlled) {
     if (
       !hasControlledYearEndShape(entry, companyId)
-      || !hasValidYearEndStatusLineage(entry, companyId)
+      || !hasWellFormedControlledLines(entry)
+      || (entry.status !== 'posted' && entry.status !== 'reversed')
     ) {
       throw new Error(
         `malformed controlled cash-method cutoff entry ${entry.id}`,
@@ -604,8 +639,8 @@ function verifiedScheduledPairIds(
   const reversals = controlled.filter(
     (entry) => controlledYearEndKind(entry) === 'scheduled_reversal',
   )
-  const matchesByCutoff = new Map<string, ControlledCutoffQueryEntry[]>()
-  const matchesByReversal = new Map<string, ControlledCutoffQueryEntry[]>()
+  const matchesByCutoff = new Map<string, ControlledCutoffRelatedEntry[]>()
+  const matchesByReversal = new Map<string, ControlledCutoffRelatedEntry[]>()
 
   for (const cutoff of cutoffs) {
     for (const reversal of reversals) {
@@ -650,57 +685,370 @@ function verifiedScheduledPairIds(
   return verified
 }
 
+function collectControlledLineageEntries(
+  entryId: string,
+  lineage: ControlledCutoffLineage,
+  companyId: string,
+  included: Set<string>,
+  visiting: Set<string> = new Set(),
+): void {
+  const entry = lineage.entries.get(entryId)
+  if (!entry) {
+    throw new Error(`missing controlled cash-method cutoff lineage entry ${entryId}`)
+  }
+  if (visiting.has(entry.id)) {
+    throw new Error(`cyclic controlled cash-method cutoff correction lineage at ${entry.id}`)
+  }
+
+  const corrections = lineage.correctionsByParent.get(entry.id) ?? []
+  const reversals = lineage.reversalsByParent.get(entry.id) ?? []
+  if (entry.status === 'posted') {
+    if (entry.reversed_by_id !== null || corrections.length > 0 || reversals.length > 0) {
+      throw new Error(
+        `contradictory controlled cash-method cutoff lineage for ${entry.id}`,
+      )
+    }
+    included.add(entry.id)
+    return
+  }
+  if (entry.status !== 'reversed' || !entry.reversed_by_id) {
+    throw new Error(`malformed controlled cash-method cutoff lineage for ${entry.id}`)
+  }
+  if (corrections.length > 1) {
+    throw new Error(`ambiguous controlled cash-method cutoff correction for ${entry.id}`)
+  }
+  if (reversals.length !== 1) {
+    throw new Error(`partial controlled cash-method cutoff storno lineage for ${entry.id}`)
+  }
+
+  const storno = reversals[0]
+  if (!isExactControlledStorno(storno, entry, companyId)) {
+    throw new Error(`malformed controlled cash-method cutoff storno ${storno.id}`)
+  }
+  included.add(entry.id)
+  included.add(storno.id)
+
+  const correction = corrections[0]
+  if (!correction) return
+  if (
+    !isControlledCorrection(correction, entry, companyId)
+    || storno.entry_date !== entry.entry_date
+  ) {
+    throw new Error(`malformed controlled cash-method cutoff correction ${correction.id}`)
+  }
+
+  const nextVisiting = new Set(visiting)
+  nextVisiting.add(entry.id)
+  collectControlledLineageEntries(
+    correction.id,
+    lineage,
+    companyId,
+    included,
+    nextVisiting,
+  )
+}
+
 function sumControlledCutoffInputVat(
-  entries: ControlledCutoffQueryEntry[],
+  roots: ControlledCutoffRelatedEntry[],
+  lineage: ControlledCutoffLineage,
   companyId: string,
   start: string,
   end: string,
 ): { debit: number; credit: number } {
-  const verifiedPairs = verifiedScheduledPairIds(entries, companyId)
+  const verifiedPairs = verifiedScheduledPairIds(roots, companyId)
+  const included = new Set<string>()
+  for (const rootId of verifiedPairs) {
+    collectControlledLineageEntries(rootId, lineage, companyId, included)
+  }
+
   let debit = 0
   let credit = 0
-
-  for (const entry of entries) {
-    if (entry.entry_date < start || entry.entry_date > end) continue
-
-    let include = false
-    if (entry.source_type === 'year_end') {
-      include = (
-        hasControlledYearEndShape(entry, companyId)
-        && hasValidYearEndStatusLineage(entry, companyId)
-        && (verifiedPairs.has(entry.id) || entry.status === 'reversed')
-      )
-    } else if (entry.source_type === 'storno') {
-      const original = relatedEntry(entry.reversed_entry)
-      const claimsControlledStorno = (
-        entry.description === `Makulering: ${CUTOFF_PAYABLE_DESCRIPTION}`
-        || entry.description === `Makulering: ${CUTOFF_PAYABLE_REVERSAL_DESCRIPTION}`
-        || Boolean(original && controlledYearEndKind(original) !== null)
-      )
-      if (
-        claimsControlledStorno
-        && (!original || !isExactCutoffStorno(entry, original, companyId))
-      ) {
-        throw new Error(`malformed controlled cash-method cutoff storno ${entry.id}`)
-      }
-      include = Boolean(original && isExactCutoffStorno(entry, original, companyId))
-    }
-    if (!include) continue
-
+  for (const entryId of included) {
+    const entry = lineage.entries.get(entryId)
+    if (!entry || entry.entry_date < start || entry.entry_date > end) continue
     for (const line of entry.lines ?? []) {
       if (line.account_number !== '2648') continue
       debit = round(debit + Number(line.debit_amount))
       credit = round(credit + Number(line.credit_amount))
     }
   }
-
   return { debit, credit }
 }
 
+function assertControlledEntryBound(
+  count: number,
+  context: string,
+): void {
+  if (count > CONTROLLED_CUTOFF_MAX_ENTRIES) {
+    throw new Error(
+      `${context} exceeds ${CONTROLLED_CUTOFF_MAX_ENTRIES} entries`,
+    )
+  }
+}
+
+async function fetchBoundedControlledRows<T>(
+  query: (range: { from: number; to: number }) => PromiseLike<{
+    data: T[] | null
+    error: { message: string } | null
+  }>,
+  context: string,
+): Promise<T[]> {
+  const rows: T[] = []
+  let from = 0
+  while (rows.length <= CONTROLLED_CUTOFF_MAX_ENTRIES) {
+    const remainingWithSentinel = CONTROLLED_CUTOFF_MAX_ENTRIES + 1 - rows.length
+    const pageSize = Math.min(1000, remainingWithSentinel)
+    const { data, error } = await query({ from, to: from + pageSize - 1 })
+    if (error) throw new Error(error.message)
+    if (!data?.length) break
+    rows.push(...data)
+    assertControlledEntryBound(rows.length, context)
+    if (data.length < pageSize) break
+    from += pageSize
+  }
+  return rows
+}
+
+function mergeControlledEntries(
+  target: Map<string, ControlledCutoffRelatedEntry>,
+  entries: ControlledCutoffRelatedEntry[],
+): void {
+  for (const entry of entries) {
+    const existing = target.get(entry.id)
+    if (
+      existing
+      && (
+        existing.company_id !== entry.company_id
+        || existing.status !== entry.status
+        || existing.entry_date !== entry.entry_date
+        || existing.description !== entry.description
+        || existing.source_type !== entry.source_type
+        || existing.source_id !== entry.source_id
+        || existing.correction_of_id !== entry.correction_of_id
+        || existing.reverses_id !== entry.reverses_id
+        || existing.reversed_by_id !== entry.reversed_by_id
+        || JSON.stringify(existing.lines) !== JSON.stringify(entry.lines)
+      )
+    ) {
+      throw new Error(`conflicting controlled cash-method cutoff entry ${entry.id}`)
+    }
+    target.set(entry.id, entry)
+  }
+  assertControlledEntryBound(target.size, 'controlled cash-method cutoff lineage')
+}
+
+async function fetchControlledEntriesByIds(
+  supabase: SupabaseClient,
+  companyId: string,
+  entryIds: string[],
+): Promise<ControlledCutoffRelatedEntry[]> {
+  const entries: ControlledCutoffRelatedEntry[] = []
+  const uniqueIds = Array.from(new Set(entryIds)).sort()
+  for (let offset = 0; offset < uniqueIds.length; offset += CONTROLLED_CUTOFF_ID_BATCH_SIZE) {
+    const ids = uniqueIds.slice(offset, offset + CONTROLLED_CUTOFF_ID_BATCH_SIZE)
+    const rows = await fetchAllRows<ControlledCutoffRelatedEntry>(({ from, to }) =>
+      supabase
+        .from('journal_entries')
+        .select(`
+          id, company_id, status, entry_date, description,
+          source_type, source_id, correction_of_id, reverses_id, reversed_by_id,
+          lines:journal_entry_lines(account_number, debit_amount, credit_amount)
+        `)
+        .eq('company_id', companyId)
+        .in('status', ['posted', 'reversed'])
+        .in('id', ids)
+        .order('id', { ascending: true })
+        .range(from, to),
+    )
+    entries.push(...rows)
+    assertControlledEntryBound(entries.length, 'controlled cash-method cutoff lookup')
+  }
+  return entries
+}
+
+function parseControlledLineageRow(value: unknown): ControlledCutoffLineageRow {
+  if (!value || typeof value !== 'object') {
+    throw new Error('malformed controlled cash-method cutoff lineage response')
+  }
+  const row = value as Record<string, unknown>
+  if (
+    typeof row.root_id !== 'string'
+    || typeof row.id !== 'string'
+    || typeof row.entry_date !== 'string'
+    || typeof row.status !== 'string'
+    || (row.source_type !== null && typeof row.source_type !== 'string')
+    || (row.correction_of_id !== null && typeof row.correction_of_id !== 'string')
+    || (row.reverses_id !== null && typeof row.reverses_id !== 'string')
+    || (row.parent_id !== null && typeof row.parent_id !== 'string')
+    || (row.edge_kind !== 'root'
+      && row.edge_kind !== 'correction'
+      && row.edge_kind !== 'storno')
+    || !Number.isInteger(row.depth)
+    || !Array.isArray(row.path)
+    || !row.path.every((id) => typeof id === 'string')
+    || typeof row.cycle !== 'boolean'
+  ) {
+    throw new Error('malformed controlled cash-method cutoff lineage response')
+  }
+  return row as unknown as ControlledCutoffLineageRow
+}
+
+async function fetchControlledCutoffLineage(
+  supabase: SupabaseClient,
+  companyId: string,
+  roots: ControlledCutoffRelatedEntry[],
+  knownEntries: Map<string, ControlledCutoffRelatedEntry>,
+): Promise<ControlledCutoffLineage> {
+  const rootIds = Array.from(new Set(roots.map((entry) => entry.id))).sort()
+  const rows: ControlledCutoffLineageRow[] = []
+
+  for (let offset = 0; offset < rootIds.length; offset += CONTROLLED_CUTOFF_ROOT_BATCH_SIZE) {
+    const batchRootIds = rootIds.slice(
+      offset,
+      offset + CONTROLLED_CUTOFF_ROOT_BATCH_SIZE,
+    )
+    const { data, error } = await supabase.rpc('get_supplier_payment_lineage', {
+      p_company_id: companyId,
+      p_root_ids: batchRootIds,
+    })
+    if (error) {
+      throw new Error(`controlled cash-method cutoff lineage RPC failed: ${error.message}`)
+    }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      throw new Error('malformed controlled cash-method cutoff lineage response')
+    }
+    const payload = data as Record<string, unknown>
+    if (
+      payload.requested_root_count !== batchRootIds.length
+      || !Array.isArray(payload.rows)
+    ) {
+      throw new Error('malformed controlled cash-method cutoff lineage response')
+    }
+    const batchRoots = new Set(batchRootIds)
+    for (const value of payload.rows) {
+      const row = parseControlledLineageRow(value)
+      if (!batchRoots.has(row.root_id)) {
+        throw new Error(`unexpected controlled cash-method cutoff root ${row.root_id}`)
+      }
+      rows.push(row)
+      assertControlledEntryBound(rows.length, 'controlled cash-method cutoff lineage')
+    }
+  }
+
+  const lineageEntryIds = Array.from(new Set(rows.map((row) => row.id)))
+  const missingEntryIds = lineageEntryIds.filter((id) => !knownEntries.has(id))
+  mergeControlledEntries(
+    knownEntries,
+    await fetchControlledEntriesByIds(supabase, companyId, missingEntryIds),
+  )
+  const unresolvedEntries = lineageEntryIds.filter((id) => !knownEntries.has(id))
+  if (unresolvedEntries.length > 0) {
+    throw new Error(
+      `missing ${unresolvedEntries.length} controlled cash-method cutoff lineage entries`,
+    )
+  }
+
+  const requested = new Set(rootIds)
+  const resolvedRoots = new Set<string>()
+  const rpcEntries = new Map<string, ControlledCutoffLineageRow>()
+  const corrections = new Map<string, Map<string, ControlledCutoffRelatedEntry>>()
+  const reversals = new Map<string, Map<string, ControlledCutoffRelatedEntry>>()
+  for (const row of rows) {
+    const entry = knownEntries.get(row.id)!
+    if (
+      !requested.has(row.root_id)
+      || row.path[0] !== row.root_id
+      || row.path.at(-1) !== row.id
+      || row.path.length !== row.depth + 1
+      || row.depth > CONTROLLED_CUTOFF_MAX_DEPTH
+      || row.cycle
+      || entry.entry_date !== row.entry_date
+      || entry.status !== row.status
+      || entry.source_type !== row.source_type
+      || entry.correction_of_id !== row.correction_of_id
+      || entry.reverses_id !== row.reverses_id
+    ) {
+      throw new Error(`malformed controlled cash-method cutoff lineage at ${row.id}`)
+    }
+    const existing = rpcEntries.get(row.id)
+    if (
+      existing
+      && (
+        existing.entry_date !== row.entry_date
+        || existing.status !== row.status
+        || existing.source_type !== row.source_type
+        || existing.correction_of_id !== row.correction_of_id
+        || existing.reverses_id !== row.reverses_id
+      )
+    ) {
+      throw new Error(`conflicting controlled cash-method cutoff lineage at ${row.id}`)
+    }
+    rpcEntries.set(row.id, row)
+
+    if (row.edge_kind === 'root') {
+      if (
+        row.parent_id !== null
+        || row.depth !== 0
+        || row.id !== row.root_id
+        || resolvedRoots.has(row.root_id)
+      ) {
+        throw new Error(`malformed controlled cash-method cutoff root ${row.root_id}`)
+      }
+      resolvedRoots.add(row.root_id)
+      continue
+    }
+    if (!row.parent_id) {
+      throw new Error(`orphan controlled cash-method cutoff lineage at ${row.id}`)
+    }
+    const target = row.edge_kind === 'correction' ? corrections : reversals
+    const children = target.get(row.parent_id)
+      ?? new Map<string, ControlledCutoffRelatedEntry>()
+    children.set(row.id, entry)
+    target.set(row.parent_id, children)
+  }
+
+  for (const row of rows) {
+    if (
+      row.edge_kind !== 'root'
+      && (!row.parent_id || !rpcEntries.has(row.parent_id))
+    ) {
+      throw new Error(`orphan controlled cash-method cutoff lineage at ${row.id}`)
+    }
+  }
+  const unresolvedRoots = rootIds.filter((id) => !resolvedRoots.has(id))
+  if (unresolvedRoots.length > 0) {
+    throw new Error(
+      `missing ${unresolvedRoots.length} controlled cash-method cutoff roots`,
+    )
+  }
+  for (const [parentId, children] of corrections) {
+    if (children.size > 1) {
+      throw new Error(`ambiguous controlled cash-method cutoff correction for ${parentId}`)
+    }
+  }
+  for (const [parentId, children] of reversals) {
+    if (children.size > 1) {
+      throw new Error(`ambiguous controlled cash-method cutoff storno for ${parentId}`)
+    }
+  }
+
+  return {
+    entries: knownEntries,
+    correctionsByParent: new Map(
+      Array.from(corrections, ([parentId, children]) => [parentId, [...children.values()]]),
+    ),
+    reversalsByParent: new Map(
+      Array.from(reversals, ([parentId, children]) => [parentId, [...children.values()]]),
+    ),
+  }
+}
+
 /**
- * Read only 2648-bearing year-end/storno candidates in the requested company
- * and period, plus one adjacent day for the app-created cutoff pair. Related
- * storno rows are embedded in the same bounded paginated query, avoiding N+1.
+ * Find 2648-bearing candidates in the requested period, walk at most 32
+ * ancestor edges in 100-id batches, then resolve each controlled year-end
+ * root's complete descendants through bounded lineage RPC batches. This
+ * admits correction rows only when they descend from an exact app-created
+ * cutoff pair.
  */
 async function fetchControlledCutoffInputVat(
   supabase: SupabaseClient,
@@ -709,37 +1057,142 @@ async function fetchControlledCutoffInputVat(
   end: string,
 ): Promise<{ debit: number; credit: number }> {
   try {
-    const entries = await fetchAllRows<ControlledCutoffQueryEntry>(
+    const anchors = await fetchBoundedControlledRows<ControlledCutoffRelatedEntry>(
       ({ from, to }) =>
         supabase
           .from('journal_entries')
           .select(`
             id, company_id, status, entry_date, description,
-            source_type, source_id, reverses_id, reversed_by_id,
+            source_type, source_id, correction_of_id, reverses_id, reversed_by_id,
             lines:journal_entry_lines(account_number, debit_amount, credit_amount),
-            vat_lines:journal_entry_lines!inner(id),
-            reversed_entry:journal_entries!journal_entries_reverses_id_fkey(
-              id, company_id, status, entry_date, description,
-              source_type, source_id, reverses_id, reversed_by_id,
-              lines:journal_entry_lines(account_number, debit_amount, credit_amount)
-            ),
-            reversal_entry:journal_entries!journal_entries_reversed_by_id_fkey(
-              id, company_id, status, entry_date, description,
-              source_type, source_id, reverses_id, reversed_by_id,
-              lines:journal_entry_lines(account_number, debit_amount, credit_amount)
-            )
+            vat_lines:journal_entry_lines!inner(id)
           `)
           .eq('company_id', companyId)
           .in('status', ['posted', 'reversed'])
-          .in('source_type', ['year_end', 'storno'])
+          .in('source_type', ['year_end', 'storno', 'correction'])
           .gte('entry_date', shiftedIsoDate(start, -1))
           .lte('entry_date', shiftedIsoDate(end, 1))
           .eq('vat_lines.account_number', '2648')
           .order('id', { ascending: true })
           .range(from, to),
-      { dedupeBy: (entry) => entry.id },
+      'controlled cash-method cutoff lookup',
     )
-    return sumControlledCutoffInputVat(entries, companyId, start, end)
+    assertControlledEntryBound(anchors.length, 'controlled cash-method cutoff lookup')
+    if (anchors.length === 0) return { debit: 0, credit: 0 }
+
+    const knownEntries = new Map<string, ControlledCutoffRelatedEntry>()
+    mergeControlledEntries(knownEntries, anchors)
+    let parentIds = Array.from(new Set(
+      anchors.flatMap((entry) =>
+        [entry.correction_of_id, entry.reverses_id].filter(
+          (id): id is string => id !== null,
+        ),
+      ),
+    ))
+    const expandedAncestors = new Set<string>()
+    let depth = 0
+    while (parentIds.length > 0 && depth < CONTROLLED_CUTOFF_MAX_DEPTH) {
+      const currentParentIds = parentIds.filter((id) => !expandedAncestors.has(id))
+      if (currentParentIds.length === 0) break
+      currentParentIds.forEach((id) => expandedAncestors.add(id))
+      const unresolved = currentParentIds.filter((id) => !knownEntries.has(id))
+      const fetchedParents = await fetchControlledEntriesByIds(
+        supabase,
+        companyId,
+        unresolved,
+      )
+      mergeControlledEntries(knownEntries, fetchedParents)
+      const missing = unresolved.filter((id) => !knownEntries.has(id))
+      if (missing.length > 0) {
+        const malformedStorno = [...knownEntries.values()].find((entry) =>
+          entry.source_type === 'storno'
+          && entry.reverses_id !== null
+          && missing.includes(entry.reverses_id)
+          && (
+            entry.description === `Makulering: ${CUTOFF_PAYABLE_DESCRIPTION}`
+            || entry.description === `Makulering: ${CUTOFF_PAYABLE_REVERSAL_DESCRIPTION}`
+          ),
+        )
+        if (malformedStorno) {
+          throw new Error(
+            `malformed controlled cash-method cutoff storno ${malformedStorno.id}`,
+          )
+        }
+        throw new Error(
+          `missing ${missing.length} controlled cash-method cutoff ancestors`,
+        )
+      }
+      const parents = currentParentIds.map((id) => knownEntries.get(id)!)
+      parentIds = Array.from(new Set(
+        parents.flatMap((entry) =>
+          [entry.correction_of_id, entry.reverses_id].filter(
+            (id): id is string => id !== null,
+          ),
+        ),
+      ))
+      depth += 1
+    }
+    if (parentIds.some((id) => !expandedAncestors.has(id))) {
+      throw new Error(
+        `controlled cash-method cutoff ancestry exceeds ${CONTROLLED_CUTOFF_MAX_DEPTH} edges`,
+      )
+    }
+
+    const discoveredRoots = [...knownEntries.values()].filter((entry) =>
+      entry.source_type === 'year_end'
+      && controlledYearEndKind(entry) !== null,
+    )
+    if (discoveredRoots.length === 0) return { debit: 0, credit: 0 }
+
+    const companionDates = Array.from(new Set(
+      discoveredRoots.flatMap((entry) => [
+        shiftedIsoDate(entry.entry_date, -1),
+        entry.entry_date,
+        shiftedIsoDate(entry.entry_date, 1),
+      ]),
+    )).sort()
+    for (
+      let offset = 0;
+      offset < companionDates.length;
+      offset += CONTROLLED_CUTOFF_ID_BATCH_SIZE
+    ) {
+      const dates = companionDates.slice(offset, offset + CONTROLLED_CUTOFF_ID_BATCH_SIZE)
+      const companions = await fetchBoundedControlledRows<ControlledCutoffRelatedEntry>(({ from, to }) =>
+        supabase
+          .from('journal_entries')
+          .select(`
+            id, company_id, status, entry_date, description,
+            source_type, source_id, correction_of_id, reverses_id, reversed_by_id,
+            lines:journal_entry_lines(account_number, debit_amount, credit_amount),
+            vat_lines:journal_entry_lines!inner(id)
+          `)
+          .eq('company_id', companyId)
+          .in('status', ['posted', 'reversed'])
+          .eq('source_type', 'year_end')
+          .in('description', [
+            CUTOFF_PAYABLE_DESCRIPTION,
+            CUTOFF_PAYABLE_REVERSAL_DESCRIPTION,
+          ])
+          .in('entry_date', dates)
+          .eq('vat_lines.account_number', '2648')
+          .order('id', { ascending: true })
+          .range(from, to),
+        'controlled cash-method cutoff companion lookup',
+      )
+      mergeControlledEntries(knownEntries, companions)
+    }
+
+    const roots = [...knownEntries.values()].filter((entry) =>
+      entry.source_type === 'year_end'
+      && controlledYearEndKind(entry) !== null,
+    )
+    const lineage = await fetchControlledCutoffLineage(
+      supabase,
+      companyId,
+      roots,
+      knownEntries,
+    )
+    return sumControlledCutoffInputVat(roots, lineage, companyId, start, end)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     throw new Error(`controlled cutoff 2648 lookup failed: ${message}`)
@@ -951,8 +1404,9 @@ export async function calculateVatDeclaration(
   const dynamicRuta05 = await fetchDynamicRuta05Accounts(supabase, companyId)
 
   // Aggregate statically mapped accounts and resolve the controlled 2648
-  // exception independently. The second query is bounded to this company and
-  // period, pages by entry id, and embeds reversal relations instead of N+1.
+  // exception independently. The second path is company-scoped and bounded;
+  // it pages candidate entries, then resolves ancestry and descendants in
+  // batches rather than issuing one query per correction edge.
   const [
     { totals, sourceTypeCounts },
     controlledCutoffInputVat,

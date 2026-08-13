@@ -21,6 +21,28 @@ export async function getClient(): Promise<PoolClient> {
   return getPool().connect()
 }
 
+let savepointSequence = 0
+
+// Keep an expected SQL error from aborting the caller's surrounding
+// transaction. The original error is rethrown only after the savepoint has
+// restored the same role and transaction context for follow-up assertions.
+export async function withErrorSavepoint<T>(
+  client: PoolClient,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const savepoint = `expected_error_${savepointSequence++}`
+  await client.query(`SAVEPOINT ${savepoint}`)
+  try {
+    const result = await fn()
+    await client.query(`RELEASE SAVEPOINT ${savepoint}`)
+    return result
+  } catch (error) {
+    await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`)
+    await client.query(`RELEASE SAVEPOINT ${savepoint}`)
+    throw error
+  }
+}
+
 // Run `fn` inside a role/JWT context that auth.uid() / user_company_ids() will
 // observe. Uses SET LOCAL inside a transaction so the role reverts on commit
 // or rollback. Rolls back by default so test writes do not persist; callers

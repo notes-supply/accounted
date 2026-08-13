@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { describe, expect, it } from 'vitest'
-import { getPool, withUserContext } from './setup'
+import { getPool, withErrorSavepoint, withUserContext } from './setup'
 import { insertPostedJournalEntry, seedCompany } from './fixtures'
 
 async function expectStatementRejected(
@@ -9,16 +9,9 @@ async function expectStatementRejected(
   sql: string,
   params: unknown[],
 ): Promise<void> {
-  await client.query('SAVEPOINT guarded_write')
-  let raised: (Error & { code?: string }) | null = null
-  try {
-    await client.query(sql, params)
-  } catch (error) {
-    raised = error as Error & { code?: string }
-  }
-  expect(raised, 'the authenticated mutation must be rejected').not.toBeNull()
-  await client.query('ROLLBACK TO SAVEPOINT guarded_write')
-  await client.query('RELEASE SAVEPOINT guarded_write')
+  await expect(
+    withErrorSavepoint(client, () => client.query(sql, params)),
+  ).rejects.toThrow()
 }
 
 describe('gnubok.allow_delete trusted execution context', () => {
@@ -95,9 +88,9 @@ describe('gnubok.allow_delete trusted execution context', () => {
       const retainedLines = await client.query<{
         id: string
         account_number: string
-        debit_amount: string
+        debit_amount: number
       }>(
-        `SELECT id, account_number, debit_amount::text
+        `SELECT id, account_number, debit_amount::double precision AS debit_amount
            FROM public.journal_entry_lines
           WHERE journal_entry_id = $1
           ORDER BY sort_order, id`,
@@ -107,7 +100,7 @@ describe('gnubok.allow_delete trusted execution context', () => {
       expect(retainedLines.rows[0]).toMatchObject({
         id: lineId,
         account_number: '1930',
-        debit_amount: '1000.00',
+        debit_amount: 1000,
       })
 
       const retainedDocument = await client.query<{

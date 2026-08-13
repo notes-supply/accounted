@@ -542,7 +542,7 @@ describe('fetchPaymentsAsOf', () => {
     ]))
   })
 
-  it('uses one lineage RPC for 10,001 paginated allocations', async () => {
+  it('batches lineage RPCs for 10,001 paginated allocations without changing totals', async () => {
     const paymentRows = Array.from({ length: 10_001 }, (_, index) => ({
       ...activePayment,
       id: `payment-${index}`,
@@ -576,16 +576,46 @@ describe('fetchPaymentsAsOf', () => {
       [9000, 9999],
       [10000, 10999],
     ])
-    expect(rpcCalls).toHaveLength(1)
-    expect(rpcCalls[0]).toMatchObject({
-      name: 'get_supplier_payment_lineage',
-      params: {
-        p_company_id: 'co-1',
-      },
-    })
-    expect(rpcCalls[0].params.p_root_ids).toHaveLength(10_001)
+    expect(rpcCalls).toHaveLength(34)
+    expect(rpcCalls.every((call) =>
+      call.name === 'get_supplier_payment_lineage'
+      && call.params.p_company_id === 'co-1'
+      && call.params.p_root_ids.length <= 300
+    )).toBe(true)
+    expect(rpcCalls.flatMap((call) => call.params.p_root_ids)).toHaveLength(10_001)
     expect(calls).toHaveLength(11)
     expect(calls.every((call) => call.table === 'supplier_invoice_payments')).toBe(true)
+  })
+
+  it('merges more than 20,000 distinct roots exactly across bounded RPC calls', async () => {
+    const rootCount = 20_001
+    const paymentRows = Array.from({ length: rootCount }, (_, index) => ({
+      ...activePayment,
+      id: `payment-${index}`,
+      supplier_invoice_id: `supplier-invoice-${index}`,
+      amount: 1,
+      journal_entry_id: `entry-${index}`,
+    }))
+    const journalRows = Array.from({ length: rootCount }, (_, index) =>
+      journalEntry(`entry-${index}`),
+    )
+    const { supabase, rpcCalls } = makeSupabase(paymentRows, journalRows)
+
+    const result = await fetchPaymentsAsOf(
+      supabase as never,
+      'supplier_invoice_payments',
+      'supplier_invoice_id',
+      'co-1',
+      '2025-12-31',
+    )
+
+    const requestedRoots = rpcCalls.flatMap((call) => call.params.p_root_ids)
+    expect(rpcCalls).toHaveLength(67)
+    expect(rpcCalls.every((call) => call.params.p_root_ids.length <= 300)).toBe(true)
+    expect(requestedRoots).toHaveLength(rootCount)
+    expect(new Set(requestedRoots).size).toBe(rootCount)
+    expect(result.paidThrough.size).toBe(rootCount)
+    expect(new Set(result.paidThrough.values())).toEqual(new Set([1]))
   })
 
   it('leaves customer payment history unchanged and does not fetch journal lineage', async () => {

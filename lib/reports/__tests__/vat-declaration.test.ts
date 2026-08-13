@@ -34,6 +34,7 @@ interface ControlledTestEntry {
   description: string
   source_type: string | null
   source_id: string | null
+  correction_of_id: string | null
   reverses_id: string | null
   reversed_by_id: string | null
   lines: ControlledTestLine[]
@@ -84,13 +85,104 @@ function makeSettingsBuilder() {
   return b
 }
 
+function allControlledEntries(): ControlledTestEntry[] {
+  const entries = new Map<string, ControlledTestEntry>()
+  const visit = (entry: ControlledTestEntry | null | undefined) => {
+    if (!entry || entries.has(entry.id)) return
+    entries.set(entry.id, entry)
+    visit(entry.reversed_entry)
+    visit(entry.reversal_entry)
+  }
+  controlledEntries.forEach(visit)
+  return [...entries.values()]
+}
+
+function controlledLineagePayload(companyId: string, rootIds: string[]) {
+  const entries = new Map(allControlledEntries().map((entry) => [entry.id, entry]))
+  const children = new Map<string, ControlledTestEntry[]>()
+  for (const entry of entries.values()) {
+    for (const parentId of [entry.correction_of_id, entry.reverses_id]) {
+      if (!parentId) continue
+      const siblings = children.get(parentId) ?? []
+      siblings.push(entry)
+      children.set(parentId, siblings)
+    }
+  }
+  const rows: Array<Record<string, unknown>> = []
+  const visit = (
+    rootId: string,
+    entry: ControlledTestEntry,
+    parentId: string | null,
+    edgeKind: 'root' | 'correction' | 'storno',
+    path: string[],
+  ) => {
+    const cycle = path.includes(entry.id)
+    const nextPath = [...path, entry.id]
+    rows.push({
+      root_id: rootId,
+      parent_id: parentId,
+      edge_kind: edgeKind,
+      id: entry.id,
+      entry_date: entry.entry_date,
+      status: entry.status,
+      source_type: entry.source_type,
+      correction_of_id: entry.correction_of_id,
+      reverses_id: entry.reverses_id,
+      depth: nextPath.length - 1,
+      path: nextPath,
+      cycle,
+    })
+    if (cycle || edgeKind === 'storno') return
+    for (const child of children.get(entry.id) ?? []) {
+      visit(
+        rootId,
+        child,
+        entry.id,
+        child.correction_of_id === entry.id ? 'correction' : 'storno',
+        nextPath,
+      )
+    }
+  }
+  const uniqueRootIds = Array.from(new Set(rootIds))
+  for (const rootId of uniqueRootIds) {
+    const root = entries.get(rootId)
+    if (root?.company_id === companyId) visit(rootId, root, null, 'root', [])
+  }
+  return { requested_root_count: uniqueRootIds.length, rows }
+}
+
 function makeControlledCutoffBuilder() {
   const b: Record<string, unknown> = {}
-  for (const m of ['select', 'eq', 'in', 'gte', 'lte', 'order', 'range']) {
-    b[m] = vi.fn().mockReturnValue(b)
+  const filters: Array<{ method: string; column: string; value: unknown }> = []
+  let range: [number, number] | null = null
+  b.select = vi.fn().mockReturnValue(b)
+  for (const method of ['eq', 'in', 'gte', 'lte']) {
+    b[method] = vi.fn().mockImplementation((column: string, value: unknown) => {
+      filters.push({ method, column, value })
+      return b
+    })
   }
-  b.then = (resolve: (value: unknown) => void) =>
-    resolve({ data: controlledError ? null : controlledEntries, error: controlledError })
+  b.order = vi.fn().mockReturnValue(b)
+  b.range = vi.fn().mockImplementation((from: number, to: number) => {
+    range = [from, to]
+    return b
+  })
+  b.then = (resolve: (value: unknown) => void) => {
+    let rows = allControlledEntries().filter((entry) =>
+      filters.every(({ method, column, value }) => {
+        if (column === 'vat_lines.account_number') {
+          return entry.lines.some((line) => line.account_number === value)
+        }
+        const entryValue = entry[column as keyof ControlledTestEntry]
+        if (method === 'eq') return entryValue === value
+        if (method === 'in') return (value as unknown[]).includes(entryValue)
+        if (method === 'gte') return String(entryValue) >= String(value)
+        return String(entryValue) <= String(value)
+      }),
+    )
+    if (range) rows = rows.slice(range[0], range[1] + 1)
+    resolve({ data: controlledError ? null : rows, error: controlledError })
+  }
   controlledQueries.push(b)
   return b
 }
@@ -106,7 +198,18 @@ function makeClient() {
             ? makeControlledCutoffBuilder()
             : makeBuilder()
     ),
-    rpc: vi.fn().mockImplementation(async () => results[resultIdx++] ?? { data: null, error: null }),
+    rpc: vi.fn().mockImplementation(async (
+      name: string,
+      params: Record<string, unknown>,
+    ) => name === 'get_supplier_payment_lineage'
+      ? {
+          data: controlledLineagePayload(
+            params.p_company_id as string,
+            params.p_root_ids as string[],
+          ),
+          error: null,
+        }
+      : results[resultIdx++] ?? { data: null, error: null }),
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } as any
 }
@@ -163,6 +266,7 @@ function controlledCutoffPair(amount = 250): [ControlledTestEntry, ControlledTes
     description: CUTOFF_DESCRIPTION,
     source_type: 'year_end',
     source_id: null,
+    correction_of_id: null,
     reverses_id: null,
     reversed_by_id: null,
     lines: cutoffLines,
@@ -175,6 +279,7 @@ function controlledCutoffPair(amount = 250): [ControlledTestEntry, ControlledTes
     description: SCHEDULED_REVERSAL_DESCRIPTION,
     source_type: 'year_end',
     source_id: null,
+    correction_of_id: null,
     reverses_id: null,
     reversed_by_id: null,
     lines: cutoffLines.map((line) => ({
@@ -184,6 +289,51 @@ function controlledCutoffPair(amount = 250): [ControlledTestEntry, ControlledTes
     })),
   }
   return [cutoff, reversal]
+}
+
+function correctedControlledEntry(
+  original: ControlledTestEntry,
+  correctionId: string,
+  correctionDate: string,
+  correctedLines: ControlledTestLine[],
+): [ControlledTestEntry, ControlledTestEntry, ControlledTestEntry] {
+  const stornoId = `storno-${original.id}`
+  const reversedOriginal = {
+    ...original,
+    status: 'reversed',
+    reversed_by_id: stornoId,
+  }
+  const storno: ControlledTestEntry = {
+    id: stornoId,
+    company_id: original.company_id,
+    status: 'posted',
+    entry_date: original.entry_date,
+    description: `Makulering: ${original.description}`,
+    source_type: 'storno',
+    source_id: null,
+    correction_of_id: null,
+    reverses_id: original.id,
+    reversed_by_id: null,
+    lines: original.lines.map((line) => ({
+      account_number: line.account_number,
+      debit_amount: line.credit_amount,
+      credit_amount: line.debit_amount,
+    })),
+  }
+  const correction: ControlledTestEntry = {
+    id: correctionId,
+    company_id: original.company_id,
+    status: 'posted',
+    entry_date: correctionDate,
+    description: `Rättelse: ${original.description}`,
+    source_type: 'correction',
+    source_id: null,
+    correction_of_id: original.id,
+    reverses_id: null,
+    reversed_by_id: null,
+    lines: correctedLines,
+  }
+  return [reversedOriginal, storno, correction]
 }
 
 import {
@@ -634,6 +784,137 @@ describe('calculateVatDeclaration', () => {
     expect(controlledQueries[0].lte).toHaveBeenCalledWith('entry_date', '2026-01-01')
   })
 
+  it('projects a corrected cutoff at its replacement amount and date', async () => {
+    const [cutoff, scheduledReversal] = controlledCutoffPair()
+    const [reversedCutoff, storno, correction] = correctedControlledEntry(
+      cutoff,
+      'corrected-cutoff-1',
+      '2026-01-15',
+      [
+        { account_number: '5410', debit_amount: 1200, credit_amount: 0 },
+        { account_number: '2648', debit_amount: 300, credit_amount: 0 },
+        { account_number: '2440', debit_amount: 0, credit_amount: 1500 },
+      ],
+    )
+    controlledEntries = [reversedCutoff, storno, correction, scheduledReversal]
+
+    seedLedger([])
+    const december = await calculateVatDeclaration(
+      supabase, 'company-1', 'monthly', 2025, 12,
+    )
+    seedLedger([])
+    const january = await calculateVatDeclaration(
+      supabase, 'company-1', 'monthly', 2026, 1,
+    )
+
+    expect(december.rutor.ruta48).toBe(0)
+    expect(january.rutor.ruta48).toBe(50)
+  })
+
+  it('projects the live leaf of a multi-step controlled correction chain', async () => {
+    const [cutoff, scheduledReversal] = controlledCutoffPair()
+    const [reversedCutoff, cutoffStorno, firstCorrection] = correctedControlledEntry(
+      cutoff,
+      'corrected-cutoff-1',
+      '2026-01-10',
+      [
+        { account_number: '5410', debit_amount: 1200, credit_amount: 0 },
+        { account_number: '2648', debit_amount: 300, credit_amount: 0 },
+        { account_number: '2440', debit_amount: 0, credit_amount: 1500 },
+      ],
+    )
+    const [reversedFirst, firstStorno, liveCorrection] = correctedControlledEntry(
+      firstCorrection,
+      'corrected-cutoff-2',
+      '2026-01-20',
+      [
+        { account_number: '5410', debit_amount: 1400, credit_amount: 0 },
+        { account_number: '2648', debit_amount: 350, credit_amount: 0 },
+        { account_number: '2440', debit_amount: 0, credit_amount: 1750 },
+      ],
+    )
+    controlledEntries = [
+      reversedCutoff,
+      cutoffStorno,
+      reversedFirst,
+      firstStorno,
+      liveCorrection,
+      scheduledReversal,
+    ]
+
+    seedLedger([])
+    const january = await calculateVatDeclaration(
+      supabase, 'company-1', 'monthly', 2026, 1,
+    )
+
+    expect(january.rutor.ruta48).toBe(100)
+  })
+
+  it('projects a corrected scheduled reversal from its live replacement', async () => {
+    const [cutoff, scheduledReversal] = controlledCutoffPair()
+    const [reversedScheduled, storno, correction] = correctedControlledEntry(
+      scheduledReversal,
+      'corrected-scheduled-reversal-1',
+      '2026-01-20',
+      [
+        { account_number: '2440', debit_amount: 1500, credit_amount: 0 },
+        { account_number: '5410', debit_amount: 0, credit_amount: 1200 },
+        { account_number: '2648', debit_amount: 0, credit_amount: 300 },
+      ],
+    )
+    controlledEntries = [cutoff, reversedScheduled, storno, correction]
+
+    seedLedger([])
+    const january = await calculateVatDeclaration(
+      supabase, 'company-1', 'monthly', 2026, 1,
+    )
+
+    expect(january.rutor.ruta48).toBe(-300)
+  })
+
+  it('fails closed on malformed controlled correction lineage', async () => {
+    const [cutoff, scheduledReversal] = controlledCutoffPair()
+    const [reversedCutoff, storno, correction] = correctedControlledEntry(
+      cutoff,
+      'malformed-correction-1',
+      '2025-12-31',
+      cutoff.lines,
+    )
+    controlledEntries = [
+      reversedCutoff,
+      storno,
+      { ...correction, source_type: 'manual' },
+      scheduledReversal,
+    ]
+    seedLedger([])
+
+    await expect(calculateVatDeclaration(
+      supabase, 'company-1', 'monthly', 2025, 12,
+    )).rejects.toThrow(/malformed controlled cash-method cutoff correction/i)
+  })
+
+  it('fails closed on ambiguous controlled correction lineage', async () => {
+    const [cutoff, scheduledReversal] = controlledCutoffPair()
+    const [reversedCutoff, storno, correction] = correctedControlledEntry(
+      cutoff,
+      'correction-1',
+      '2025-12-31',
+      cutoff.lines,
+    )
+    controlledEntries = [
+      reversedCutoff,
+      storno,
+      correction,
+      { ...correction, id: 'correction-2' },
+      scheduledReversal,
+    ]
+    seedLedger([])
+
+    await expect(calculateVatDeclaration(
+      supabase, 'company-1', 'monthly', 2025, 12,
+    )).rejects.toThrow(/ambiguous controlled cash-method cutoff correction/i)
+  })
+
   it('ignores manual and SIE-imported dormant 2648', async () => {
     const [cutoff] = controlledCutoffPair()
     controlledEntries = [
@@ -667,7 +948,7 @@ describe('calculateVatDeclaration', () => {
   })
 
   it('includes an exact storno and aborts on malformed reversal lineage', async () => {
-    const [cutoff] = controlledCutoffPair()
+    const [cutoff, scheduledReversal] = controlledCutoffPair()
     const reversedCutoff: ControlledTestEntry = {
       ...cutoff,
       status: 'reversed',
@@ -681,6 +962,7 @@ describe('calculateVatDeclaration', () => {
       description: `Makulering: ${CUTOFF_DESCRIPTION}`,
       source_type: 'storno',
       source_id: null,
+      correction_of_id: null,
       reverses_id: reversedCutoff.id,
       reversed_by_id: null,
       lines: reversedCutoff.lines.map((line) => ({
@@ -689,7 +971,7 @@ describe('calculateVatDeclaration', () => {
         credit_amount: line.debit_amount,
       })),
       reversed_entry: reversedCutoff,
-    }]
+    }, scheduledReversal]
     seedLedger([])
 
     const result = await calculateVatDeclaration(
@@ -701,7 +983,7 @@ describe('calculateVatDeclaration', () => {
     controlledEntries = [{
       ...controlledEntries[0],
       reverses_id: 'different-cutoff',
-    }]
+    }, scheduledReversal]
     seedLedger([])
     await expect(calculateVatDeclaration(
       supabase, 'company-1', 'monthly', 2026, 2,

@@ -7,7 +7,7 @@ import {
   insertFiscalPeriod,
   insertBalancedLines,
 } from '@/tests/pg/fixtures'
-import { getPool, withUserContext } from '@/tests/pg/setup'
+import { getPool, withErrorSavepoint, withUserContext } from '@/tests/pg/setup'
 
 /**
  * Regression for the draft-only delete_last_voucher contract. A posted
@@ -82,9 +82,12 @@ describe('delete_last_voucher with a committed opening-balance link', () => {
     )
 
     await withUserContext(userId, async (client) => {
-      await expect(client.query(
-        `SELECT delete_last_voucher($1, $2)`,
-        [companyId, ibEntryId],
+      await expect(withErrorSavepoint(
+        client,
+        () => client.query(
+          `SELECT delete_last_voucher($1, $2)`,
+          [companyId, ibEntryId],
+        ),
       )).rejects.toThrow(/Only genuine draft journal entries/i)
 
       const state = await client.query<{
