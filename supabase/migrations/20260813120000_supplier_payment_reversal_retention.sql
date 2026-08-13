@@ -568,7 +568,10 @@ BEGIN
      AND e.event_type = o.event_type
      AND e.entity_id = o.reversal_journal_entry_id
      AND e.data = o.payload - 'userId' - 'companyId';
-  IF v_event_log_count <> 2 THEN
+  -- event_log is a 30-day projection. Require it before first publication, but
+  -- never make an exact retry depend on rows the scheduled cleanup is designed
+  -- to remove; the locked, published outbox pair remains the durable authority.
+  IF v_published_count = 0 AND v_event_log_count <> 2 THEN
     RAISE EXCEPTION 'supplier reversal event_log persistence could not be verified'
       USING ERRCODE = '55000';
   END IF;

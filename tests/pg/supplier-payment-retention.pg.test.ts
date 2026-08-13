@@ -957,6 +957,75 @@ describe('supplier payment reversal retention migration', () => {
     })
   })
 
+  it('accepts an exact retry after the 30-day event-log projection expires', async () => {
+    const seeded = await seedPaymentVoucher()
+    await insertPayment(seeded)
+    await insertWebhook(seeded.companyId, 'journal_entry.committed')
+    await insertWebhook(seeded.companyId, 'journal_entry.reversed')
+    const stornoId = await insertPostedStorno({
+      ...seeded,
+      originalJournalEntryId: seeded.journalEntryId,
+    })
+
+    let outboxIds: string[] = []
+    await withUserContext(seeded.userId, async (client) => {
+      const first = await applySupplierPaymentReversal(client, {
+        companyId: seeded.companyId,
+        originalJournalEntryId: seeded.journalEntryId,
+        stornoJournalEntryId: stornoId,
+      })
+      outboxIds = (first.event_publication as { event_outbox_ids: string[] }).event_outbox_ids
+    }, { commit: true })
+
+    // Mirrors the privileged daily retention job, not an authenticated user.
+    await getPool().query(
+      `DELETE FROM public.event_log
+        WHERE outbox_event_id = ANY($1::uuid[])`,
+      [outboxIds],
+    )
+
+    await withUserContext(seeded.userId, async (client) => {
+      const retry = await applySupplierPaymentReversal(client, {
+        companyId: seeded.companyId,
+        originalJournalEntryId: seeded.journalEntryId,
+        stornoJournalEntryId: stornoId,
+      })
+      expect(retry).toMatchObject({
+        ok: true,
+        status: 'already_applied',
+        event_publication: {
+          status: 'already_published',
+          event_log_count: 0,
+          webhook_delivery_count: 2,
+        },
+      })
+    })
+
+    const durable = await getPool().query<{
+      outbox_count: number
+      published_count: number
+      delivery_count: number
+    }>(
+      `SELECT
+         (SELECT count(*)::integer
+            FROM public.supplier_payment_reversal_event_outbox
+           WHERE id = ANY($1::uuid[])) AS outbox_count,
+         (SELECT count(*)::integer
+            FROM public.supplier_payment_reversal_event_outbox
+           WHERE id = ANY($1::uuid[])
+             AND published_at IS NOT NULL) AS published_count,
+         (SELECT count(*)::integer
+            FROM public.webhook_deliveries
+           WHERE outbox_event_id = ANY($1::uuid[])) AS delivery_count`,
+      [outboxIds],
+    )
+    expect(durable.rows).toEqual([{
+      outbox_count: 2,
+      published_count: 2,
+      delivery_count: 2,
+    }])
+  })
+
   it('rejects a mismatched storno and leaves supplier state unchanged', async () => {
     const seeded = await seedPaymentVoucher()
     const paymentId = await insertPayment(seeded)
