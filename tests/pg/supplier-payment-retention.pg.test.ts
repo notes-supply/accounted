@@ -1116,7 +1116,6 @@ describe('supplier payment reversal retention migration', () => {
                         paid_amount::text AS paid_amount,
                         remaining_amount::text AS remaining_amount,
                         paid_at,
-                        journal_entry_id,
                         payment_journal_entry_id
                    FROM public.supplier_invoices
                   WHERE id = $3
