@@ -1214,6 +1214,271 @@ REVOKE ALL ON FUNCTION public.record_supplier_payment_reversal_events(
   uuid,
   uuid
 ) FROM PUBLIC, anon, authenticated, service_role;
+-- Retained allocations stay attached to their original payment root even when
+-- the live correction descendant is cancelled. Re-publish the trigger so its
+-- storno-pointer guard proves that exact immutable ancestry instead of requiring
+-- every sanctioned storno to reverse the root directly.
+CREATE OR REPLACE FUNCTION public.enforce_supplier_invoice_payment_retention()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path TO 'public'
+AS $$
+DECLARE
+  v_reversal record;
+  v_invoice_company_id uuid;
+  v_journal record;
+  v_transaction_company_id uuid;
+  v_current record;
+  v_current_id uuid;
+  v_ancestry_ids uuid[] := ARRAY[]::uuid[];
+  v_ancestry_depth integer := 0;
+BEGIN
+  -- The repository's sanctioned sandbox teardown sets this transaction-local
+  -- marker only after verifying every company for the user is a sandbox. Keep
+  -- the per-row authoritative re-check here: the marker alone never unlocks a
+  -- real company's retained allocations.
+  IF TG_OP = 'DELETE'
+     AND current_setting('gnubok.sandbox_cleanup', true) = 'true'
+     AND EXISTS (
+       SELECT 1
+         FROM public.company_settings cs
+        WHERE cs.company_id = OLD.company_id
+          AND cs.is_sandbox = true
+     ) THEN
+    RETURN OLD;
+  END IF;
+
+  -- FK cleanup may clear journal/transaction pointers before the parent
+  -- supplier invoice cascade deletes the allocation. Only nullification of
+  -- those two pointers is accepted, and only for a reverified sandbox row.
+  IF TG_OP = 'UPDATE'
+     AND current_setting('gnubok.sandbox_cleanup', true) = 'true'
+     AND EXISTS (
+       SELECT 1
+         FROM public.company_settings cs
+        WHERE cs.company_id = OLD.company_id
+          AND cs.is_sandbox = true
+     )
+     AND (
+       to_jsonb(NEW) - ARRAY['journal_entry_id', 'transaction_id']
+     ) IS NOT DISTINCT FROM (
+       to_jsonb(OLD) - ARRAY['journal_entry_id', 'transaction_id']
+     )
+     AND (
+       NEW.journal_entry_id IS NOT DISTINCT FROM OLD.journal_entry_id
+       OR NEW.journal_entry_id IS NULL
+     )
+     AND (
+       NEW.transaction_id IS NOT DISTINCT FROM OLD.transaction_id
+       OR NEW.transaction_id IS NULL
+     ) THEN
+    RETURN NEW;
+  END IF;
+
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'supplier invoice payment allocations are retained and cannot be deleted'
+      USING ERRCODE = '55000';
+  END IF;
+
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.reversed_at IS NOT NULL OR NEW.reversed_by_journal_entry_id IS NOT NULL THEN
+      RAISE EXCEPTION 'new supplier invoice payment allocations must be active'
+        USING ERRCODE = '23514';
+    END IF;
+    -- Bind every allocation to one company at the database boundary. RLS on
+    -- the parent invoice is not enough: pointer FKs otherwise accept UUIDs
+    -- from another tenant, and the retained row cannot later be repaired.
+    SELECT si.company_id
+      INTO v_invoice_company_id
+      FROM public.supplier_invoices si
+     WHERE si.id = NEW.supplier_invoice_id
+     FOR SHARE;
+    IF NOT FOUND OR v_invoice_company_id IS DISTINCT FROM NEW.company_id THEN
+      RAISE EXCEPTION 'supplier payment invoice company mismatch'
+        USING ERRCODE = '23514';
+    END IF;
+
+    IF NEW.journal_entry_id IS NOT NULL THEN
+      SELECT je.company_id, je.status, je.source_type
+        INTO v_journal
+        FROM public.journal_entries je
+       WHERE je.id = NEW.journal_entry_id
+       FOR SHARE;
+      IF NOT FOUND
+         OR v_journal.company_id IS DISTINCT FROM NEW.company_id
+         OR v_journal.status IS DISTINCT FROM 'posted'
+         OR v_journal.source_type IN ('opening_balance', 'storno') THEN
+        RAISE EXCEPTION 'supplier payment journal target mismatch'
+          USING ERRCODE = '23514';
+      END IF;
+    END IF;
+
+    IF NEW.transaction_id IS NOT NULL THEN
+      SELECT t.company_id
+        INTO v_transaction_company_id
+        FROM public.transactions t
+       WHERE t.id = NEW.transaction_id
+       FOR SHARE;
+      IF NOT FOUND
+         OR v_transaction_company_id IS DISTINCT FROM NEW.company_id THEN
+        RAISE EXCEPTION 'supplier payment transaction company mismatch'
+          USING ERRCODE = '23514';
+      END IF;
+    END IF;
+
+
+    IF NEW.journal_entry_id IS NOT NULL THEN
+      -- A plain trigger existence check races. Serialize prospective inserts
+      -- for this exact pair without validating or rewriting historical rows.
+      PERFORM pg_advisory_xact_lock(
+        hashtextextended(
+          'supplier_invoice_payments:'
+          || NEW.journal_entry_id::text
+          || ':'
+          || NEW.supplier_invoice_id::text,
+          0
+        )
+      );
+
+      IF EXISTS (
+        SELECT 1
+        FROM public.supplier_invoice_payments sip
+        WHERE sip.journal_entry_id = NEW.journal_entry_id
+          AND sip.supplier_invoice_id = NEW.supplier_invoice_id
+          AND sip.reversed_at IS NULL
+      ) THEN
+        RAISE EXCEPTION 'duplicate active supplier payment journal allocation'
+          USING ERRCODE = '23505',
+                CONSTRAINT = 'supplier_invoice_payments_je_inv_active_unique';
+      END IF;
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  -- The allocation row is the durable invoice-level evidence that a batch
+  -- voucher cannot reconstruct from its aggregate journal lines. Freeze every
+  -- allocation field from insertion; reversal metadata is the only permitted
+  -- transition. Historical repair scripts must run before this migration or
+  -- create a new explicit forward repair contract instead of rewriting history.
+  IF (
+    to_jsonb(NEW) - ARRAY['reversed_at', 'reversed_by_journal_entry_id']
+  ) IS DISTINCT FROM (
+    to_jsonb(OLD) - ARRAY['reversed_at', 'reversed_by_journal_entry_id']
+  ) THEN
+    RAISE EXCEPTION 'supplier invoice payment allocation fields are immutable'
+      USING ERRCODE = '55000';
+  END IF;
+
+  IF OLD.reversed_at IS NOT NULL THEN
+    IF NEW.reversed_at IS DISTINCT FROM OLD.reversed_at
+       OR NEW.reversed_by_journal_entry_id IS DISTINCT FROM OLD.reversed_by_journal_entry_id THEN
+      RAISE EXCEPTION 'supplier invoice payment reversal metadata is immutable'
+        USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF NEW.reversed_at IS NULL AND NEW.reversed_by_journal_entry_id IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.reversed_at IS NULL OR NEW.reversed_by_journal_entry_id IS NULL THEN
+    RAISE EXCEPTION 'supplier invoice payment reversal requires timestamp and storno journal entry'
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF OLD.journal_entry_id IS NULL THEN
+    RAISE EXCEPTION 'cannot soft-reverse an unlinked legacy supplier payment allocation'
+      USING ERRCODE = '23514';
+  END IF;
+
+  -- Reversal metadata is the durable idempotency marker for the atomic
+  -- business-state transition below. Only that SECURITY DEFINER command may
+  -- create the marker. A caller-set custom GUC is insufficient because direct
+  -- authenticated writes do not run as a trusted migration/function owner.
+  IF current_user NOT IN ('postgres', 'supabase_admin')
+     OR current_setting('gnubok.supplier_payment_reversal', true)
+        IS DISTINCT FROM (
+          OLD.journal_entry_id::text
+          || ':'
+          || NEW.reversed_by_journal_entry_id::text
+        ) THEN
+    RAISE EXCEPTION 'supplier payment allocations must be reversed by the atomic command'
+      USING ERRCODE = '55000';
+  END IF;
+
+  SELECT je.company_id, je.status, je.source_type, je.reverses_id, je.committed_at
+    INTO v_reversal
+  FROM public.journal_entries je
+  WHERE je.id = NEW.reversed_by_journal_entry_id;
+
+  IF NOT FOUND
+     OR v_reversal.company_id IS DISTINCT FROM OLD.company_id
+     OR v_reversal.status IS DISTINCT FROM 'posted'
+     OR v_reversal.source_type IS DISTINCT FROM 'storno'
+     OR v_reversal.reverses_id IS NULL THEN
+    RAISE EXCEPTION 'supplier invoice payment reversal must reference the exact posted storno'
+      USING ERRCODE = '23514';
+  END IF;
+
+  -- A plain cancellation directly reverses the allocation-bearing root. A
+  -- sanctioned correction cancellation reverses the live correction leaf while
+  -- the immutable allocation remains attached to its original root. Walk that
+  -- committed correction ancestry backwards and require it to terminate at the
+  -- exact allocation root; missing, cross-company, cyclic, non-correction, live,
+  -- or over-deep intermediates remain invalid. The SECURITY DEFINER RPC performs
+  -- the broader state and sibling checks before setting the trusted GUC; this
+  -- trigger independently protects the retained root/storno pointer invariant.
+  v_current_id := v_reversal.reverses_id;
+  LOOP
+    IF v_current_id = ANY(v_ancestry_ids) THEN
+      RAISE EXCEPTION 'supplier invoice payment reversal correction ancestry is cyclic'
+        USING ERRCODE = '23514';
+    END IF;
+    IF v_ancestry_depth > 32 THEN
+      RAISE EXCEPTION 'supplier invoice payment reversal correction ancestry exceeds maximum depth'
+        USING ERRCODE = '54000';
+    END IF;
+
+    SELECT je.company_id, je.status, je.source_type, je.correction_of_id
+      INTO v_current
+      FROM public.journal_entries je
+     WHERE je.id = v_current_id
+     FOR SHARE;
+    IF NOT FOUND OR v_current.company_id IS DISTINCT FROM OLD.company_id THEN
+      RAISE EXCEPTION 'supplier invoice payment reversal correction ancestry is missing or cross-company'
+        USING ERRCODE = '23514';
+    END IF;
+    IF v_current.status IS DISTINCT FROM 'reversed' THEN
+      RAISE EXCEPTION 'supplier invoice payment reversal correction ancestry contains a non-reversed entry'
+        USING ERRCODE = '23514';
+    END IF;
+
+    IF v_current_id = OLD.journal_entry_id THEN
+      EXIT;
+    END IF;
+    IF v_current.source_type IS DISTINCT FROM 'correction'
+       OR v_current.correction_of_id IS NULL THEN
+      RAISE EXCEPTION 'supplier invoice payment reversal must reference the exact posted storno'
+        USING ERRCODE = '23514';
+    END IF;
+
+    v_ancestry_ids := pg_catalog.array_append(v_ancestry_ids, v_current_id);
+    v_current_id := v_current.correction_of_id;
+    v_ancestry_depth := v_ancestry_depth + 1;
+  END LOOP;
+
+  -- The linked storno is freshly posted and normally has committed_at. Keep the
+  -- fallback for the same legacy nullable-commit boundary as journal lineage.
+  NEW.reversed_at := COALESCE(v_reversal.committed_at, now());
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.enforce_supplier_invoice_payment_retention()
+  OWNER TO postgres;
+
 CREATE OR REPLACE FUNCTION public.apply_supplier_payment_reversal(
   p_company_id uuid,
   p_original_journal_entry_id uuid,

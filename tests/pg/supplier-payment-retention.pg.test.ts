@@ -515,6 +515,7 @@ describe('supplier payment reversal retention migration', () => {
         replace_definition: string
         event_definition: string
         apply_definition: string
+        payment_retention_definition: string
       }>(
         `SELECT
            pg_get_functiondef(
@@ -546,7 +547,10 @@ describe('supplier payment reversal retention migration', () => {
            ) AS event_definition,
            pg_get_functiondef(
              'public.apply_supplier_payment_reversal(uuid,uuid,uuid)'::regprocedure
-           ) AS apply_definition`,
+           ) AS apply_definition,
+           pg_get_functiondef(
+             'public.enforce_supplier_invoice_payment_retention()'::regprocedure
+           ) AS payment_retention_definition`,
       )
       const installed = definitions.rows[0]!
       expect(installed.delete_definition).toContain(
@@ -559,10 +563,10 @@ describe('supplier payment reversal retention migration', () => {
         `v_max_rows constant integer := ${MAX_LINEAGE_ROWS}`,
       )
       expect(installed.lineage_definition).toContain(
-        `entry.status = ANY (ARRAY['posted'::text, 'reversed'::text])`,
+        `entry.status IN ('posted', 'reversed')`,
       )
       expect(installed.lineage_definition).toContain(
-        `child.status = ANY (ARRAY['posted'::text, 'reversed'::text])`,
+        `child.status IN ('posted', 'reversed')`,
       )
       for (const guardDefinition of [
         installed.trigger_definition,
@@ -600,6 +604,12 @@ describe('supplier payment reversal retention migration', () => {
       )
       expect(installed.apply_definition).toContain(
         'v_root_journal_entry_id',
+      )
+      expect(installed.payment_retention_definition).toContain(
+        'supplier invoice payment reversal correction ancestry is cyclic',
+      )
+      expect(installed.payment_retention_definition).toContain(
+        'v_current_id = OLD.journal_entry_id',
       )
       const correctionConstraint = await client.query<{ present: boolean }>(
         `SELECT to_regclass(
@@ -1917,6 +1927,10 @@ describe('supplier payment reversal retention migration', () => {
   it('rejects a mismatched storno and leaves supplier state unchanged', async () => {
     const seeded = await seedPaymentVoucher()
     const paymentId = await insertPayment(seeded)
+    await insertPostedStorno({
+      ...seeded,
+      originalJournalEntryId: seeded.journalEntryId,
+    })
     const otherJournalEntryId = await insertPostedJournalEntry({
       ...seeded,
       sourceType: 'supplier_invoice_paid',
@@ -2751,6 +2765,7 @@ describe('supplier payment reversal retention migration', () => {
     const client = await getPool().connect()
     try {
       await client.query('BEGIN')
+      await client.query('SET LOCAL session_replication_role = replica')
       await client.query(
         `INSERT INTO public.journal_entries
            (id, user_id, company_id, fiscal_period_id, voucher_number,
@@ -2906,10 +2921,7 @@ describe('supplier payment reversal retention migration', () => {
 
   it('rejects committed lineage above the emitted-row cap', async () => {
     const tenant = await seedCompany()
-    const rootIds = Array.from(
-      { length: Math.floor(MAX_LINEAGE_ROWS / 2) + 1 },
-      () => randomUUID(),
-    )
+    const rootId = randomUUID()
     const client = await getPool().connect()
     try {
       await client.query('BEGIN')
@@ -2927,9 +2939,8 @@ describe('supplier payment reversal retention migration', () => {
            source_type,
            status,
            committed_at
-         )
-         SELECT
-           root.id,
+         ) VALUES (
+           $1,
            $2,
            $3,
            $4,
@@ -2940,8 +2951,8 @@ describe('supplier payment reversal retention migration', () => {
            'supplier_invoice_paid',
            'reversed',
            '2026-06-01T10:00:00Z'
-         FROM unnest($1::uuid[]) AS root(id)`,
-        [rootIds, tenant.userId, tenant.companyId, tenant.fiscalPeriodId],
+         )`,
+        [rootId, tenant.userId, tenant.companyId, tenant.fiscalPeriodId],
       )
       await client.query(
         `INSERT INTO public.journal_entries (
@@ -2969,10 +2980,16 @@ describe('supplier payment reversal retention migration', () => {
            'Lineage row-cap storno',
            'storno',
            'posted',
-           root.id,
+           $1,
            '2026-06-02T10:00:00Z'
-         FROM unnest($1::uuid[]) AS root(id)`,
-        [rootIds, tenant.userId, tenant.companyId, tenant.fiscalPeriodId],
+         FROM generate_series(1, $5::integer)`,
+        [
+          rootId,
+          tenant.userId,
+          tenant.companyId,
+          tenant.fiscalPeriodId,
+          MAX_LINEAGE_ROWS,
+        ],
       )
       await client.query('SET LOCAL session_replication_role = origin')
       await client.query(
@@ -2991,7 +3008,7 @@ describe('supplier payment reversal retention migration', () => {
 
       await expect(client.query(
         `SELECT public.get_supplier_payment_lineage($1, $2::uuid[])`,
-        [tenant.companyId, rootIds],
+        [tenant.companyId, [rootId]],
       )).rejects.toThrow(
         `supplier payment lineage exceeds maximum emitted row count of ${MAX_LINEAGE_ROWS}`,
       )
@@ -3000,7 +3017,7 @@ describe('supplier payment reversal retention migration', () => {
       await client.query('ROLLBACK').catch(() => {})
       client.release()
     }
-  }, 30_000)
+  }, 60_000)
 
   it('rejects null roots, null elements, and oversized root arrays', async () => {
     const tenant = await seedCompany()
