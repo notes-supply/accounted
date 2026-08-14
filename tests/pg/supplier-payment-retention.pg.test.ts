@@ -2816,7 +2816,7 @@ describe('supplier payment reversal retention migration', () => {
         companyId: tenant.companyId,
         originalJournalEntryId: manualId,
         stornoJournalEntryId: manualStornoId,
-      })).rejects.toThrow(/manual supplier payment reversal has no retained allocations/i)
+      })).rejects.toThrow(/supplier payment reversal has no retained allocations/i)
     }, { commit: true })
     await withUserContext(tenant.userId, async (client) => {
       await expect(applySupplierPaymentReversal(client, {
