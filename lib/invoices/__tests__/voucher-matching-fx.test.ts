@@ -991,6 +991,31 @@ describe('validateVoucherForSupplierInvoiceLink: foreign-currency invoices', () 
     vi.clearAllMocks()
   })
 
+  it('rejects linking a correction entry as a new supplier payment owner', async () => {
+    const correctionVoucher = {
+      ...correctEurApVoucher,
+      id: 'je-ap-correction',
+      source_type: 'correction',
+    }
+    const { supabase, queries } = createFilteringSupabase({
+      entries: [correctionVoucher],
+    })
+
+    const result = await validateVoucherForSupplierInvoiceLink(
+      supabase as never,
+      'company-1',
+      eurSupplierInvoice() as never,
+      correctionVoucher.id,
+    )
+
+    expect(result).toMatchObject({
+      ok: false,
+      code: 'LINK_SI_VOUCHER_NO_AP_DEBIT',
+      details: { source_type: 'correction' },
+    })
+    expect(queries.some((query) => query.table === 'journal_entry_lines')).toBe(false)
+  })
+
   it('accepts the correct EUR voucher instead of EXCEEDS_REMAINING', async () => {
     const { supabase } = createFilteringSupabase({ entries: [correctEurApVoucher] })
 

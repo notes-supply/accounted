@@ -46,7 +46,10 @@ function createMockChain(overrides: Record<string, unknown> = {}) {
 
 // Mock event bus
 vi.mock('@/lib/events', () => ({
-  eventBus: { emit: vi.fn().mockResolvedValue([]) },
+  eventBus: {
+    emit: vi.fn().mockResolvedValue([]),
+    emitExtensions: vi.fn().mockResolvedValue([]),
+  },
 }))
 
 vi.mock('@/lib/webhooks/durable-dispatch-notify', () => ({
@@ -853,6 +856,9 @@ describe('reverseEntry: storno guard', () => {
     })
     expect(inserts).toEqual([])
     expect(eventBus.emit).not.toHaveBeenCalled()
+    expect(eventBus.emitExtensions).toHaveBeenCalledTimes(
+      publicationStatus === 'published' ? 2 : 0,
+    )
     expect(notifyDurableWebhookDeliveries).toHaveBeenCalledTimes(1)
   })
 
@@ -1189,6 +1195,7 @@ describe('reverseEntry: storno guard', () => {
     }
 
     vi.mocked(eventBus.emit).mockClear()
+    vi.mocked(eventBus.emitExtensions).mockClear()
     await expect(reverseEntry(
       supabase as never,
       'company-1',
@@ -1203,6 +1210,24 @@ describe('reverseEntry: storno guard', () => {
     })
     expect(transactionUpdates).toEqual([])
     expect(eventBus.emit).not.toHaveBeenCalled()
+    expect(eventBus.emitExtensions).toHaveBeenCalledTimes(2)
+    expect(eventBus.emitExtensions).toHaveBeenNthCalledWith(1, {
+      type: 'journal_entry.committed',
+      payload: {
+        entry: reversal,
+        userId: 'user-1',
+        companyId: 'company-1',
+      },
+    })
+    expect(eventBus.emitExtensions).toHaveBeenNthCalledWith(2, {
+      type: 'journal_entry.reversed',
+      payload: {
+        originalEntry: original,
+        reversalEntry: reversal,
+        userId: 'user-1',
+        companyId: 'company-1',
+      },
+    })
   })
 
   it('resumes the exact correction-descendant cancellation without posting a second storno', async () => {

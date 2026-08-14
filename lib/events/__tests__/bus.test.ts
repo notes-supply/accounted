@@ -32,6 +32,36 @@ describe('EventBus', () => {
     expect(handler2).toHaveBeenCalledWith({ entry: fakeEntry, userId: 'u1', companyId: 'company-1' })
   })
 
+  it('emitExtensions() skips core handlers and calls extension handlers', async () => {
+    const coreHandler = vi.fn()
+    const extensionHandler = vi.fn()
+    eventBus.onCore('journal_entry.committed', coreHandler)
+    eventBus.on('journal_entry.committed', extensionHandler)
+
+    await eventBus.emitExtensions({
+      type: 'journal_entry.committed',
+      payload: { entry: fakeEntry, userId: 'u1', companyId: 'company-1' },
+    })
+
+    expect(coreHandler).not.toHaveBeenCalled()
+    expect(extensionHandler).toHaveBeenCalledOnce()
+  })
+
+  it('emit() calls both core and extension handlers', async () => {
+    const coreHandler = vi.fn()
+    const extensionHandler = vi.fn()
+    eventBus.onCore('journal_entry.committed', coreHandler)
+    eventBus.on('journal_entry.committed', extensionHandler)
+
+    await eventBus.emit({
+      type: 'journal_entry.committed',
+      payload: { entry: fakeEntry, userId: 'u1', companyId: 'company-1' },
+    })
+
+    expect(coreHandler).toHaveBeenCalledOnce()
+    expect(extensionHandler).toHaveBeenCalledOnce()
+  })
+
   it('emit() uses Promise.allSettled: a failing handler does not crash others', async () => {
     const failingHandler = vi.fn().mockRejectedValue(new Error('boom'))
     const goodHandler = vi.fn()

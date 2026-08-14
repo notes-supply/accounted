@@ -1563,6 +1563,151 @@ describe('supplier payment reversal retention migration', () => {
     })])
   })
 
+  it('reverses a retained allocation owned by the exact correction leaf', async () => {
+    const seeded = await seedPaymentVoucher()
+    const rootStornoId = await insertPostedStorno({
+      ...seeded,
+      originalJournalEntryId: seeded.journalEntryId,
+      entryDate: '2026-06-01',
+    })
+    const correctionId = await insertPostedCorrection({
+      ...seeded,
+      originalJournalEntryId: seeded.journalEntryId,
+      entryDate: '2026-06-03',
+    })
+    const transactionId = await insertTransaction({
+      ...seeded,
+      amount: -seeded.total,
+      journalEntryId: correctionId,
+    })
+    const seedClient = await getPool().connect()
+    let paymentId: string
+    try {
+      await seedClient.query('BEGIN')
+      await seedClient.query('SET LOCAL session_replication_role = replica')
+      const inserted = await seedClient.query<{ id: string }>(
+        `INSERT INTO public.supplier_invoice_payments
+           (user_id, company_id, supplier_invoice_id, payment_date, amount,
+            currency, journal_entry_id, transaction_id)
+         VALUES ($1, $2, $3, '2026-06-03', $4, 'SEK', $5, $6)
+         RETURNING id`,
+        [
+          seeded.userId,
+          seeded.companyId,
+          seeded.supplierInvoiceId,
+          seeded.total,
+          correctionId,
+          transactionId,
+        ],
+      )
+      paymentId = inserted.rows[0].id
+      await seedClient.query('SET LOCAL session_replication_role = origin')
+      await seedClient.query('COMMIT')
+    } catch (error) {
+      await seedClient.query('ROLLBACK').catch(() => {})
+      throw error
+    } finally {
+      seedClient.release()
+    }
+    await getPool().query(
+      `UPDATE public.supplier_invoices
+          SET paid_at = '2026-06-03T12:00:00Z',
+              payment_journal_entry_id = $1
+        WHERE id = $2`,
+      [correctionId, seeded.supplierInvoiceId],
+    )
+    await getPool().query(
+      `UPDATE public.transactions
+          SET supplier_invoice_id = $1,
+              is_business = true,
+              category = 'expense_other'
+        WHERE id = $2`,
+      [seeded.supplierInvoiceId, transactionId],
+    )
+    const descendantStornoId = await insertPostedStorno({
+      ...seeded,
+      originalJournalEntryId: correctionId,
+      entryDate: '2026-06-03',
+    })
+
+    await withUserContext(seeded.userId, async (client) => {
+      await expect(applySupplierPaymentReversal(client, {
+        companyId: seeded.companyId,
+        originalJournalEntryId: correctionId,
+        stornoJournalEntryId: descendantStornoId,
+      })).resolves.toMatchObject({
+        ok: true,
+        status: 'applied',
+        allocation_count: 1,
+        invoice_count: 1,
+        transaction_count: 1,
+        event_publication: { status: 'published', event_log_count: 2 },
+      })
+    }, { commit: true })
+
+    const restored = await getPool().query(
+      `SELECT si.status,
+              si.paid_amount::double precision AS paid_amount,
+              si.remaining_amount::double precision AS remaining_amount,
+              si.payment_journal_entry_id,
+              sip.journal_entry_id AS allocation_journal_entry_id,
+              sip.reversed_by_journal_entry_id,
+              t.journal_entry_id AS transaction_journal_entry_id,
+              t.supplier_invoice_id AS transaction_supplier_invoice_id,
+              t.is_business,
+              t.category
+         FROM public.supplier_invoices si
+         JOIN public.supplier_invoice_payments sip
+           ON sip.supplier_invoice_id = si.id
+         JOIN public.transactions t ON t.id = $3
+        WHERE si.id = $1 AND sip.id = $2`,
+      [seeded.supplierInvoiceId, paymentId, transactionId],
+    )
+    expect(restored.rows).toEqual([expect.objectContaining({
+      status: 'overdue',
+      paid_amount: 0,
+      remaining_amount: 1000,
+      payment_journal_entry_id: null,
+      allocation_journal_entry_id: correctionId,
+      reversed_by_journal_entry_id: descendantStornoId,
+      transaction_journal_entry_id: null,
+      transaction_supplier_invoice_id: null,
+      is_business: null,
+      category: null,
+    })])
+
+    const rootAllocation = await getPool().query(
+      `SELECT count(*)::integer AS count
+         FROM public.supplier_invoice_payments
+        WHERE journal_entry_id = $1`,
+      [seeded.journalEntryId],
+    )
+    expect(rootAllocation.rows).toEqual([{ count: 0 }])
+    expect(rootStornoId).not.toBe(descendantStornoId)
+  })
+
+  it('rejects creating a new supplier allocation on a correction entry', async () => {
+    const seeded = await seedPaymentVoucher()
+    await insertPostedStorno({
+      ...seeded,
+      originalJournalEntryId: seeded.journalEntryId,
+      entryDate: '2026-06-01',
+    })
+    const correctionId = await insertPostedCorrection({
+      ...seeded,
+      originalJournalEntryId: seeded.journalEntryId,
+      entryDate: '2026-06-03',
+    })
+
+    await expect(insertPayment({
+      ...seeded,
+      journalEntryId: correctionId,
+    })).rejects.toMatchObject({
+      code: '23514',
+      message: 'supplier payment journal target mismatch',
+    })
+  })
+
   it('rejects cross-company correction ancestry before touching the foreign root', async () => {
     const foreign = await seedPaymentVoucher()
     const paymentId = await insertPayment(foreign)
@@ -2087,6 +2232,66 @@ describe('supplier payment reversal retention migration', () => {
       published_count: 2,
       delivery_count: 2,
     }])
+  })
+
+  it('ignores webhook subscriptions enabled after durable publication on retry', async () => {
+    const seeded = await seedPaymentVoucher()
+    await insertPayment(seeded)
+    const committedWebhookId = await insertWebhook(
+      seeded.companyId,
+      'journal_entry.committed',
+    )
+    const stornoId = await insertPostedStorno({
+      ...seeded,
+      originalJournalEntryId: seeded.journalEntryId,
+    })
+
+    let outboxIds: string[] = []
+    await withUserContext(seeded.userId, async (client) => {
+      const first = await applySupplierPaymentReversal(client, {
+        companyId: seeded.companyId,
+        originalJournalEntryId: seeded.journalEntryId,
+        stornoJournalEntryId: stornoId,
+      })
+      outboxIds = getEventOutboxIds(first)
+      expect(first).toMatchObject({
+        event_publication: {
+          status: 'published',
+          webhook_delivery_count: 1,
+        },
+      })
+    }, { commit: true })
+
+    const laterWebhookId = await insertWebhook(
+      seeded.companyId,
+      'journal_entry.reversed',
+    )
+
+    await withUserContext(seeded.userId, async (client) => {
+      const retry = await applySupplierPaymentReversal(client, {
+        companyId: seeded.companyId,
+        originalJournalEntryId: seeded.journalEntryId,
+        stornoJournalEntryId: stornoId,
+      })
+      expect(retry).toMatchObject({
+        ok: true,
+        status: 'already_applied',
+        event_publication: {
+          status: 'already_published',
+          webhook_delivery_count: 1,
+        },
+      })
+    })
+
+    const deliveries = await getPool().query<{ webhook_id: string }>(
+      `SELECT webhook_id
+         FROM public.webhook_deliveries
+        WHERE outbox_event_id = ANY($1::uuid[])
+        ORDER BY webhook_id`,
+      [outboxIds],
+    )
+    expect(deliveries.rows).toEqual([{ webhook_id: committedWebhookId }])
+    expect(deliveries.rows).not.toContainEqual({ webhook_id: laterWebhookId })
   })
 
   it('rejects a retry when an outbox projection row is contradictory', async () => {

@@ -221,9 +221,9 @@ async function handleSupplierInvoiceRetroMatch(
  */
 export function registerSupplierInvoiceHandler(): () => void {
   const unsubscribers = [
-    eventBus.on('supplier_invoice.confirmed', handleSupplierInvoiceConfirmed),
-    eventBus.on('supplier_invoice.registered', handleSupplierInvoiceRetroMatch),
-    eventBus.on('supplier_invoice.approved', handleSupplierInvoiceRetroMatch),
+    eventBus.onCore('supplier_invoice.confirmed', handleSupplierInvoiceConfirmed),
+    eventBus.onCore('supplier_invoice.registered', handleSupplierInvoiceRetroMatch),
+    eventBus.onCore('supplier_invoice.approved', handleSupplierInvoiceRetroMatch),
   ]
   return () => unsubscribers.forEach((unsub) => unsub())
 }

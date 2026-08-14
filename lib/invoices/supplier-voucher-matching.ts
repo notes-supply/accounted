@@ -111,7 +111,7 @@ interface CandidateContext {
   remainingAmount: number
 }
 
-const EXCLUDED_SOURCE_TYPES = ['opening_balance', 'storno']
+const EXCLUDED_SOURCE_TYPES = ['opening_balance', 'storno', 'correction']
 
 /**
  * Find posted journal entries whose lines debit 2440 and could plausibly be
@@ -434,7 +434,7 @@ export async function validateVoucherForSupplierInvoiceLink(
   if (v.status !== 'posted') {
     return { ok: false, code: 'LINK_SI_VOUCHER_NOT_POSTED', details: { status: v.status } }
   }
-  if (EXCLUDED_SOURCE_TYPES.includes(v.source_type ?? '')) {
+  if (!v.source_type || EXCLUDED_SOURCE_TYPES.includes(v.source_type)) {
     return {
       ok: false,
       code: 'LINK_SI_VOUCHER_NO_AP_DEBIT',

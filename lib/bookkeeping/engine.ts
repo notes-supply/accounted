@@ -1573,6 +1573,21 @@ export async function reverseEntry(
       original.reversed_by_id,
       true,
     )
+    if (recoveryPublication === 'published') {
+      await eventBus.emitExtensions({
+        type: 'journal_entry.committed',
+        payload: { entry: existingReversal as JournalEntry, userId, companyId },
+      })
+      await eventBus.emitExtensions({
+        type: 'journal_entry.reversed',
+        payload: {
+          originalEntry: original as JournalEntry,
+          reversalEntry: existingReversal as JournalEntry,
+          userId,
+          companyId,
+        },
+      })
+    }
     if (recoveryPublication !== 'none') notifyDurableWebhookDeliveries()
 
     return existingReversal as JournalEntry
@@ -1788,9 +1803,9 @@ export async function reverseEntry(
   const result = completeEntry as JournalEntry
 
   // Supplier reversals persist event_log rows and webhook deliveries inside the
-  // same database transaction as the business-state change. Do not replay the
-  // ordinary in-process bus here: its core subscribers would duplicate those
-  // durable records, and no enabled extension subscribes to these event types.
+  // same database transaction as the business-state change. Dispatch extension
+  // subscribers only for a newly published durable intent; exact retries stay
+  // silent, and core subscribers never duplicate the durable rows.
   if (supplierEventPublication === 'none') {
     await eventBus.emit({
       type: 'journal_entry.committed',
@@ -1802,6 +1817,21 @@ export async function reverseEntry(
       payload: { originalEntry: original as JournalEntry, reversalEntry: result, userId, companyId },
     })
   } else {
+    if (supplierEventPublication === 'published') {
+      await eventBus.emitExtensions({
+        type: 'journal_entry.committed',
+        payload: { entry: result, userId, companyId },
+      })
+      await eventBus.emitExtensions({
+        type: 'journal_entry.reversed',
+        payload: {
+          originalEntry: original as JournalEntry,
+          reversalEntry: result,
+          userId,
+          companyId,
+        },
+      })
+    }
     // The atomic supplier command already inserted durable delivery rows. Kick
     // their first attempt without replaying event handlers or blocking the
     // reversal on receiver HTTP; the cron remains the retry/sweep path.

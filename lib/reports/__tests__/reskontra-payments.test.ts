@@ -327,6 +327,48 @@ describe('fetchPaymentsAsOf', () => {
     expect(result.paidThrough.get('supplier-invoice-1')).toBe(500)
   })
 
+  it.each([
+    { label: 'after cutoff', stornoDate: '2026-01-05', counted: true },
+    { label: 'on cutoff', stornoDate: '2025-12-31', counted: false },
+  ])('validates a retained correction-leaf reversal $label', async ({
+    stornoDate,
+    counted,
+  }) => {
+    const root = journalEntry('payment-entry-1', { status: 'reversed' })
+    const correction = correctionEntry(root.id, '2025-12-20', {
+      id: 'correction-1',
+      status: 'reversed',
+    })
+    const terminalStorno = stornoEntry(correction.id, stornoDate, {
+      id: 'terminal-storno-1',
+      committed_at: '2026-01-10T12:00:00Z',
+    })
+    const { supabase } = makeSupabase(
+      [{
+        ...activePayment,
+        reversed_at: '2026-01-10T12:00:00Z',
+        reversed_by_journal_entry_id: terminalStorno.id,
+      }],
+      [
+        root,
+        stornoEntry(root.id, root.entry_date),
+        correction,
+        terminalStorno,
+      ],
+    )
+
+    const result = await fetchPaymentsAsOf(
+      supabase as never,
+      'supplier_invoice_payments',
+      'supplier_invoice_id',
+      'co-1',
+      '2025-12-31',
+    )
+
+    expect(result.paidThrough.has('supplier-invoice-1')).toBe(counted)
+    expect(result.hasRows).toEqual(new Set(['supplier-invoice-1']))
+  })
+
   it('keeps payment_date behavior for legacy null journal links', async () => {
     const { supabase, calls } = makeSupabase([
       {

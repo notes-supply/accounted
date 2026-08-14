@@ -130,6 +130,43 @@ describe('resolveSupplierPaymentRootId', () => {
     )).resolves.toBe('root-1')
   })
 
+  it('resolves a retained allocation owned by the exact correction leaf', async () => {
+    const { supabase, calls } = createRecordingSupabase([
+      {
+        data: {
+          id: 'root-1',
+          company_id: 'co-1',
+          status: 'reversed',
+          source_type: 'imported',
+          correction_of_id: null,
+          reversed_by_id: 'root-storno-1',
+        },
+        error: null,
+      },
+      { data: [], error: null },
+      { data: [{ id: 'allocation-on-correction' }], error: null },
+    ])
+
+    await expect(resolveSupplierPaymentRootId(
+      supabase,
+      'co-1',
+      correction(),
+    )).resolves.toBe('root-1')
+
+    const allocationQueries = calls.filter(
+      (call) => call.table === 'supplier_invoice_payments',
+    )
+    expect(allocationQueries).toHaveLength(2)
+    expect(allocationQueries[0].ops).toContainEqual({
+      method: 'eq',
+      args: ['journal_entry_id', 'root-1'],
+    })
+    expect(allocationQueries[1].ops).toContainEqual({
+      method: 'eq',
+      args: ['journal_entry_id', 'correction-1'],
+    })
+  })
+
   it('fails closed for missing or cross-company ancestry', async () => {
     const { supabase } = createRecordingSupabase([{ data: null, error: null }])
 

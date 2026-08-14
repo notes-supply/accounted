@@ -330,6 +330,27 @@ export function effectiveAccountingDateAtCutoff(
   )
 }
 
+function resolveRetainedReversal(
+  root: JournalLineageRow,
+  lineage: JournalLineage,
+  reversalId: string,
+): { target: JournalLineageRow; reversal: JournalLineageRow } | null {
+  let current = root
+  const visited = new Set<string>()
+  while (!visited.has(current.id)) {
+    visited.add(current.id)
+    const corrections = lineage.correctionsByParent.get(current.id) ?? []
+    const reversal = (lineage.reversalsByParent.get(current.id) ?? [])
+      .find((entry) => entry.id === reversalId)
+    if (reversal) {
+      return corrections.length === 0 ? { target: current, reversal } : null
+    }
+    if (corrections.length !== 1) return null
+    current = corrections[0]
+  }
+  return null
+}
+
 /**
  * Fetch the company's payment rows for one of the two invoice ledgers and
  * aggregate them per invoice as of `asOfDate` (inclusive). Amounts are in the
@@ -420,14 +441,18 @@ export async function fetchPaymentsAsOf(
       const row = rawRow as SupplierPaymentRow & Record<string, unknown>
       if (!row.reversed_by_journal_entry_id || !row.journal_entry_id) continue
       const root = supplierRoots.get(row.journal_entry_id)
-      const reversal = (supplierLineage.reversalsByParent.get(row.journal_entry_id) ?? [])
-        .find((entry) => entry.id === row.reversed_by_journal_entry_id)
+      const retainedReversal = root
+        ? resolveRetainedReversal(root, supplierLineage, row.reversed_by_journal_entry_id)
+        : null
+      const reversal = retainedReversal?.reversal
+      const target = retainedReversal?.target
       if (
         root?.status !== 'reversed'
+        || target?.status !== 'reversed'
         || !reversal
         || reversal.status !== 'posted'
         || reversal.source_type !== 'storno'
-        || reversal.reverses_id !== row.journal_entry_id
+        || reversal.reverses_id !== target.id
         || (
           reversal.committed_at !== null
           && Date.parse(reversal.committed_at) !== Date.parse(row.reversed_at!)

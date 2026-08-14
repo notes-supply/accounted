@@ -83,7 +83,7 @@ export function registerWebhookHandler(): void {
   registered = true
 
   for (const eventType of PUBLIC_WEBHOOK_EVENTS) {
-    eventBus.on(eventType, async (payload) => {
+    eventBus.onCore(eventType, async (payload) => {
       // payload type depends on eventType but every variant carries
       // companyId: the only field we structurally need here.
       const companyId = (payload as { companyId?: string }).companyId

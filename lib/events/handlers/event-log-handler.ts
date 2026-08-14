@@ -199,7 +199,7 @@ async function persistEvent(
  */
 export function registerEventLogHandler(): (() => void)[] {
   return PERSISTED_EVENT_TYPES.map((eventType) =>
-    eventBus.on(eventType, async (payload) => {
+    eventBus.onCore(eventType, async (payload) => {
       try {
         const rawPayload = payload as Record<string, unknown>
         const userId = rawPayload.userId as string

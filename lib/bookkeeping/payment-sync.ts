@@ -98,11 +98,11 @@ export function isPaymentSourceType(sourceType: string | null | undefined): bool
   return (PAYMENT_SOURCE_TYPES as readonly string[]).includes(sourceType)
 }
 /**
- * Manual vouchers gain supplier-payment semantics only from retained
+ * Non-correction vouchers gain supplier-payment semantics only from retained
  * allocation evidence. A fresh reversal requires an active allocation. A
  * recovery may also use an allocation already soft-reversed by the exact
- * original/storno pair. Missing evidence leaves an arbitrary manual reversal
- * on the normal non-posted error path.
+ * original/storno pair. Missing evidence leaves an arbitrary reversal on the
+ * normal non-posted error path.
  */
 export async function hasSupplierPaymentReversalEvidence(
   supabase: SupabaseClient,
@@ -195,9 +195,7 @@ export async function resolveSupplierPaymentRootId(
       ) {
         return current.id
       }
-      if (current.source_type !== 'manual') return null
-
-      const hasEvidence = await hasSupplierPaymentReversalEvidence(
+      const rootHasEvidence = await hasSupplierPaymentReversalEvidence(
         supabase,
         companyId,
         current.id,
@@ -205,7 +203,23 @@ export async function resolveSupplierPaymentRootId(
           ? requested.reversed_by_id ?? undefined
           : undefined,
       )
-      return hasEvidence ? current.id : null
+      if (rootHasEvidence) return current.id
+
+      // Older voucher-link flows could attach the retained allocation to the
+      // exact live correction instead of its ancestry root. Accept that one
+      // historical owner only after the full ancestry above has been verified.
+      if (requested.id !== current.id) {
+        const requestedHasEvidence = await hasSupplierPaymentReversalEvidence(
+          supabase,
+          companyId,
+          requested.id,
+          requested.status === 'reversed'
+            ? requested.reversed_by_id ?? undefined
+            : undefined,
+        )
+        if (requestedHasEvidence) return current.id
+      }
+      return null
     }
 
     const ancestorId = current.correction_of_id
