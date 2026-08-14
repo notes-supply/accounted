@@ -850,6 +850,53 @@ describe('calculateVatDeclaration', () => {
     expect(january.rutor.ruta48).toBe(100)
   })
 
+  it('accepts a terminal storno after the maximum 32 controlled corrections', async () => {
+    const [cutoff, scheduledReversal] = controlledCutoffPair()
+    const lineage: ControlledTestEntry[] = []
+    let live = cutoff
+    for (let index = 1; index <= 32; index += 1) {
+      const [reversed, storno, correction] = correctedControlledEntry(
+        live,
+        `corrected-cutoff-${index}`,
+        '2025-12-31',
+        cutoff.lines,
+      )
+      lineage.push(reversed, storno)
+      live = correction
+    }
+    const terminalStornoId = `storno-${live.id}`
+    const reversedLeaf: ControlledTestEntry = {
+      ...live,
+      status: 'reversed',
+      reversed_by_id: terminalStornoId,
+    }
+    const terminalStorno: ControlledTestEntry = {
+      id: terminalStornoId,
+      company_id: live.company_id,
+      status: 'posted',
+      entry_date: live.entry_date,
+      description: `Makulering: ${live.description}`,
+      source_type: 'storno',
+      source_id: null,
+      correction_of_id: null,
+      reverses_id: live.id,
+      reversed_by_id: null,
+      lines: live.lines.map((line) => ({
+        account_number: line.account_number,
+        debit_amount: line.credit_amount,
+        credit_amount: line.debit_amount,
+      })),
+    }
+    controlledEntries = [...lineage, reversedLeaf, terminalStorno, scheduledReversal]
+    seedLedger([])
+
+    const december = await calculateVatDeclaration(
+      supabase, 'company-1', 'monthly', 2025, 12,
+    )
+
+    expect(december.rutor.ruta48).toBe(0)
+  })
+
   it('projects a corrected scheduled reversal from its live replacement', async () => {
     const [cutoff, scheduledReversal] = controlledCutoffPair()
     const [reversedScheduled, storno, correction] = correctedControlledEntry(

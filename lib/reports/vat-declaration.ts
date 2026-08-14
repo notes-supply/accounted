@@ -960,7 +960,13 @@ async function fetchControlledCutoffLineage(
       || row.path[0] !== row.root_id
       || row.path.at(-1) !== row.id
       || row.path.length !== row.depth + 1
-      || row.depth > CONTROLLED_CUTOFF_MAX_DEPTH
+      || (
+        row.depth > CONTROLLED_CUTOFF_MAX_DEPTH
+        && !(
+          row.edge_kind === 'storno'
+          && row.depth === CONTROLLED_CUTOFF_MAX_DEPTH + 1
+        )
+      )
       || row.cycle
       || entry.entry_date !== row.entry_date
       || entry.status !== row.status

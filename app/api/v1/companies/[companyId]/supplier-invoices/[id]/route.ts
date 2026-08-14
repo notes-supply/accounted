@@ -150,14 +150,11 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string; id: string }
     if (expand.has('payments')) parts.push(`payments:supplier_invoice_payments(${SI_PAYMENT_COLUMNS})`)
     const selectClause = parts.join(', ')
 
-    let query = ctx.supabase
+    const query = ctx.supabase
       .from('supplier_invoices')
       .select(selectClause)
       .eq('company_id', ctx.companyId!)
       .eq('id', invoiceId)
-    if (expand.has('payments')) {
-      query = query.is('payments.reversed_at', null)
-    }
     const { data, error } = await query.maybeSingle()
 
     if (error) {

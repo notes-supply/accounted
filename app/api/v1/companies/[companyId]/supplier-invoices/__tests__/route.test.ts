@@ -83,12 +83,14 @@ interface TableResp {
 
 /** Payload handed to `.insert()`, recorded per table so writes can be asserted. */
 type InsertRecord = { table: string; payload: Record<string, unknown> }
+type QueryCall = { table: string; method: PropertyKey; args: unknown[] }
 
 function makeFlexibleSupabase(
   byTable: Record<string, TableResp | TableResp[]>,
   // Opt-in sink for insert payloads: the Proxy chain is otherwise write-only,
   // and the route echoes back the fixture row rather than what it wrote.
   insertSink?: InsertRecord[],
+  querySink?: QueryCall[],
 ) {
   // Per-table queue: TableResp[] consumes one entry per await, then sticks
   // on the last entry. Plain TableResp is treated as a constant.
@@ -107,6 +109,7 @@ function makeFlexibleSupabase(
           }
         }
         return (...args: unknown[]) => {
+          querySink?.push({ table, method: prop, args })
           if (
             insertSink &&
             prop === 'insert' &&
@@ -269,6 +272,40 @@ describe('GET /api/v1/companies/:companyId/supplier-invoices/:id', () => {
     expect(res.status).toBe(200)
     const body = await res.json()
     expect(body.data.id).toBe(SI_ID)
+  })
+
+  it('returns retained reversed payments in the audit expansion', async () => {
+    const queryCalls: QueryCall[] = []
+    const payments = [
+      { id: 'payment-active', reversed_at: null, reversed_by_journal_entry_id: null },
+      {
+        id: 'payment-reversed',
+        reversed_at: '2026-08-14T00:00:00Z',
+        reversed_by_journal_entry_id: JE_ID,
+      },
+    ]
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        supplier_invoices: { data: { ...SAMPLE_SI, payments }, error: null },
+      }, undefined, queryCalls),
+    )
+
+    const res = await getSI(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/supplier-invoices/${SI_ID}?expand=payments`,
+      ),
+      detailParams(COMPANY_ID, SI_ID),
+    )
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.data.payments).toEqual(payments)
+    expect(queryCalls).not.toContainEqual({
+      table: 'supplier_invoices',
+      method: 'is',
+      args: ['payments.reversed_at', null],
+    })
   })
 
   it('returns 404 SI_NOT_FOUND when missing', async () => {
