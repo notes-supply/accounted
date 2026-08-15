@@ -5,7 +5,7 @@ describe('shouldRefreshAfterInviteFailure', () => {
   it('refreshes after a persisted pending invitation reports delivery failure', () => {
     expect(
       shouldRefreshAfterInviteFailure(502, {
-        error: 'Inbjudan skapades, men e-postmeddelandet kunde inte skickas.',
+        error: { code: 'INVITE_EMAIL_DELIVERY_FAILED' },
         data: {
           email: 'customer@example.com',
           status: 'pending',
@@ -16,7 +16,16 @@ describe('shouldRefreshAfterInviteFailure', () => {
   })
 
   it('does not refresh for an unrelated gateway failure or successful send', () => {
-    expect(shouldRefreshAfterInviteFailure(502, { error: 'Gateway failure' })).toBe(false)
+    expect(
+      shouldRefreshAfterInviteFailure(502, {
+        error: { code: 'TRANSIENT_ERROR' },
+        data: {
+          email: 'customer@example.com',
+          status: 'pending',
+          email_sent: false,
+        },
+      }),
+    ).toBe(false)
     expect(
       shouldRefreshAfterInviteFailure(200, {
         data: {

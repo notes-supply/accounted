@@ -164,12 +164,16 @@ describe('POST /api/company/members/invite', () => {
     enqueue({ data: null })
 
     const { status, body } = await parseJsonResponse<{
-      error: string
+      error: { code: string; message: string; requestId: string }
       data: { email: string; email_sent: boolean; status: string }
     }>(await post({ email: 'client@example.com' }))
 
     expect(status).toBe(502)
-    expect(body.error).toBe('Inbjudan skapades, men e-postmeddelandet kunde inte skickas.')
+    expect(body.error).toMatchObject({
+      code: 'INVITE_EMAIL_DELIVERY_FAILED',
+      message: 'Inbjudan skapades, men e-postmeddelandet kunde inte skickas.',
+      requestId: expect.stringMatching(/^req_/),
+    })
     expect(body.data).toMatchObject({
       email: 'client@example.com',
       status: 'pending',

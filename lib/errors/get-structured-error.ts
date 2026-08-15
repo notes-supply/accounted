@@ -234,12 +234,16 @@ export interface ErrorEnvelope {
     requestId?: string
     details?: unknown
   }
+  /** Durable partial result returned with a failed follow-up side effect. */
+  data?: unknown
 }
 
 interface ErrorResponseContext {
   requestId?: string
   /** Additional details to attach to the response for the user/agent. */
   details?: unknown
+  /** Durable partial result that remains valid despite the reported failure. */
+  data?: unknown
   /** When known, override the http status from the registry entry. */
   status?: number
   /**
@@ -512,6 +516,7 @@ function buildResponse(
   entry: StructuredErrorEntry,
   requestId: string | undefined,
   details: unknown,
+  data?: unknown,
 ): NextResponse {
   const body: ErrorEnvelope = {
     error: {
@@ -522,6 +527,7 @@ function buildResponse(
       ...(requestId ? { requestId } : {}),
       ...(details !== undefined ? { details } : {}),
     },
+    ...(data !== undefined ? { data } : {}),
   }
   const res = NextResponse.json(body, { status: entry.httpStatus })
   if (requestId) res.headers.set('X-Request-Id', requestId)
@@ -551,5 +557,6 @@ export function errorResponseFromCode(
     },
     ctx.requestId,
     ctx.details,
+    ctx.data,
   )
 }

@@ -132,7 +132,10 @@ export function CompanyMembersSection() {
         if (shouldRefreshAfterInviteFailure(res.status, data)) {
           await fetchMembers()
         }
-        toast({ title: data.error, variant: 'destructive' })
+        toast({
+          title: getErrorMessage(data, { statusCode: res.status, locale: errorLocale }),
+          variant: 'destructive',
+        })
         return
       }
 

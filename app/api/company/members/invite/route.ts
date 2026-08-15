@@ -6,6 +6,7 @@ import { withRouteContext } from '@/lib/api/with-route-context'
 import { validateBody } from '@/lib/api/validate'
 import { generateInviteToken, getInviteExpiry } from '@/lib/auth/invite-tokens'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
+import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import { getEmailService } from '@/lib/email/service'
 import {
   generateInviteEmailSubject,
@@ -247,13 +248,10 @@ export const POST = withRouteContext(
     }
 
     if (!emailSent && !isDev) {
-      return NextResponse.json(
-        {
-          error: 'Inbjudan skapades, men e-postmeddelandet kunde inte skickas.',
-          data: responseData,
-        },
-        { status: 502 },
-      )
+      return errorResponseFromCode('INVITE_EMAIL_DELIVERY_FAILED', log, {
+        requestId: ctx.requestId,
+        data: responseData,
+      })
     }
 
     return NextResponse.json({ data: responseData })
