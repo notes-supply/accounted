@@ -16,20 +16,17 @@ name: Build and Push Docker Image
 # because the digest consumers actually resolve is the manifest list's, not
 # either platform's.
 #
-# workflow_dispatch is deliberate: it makes this runnable from a branch before
-# merge. On a non-default branch the is_default_branch guard below disables the
-# `latest` tag, so a dispatch run publishes only the immutable commit-sha tag and
-# cannot move what production pulls.
+# This release-only wrapper is manually dispatched from its dedicated branch.
+# Every build job checks out SOURCE_SHA rather than the wrapper commit, and the
+# sole image tag is that full source identity. It cannot move `latest`.
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*.*.*']
   workflow_dispatch: {}
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: erp-mafia/gnubok
+  IMAGE_NAME: notes-supply/accounted
+  SOURCE_SHA: 26932a2a8b8bcbfe6661524126505611b5e561f2
 
 jobs:
   build:
@@ -54,9 +51,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          # SOURCE_SHA is a hardcoded reviewed object, never event input.
+          ref: ${{ env.SOURCE_SHA }}
           # The build pushes to GHCR via docker/login-action, never over git, so
           # the git credential is dead weight inside a Docker build context.
           persist-credentials: false
+
+      - name: Verify frozen source identity
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
 
       - name: Log in to GHCR
         uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4
@@ -71,6 +75,10 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/notes-supply/accounted
+            org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
+            org.opencontainers.image.version=${{ env.SOURCE_SHA }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
@@ -107,9 +115,9 @@ jobs:
           # platform, so a shared tag would leave the two jobs racing to
           # overwrite a cache manifest describing layers the other cannot use.
           #
-          # A stable cache tag is safe here: this workflow runs only on main,
-          # on v*.*.* tags (cut from main), and on manual dispatch, so there is
-          # no untrusted ref that could poison the layers.
+          # A stable cache tag is safe here: this release wrapper is manually
+          # dispatched and checks out one hardcoded, reviewed source commit. No
+          # event-controlled ref can poison the layers.
           #
           # image-manifest=true,oci-mediatypes=true is required by GHCR, which
           # rejects buildkit's default cache manifest media type.
@@ -171,41 +179,45 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # On main: push `latest` + commit-sha tags.
-          # On v*.*.* tags: push semver tags (1.2.3, 1.2, 1) for production pinning.
-          # A workflow_dispatch run from a branch gets the sha tag only, because
-          # is_default_branch gates `latest`.
+          # The sole candidate tag is the full frozen source commit. No mutable
+          # or semver tag is moved by this release-only workflow.
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=raw,value=${{ env.SOURCE_SHA }}
 
       - name: Create and push manifest list
+        id: manifest
         working-directory: /tmp/digests
         run: |
           set -euo pipefail
+          metadata="${RUNNER_TEMP}/manifest-metadata.json"
+          mapfile -t tags < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          tag_args=()
+          for tag in "${tags[@]}"; do
+            tag_args+=("-t" "${tag}")
+          done
+          mapfile -t digests < <(printf '%s\n' *)
+          source_args=()
+          for digest in "${digests[@]}"; do
+            source_args+=("${REGISTRY}/${IMAGE_NAME}@sha256:${digest}")
+          done
           docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf "${REGISTRY}/${IMAGE_NAME}@sha256:%s " *)
+            "${tag_args[@]}" \
+            --metadata-file "${metadata}" \
+            "${source_args[@]}"
+
+          DIGEST=$(jq -er \
+            '."containerimage.descriptor".digest
+             | select(test("^sha256:[0-9a-f]{64}$"))' \
+            "${metadata}")
+          echo "Created ${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
 
       # Cosign and Trivy must address the manifest list, not either platform's
       # image: the list digest is what `docker pull` resolves for consumers, so
       # it is the thing worth signing and the thing worth scanning.
-      - name: Resolve manifest list digest
-        id: manifest
-        env:
-          VERSION: ${{ steps.meta.outputs.version }}
-        run: |
-          set -euo pipefail
-          DIGEST=$(docker buildx imagetools inspect \
-            "${REGISTRY}/${IMAGE_NAME}:${VERSION}" \
-            --format '{{json .Manifest}}' | jq -r '.digest')
-          echo "Resolved ${REGISTRY}/${IMAGE_NAME}:${VERSION} -> ${DIGEST}"
-          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
 
       - name: Verify both platforms are present
+        id: platforms
         # A merge that quietly produced a single-arch manifest would ship a
         # broken image to every arm64 self-hoster, and nothing downstream checks
         # architecture. Assert it here while the digest is still in hand.
@@ -225,6 +237,42 @@ jobs:
             echo "::error::Expected linux/amd64,linux/arm64 but got ${PLATFORMS}"
             exit 1
           }
+          echo "platforms=${PLATFORMS}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify embedded SBOM and provenance attestations
+        id: attestations
+        env:
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          raw=$(docker buildx imagetools inspect \
+            "${REGISTRY}/${IMAGE_NAME}@${DIGEST}" --raw)
+          mapfile -t attestations < <(jq -r '
+            .manifests[]
+            | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest")
+            | .digest' <<< "${raw}")
+          [ "${#attestations[@]}" -ge 2 ] || {
+            echo "::error::Expected per-platform attestation manifests"
+            exit 1
+          }
+
+          sbom=0
+          provenance=0
+          for attestation in "${attestations[@]}"; do
+            manifest=$(docker buildx imagetools inspect \
+              "${REGISTRY}/${IMAGE_NAME}@${attestation}" --raw)
+            sbom=$((sbom + $(jq '[.layers[]
+              | select(.annotations["in-toto.io/predicate-type"] == "https://spdx.dev/Document")]
+              | length' <<< "${manifest}")))
+            provenance=$((provenance + $(jq '[.layers[]
+              | select(.annotations["in-toto.io/predicate-type"]
+                | startswith("https://slsa.dev/provenance/"))]
+              | length' <<< "${manifest}")))
+          done
+          [ "${sbom}" -ge 2 ] || { echo "::error::Missing per-platform SPDX SBOM"; exit 1; }
+          [ "${provenance}" -ge 2 ] || { echo "::error::Missing per-platform SLSA provenance"; exit 1; }
+          echo "sbom=${sbom}" >> "$GITHUB_OUTPUT"
+          echo "provenance=${provenance}" >> "$GITHUB_OUTPUT"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -236,30 +284,63 @@ jobs:
           set -euo pipefail
           cosign sign --yes "${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
 
-      - name: Scan image with Trivy (report-only)
+      - name: Verify keyless signature
+        env:
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-identity \
+              "https://github.com/notes-supply/accounted/.github/workflows/docker-publish.yml@refs/heads/release/accounted-candidate-image-20260815" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${REGISTRY}/${IMAGE_NAME}@${DIGEST}" >/dev/null
+
+      - name: Scan exact image digest with Trivy
         id: trivy
-        # Decoupled from the publish gate on purpose: this pipeline must stay
-        # green so builds are deterministic. The image is already pushed and
-        # signed above, so failing here would only redden the run: it would not
-        # unship a vulnerable image. exit-code:0 + continue-on-error keep CVEs
-        # (and even a Trivy/DB outage) from failing the build; findings still
-        # flow to the Security tab below. The real blocking gate is
-        # docker-image-scan.yml, which re-scans the published image and fails
-        # (notifying admins) on a fixable CRITICAL/HIGH CVE. It runs on a
-        # workflow_run trigger the moment THIS workflow completes (so the gap
-        # between publish and the blocking scan is the scan's own duration
-        # (minutes), not a 24h cron window) plus a daily cron as a safety net.
-        # Accepted residual risk: an image is live for that short scan window
-        # before the gate fires; see docs/SELF-HOSTING.md / the risk register.
-        continue-on-error: true
+        # Scan the immutable manifest digest resolved by this run. A tag-based
+        # follow-up scan can race another run that republishes the same tag.
+        # The image is already pushed, but a finding fails this publication run
+        # and prevents it from being accepted for deployment.
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.manifest.outputs.digest }}
           severity: CRITICAL,HIGH
-          exit-code: '0'
+          exit-code: '1'
           ignore-unfixed: true
           format: sarif
+          limit-severities-for-sarif: true
           output: trivy-results.sarif
+
+      - name: Record immutable candidate evidence
+        env:
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+          PLATFORMS: ${{ steps.platforms.outputs.platforms }}
+          SBOM: ${{ steps.attestations.outputs.sbom }}
+          PROVENANCE: ${{ steps.attestations.outputs.provenance }}
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg source "${SOURCE_SHA}" \
+            --arg image "${REGISTRY}/${IMAGE_NAME}" \
+            --arg tag "${SOURCE_SHA}" \
+            --arg digest "${DIGEST}" \
+            --arg platforms "${PLATFORMS}" \
+            --argjson sbom "${SBOM}" \
+            --argjson provenance "${PROVENANCE}" \
+            '{source_commit:$source,image:$image,tag:$tag,digest:$digest,
+              platforms:($platforms|split(",")),spdx_sbom_layers:$sbom,
+              slsa_provenance_layers:$provenance,signature:"verified",
+              trivy_fixable_high_critical:"passed"}' \
+            > candidate-evidence.json
+          cat candidate-evidence.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload candidate evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: accounted-candidate-${{ env.SOURCE_SHA }}
+          path: candidate-evidence.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Upload Trivy results to GitHub Security tab
         # if: always(), evidence must reach the Security tab regardless of the
