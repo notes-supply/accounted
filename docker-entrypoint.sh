@@ -15,28 +15,6 @@ if [ -n "$missing" ]; then
   exit 1
 fi
 
-# Self-hosted defaults to MFA disabled, but the public and server policies must
-# remain explicit and identical. Hosted deployments can set both to true.
-if [ -z "${NEXT_PUBLIC_REQUIRE_MFA+x}" ]; then
-  NEXT_PUBLIC_REQUIRE_MFA=false
-fi
-if [ -z "${REQUIRE_MFA+x}" ]; then
-  REQUIRE_MFA=$NEXT_PUBLIC_REQUIRE_MFA
-fi
-case "$NEXT_PUBLIC_REQUIRE_MFA" in
-  true|false) ;;
-  *) printf 'ERROR: NEXT_PUBLIC_REQUIRE_MFA must be exactly "true" or "false".\n' >&2; exit 1 ;;
-esac
-case "$REQUIRE_MFA" in
-  true|false) ;;
-  *) printf 'ERROR: REQUIRE_MFA must be exactly "true" or "false".\n' >&2; exit 1 ;;
-esac
-if [ "$REQUIRE_MFA" != "$NEXT_PUBLIC_REQUIRE_MFA" ]; then
-  printf 'ERROR: REQUIRE_MFA and NEXT_PUBLIC_REQUIRE_MFA must match.\n' >&2
-  exit 1
-fi
-export REQUIRE_MFA NEXT_PUBLIC_REQUIRE_MFA
-
 # Warn if placeholder values are still set
 placeholders_found=""
 case "$NEXT_PUBLIC_SUPABASE_ANON_KEY" in *your-anon-key*) placeholders_found="$placeholders_found  - NEXT_PUBLIC_SUPABASE_ANON_KEY\n" ;; esac
@@ -113,7 +91,7 @@ if [ -n "$SUBST_PATHS" ]; then
   E_APP_URL=$(sed_esc "$NEXT_PUBLIC_APP_URL")
   E_VAPID_PUBLIC_KEY=$(sed_esc "${NEXT_PUBLIC_VAPID_PUBLIC_KEY:-}")
   E_SELF_HOSTED=$(sed_esc "${NEXT_PUBLIC_SELF_HOSTED:-true}")
-  E_REQUIRE_MFA=$(sed_esc "$NEXT_PUBLIC_REQUIRE_MFA")
+  E_REQUIRE_MFA=$(sed_esc "${NEXT_PUBLIC_REQUIRE_MFA:-false}")
   E_SESSION_IDLE_TIMEOUT_MS=$(sed_esc "${NEXT_PUBLIC_SESSION_IDLE_TIMEOUT_MS:-}")
   E_SESSION_ABSOLUTE_TIMEOUT_MS=$(sed_esc "${NEXT_PUBLIC_SESSION_ABSOLUTE_TIMEOUT_MS:-}")
   E_SESSION_WARNING_MS=$(sed_esc "${NEXT_PUBLIC_SESSION_WARNING_MS:-}")

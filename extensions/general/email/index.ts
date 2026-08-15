@@ -3,7 +3,7 @@ import type { Extension } from '@/lib/extensions/types'
 import { registerEmailService } from '@/lib/email/service'
 import { createServiceClientNoCookies } from '@/lib/auth/api-keys'
 import { createLogger } from '@/lib/logger'
-import { createEmailServiceFromEnv } from './lib/provider'
+import { ResendEmailService } from './lib/resend-service'
 import {
   ResendDeliverySignatureError,
   isDeliveryWebhookConfigured,
@@ -11,14 +11,14 @@ import {
   verifyDeliveryWebhook,
 } from './lib/delivery-webhook'
 
-// Provider selection stays inside the extension. Core only sees EmailService.
-registerEmailService(createEmailServiceFromEnv())
+// Register the Resend implementation immediately when this extension is loaded
+registerEmailService(new ResendEmailService())
 
 const log = createLogger('email-delivery-webhook')
 
 export const emailExtension: Extension = {
   id: 'email',
-  name: 'E-post',
+  name: 'E-post (Resend)',
   version: '1.0.0',
 
   apiRoutes: [

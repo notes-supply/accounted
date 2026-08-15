@@ -24,7 +24,7 @@ In the Supabase dashboard under **Authentication > URL Configuration**:
 
 Accounted uses email + password authentication with magic link as a fallback. The default Supabase email auth settings work out of the box. For production, configure a custom SMTP provider under **Authentication > SMTP Settings** to avoid Supabase's built-in rate limits.
 
-MFA (two-factor authentication via TOTP) is **not enforced** by default for self-hosted deployments. The Docker configuration sets `NEXT_PUBLIC_REQUIRE_MFA=false` and `REQUIRE_MFA=false`; the public and server values must always match. Users can still optionally enable 2FA in Settings > Säkerhet. Idle and absolute session timeouts are also off by default for self-hosted installs; operators can opt in with the variables below.
+MFA (two-factor authentication via TOTP) is **not enforced** for self-hosted deployments: the Docker image sets `NEXT_PUBLIC_SELF_HOSTED=true` by default, which disables MFA enforcement. Users can still optionally enable 2FA in Settings > Säkerhet if they wish. Idle and absolute session timeouts are also off by default for self-hosted installs; operators can opt in with the variables below.
 
 ## 3. Apply Database Migrations
 
@@ -386,8 +386,6 @@ flowchart LR
    NEXT_PUBLIC_APP_URL=https://app.example.com
    CRON_SECRET=<openssl rand -hex 32>
    NEXT_PUBLIC_SELF_HOSTED=true
-   NEXT_PUBLIC_REQUIRE_MFA=false
-   REQUIRE_MFA=false
    ```
 
 4. **Allowlist the callback URLs** in GoTrue's redirect list (the Supabase stack's `.env`), then recreate the auth container so it picks up the change:
@@ -517,7 +515,7 @@ portable base file alone.
 ### Notes
 
 - **`pg_cron`** is included in the `supabase/postgres` image, so the `pg_cron` migration succeeds (unlike on the Supabase free tier, see the standard self-hosting flow above).
-- **MFA**: as on the standard path, matching `NEXT_PUBLIC_REQUIRE_MFA=false` and `REQUIRE_MFA=false` disable enforcement; users may still enable TOTP voluntarily.
+- **MFA**: as on the standard path, `NEXT_PUBLIC_SELF_HOSTED=true` disables enforcement; users may still enable TOTP voluntarily.
 
 ## Troubleshooting
 

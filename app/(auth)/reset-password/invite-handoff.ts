@@ -3,7 +3,7 @@ import {
   readInviteCookie,
   type InviteAcceptProblem,
 } from '@/lib/auth/consume-invite-cookie'
-import { hasValidAssuranceLevel, isMfaRequired } from '@/lib/auth/mfa'
+import { shouldEnforceMfa } from '@/lib/auth/mfa'
 
 /**
  * Invite handoff for the password-recovery flow.
@@ -110,24 +110,26 @@ export async function handoffPendingInvite(
  * which the shared classifier cannot tell apart from an email mismatch, so a
  * legitimate invitee would be told their invitation belongs to someone else.
  *
- * The browser preflight follows the public UI policy, whose equality with the
- * authoritative server policy is a deployment invariant. The acceptance
- * request remains protected by both middleware and `requireAuth()`, so this
- * check cannot authorize anything. It only avoids misclassifying an MFA 403 as
- * an email mismatch while preserving the invite for `/mfa/verify`.
+ * The predicate mirrors the middleware's own condition exactly
+ * (`shouldEnforceMfa` plus aal1-with-aal2-required), which makes "we skipped"
+ * and "the middleware will bounce this user to /mfa/verify" the same statement:
+ * the cookie survives untouched and `/mfa/verify` consumes it once the second
+ * factor is in. A user whose MFA is not enforced (self-hosted, BankID-linked)
+ * is deliberately never deferred, because nothing would bounce them and the
+ * token would sit there unused.
  *
- * Missing, malformed, or unreadable assurance data is not proof of AAL2. The
- * preflight therefore defers instead of attempting acceptance.
+ * A failed read is not evidence of a pending step-up, so it falls through to
+ * the attempt: the server is the authority, and a 403 keeps the token anyway.
  */
 async function mfaStepUpOwed(deps: InviteHandoffDeps): Promise<boolean> {
   try {
     const user = await deps.getUser()
-    if (!user || !isMfaRequired()) return false
+    if (!user || !shouldEnforceMfa(user)) return false
 
     const aal = await deps.getAssuranceLevel()
-    return !hasValidAssuranceLevel(aal) || aal.currentLevel !== 'aal2'
+    return aal?.nextLevel === 'aal2' && aal.currentLevel === 'aal1'
   } catch (err) {
     console.error('[reset-password] could not read the session MFA state', err)
-    return true
+    return false
   }
 }

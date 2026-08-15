@@ -61,12 +61,6 @@ const GENERIC: Record<string, StructuredErrorEntry> = {
     message_sv: 'Ett oväntat serverfel uppstod. Försök igen senare.',
     message_en: 'Internal server error.',
   },
-  INVITE_EMAIL_DELIVERY_FAILED: {
-    httpStatus: 502,
-    message_sv: 'Inbjudan skapades, men e-postmeddelandet kunde inte skickas.',
-    message_en: 'The invitation was created, but the email could not be delivered.',
-    retryable: false,
-  },
   VALIDATION_ERROR: {
     httpStatus: 400,
     message_sv: 'Förfrågan innehåller ogiltiga uppgifter.',

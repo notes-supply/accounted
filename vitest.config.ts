@@ -15,25 +15,10 @@ const unitProject = {
     name: 'unit',
     globals: true,
     environment: 'node' as const,
-    env: {
-      REQUIRE_MFA: 'false',
-      NEXT_PUBLIC_REQUIRE_MFA: 'false',
-    },
     include: ['**/*.test.ts'],
     // `.claude/worktrees/*` are ephemeral agent checkouts whose `@/*` imports
     // resolve back to this root: never part of the suite.
-    exclude: ['**/node_modules/**', '**/*.pg.test.ts', '**/*.mfa-config.test.ts', '**/.claude/**'],
-  },
-}
-
-const mfaConfigProject = {
-  resolve: { alias },
-  test: {
-    name: 'mfa-config',
-    globals: true,
-    environment: 'node' as const,
-    include: ['**/*.mfa-config.test.ts'],
-    exclude: ['**/node_modules/**', '**/.claude/**'],
+    exclude: ['**/node_modules/**', '**/*.pg.test.ts', '**/.claude/**'],
   },
 }
 
@@ -56,8 +41,8 @@ const pgRealProject = {
 // running a bare `vitest run` would otherwise hit the schema sanity check
 // against a non-existent DB. `npm run test:pg` is the opt-in entry point.
 const projects = process.env.DATABASE_URL
-  ? [unitProject, mfaConfigProject, pgRealProject]
-  : [unitProject, mfaConfigProject]
+  ? [unitProject, pgRealProject]
+  : [unitProject]
 
 export default defineConfig({
   resolve: { alias },

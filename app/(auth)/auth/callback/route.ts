@@ -2,18 +2,9 @@ import { createServerClient } from '@supabase/ssr'
 import { type NextRequest, NextResponse } from 'next/server'
 import { hashInviteToken } from '@/lib/auth/invite-tokens'
 import { INVITE_COOKIE_NAME } from '@/lib/auth/consume-invite-cookie'
-import { resolvePublicOrigin } from '@/lib/auth/public-origin'
 
 export async function GET(request: NextRequest) {
-  const requestUrl = new URL(request.url)
-  const { searchParams } = requestUrl
-  const origin = resolvePublicOrigin(request)
-  if (!origin) {
-    return NextResponse.json(
-      { error: 'server_error', error_description: 'Public application origin is not configured' },
-      { status: 500 },
-    )
-  }
+  const { searchParams, origin } = new URL(request.url)
   const code = searchParams.get('code')
   const token_hash = searchParams.get('token_hash')
   const type = searchParams.get('type')

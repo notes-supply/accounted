@@ -6,7 +6,6 @@ import { withRouteContext } from '@/lib/api/with-route-context'
 import { validateBody } from '@/lib/api/validate'
 import { generateInviteToken, getInviteExpiry } from '@/lib/auth/invite-tokens'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
-import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import { getEmailService } from '@/lib/email/service'
 import {
   generateInviteEmailSubject,
@@ -14,9 +13,10 @@ import {
   generateInviteEmailText,
 } from '@/lib/email/invite-templates'
 
-// Loads the email extension so getEmailService() returns the configured
-// provider instead of the noop default. Without this, invite delivery is
-// silently skipped when this route runs before another initialized route.
+// Loads the email extension so getEmailService() returns the Resend
+// implementation instead of the noop default. Without this, the invite email
+// is silently skipped in dev whenever this route is hit before any other
+// init'd route in the process.
 ensureInitialized()
 
 const InviteSchema = z.object({
@@ -205,9 +205,9 @@ export const POST = withRouteContext(
       }
     }
 
-    // The row is already durable at this point. A delivery failure must keep
-    // that pending invitation in the response without reporting a successful
-    // send.
+    // Send email. email_sent is surfaced in the response so the UI can tell
+    // the user when the invitation exists but the mail never went out:
+    // previously a send failure was invisible (invite looked sent).
     const emailService = getEmailService()
     let emailSent = false
     if (emailService.isConfigured()) {
@@ -236,25 +236,19 @@ export const POST = withRouteContext(
       log.warn('email service not configured: invite email skipped', { to: email })
     }
 
-    // In development, return the invite URL directly (no email service).
+    // In development, return the invite URL directly (no email service)
     const isDev = process.env.NODE_ENV === 'development'
     const devInviteUrl = isDev ? `${appUrl}/invite/${token}` : undefined
-    const responseData = {
-      email,
-      status: 'pending',
-      email_sent: emailSent,
-      user_provisioned: userProvisioned,
-      ...(isDev && { inviteUrl: devInviteUrl }),
-    }
 
-    if (!emailSent && !isDev) {
-      return errorResponseFromCode('INVITE_EMAIL_DELIVERY_FAILED', log, {
-        requestId: ctx.requestId,
-        data: responseData,
-      })
-    }
-
-    return NextResponse.json({ data: responseData })
+    return NextResponse.json({
+      data: {
+        email,
+        status: 'pending',
+        email_sent: emailSent,
+        user_provisioned: userProvisioned,
+        ...(isDev && { inviteUrl: devInviteUrl }),
+      },
+    })
   },
   { requireWrite: true },
 )

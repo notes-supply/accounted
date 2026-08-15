@@ -13,8 +13,7 @@ const state = vi.hoisted(() => ({
   user: null as null | { id: string; app_metadata?: Record<string, unknown> },
   sessionId: 'session-1' as string | null,
   authError: null as unknown,
-  aal: null as unknown,
-  aalError: null as unknown,
+  aal: null as null | { currentLevel: string; nextLevel: string },
   factors: null as null | { totp: Array<{ id: string; status: string }> },
   company: {
     data: [{ company_id: 'company-1', locale: 'sv', used_fallback: false }],
@@ -45,10 +44,7 @@ vi.mock('@supabase/ssr', () => ({
       })),
       signOut: state.signOut,
       mfa: {
-        getAuthenticatorAssuranceLevel: vi.fn(async () => ({
-          data: state.aal,
-          error: state.aalError,
-        })),
+        getAuthenticatorAssuranceLevel: vi.fn(async () => ({ data: state.aal })),
         listFactors: vi.fn(async () => ({ data: state.factors })),
       },
     },
@@ -97,8 +93,7 @@ function run(path: string, init?: RequestInit) {
 
 describe('updateSession redirect destinations', () => {
   const envBackup = {
-    require: process.env.REQUIRE_MFA,
-    publicRequire: process.env.NEXT_PUBLIC_REQUIRE_MFA,
+    require: process.env.NEXT_PUBLIC_REQUIRE_MFA,
     selfHosted: process.env.NEXT_PUBLIC_SELF_HOSTED,
     signingSecret: process.env.SESSION_TIMEOUT_SECRET,
     idleTimeout: process.env.NEXT_PUBLIC_SESSION_IDLE_TIMEOUT_MS,
@@ -112,7 +107,6 @@ describe('updateSession redirect destinations', () => {
     state.sessionId = 'session-1'
     state.authError = null
     state.aal = null
-    state.aalError = null
     state.factors = null
     state.company = {
       data: [{ company_id: 'company-1', locale: 'sv', used_fallback: false }],
@@ -120,8 +114,7 @@ describe('updateSession redirect destinations', () => {
     }
     state.userPreferences = null
     state.userPreferencesError = null
-    process.env.REQUIRE_MFA = 'false'
-    process.env.NEXT_PUBLIC_REQUIRE_MFA = 'false'
+    delete process.env.NEXT_PUBLIC_REQUIRE_MFA
     delete process.env.NEXT_PUBLIC_SELF_HOSTED
     process.env.SESSION_TIMEOUT_SECRET = 'middleware-test-secret'
     delete process.env.NEXT_PUBLIC_SESSION_IDLE_TIMEOUT_MS
@@ -130,10 +123,8 @@ describe('updateSession redirect destinations', () => {
   })
 
   afterEach(() => {
-    if (envBackup.require === undefined) delete process.env.REQUIRE_MFA
-    else process.env.REQUIRE_MFA = envBackup.require
-    if (envBackup.publicRequire === undefined) delete process.env.NEXT_PUBLIC_REQUIRE_MFA
-    else process.env.NEXT_PUBLIC_REQUIRE_MFA = envBackup.publicRequire
+    if (envBackup.require === undefined) delete process.env.NEXT_PUBLIC_REQUIRE_MFA
+    else process.env.NEXT_PUBLIC_REQUIRE_MFA = envBackup.require
     if (envBackup.selfHosted === undefined) delete process.env.NEXT_PUBLIC_SELF_HOSTED
     else process.env.NEXT_PUBLIC_SELF_HOSTED = envBackup.selfHosted
     if (envBackup.signingSecret === undefined) delete process.env.SESSION_TIMEOUT_SECRET
@@ -479,7 +470,6 @@ describe('updateSession redirect destinations', () => {
 
   describe('MFA step-up bounce to /mfa/verify', () => {
     beforeEach(() => {
-      process.env.REQUIRE_MFA = 'true'
       process.env.NEXT_PUBLIC_REQUIRE_MFA = 'true'
       state.user = SIGNED_IN
       state.aal = { currentLevel: 'aal1', nextLevel: 'aal2' }
@@ -508,40 +498,10 @@ describe('updateSession redirect destinations', () => {
       expect(url.pathname).toBe('/mfa/verify')
       expect(url.searchParams.get('returnTo')).toBeNull()
     })
-    it.each([
-      [null, null],
-      [{}, null],
-      [{ currentLevel: 'aal3', nextLevel: 'aal2' }, null],
-      [{ currentLevel: 'aal2', nextLevel: 'aal1' }, null],
-      [null, { message: 'assurance lookup failed' }],
-    ])('redirects an untrusted assurance response to verification: %j', async (aal, error) => {
-      state.aal = aal
-      state.aalError = error
-
-      const response = await run('/settings/tax')
-
-      expect(response.status).toBe(307)
-      expect(new URL(locationOf(response)!).pathname).toBe('/mfa/verify')
-    })
-
-    it.each([
-      [null, null],
-      [{}, null],
-      [null, { message: 'assurance lookup failed' }],
-    ])('rejects an API request with an untrusted assurance response: %j', async (aal, error) => {
-      state.aal = aal
-      state.aalError = error
-
-      const response = await run('/api/invoices')
-
-      expect(response.status).toBe(403)
-    })
-
   })
 
   describe('forced enrollment bounce to /mfa/enroll', () => {
     beforeEach(() => {
-      process.env.REQUIRE_MFA = 'true'
       process.env.NEXT_PUBLIC_REQUIRE_MFA = 'true'
       state.user = SIGNED_IN
       state.aal = { currentLevel: 'aal1', nextLevel: 'aal1' }
@@ -573,48 +533,38 @@ describe('updateSession redirect destinations', () => {
     })
   })
 
-  // ── Explicit runtime MFA policy semantics ──────────────────────────────
+  // ── MFA semantics that must not change ────────────────────────────────
 
-  describe('runtime MFA policy', () => {
-    it('rejects requests when REQUIRE_MFA is unset', async () => {
-      delete process.env.REQUIRE_MFA
-      state.user = SIGNED_IN
-      state.aal = { currentLevel: 'aal1', nextLevel: 'aal2' }
-
-      await expect(run('/settings/tax')).rejects.toThrow(/REQUIRE_MFA/)
-    })
-
-    it('does not redirect when server policy explicitly disables MFA', async () => {
-      process.env.REQUIRE_MFA = 'false'
-      state.user = SIGNED_IN
-      state.aal = { currentLevel: 'aal1', nextLevel: 'aal2' }
-
-      expect((await run('/settings/tax')).status).toBe(200)
-    })
-
-    it('enforces MFA on self-hosted deployments', async () => {
-      process.env.REQUIRE_MFA = 'true'
-      process.env.NEXT_PUBLIC_REQUIRE_MFA = 'true'
-      process.env.NEXT_PUBLIC_SELF_HOSTED = 'true'
+  describe('MFA-disabled and self-hosted paths are unchanged', () => {
+    it('does not redirect when NEXT_PUBLIC_REQUIRE_MFA is unset', async () => {
       state.user = SIGNED_IN
       state.aal = { currentLevel: 'aal1', nextLevel: 'aal2' }
 
       const response = await run('/settings/tax')
 
-      expect(response.status).toBe(307)
-      expect(new URL(locationOf(response)!).pathname).toBe('/mfa/verify')
+      expect(response.status).toBe(200)
     })
 
-    it('enforces current-session AAL2 when BankID is linked', async () => {
-      process.env.REQUIRE_MFA = 'true'
+    it('does not redirect on self-hosted even with MFA required', async () => {
+      process.env.NEXT_PUBLIC_REQUIRE_MFA = 'true'
+      process.env.NEXT_PUBLIC_SELF_HOSTED = 'true'
+      state.user = SIGNED_IN
+      state.aal = { currentLevel: 'aal1', nextLevel: 'aal2' }
+      state.factors = { totp: [] }
+
+      const response = await run('/settings/tax')
+
+      expect(response.status).toBe(200)
+    })
+
+    it('does not redirect BankID-linked users, who are already 2FA', async () => {
       process.env.NEXT_PUBLIC_REQUIRE_MFA = 'true'
       state.user = { id: 'user-1', app_metadata: { bankid_linked: true } }
       state.aal = { currentLevel: 'aal1', nextLevel: 'aal2' }
 
       const response = await run('/settings/tax')
 
-      expect(response.status).toBe(307)
-      expect(new URL(locationOf(response)!).pathname).toBe('/mfa/verify')
+      expect(response.status).toBe(200)
     })
   })
 })

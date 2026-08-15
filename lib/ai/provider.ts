@@ -17,32 +17,28 @@ export type AiProvider = 'bedrock' | 'anthropic'
 export type AiClient = Anthropic | AnthropicBedrock
 
 /**
- * Resolve the provider from the environment. Bedrock is the default so the AWS
- * credential provider chain gets a chance when no environment key is visible.
+ * Resolve the provider from the environment, or null when neither backend has
+ * usable credentials.
  *
  * Precedence is deliberate:
  *
  *   1. `AI_PROVIDER` wins when set. The escape hatch for a deployment that has
  *      both credential sets and needs to say which one it means.
- *   2. A Bedrock bearer token means Bedrock. Within Bedrock it takes precedence
- *      over static keys and the AWS credential provider chain.
- *   3. Static AWS keys mean Bedrock. This is what keeps hosted byte-identical:
+ *   2. Static AWS keys mean Bedrock. This is what keeps hosted byte-identical:
  *      an operator who adds an Anthropic key for a side experiment must not
  *      silently move production inference out of eu-north-1.
- *   4. Otherwise an Anthropic key means the direct API. This is the
+ *   3. Otherwise an Anthropic key means the direct API. This is the
  *      self-hosted path.
- *   5. Otherwise Bedrock without explicit credentials, so the AWS credential
- *      provider chain (instance profile, IRSA, EKS pod identity) still resolves
- *      on hosted infrastructure that injects credentials rather than setting
- *      env vars. `hasAiCredentials()` reports false here: we cannot see the
- *      chain from this side, so callers that need a cheap pre-flight treat it
- *      as unconfigured rather than paying a request to find out.
+ *   4. Otherwise Bedrock without static keys, so the AWS credential provider
+ *      chain (instance profile, IRSA, EKS pod identity) still resolves on
+ *      hosted infrastructure that injects credentials rather than setting env
+ *      vars. `hasAiCredentials()` reports false here: we cannot see the chain
+ *      from this side, so callers that need a cheap pre-flight treat it as
+ *      unconfigured rather than paying a request to find out.
  */
 export function resolveAiProvider(): AiProvider {
   const explicit = (process.env.AI_PROVIDER ?? '').trim().toLowerCase()
   if (explicit === 'bedrock' || explicit === 'anthropic') return explicit
-
-  if (process.env.AWS_BEARER_TOKEN_BEDROCK) return 'bedrock'
 
   if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) return 'bedrock'
   if (process.env.ANTHROPIC_API_KEY) return 'anthropic'
@@ -54,15 +50,14 @@ export function resolveAiProvider(): AiProvider {
  *
  * Used by call sites that must degrade quietly rather than throw: document
  * extraction returns an empty result instead of failing an upload. Returns
- * false for the AWS provider chain (case 5 above) because it is not visible
+ * false for the AWS provider chain (case 4 above) because it is not visible
  * here; that path was already treated the same way before the direct-API
  * option existed.
  */
 export function hasAiCredentials(): boolean {
   return resolveAiProvider() === 'anthropic'
     ? !!process.env.ANTHROPIC_API_KEY
-    : !!process.env.AWS_BEARER_TOKEN_BEDROCK ||
-        !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY)
+    : !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY)
 }
 
 /**
@@ -80,11 +75,6 @@ export function createAiClient(): AiClient {
   }
 
   const awsRegion = process.env.AWS_REGION || 'eu-north-1'
-  const bearerToken = process.env.AWS_BEARER_TOKEN_BEDROCK
-  if (bearerToken) {
-    return new AnthropicBedrock({ apiKey: bearerToken, awsRegion })
-  }
-
   const awsAccessKey = process.env.AWS_ACCESS_KEY_ID
   const awsSecretKey = process.env.AWS_SECRET_ACCESS_KEY
   // When both static keys are present, pass them. Otherwise omit them so the
@@ -116,14 +106,12 @@ export function toProviderModelId(bareModelId: string, provider = resolveAiProvi
  * Non-secret identification of the configured credential, for startup logs.
  * Anthropic keys carry a public prefix (`sk-ant-api03` for a standard API key,
  * `sk-ant-oat` for an OAuth token); AWS access key ids carry `AKIA` for a
- * long-term IAM user key and `ASIA` for an STS/role credential. Bedrock bearer
- * tokens have no public portion, so they are identified only as `bearer`.
- * Never returns any part of a secret.
+ * long-term IAM user key and `ASIA` for an STS/role credential. Never returns
+ * any part of a secret.
  */
 export function aiCredentialPrefix(): string | null {
   if (resolveAiProvider() === 'anthropic') {
     return process.env.ANTHROPIC_API_KEY?.slice(0, 12) ?? null
   }
-  if (process.env.AWS_BEARER_TOKEN_BEDROCK) return 'bearer'
   return process.env.AWS_ACCESS_KEY_ID?.slice(0, 4) ?? null
 }

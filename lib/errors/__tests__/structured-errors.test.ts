@@ -130,20 +130,6 @@ describe('errorResponse', () => {
     expect(res.headers.get('X-Request-Id')).toBe('req_7')
   })
 
-  it('errorResponseFromCode can include a durable partial result', async () => {
-    const data = { status: 'pending', email_sent: false }
-    const res = errorResponseFromCode('INVITE_EMAIL_DELIVERY_FAILED', noopLogger, {
-      requestId: 'req_invite',
-      data,
-    })
-    expect(res.status).toBe(502)
-    expect(res.headers.get('X-Request-Id')).toBe('req_invite')
-    await expect(res.json()).resolves.toMatchObject({
-      error: { code: 'INVITE_EMAIL_DELIVERY_FAILED', requestId: 'req_invite' },
-      data,
-    })
-  })
-
   it('preserves EntryDateOutsideFiscalPeriodError fields', async () => {
     const err = new EntryDateOutsideFiscalPeriodError(
       '2026-01-01',

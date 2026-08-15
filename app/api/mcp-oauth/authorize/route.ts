@@ -3,11 +3,11 @@ import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
 import type { SupabaseClient, User } from '@supabase/supabase-js'
 import { createAuthCode } from '@/lib/auth/oauth-codes'
-import { hasValidAssuranceLevel, shouldEnforceMfa } from '@/lib/auth/mfa'
+import { shouldEnforceMfa } from '@/lib/auth/mfa'
 import { requireCompanyId } from '@/lib/company/context'
 import { getBranding } from '@/lib/branding/service'
 import { isAllowedRedirectUri } from '@/lib/auth/oauth-allowlist'
-import { resolvePublicOrigin } from '@/lib/auth/public-origin'
+import { resolveDiscoveryBaseUrl } from '@/lib/api/v1/base-url'
 import {
   ALL_SCOPES,
   API_KEY_SCOPES,
@@ -30,13 +30,6 @@ import {
 type ScopeParseResult =
   | { kind: 'ok'; scopes: ApiKeyScope[] | undefined }
   | { kind: 'invalid_scope'; description: string }
-
-function publicOriginErrorResponse(): Response {
-  return NextResponse.json(
-    { error: 'server_error', error_description: 'Public application origin is not configured' },
-    { status: 500 },
-  )
-}
 
 /**
  * Parse the OAuth `scope` query param (RFC 6749 §3.3, space-delimited list)
@@ -110,10 +103,8 @@ function verifyScopeBinding(scopeParam: string, signature: string): boolean {
 function buildLoginRedirect(request: Request): Response {
   const url = new URL(request.url)
   const next = `${url.pathname}${url.search}`
-  const publicOrigin = resolvePublicOrigin(request)
-  if (!publicOrigin) return publicOriginErrorResponse()
   return NextResponse.redirect(
-    new URL(`/login?next=${encodeURIComponent(next)}`, publicOrigin)
+    new URL(`/login?next=${encodeURIComponent(next)}`, url.origin)
   )
 }
 
@@ -131,31 +122,26 @@ async function requireAal2(
   request: Request,
 ): Promise<Response | null> {
   if (!shouldEnforceMfa(user)) return null
-  const { data: aal, error: aalError } =
-    await supabase.auth.mfa.getAuthenticatorAssuranceLevel()
-  if (aalError || !hasValidAssuranceLevel(aal) || aal.currentLevel !== 'aal2') {
+  const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel()
+  if (aal?.nextLevel === 'aal2' && aal?.currentLevel !== 'aal2') {
     const url = new URL(request.url)
     const returnTo = `${url.pathname}${url.search}`
-    const publicOrigin = resolvePublicOrigin(request)
-    if (!publicOrigin) return publicOriginErrorResponse()
     return NextResponse.redirect(
-      new URL(`/mfa/verify?returnTo=${encodeURIComponent(returnTo)}`, publicOrigin),
+      new URL(`/mfa/verify?returnTo=${encodeURIComponent(returnTo)}`, url.origin),
     )
   }
   return null
 }
 
 function errorRedirect(request: Request, redirectUri: string, state: string | null, error: string, desc: string): Response {
-  const publicOrigin = resolvePublicOrigin(request)
-  if (!publicOrigin) return publicOriginErrorResponse()
   const url = new URL(redirectUri)
   url.searchParams.set('error', error)
   url.searchParams.set('error_description', desc)
   if (state) url.searchParams.set('state', state)
   // RFC 9207: identify the issuer in every authorization response so clients
-  // can detect mix-up attacks. It is resolved by the same public-origin policy
-  // used for browser redirects, so a private ingress address cannot escape.
-  url.searchParams.set('iss', publicOrigin)
+  // can detect mix-up attacks. Must equal the issuer that discovery
+  // advertised for the host the client connected through.
+  url.searchParams.set('iss', resolveDiscoveryBaseUrl(request))
   return NextResponse.redirect(url.toString(), 303)
 }
 
@@ -763,9 +749,6 @@ export async function POST(request: Request) {
     ? boundedToClient
     : [...DEFAULT_OAUTH_SCOPES].filter(s => ceilingSet.has(s))
 
-  const publicOrigin = resolvePublicOrigin(request)
-  if (!publicOrigin) return publicOriginErrorResponse()
-
   // Create auth code with userId (NO API key: that's created at /token after PKCE)
   const code = createAuthCode({
     userId: user.id,
@@ -778,9 +761,9 @@ export async function POST(request: Request) {
   const callbackUrl = new URL(redirectUri)
   callbackUrl.searchParams.set('code', code)
   if (state) callbackUrl.searchParams.set('state', state)
-  // RFC 9207: issuer identification in the authorization response. The
-  // browser redirects and issuer share one canonical public-origin policy.
-  callbackUrl.searchParams.set('iss', publicOrigin)
+  // RFC 9207: issuer identification in the authorization response. Must match
+  // the issuer discovery advertises for the host the client connected through.
+  callbackUrl.searchParams.set('iss', resolveDiscoveryBaseUrl(request))
 
   // 303 See Other: forces browser to GET the callback URL, even though this
   // handler was reached via POST. NextResponse.redirect() defaults to 307,
