@@ -56,6 +56,7 @@ vi.mock('@/lib/reports/rc-basis-gaps', () => ({
 import { tools } from '../server'
 
 const validate = tools.find((t) => t.name === 'gnubok_vat_declaration_validate')!
+const submit = tools.find((t) => t.name === 'gnubok_vat_declaration_submit')!
 
 /** Full SKV 4700 projection with ruta 49 derived, so SUMMA_MOMS_DRIFT stays quiet. */
 function makeRutor(partial: Partial<VatDeclarationRutor> = {}): VatDeclarationRutor {
@@ -89,7 +90,21 @@ function setDeclaration(
   rcInput?: Record<string, { debit: number; credit: number }>,
 ) {
   mockCalculateVatDeclaration.mockResolvedValue({
+    period: {
+      type: 'monthly',
+      year: 2026,
+      period: 1,
+      start: '2026-01-01',
+      end: '2026-01-31',
+      originalStart: '2026-01-01',
+      originalEnd: '2026-01-31',
+      fiscalPeriodId: null,
+      fiscalPeriodStart: null,
+      fiscalPeriodEnd: null,
+      vatLiabilityStartDate: null,
+    },
     rutor,
+    rcBasisByRate: { r25: 0, r12: 0, r6: 0 },
     ...(rcInput ? { rcInputAccountTotals: rcInput } : {}),
   })
 }
@@ -247,11 +262,81 @@ describe('gnubok_vat_declaration_validate', () => {
     }
     expect(schema.properties).toHaveProperty('arithmetic_ok')
     expect(schema.properties).toHaveProperty('completeness_ok')
+
     expect(schema.properties).toHaveProperty('completeness_checks')
     expect(schema.required).toContain('arithmetic_ok')
     expect(schema.required).toContain('completeness_ok')
     expect(validate.description.length).toBeLessThanOrEqual(280)
     // The description must not imply Skatteverket checked the underlag.
     expect(validate.description).toMatch(/completeness/i)
+  })
+})
+describe('gnubok_vat_declaration_submit identity staging', () => {
+  it('stages annual fiscal identity, approved snapshots, and the API-key actor', async () => {
+    const fiscalPeriodId = '33333333-3333-4333-8333-333333333333'
+    mockCalculateVatDeclaration.mockResolvedValue({
+      period: {
+        type: 'yearly',
+        year: 2026,
+        period: 1,
+        start: '2025-08-01',
+        end: '2026-06-30',
+        originalStart: '2025-07-01',
+        originalEnd: '2026-06-30',
+        fiscalPeriodId,
+        fiscalPeriodStart: '2025-07-01',
+        fiscalPeriodEnd: '2026-06-30',
+        vatLiabilityStartDate: '2025-08-01',
+      },
+      rutor: CLEAN,
+      rcInputAccountTotals: rcInput({ '2645': 1250 }),
+      rcBasisByRate: { r25: 5000, r12: 0, r6: 0 },
+    })
+    skvOk()
+
+    let inserted: Record<string, unknown> | undefined
+    const chain: Record<string, unknown> = {}
+    for (const method of ['eq', 'gte', 'lte', 'order', 'limit', 'select']) {
+      chain[method] = () => chain
+    }
+    chain.insert = (payload: Record<string, unknown>) => {
+      inserted = payload
+      return chain
+    }
+    chain.single = async () => ({ data: { id: 'op-vat-1' }, error: null })
+    const db = { from: () => chain } as never
+
+    const result = await submit.execute(
+      {
+        period_type: 'yearly',
+        year: 2026,
+        period: 1,
+        fiscal_period_id: fiscalPeriodId,
+      },
+      'company-1',
+      'user-1',
+      db,
+      { type: 'api_key', id: 'key-1', label: 'Accounting agent' },
+    )
+
+    expect(result).toMatchObject({ staged: true, operation_id: 'op-vat-1' })
+    expect(inserted).toMatchObject({
+      operation_type: 'submit_vat_declaration',
+      actor_type: 'api_key',
+      actor_id: 'key-1',
+      actor_label: 'Accounting agent',
+      params: {
+        fiscal_period_id: fiscalPeriodId,
+        fiscal_period_start: '2025-07-01',
+        fiscal_period_end: '2026-06-30',
+        original_period_start: '2025-07-01',
+        original_period_end: '2026-06-30',
+        resolved_period_start: '2025-08-01',
+        resolved_period_end: '2026-06-30',
+        vat_liability_start_date: '2025-08-01',
+        approved_rutor: CLEAN,
+        approved_momsuppgift: { summaMoms: 2500 },
+      },
+    })
   })
 })

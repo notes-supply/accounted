@@ -15,6 +15,7 @@ DECLARE
   v_company       INT;
   v_period        INT;
   v_max_voucher   INT;
+  v_invalid_commit_metadata INT;
 BEGIN
   -- 1. The company, its membership and its fiscal period survived.
   SELECT count(*) INTO v_company
@@ -78,6 +79,19 @@ BEGIN
     WHERE company_id = '22222222-2222-2222-2222-222222222222';
   IF v_max_voucher <> 3 THEN
     RAISE EXCEPTION 'upgrade: highest voucher number changed to %, expected 3', v_max_voucher;
+  END IF;
+
+  -- 7. The predecessor fixture mirrors production's preflight result: every
+  --    posted row was already durably timestamped before M2. The upgrade must
+  --    preserve that commitment metadata rather than inventing or clearing it.
+  SELECT count(*) INTO v_invalid_commit_metadata
+    FROM public.journal_entries
+    WHERE company_id = '22222222-2222-2222-2222-222222222222'
+      AND status = 'posted'
+      AND (committed_at IS NULL OR commit_method IS DISTINCT FROM 'legacy');
+  IF v_invalid_commit_metadata <> 0 THEN
+    RAISE EXCEPTION 'upgrade: % posted entries lost valid predecessor commit metadata',
+      v_invalid_commit_metadata;
   END IF;
 
   RAISE NOTICE 'upgrade-path assertions passed: % entries, % lines, balanced at %',

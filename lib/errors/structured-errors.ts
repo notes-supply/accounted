@@ -278,6 +278,46 @@ const BOOKKEEPING: Record<string, StructuredErrorEntry> = {
     message_en: 'Bookkeeping database operation failed.',
     retryable: true,
   },
+  AMBIGUOUS_JOURNAL_COMMIT: {
+    httpStatus: 500,
+    message_sv:
+      'Det går inte att fastställa om verifikationen bokfördes. Bokför inte samma händelse igen innan verifikations-id:t har kontrollerats.',
+    message_en:
+      'The journal commit outcome is ambiguous. Do not post the same event again until the journal entry identity has been checked.',
+    retryable: false,
+  },
+  DURABLE_ACCOUNTING_CONFLICT: {
+    httpStatus: 409,
+    message_sv:
+      'Den bokförda återställningen stämmer inte med den begärda händelsen. Kontrollera de angivna verifikations-id:na.',
+    message_en:
+      'The persisted accounting recovery conflicts with the requested event. Inspect the returned journal entry identities.',
+    retryable: false,
+  },
+  DURABLE_ACCOUNTING_PARTIAL: {
+    httpStatus: 500,
+    message_sv:
+      'En del av bokföringen är redan beständig. Bokför inte händelsen igen; kontrollera de angivna verifikations-id:na.',
+    message_en:
+      'Part of the accounting operation is already durable. Do not repeat the business operation; inspect the returned journal entry identities.',
+    retryable: false,
+  },
+  DURABLE_ACCOUNTING_IDENTITY_INVALID: {
+    httpStatus: 500,
+    message_sv:
+      'Bokföringen sparades men dess beständiga identiteter kunde inte verifieras. Försök samma idempotenta återställningsanrop igen.',
+    message_en:
+      'The accounting state was persisted but its durable identities could not be verified. Retry the same idempotent recovery call.',
+    retryable: true,
+  },
+  SUPPLIER_PAYMENT_ACCOUNTING_CHANGED: {
+    httpStatus: 409,
+    message_sv:
+      'En betalning av en leverantörsfaktura får bara rättas genom datum eller beskrivning. Belopp, konton, valuta, momskod och dimensioner måste vara oförändrade.',
+    message_en:
+      'A supplier payment correction may change only date or description. Amounts, accounts, currency, tax code, and dimensions must remain unchanged.',
+    retryable: false,
+  },
   MEANINGLESS_CORRECTION: {
     httpStatus: 400,
     message_sv: 'Rättelsen motsvarar ingen ekonomisk händelse: det finns inget att rätta.',

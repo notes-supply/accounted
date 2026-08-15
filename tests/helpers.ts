@@ -537,6 +537,7 @@ export function makeCompanySettings(
     vat_registered: true,
     vat_number: null,
     moms_period: 'quarterly',
+    vat_liability_start_date: null,
     periodisk_sammanstallning_period: 'quarterly',
     vat_taxable_base_over_40m: false,
     vat_has_eu_trade: false,

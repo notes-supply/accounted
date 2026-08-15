@@ -21,10 +21,12 @@ interface MockData {
   /** Error returned by the existing-settlement lookup. */
   existingError?: { message: string }
   /** fiscal_periods row for yearly (helårsmoms) bounds. */
-  fiscalPeriod?: { period_start: string; period_end: string } | null
+  fiscalPeriod?: { id: string; period_start: string; period_end: string } | null
 }
 
 let rpcCalls: Array<{ fn: string; params: Record<string, unknown> }>
+const FISCAL_PERIOD_ID = '11111111-1111-4111-8111-111111111111'
+
 
 function makeClient(data: MockData) {
   rpcCalls = []
@@ -40,15 +42,19 @@ function makeClient(data: MockData) {
         error: null,
       }
     }),
-    from: vi.fn().mockImplementation(() => {
+    from: vi.fn().mockImplementation((table: string) => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const b: Record<string, any> = {}
       for (const m of ['select', 'eq', 'neq', 'in', 'gte', 'lte', 'order', 'range', 'limit']) {
         b[m] = vi.fn().mockReturnValue(b)
       }
-      b.maybeSingle = vi.fn().mockResolvedValue({ data: data.fiscalPeriod ?? null, error: null })
-      // The only awaited from() query left in the proposal builder is the
-      // tagged existing-settlement lookup.
+      b.maybeSingle = vi.fn().mockResolvedValue(
+        table === 'company_settings'
+          ? { data: { vat_liability_start_date: null }, error: null }
+          : table === 'fiscal_periods'
+            ? { data: data.fiscalPeriod ?? null, error: null }
+            : { data: null, error: null },
+      )
       b.then = (resolve: (v: unknown) => void) =>
         resolve(
           data.existingError
@@ -173,11 +179,15 @@ describe('buildVatSettlementProposal', () => {
   it('uses the räkenskapsår bounds for yearly VAT when a fiscal period is supplied', async () => {
     const supabase = makeClient({
       totals: [total('2611', 0, 100), total('2641', 25, 0)],
-      fiscalPeriod: { period_start: '2025-07-01', period_end: '2026-06-30' },
+      fiscalPeriod: {
+        id: FISCAL_PERIOD_ID,
+        period_start: '2025-07-01',
+        period_end: '2026-06-30',
+      },
     })
 
     const proposal = await buildVatSettlementProposal(
-      supabase, 'company-1', 'yearly', 2026, 1, { fiscalPeriodId: 'fp-1' },
+      supabase, 'company-1', 'yearly', 2026, 1, { fiscalPeriodId: FISCAL_PERIOD_ID },
     )
 
     expect(proposal.period.start).toBe('2025-07-01')

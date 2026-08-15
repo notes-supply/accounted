@@ -47,6 +47,11 @@ export const CORRECTION_CHAIN_TOO_DEEP = 'CORRECTION_CHAIN_TOO_DEEP' as const
 export const NO_OPEN_PERIOD_FOR_DATE = 'NO_OPEN_PERIOD_FOR_DATE' as const
 export const TARGET_PERIOD_CLOSED = 'TARGET_PERIOD_CLOSED' as const
 export const TARGET_PERIOD_LOCKED = 'TARGET_PERIOD_LOCKED' as const
+export const AMBIGUOUS_JOURNAL_COMMIT = 'AMBIGUOUS_JOURNAL_COMMIT' as const
+export const DURABLE_ACCOUNTING_CONFLICT = 'DURABLE_ACCOUNTING_CONFLICT' as const
+export const DURABLE_ACCOUNTING_PARTIAL = 'DURABLE_ACCOUNTING_PARTIAL' as const
+export const DURABLE_ACCOUNTING_IDENTITY_INVALID = 'DURABLE_ACCOUNTING_IDENTITY_INVALID' as const
+export const SUPPLIER_PAYMENT_ACCOUNTING_CHANGED = 'SUPPLIER_PAYMENT_ACCOUNTING_CHANGED' as const
 
 // ============================================================================
 // AccountsNotInChartError: kept for back-compat (many existing call sites)
@@ -303,6 +308,92 @@ export class InvalidMappingResultError extends Error {
   }
 }
 
+export interface DurableAccountingRecoveryIdentity {
+  company_id: string
+  original_journal_entry_id: string
+  reversal_journal_entry_id: string | null
+  publication_ids: string[]
+}
+
+/**
+ * The commit RPC may have posted the immutable entry, but authoritative
+ * readback could not classify the outcome. Blind retry is unsafe.
+ */
+export class AmbiguousJournalCommitError extends Error {
+  readonly code = AMBIGUOUS_JOURNAL_COMMIT
+
+  constructor(
+    public readonly journalEntryId: string,
+    public readonly voucherNumber: number | null,
+    public readonly cause: string,
+  ) {
+    super(
+      `Journal entry ${journalEntryId} may be posted${
+        voucherNumber === null ? '' : ` as voucher ${voucherNumber}`
+      }, but the durable outcome could not be verified: ${cause}`,
+    )
+    this.name = 'AmbiguousJournalCommitError'
+  }
+}
+
+export class DurableAccountingConflictError extends Error {
+  readonly code = DURABLE_ACCOUNTING_CONFLICT
+
+  constructor(
+    public readonly operation: BookkeepingOperation,
+    public readonly recovery: DurableAccountingRecoveryIdentity,
+    public readonly reason: string,
+  ) {
+    super(`Durable accounting operation "${operation}" conflicts with persisted state: ${reason}`)
+    this.name = 'DurableAccountingConflictError'
+  }
+}
+
+/**
+ * At least one posted journal identity is durable, but the requested atomic
+ * recovery could not be verified. Callers must surface every identity and
+ * must not repeat a non-idempotent higher-level operation.
+ */
+export class DurableAccountingPartialError extends Error {
+  readonly code = DURABLE_ACCOUNTING_PARTIAL
+
+  constructor(
+    public readonly operation: BookkeepingOperation,
+    public readonly recovery: DurableAccountingRecoveryIdentity,
+    public readonly cause: string,
+  ) {
+    super(`Durable accounting operation "${operation}" has a partial outcome: ${cause}`)
+    this.name = 'DurableAccountingPartialError'
+  }
+}
+
+export class DurableAccountingIdentityError extends Error {
+  readonly code = DURABLE_ACCOUNTING_IDENTITY_INVALID
+
+  constructor(
+    public readonly operation: BookkeepingOperation,
+    public readonly recovery: DurableAccountingRecoveryIdentity,
+    public readonly cause: string,
+  ) {
+    super(`Durable accounting operation "${operation}" returned invalid identities: ${cause}`)
+    this.name = 'DurableAccountingIdentityError'
+  }
+}
+
+export class SupplierPaymentAccountingChangedError extends Error {
+  readonly code = SUPPLIER_PAYMENT_ACCOUNTING_CHANGED
+
+  constructor(
+    public readonly rootJournalEntryId: string,
+    public readonly journalEntryId: string,
+  ) {
+    super(
+      `Supplier payment correction ${journalEntryId} changes the accounting effect of root ${rootJournalEntryId}`,
+    )
+    this.name = 'SupplierPaymentAccountingChangedError'
+  }
+}
+
 // ============================================================================
 // BookkeepingDatabaseError: single wrapper for all "Failed to <op>: <cause>"
 // engine throws. The `operation` tag is preserved for logs; the cause string
@@ -329,6 +420,10 @@ export type BookkeepingOperation =
   | 'fetch_currency_payables'
   | 'check_existing_revaluation'
   | 'resolve_settlement_account'
+  | 'resolve_supplier_payment_lineage'
+  | 'apply_supplier_payment_reversal'
+  | 'compensate_transaction_categorization'
+  | 'verify_durable_accounting_identity'
 
 export class BookkeepingDatabaseError extends Error {
   readonly code = BOOKKEEPING_DATABASE_ERROR
@@ -365,6 +460,11 @@ export function isBookkeepingError(err: unknown): boolean {
     err instanceof CurrencyRevaluationAlreadyExistsError ||
     err instanceof InvalidMappingResultError ||
     err instanceof BookkeepingDatabaseError ||
+    err instanceof AmbiguousJournalCommitError ||
+    err instanceof DurableAccountingConflictError ||
+    err instanceof DurableAccountingPartialError ||
+    err instanceof DurableAccountingIdentityError ||
+    err instanceof SupplierPaymentAccountingChangedError ||
     err instanceof MeaninglessCorrectionError ||
     err instanceof CorrectionChainTooDeepError ||
     err instanceof NoOpenPeriodForDateError ||
@@ -640,6 +740,62 @@ export function bookkeepingErrorResponse(err: unknown): NextResponse | null {
         },
       },
       { status: 400 }
+    )
+  }
+
+  if (err instanceof AmbiguousJournalCommitError) {
+    return NextResponse.json(
+      {
+        error: {
+          code: err.code,
+          message: err.message,
+          details: {
+            journal_entry_id: err.journalEntryId,
+            voucher_number: err.voucherNumber,
+          },
+        },
+      },
+      { status: 500 },
+    )
+  }
+
+  if (
+    err instanceof DurableAccountingConflictError ||
+    err instanceof DurableAccountingPartialError ||
+    err instanceof DurableAccountingIdentityError
+  ) {
+    const status = err instanceof DurableAccountingConflictError ? 409 : 500
+    return NextResponse.json(
+      {
+        error: {
+          code: err.code,
+          message: err.message,
+          details: {
+            operation: err.operation,
+            ...err.recovery,
+            ...(err instanceof DurableAccountingConflictError
+              ? { reason: err.reason }
+              : {}),
+          },
+        },
+      },
+      { status },
+    )
+  }
+
+  if (err instanceof SupplierPaymentAccountingChangedError) {
+    return NextResponse.json(
+      {
+        error: {
+          code: err.code,
+          message: err.message,
+          details: {
+            root_journal_entry_id: err.rootJournalEntryId,
+            journal_entry_id: err.journalEntryId,
+          },
+        },
+      },
+      { status: 409 },
     )
   }
 

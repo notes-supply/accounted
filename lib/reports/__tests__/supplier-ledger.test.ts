@@ -6,20 +6,52 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 let resultIdx: number
 let results: Array<{ data?: unknown; error?: unknown }>
+let lineageRows: Array<Record<string, unknown>>
 
-function makeBuilder() {
+function makeBuilder(_table: string) {
   const b: Record<string, unknown> = {}
   for (const m of ['select', 'eq', 'in', 'lte', 'order', 'range']) {
     b[m] = vi.fn().mockReturnValue(b)
   }
   b.single = vi.fn().mockImplementation(async () => results[resultIdx++] ?? { data: null, error: null })
-  b.then = (resolve: (v: unknown) => void) => resolve(results[resultIdx++] ?? { data: null, error: null })
+  b.then = (resolve: (v: unknown) => void) =>
+    resolve(results[resultIdx++] ?? { data: null, error: null })
   return b
 }
 
 function makeClient() {
   return {
-    from: vi.fn().mockImplementation(() => makeBuilder()),
+    from: vi.fn().mockImplementation((table: string) => makeBuilder(table)),
+    rpc: vi.fn().mockImplementation(async (
+      _name: string,
+      args: { p_root_ids: string[] },
+    ) => {
+      const rows = lineageRows.filter((row) =>
+        args.p_root_ids.includes(row.root_id as string),
+      )
+      const stornoDepths = rows
+        .filter((row) => row.edge_kind === 'storno')
+        .map((row) => row.depth as number)
+      return {
+        data: {
+          valid: true,
+          company_id: 'company-1',
+          requested_root_count: args.p_root_ids.length,
+          row_count: rows.length,
+          max_depth: Math.max(...rows.map((row) => row.depth as number)),
+          max_correction_depth: Math.max(
+            ...rows
+              .filter((row) => row.edge_kind !== 'storno')
+              .map((row) => row.depth as number),
+          ),
+          terminal_storno_depth: stornoDepths.length > 0
+            ? Math.max(...stornoDepths)
+            : null,
+          rows,
+        },
+        error: null,
+      }
+    }),
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } as any
 }
@@ -32,6 +64,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   resultIdx = 0
   results = []
+  lineageRows = []
   supabase = makeClient()
 })
 
@@ -353,7 +386,7 @@ describe('generateSupplierLedger: historical as-of reconstruction (#1021)', () =
       },
       // Query 2: payment rows dated after the as-of date
       {
-        data: [{ supplier_invoice_id: 'si-1', amount: 8000, payment_date: '2024-07-01' }],
+        data: [{ id: 'pay-1', supplier_invoice_id: 'si-1', amount: 8000, payment_date: '2024-07-01', journal_entry_id: null }],
         error: null,
       },
     ]
@@ -379,8 +412,8 @@ describe('generateSupplierLedger: historical as-of reconstruction (#1021)', () =
       },
       {
         data: [
-          { supplier_invoice_id: 'si-1', amount: 4000, payment_date: '2024-06-10' },
-          { supplier_invoice_id: 'si-1', amount: 6000, payment_date: '2024-07-05' },
+          { id: 'pay-1', supplier_invoice_id: 'si-1', amount: 4000, payment_date: '2024-06-10', journal_entry_id: null },
+          { id: 'pay-2', supplier_invoice_id: 'si-1', amount: 6000, payment_date: '2024-07-05', journal_entry_id: null },
         ],
         error: null,
       },
@@ -425,5 +458,77 @@ describe('generateSupplierLedger: historical as-of reconstruction (#1021)', () =
 
     expect(report.total_outstanding).toBe(2000)
     expect(report.unpaid_count).toBe(1)
+  })
+  it('subtracts a positive-magnitude credit note in the live view', async () => {
+    results = [{
+      data: [{
+        ...invoiceBase,
+        id: 'si-credit',
+        total: 250,
+        remaining_amount: 250,
+        status: 'approved',
+        is_credit_note: true,
+      }],
+      error: null,
+    }]
+
+    const report = await generateSupplierLedger(supabase, 'company-1')
+
+    expect(report.total_outstanding).toBe(-250)
+  })
+
+  it('includes positive-magnitude credit notes with a negative historical sign', async () => {
+    results = [
+      {
+        data: [
+          {
+            ...invoiceBase,
+            id: 'si-original',
+            total: 1000,
+            remaining_amount: 1000,
+            status: 'credited',
+            is_credit_note: false,
+            registration_journal_entry_id: 'reg-original',
+          },
+          {
+            ...invoiceBase,
+            id: 'si-credit',
+            total: 250,
+            remaining_amount: 250,
+            status: 'reversed',
+            is_credit_note: true,
+            registration_journal_entry_id: 'reg-credit',
+          },
+        ],
+        error: null,
+      },
+      { data: [], error: null },
+      { data: [], error: null },
+    ]
+    lineageRows = ['reg-original', 'reg-credit'].map((id) => ({
+      root_id: id,
+      parent_id: null,
+      edge_kind: 'root',
+      id,
+      company_id: 'company-1',
+      entry_date: '2024-05-01',
+      status: 'posted',
+      source_type: 'supplier_invoice_received',
+      correction_of_id: null,
+      reverses_id: null,
+      reversed_by_id: null,
+      committed_at: '2024-05-01T10:00:00Z',
+      depth: 0,
+      path: [id],
+      cycle: false,
+    }))
+
+    const report = await generateSupplierLedger(supabase, 'company-1', '2024-06-15')
+    expect(report.total_outstanding).toBe(750)
+    expect(report.unpaid_count).toBe(2)
+    const invoiceQuery = supabase.from.mock.results[0]!.value as {
+      in: { mock: { calls: unknown[][] } }
+    }
+    expect(invoiceQuery.in.mock.calls).toEqual([])
   })
 })

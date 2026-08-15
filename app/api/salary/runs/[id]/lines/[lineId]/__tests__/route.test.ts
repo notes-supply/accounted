@@ -119,12 +119,12 @@ describe('DELETE /api/salary/runs/[id]/lines/[lineId]', () => {
   })
 
   it('deletes a line on a draft run', async () => {
-    const { enqueueMany } = authed()
+    const { supabase, enqueueMany } = authed()
     enqueueMany([
       { data: { id: 'run-1', status: 'draft' } }, // salary_runs lookup
       // Run-membership verification added by the shared service.
       { data: { id: 'line-1', amount: 50, salary_run_employee: { salary_run_id: 'run-1' } } },
-      { data: null }, // delete (error null)
+      { data: { outcome: 'deleted', released_trip_count: 1 } }, // atomic mileage release + delete
     ])
     const response = await DELETE(
       createMockRequest('/api/salary/runs/run-1/lines/line-1', { method: 'DELETE' }),
@@ -133,5 +133,14 @@ describe('DELETE /api/salary/runs/[id]/lines/[lineId]', () => {
     const { status, body } = await parseJsonResponse<{ data: { deleted: boolean } }>(response)
     expect(status).toBe(200)
     expect(body.data.deleted).toBe(true)
+    expect(supabase.rpc).toHaveBeenCalledWith(
+      'delete_draft_salary_object_with_mileage_release',
+      {
+        p_company_id: 'company-1',
+        p_salary_run_id: 'run-1',
+        p_target_kind: 'line_item',
+        p_target_id: 'line-1',
+      },
+    )
   })
 })

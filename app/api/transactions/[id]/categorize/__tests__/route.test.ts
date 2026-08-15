@@ -39,6 +39,11 @@ vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
     mockCreateTransactionJournalEntry(...args),
 }))
 
+const mockCoordinateSettlement = vi.fn()
+vi.mock('@/lib/transactions/settlement-attachment', () => ({
+  coordinateTransactionSettlement: (...args: unknown[]) => mockCoordinateSettlement(...args),
+}))
+
 // Booking-time duplicate guard: mocked to "no duplicate" by default so these
 // tests exercise categorization, not the guard. The detection query is
 // unit-tested in lib/transactions/__tests__/booking-duplicate-detection.test.ts.
@@ -80,14 +85,6 @@ vi.mock('@/lib/bookkeeping/counterparty-templates', () => ({
   upsertCounterpartyTemplate: vi.fn().mockResolvedValue(undefined),
 }))
 
-// CAS-race compensation is centralized in lib/bookkeeping/cancel-orphaned-entry.
-// The route must delegate to it rather than hand-rolling the cancel + the
-// voucher_gap_explanations insert (BFNAR 2013:2). The exact insert payload is
-// asserted in that helper's own test.
-const mockCancelOrphanedPaymentEntry = vi.fn()
-vi.mock('@/lib/bookkeeping/cancel-orphaned-entry', () => ({
-  cancelOrphanedPaymentEntry: (...args: unknown[]) => mockCancelOrphanedPaymentEntry(...args),
-}))
 
 const mockFindMissingActiveAccounts = vi.fn()
 vi.mock('@/lib/bookkeeping/account-validation', async () => {
@@ -128,10 +125,57 @@ describe('POST /api/transactions/[id]/categorize', () => {
     // Default: no booking-time duplicate. The dedicated guard test overrides this.
     mockDetectDup.mockResolvedValue(null)
     mockAppendProcessingHistory.mockResolvedValue('evt-1')
-    mockCancelOrphanedPaymentEntry.mockResolvedValue(undefined)
+    mockCoordinateSettlement.mockImplementation(async (input: {
+      supabase: unknown
+      companyId: string
+      userId: string
+      transaction: {
+        id: string
+        journal_entry_id: string | null
+        cash_account_id: string | null
+      }
+      mappingResult: unknown
+      notes?: string
+      category: string
+      isBusiness: boolean
+      existingCategorization: boolean
+    }) => {
+      const entry = input.existingCategorization
+        ? { id: input.transaction.journal_entry_id }
+        : await mockCreateTransactionJournalEntry(
+            input.supabase,
+            input.companyId,
+            input.userId,
+            input.transaction,
+            input.mappingResult,
+            input.notes,
+          )
+      if (!entry?.id) {
+        throw new Error('Journal entry creation failed.')
+      }
+      return {
+        kind: 'attached',
+        created: !input.existingCategorization,
+        journalEntry: entry,
+        publication: {
+          publication_id: `pub-${entry.id}`,
+          event_key: `journal:${entry.id}:committed`,
+          event_type: 'journal_entry.committed',
+        },
+        readback: {
+          transaction: {
+            journalEntryId: entry.id,
+            cashAccountId: input.transaction.cash_account_id,
+            category: input.category,
+            isBusiness: input.isBusiness,
+          },
+          journalEntry: { id: entry.id },
+        },
+      }
+    })
   })
 
-  it('delegates the CAS-race orphan to cancelOrphanedPaymentEntry (documented voucher gap)', async () => {
+  it('preserves coordinator compensation identities without synthetic success', async () => {
     const tx = makeTransaction({
       id: 'tx-1',
       amount: -500,
@@ -143,31 +187,39 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null }) // settings
     enqueue({ data: [{ id: 'period-1' }], error: null }) // ensureFiscalPeriod
 
-    mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
-    mockSaveUserMappingRule.mockResolvedValue(undefined)
-
-    // Lost the CAS: another request stamped journal_entry_id first.
-    enqueue({ data: [], error: null })
+    mockCoordinateSettlement.mockResolvedValueOnce({
+      kind: 'partial',
+      code: 'SETTLEMENT_ATTACHMENT_PARTIAL',
+      message: 'Attachment readback remained ambiguous.',
+      postedIds: {
+        originalJournalEntryId: 'je-1',
+        reversalJournalEntryId: 'je-storno',
+      },
+      publicationIds: ['pub-compensation-1'],
+    })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
       body: { is_business: true, category: 'expense_software' },
     })
     const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
-    const { status, body } = await parseJsonResponse<{ error: unknown }>(response)
+    const { status, body } = await parseJsonResponse<{
+      error: {
+        details?: {
+          code?: string
+          posted_ids?: Record<string, string>
+          publication_ids?: string[]
+        }
+      }
+    }>(response)
 
-    expect(status).toBe(409)
-    expect((body.error as { code: string }).code).toBe('TX_CATEGORIZE_RACE')
-
-    // No hand-rolled insert: the helper owns the real column set.
-    expect(mockCancelOrphanedPaymentEntry).toHaveBeenCalledTimes(1)
-    expect(mockCancelOrphanedPaymentEntry).toHaveBeenCalledWith(
-      expect.anything(),
-      'company-1',
-      'user-1',
-      'je-1',
-      'Automatiskt makulerad: dubblettbokning förhindrad av samtidighetsskydd',
-    )
+    expect(status).toBe(500)
+    expect(body.error.details?.code).toBe('SETTLEMENT_ATTACHMENT_PARTIAL')
+    expect(body.error.details?.posted_ids).toEqual({
+      originalJournalEntryId: 'je-1',
+      reversalJournalEntryId: 'je-storno',
+    })
+    expect(body.error.details?.publication_ids).toEqual(['pub-compensation-1'])
   })
 
   it('returns 401 when not authenticated', async () => {
@@ -206,8 +258,8 @@ describe('POST /api/transactions/[id]/categorize', () => {
     })
     // Fetch transaction
     enqueue({ data: tx, error: null })
-    // Update transaction
-    enqueue({ data: null, error: null })
+    // Authoritative live-entry readback for the immutable no-op path.
+    enqueue({ data: { id: 'je-existing', status: 'posted' }, error: null })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
@@ -317,6 +369,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
       'user-1',
       expect.objectContaining({ id: 'tx-1' }),
       expect.objectContaining({ dimensions: { '1': 'KS1', '6': 'P001' } }),
+      undefined,
     )
   })
 
@@ -403,7 +456,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     expect(mockSupabase.from).not.toHaveBeenCalledWith('document_attachments')
   })
 
-  it('returns success with error when journal entry creation fails (non-blocking)', async () => {
+  it('suppresses success when journal entry creation fails', async () => {
     const tx = makeTransaction({
       id: 'tx-1',
       amount: -500,
@@ -426,20 +479,14 @@ describe('POST /api/transactions/[id]/categorize', () => {
     })
     const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
     const { status, body } = await parseJsonResponse<{
-      success: boolean
-      journal_entry_created: boolean
-      journal_entry_error: string
+      error: { code: string }
     }>(response)
 
-    expect(status).toBe(200)
-    expect(body.success).toBe(true)
-    expect(body.journal_entry_created).toBe(false)
-    // Untyped errors no longer leak their raw English message (issue #337):
-    // they map to the Swedish transaction-context fallback.
-    expect(body.journal_entry_error).toBe('Kunde inte hantera transaktionen. Försök igen.')
+    expect(status).toBe(500)
+    expect(body.error.code).toBe('INTERNAL_ERROR')
   })
 
-  it('translates typed engine errors to Swedish in journal_entry_error (issue #337)', async () => {
+  it('returns the typed engine error instead of synthetic success', async () => {
     const tx = makeTransaction({
       id: 'tx-1',
       amount: -500,
@@ -462,22 +509,15 @@ describe('POST /api/transactions/[id]/categorize', () => {
     })
     const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
     const { status, body } = await parseJsonResponse<{
-      success: boolean
-      journal_entry_created: boolean
-      journal_entry_error: string
+      error: { code: string; details?: { totalDebit?: number; totalCredit?: number } }
     }>(response)
 
-    expect(status).toBe(200)
-    expect(body.success).toBe(true)
-    expect(body.journal_entry_created).toBe(false)
-    expect(body.journal_entry_error).toContain('balanserar inte')
-    expect(body.journal_entry_error).toMatch(/100/)
-    expect(body.journal_entry_error).toMatch(/80/)
-    expect(body.journal_entry_error).not.toContain('not balanced')
-    expect(body.journal_entry_error).not.toContain('check constraint')
+    expect(status).toBe(400)
+    expect(body.error.code).toBe('JOURNAL_ENTRY_NOT_BALANCED')
+    expect(body.error.details).toMatchObject({ totalDebit: 100, totalCredit: 80 })
   })
 
-  it('returns 500 when transaction update fails', async () => {
+  it('suppresses success and preserves durable identities when attachment is ambiguous', async () => {
     const tx = makeTransaction({
       id: 'tx-1',
       journal_entry_id: null,
@@ -488,20 +528,34 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null })
     enqueue({ data: [{ id: 'period-1' }], error: null })
 
-    mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
-
-    // Transaction update fails
-    enqueue({ data: null, error: { message: 'Update failed' } })
+    mockCoordinateSettlement.mockResolvedValueOnce({
+      kind: 'partial',
+      code: 'SETTLEMENT_ATTACHMENT_PARTIAL',
+      message: 'Attachment readback was ambiguous.',
+      postedIds: { originalJournalEntryId: 'je-1', reversalJournalEntryId: 'je-r1' },
+      publicationIds: ['pub-compensation-1'],
+    })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
       body: { is_business: true, category: 'expense_software' },
     })
     const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
-    const { status, body } = await parseJsonResponse<{ error: string }>(response)
+    const { status, body } = await parseJsonResponse<{
+      error: {
+        details?: {
+          posted_ids?: Record<string, string>
+          publication_ids?: string[]
+        }
+      }
+    }>(response)
 
     expect(status).toBe(500)
-    expect((body.error as unknown as { code: string }).code).toBe('INTERNAL_ERROR')
+    expect(body.error.details?.posted_ids).toEqual({
+      originalJournalEntryId: 'je-1',
+      reversalJournalEntryId: 'je-r1',
+    })
+    expect(body.error.details?.publication_ids).toEqual(['pub-compensation-1'])
   })
 
   it('returns 400 when mapping result has empty debit_account', async () => {
@@ -1232,12 +1286,12 @@ describe('POST /api/transactions/[id]/categorize', () => {
     })
     const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
     const { status, body } = await parseJsonResponse<{
-      error: { code: string; account_numbers: string[] }
+      error: { code: string; details?: { account_numbers?: string[] } }
     }>(response)
 
     expect(status).toBe(400)
     expect(body.error.code).toBe('ACCOUNTS_NOT_IN_CHART')
-    expect(body.error.account_numbers).toEqual(['6200'])
+    expect(body.error.details?.account_numbers).toEqual(['6200'])
     // Transaction update must NOT have run: if it had, the test would have
     // had to enqueue a response for it. The absence of an enqueue here plus
     // the 400 status is the assertion that the route did not fall through.

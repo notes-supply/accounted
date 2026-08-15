@@ -19,6 +19,7 @@ async function insertStornoOf(params: {
   voucherNumber: number
   status?: string
   sourceType?: string
+  reverseOriginal?: boolean
 }): Promise<string> {
   const id = randomUUID()
   const status = params.status ?? 'posted'
@@ -29,8 +30,11 @@ async function insertStornoOf(params: {
     await client.query(
       `INSERT INTO public.journal_entries
          (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-          entry_date, description, source_type, status, reverses_id)
-       VALUES ($1, $2, $3, $4, $5, 'A', '2026-12-31', 'Makulering', $6, $7, $8)`,
+          entry_date, description, source_type, status, reverses_id,
+          committed_at, commit_method)
+       VALUES ($1, $2, $3, $4, $5, 'A', '2026-12-31', 'Makulering', $6, $7, $8,
+               CASE WHEN $7 = 'posted' THEN now() END,
+               CASE WHEN $7 = 'posted' THEN 'legacy' END)`,
       [
         id,
         params.userId,
@@ -54,6 +58,14 @@ async function insertStornoOf(params: {
         [id],
       )
       await client.query('SET CONSTRAINTS check_balance_on_posted_insert IMMEDIATE')
+      if (params.reverseOriginal) {
+        await client.query(
+          `UPDATE public.journal_entries
+           SET status = 'reversed', reversed_by_id = $2
+           WHERE id = $1`,
+          [params.reversesId, id],
+        )
+      }
     }
 
     await client.query('COMMIT')
@@ -104,22 +116,17 @@ describe('closing_entry_id detach escape hatch', () => {
     ).rejects.toThrow(/year-end closing is immutable/)
   })
 
-  it('blocks detaching when status is reversed but no storno chain exists', async () => {
-    await getPool().query(
-      `UPDATE public.journal_entries SET status = 'reversed' WHERE id = $1`,
-      [closingEntryId],
-    )
-
+  it('rejects a reversed status without a storno identity', async () => {
     await expect(
       getPool().query(
-        `UPDATE public.fiscal_periods SET closing_entry_id = NULL WHERE id = $1`,
-        [fiscalPeriodId],
+        `UPDATE public.journal_entries SET status = 'reversed' WHERE id = $1`,
+        [closingEntryId],
       ),
-    ).rejects.toThrow(/year-end closing is immutable/)
+    ).rejects.toThrow(/must identify its storno/i)
   })
 
-  it('blocks the escape hatch when the storno is not posted', async () => {
-    // closingEntryId is status='reversed' from the previous test.
+  it('does not let a cancelled storno make a live closing entry detachable', async () => {
+    // The rejected status-only update left this test's closing entry posted.
     await insertStornoOf({
       userId,
       companyId,
@@ -138,13 +145,14 @@ describe('closing_entry_id detach escape hatch', () => {
   })
 
   it('blocks replacing a reversed closing entry with a non-year_end entry', async () => {
-    // Complete the storno chain so the reversal itself is now legitimate.
+    // Complete the storno chain and reverse the root in the same transaction.
     await insertStornoOf({
       userId,
       companyId,
       fiscalPeriodId,
       reversesId: closingEntryId,
       voucherNumber: 3,
+      reverseOriginal: true,
     })
 
     const manualId = await insertDraftJournalEntry({
@@ -208,16 +216,13 @@ describe('closing_entry_id detach escape hatch', () => {
     )
     const currentClosingId = current[0].closing_entry_id
 
-    await getPool().query(
-      `UPDATE public.journal_entries SET status = 'reversed' WHERE id = $1`,
-      [currentClosingId],
-    )
     await insertStornoOf({
       userId,
       companyId,
       fiscalPeriodId,
       reversesId: currentClosingId,
       voucherNumber: 6,
+      reverseOriginal: true,
     })
 
     const replacementId = await insertDraftJournalEntry({

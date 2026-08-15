@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { seedCompany, insertTransaction, insertDraftJournalEntry } from '@/tests/pg/fixtures'
+import {
+  insertDraftJournalEntry,
+  insertTransaction,
+  reversePostedJournalEntry,
+  seedCompany,
+} from '@/tests/pg/fixtures'
 import { getPool } from '@/tests/pg/setup'
 
 /**
@@ -158,11 +163,8 @@ describe('transactions potential_journal_entry: clear on reversal', () => {
     const txId = await insertTransaction({ companyId, userId })
     await setSuggestion(txId, jeId)
 
-    // The storno path's status transition (posted -> reversed).
-    await getPool().query(
-      `UPDATE public.journal_entries SET status = 'reversed' WHERE id = $1`,
-      [jeId],
-    )
+    // Exercise the legal storno transition, not an impossible status-only write.
+    await reversePostedJournalEntry(jeId)
 
     const row = await getSuggestion(txId)
     expect(row.potential_journal_entry_id).toBeNull()

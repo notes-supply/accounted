@@ -285,6 +285,7 @@ export interface CompanySettings {
   vat_registered: boolean
   vat_number: string | null
   moms_period: MomsPeriod | null
+  vat_liability_start_date: string | null
   periodisk_sammanstallning_period: 'monthly' | 'quarterly'
   vat_taxable_base_over_40m: boolean
   vat_has_eu_trade: boolean
@@ -1041,6 +1042,18 @@ export interface SupplierInvoicePayment {
   created_at: string
 }
 
+/**
+ * Immutable supplier allocation evidence moved out of the active payment table
+ * by the atomic supplier reversal command. `id` remains the original allocation
+ * id so audit and cutoff readers can join active and historical rows exactly.
+ */
+export interface SupplierInvoicePaymentHistory extends SupplierInvoicePayment {
+  user_id: string
+  company_id: string
+  reversed_at: string
+  reversed_by_journal_entry_id: string
+}
+
 // Invoice Payment (partial payments)
 export interface InvoicePayment {
   id: string
@@ -1685,6 +1698,95 @@ export type AccountType = 'asset' | 'equity' | 'liability' | 'revenue' | 'expens
 export type NormalBalance = 'debit' | 'credit'
 export type PlanType = 'k1' | 'full_bas'
 
+
+export type AccountingActorType =
+  | 'user'
+  | 'api_key'
+  | 'mcp_oauth'
+  | 'cron'
+  | 'system'
+  | 'agent_chat'
+
+/**
+ * Verified caller identity passed to service-role accounting RPCs. SQL pins
+ * authenticated calls to auth.uid(); service-role callers must supply all
+ * three fields instead of borrowing an allocation owner's identity.
+ */
+export interface AccountingActor {
+  actor_type: AccountingActorType
+  actor_id: string | null
+  actor_label: string | null
+}
+
+export type DurableAccountingEventType =
+  | 'journal_entry.committed'
+  | 'journal_entry.reversed'
+
+/** Exact identity of one transactionally persisted accounting publication. */
+export interface DurablePublicationIdentity {
+  publication_id: string
+  event_key: string
+  event_type: DurableAccountingEventType
+}
+
+/**
+ * Marks an in-process event whose core event_log row and webhook delivery
+ * projections were already persisted transactionally. Extension handlers may
+ * still observe the event; core projection handlers must no-op it.
+ */
+export interface DurablePublicationMarker {
+  persisted: true
+  publication_id: string
+  event_key: string
+}
+
+export type DurableAccountingOutcomeStatus = 'applied' | 'already_applied'
+
+export interface DurableJournalReversalOutcome {
+  status: DurableAccountingOutcomeStatus
+  company_id: string
+  root_journal_entry_id: string
+  original_journal_entry_id: string
+  reversal_journal_entry_id: string
+  actor_type: AccountingActorType
+  actor_id: string | null
+  actor_label: string | null
+  publications: [
+    DurablePublicationIdentity,
+    DurablePublicationIdentity,
+  ]
+}
+
+export interface DurableCategorizationCompensationOutcome
+  extends DurableJournalReversalOutcome {
+  transaction_id: string
+}
+
+export type SupplierPaymentLineageRelation =
+  | 'root'
+  | 'correction'
+  | 'storno'
+
+export interface SupplierPaymentLineageNode {
+  journal_entry_id: string
+  parent_journal_entry_id: string | null
+  relation: SupplierPaymentLineageRelation
+  depth: number
+  source_type: JournalEntrySourceType
+  has_supplier_payment_allocation: boolean
+}
+
+/** Bounded, company-scoped M2 lineage result consumed before storno/correction. */
+export interface SupplierPaymentLineage {
+  company_id: string
+  requested_journal_entry_id: string
+  root_journal_entry_id: string
+  live_journal_entry_id: string
+  /** Allocation evidence owner, which may differ from the true lineage root. */
+  allocation_owner_journal_entry_id: string | null
+  is_supplier_payment: boolean
+  nodes: SupplierPaymentLineageNode[]
+}
 // Journal entry source
 export type JournalEntrySourceType =
   | 'manual'
@@ -1797,6 +1899,9 @@ export interface JournalEntry {
   reversed_by_id: string | null
   reverses_id: string | null
   correction_of_id: string | null
+  /** Immutable categorization decision attached before posting. */
+  categorization_category?: TransactionCategory | null
+  categorization_is_business?: boolean | null
   attachment_urls: string[] | null
   notes: string | null
   commit_method: string | null
@@ -2267,6 +2372,8 @@ export interface CreateJournalEntryInput {
   description: string
   source_type: JournalEntrySourceType
   source_id?: string
+  categorization_category?: TransactionCategory
+  categorization_is_business?: boolean
   voucher_series?: string
   notes?: string
   lines: CreateJournalEntryLineInput[]
@@ -3274,6 +3381,12 @@ export interface VatDeclaration {
     period: number  // 1-12 for monthly, 1-4 for quarterly, 1 for yearly
     start: string   // YYYY-MM-DD
     end: string     // YYYY-MM-DD
+    originalStart: string
+    originalEnd: string
+    fiscalPeriodId: string | null
+    fiscalPeriodStart: string | null
+    fiscalPeriodEnd: string | null
+    vatLiabilityStartDate: string | null
   }
   rutor: VatDeclarationRutor
   /**
@@ -3354,6 +3467,44 @@ export interface VatDeclarationRequest {
   periodType: VatPeriodType
   year: number
   period: number
+}
+
+/**
+ * One legal VAT reporting-period identity. Original bounds retain the actual
+ * fiscal-period identity; effective bounds include the liability-start clamp.
+ */
+export interface VatLegalPeriodIdentity {
+  period_type: VatPeriodType
+  year: number
+  period: number
+  fiscal_period_id: string
+  original_start_date: string
+  original_end_date: string
+  effective_start_date: string
+  effective_end_date: string
+  liability_start_date: string | null
+}
+
+/** Immutable identity persisted from VAT approval through filing receipt. */
+export interface VatFilingIdentity extends VatLegalPeriodIdentity {
+  taxpayer_id: string
+  remote_period: string
+  approved_rutor: VatDeclarationRutor
+}
+
+/**
+ * Exact categorization snapshot staged at preview and rechecked under locks
+ * when the posted voucher is attached to its bank transaction.
+ */
+export interface CategorizationSettlementSnapshot {
+  transaction_id: string
+  expected_journal_entry_id: string | null
+  cash_account_id: string | null
+  settlement_account: string
+  amount_sek: number
+  category: TransactionCategory
+  is_business: boolean
+  lines: CreateJournalEntryLineInput[]
 }
 
 // Labels for VAT rutor

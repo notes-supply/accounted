@@ -135,20 +135,62 @@ describe('recordateEntry', () => {
     // recordateEntry fetches the original once and hands it to correctEntry via
     // preloadedOriginal, so there is no second original fetch in the sequence.
     results = [
-      { data: original, error: null },                                                              // 0 recordate fetch original
-      { data: { name: '2025', period_start: '2025-01-01', period_end: '2025-12-31' }, error: null }, // 1 target period
-      { data: [{ id: 'a1', account_number: '6230' }, { id: 'a2', account_number: '1930' }], error: null }, // 2 accounts (Step 0)
-      { data: reversalEntry, error: null },                                                         // 3 insert reversal
-      { data: null, error: null },                                                                  // 4 reversal lines
-      { data: null, error: null },                                                                  // 5 post reversal
-      { data: correctedEntry, error: null },                                                        // 6 insert corrected
-      { data: null, error: null },                                                                  // 7 corrected lines
-      { data: null, error: null },                                                                  // 8 post corrected
-      { data: [{ id: 'orig-1' }], error: null },                                                    // 9 CAS
-      { data: null, error: null },                                                                  // 10 relink transactions
-      { data: null, error: null },                                                                  // 11 relink documents
-      { data: { ...reversalEntry, lines: [] }, error: null },                                       // 12 final reversal
-      { data: { ...correctedEntry, lines: [] }, error: null },                                      // 13 final corrected
+      { data: original, error: null }, // 0 recordate fetch original
+      {
+        data: {
+          id: 'orig-1',
+          company_id: 'company-1',
+          source_type: original.source_type,
+          correction_of_id: null,
+        },
+        error: null,
+      }, // 1 correction ancestry root
+      {
+        data: {
+          valid: true,
+          company_id: 'company-1',
+          requested_root_count: 1,
+          row_count: 1,
+          max_depth: 0,
+          max_correction_depth: 0,
+          terminal_storno_depth: null,
+          rows: [
+            {
+              root_id: 'orig-1',
+              parent_id: null,
+              edge_kind: 'root',
+              id: 'orig-1',
+              company_id: 'company-1',
+              entry_date: original.entry_date,
+              status: 'posted',
+              source_type: original.source_type,
+              correction_of_id: null,
+              reverses_id: null,
+              reversed_by_id: null,
+              committed_at: '2026-07-03T10:00:00Z',
+              depth: 0,
+              path: ['orig-1'],
+              cycle: false,
+            },
+          ],
+        },
+        error: null,
+      }, // 2 canonical generic lineage
+      { data: [], error: null }, // 3 active supplier allocations
+      { data: [], error: null }, // 4 historical supplier allocations
+      { data: { name: '2025', period_start: '2025-01-01', period_end: '2025-12-31' }, error: null }, // 5 target period
+      { data: [{ id: 'a1', account_number: '6230' }, { id: 'a2', account_number: '1930' }], error: null }, // 6 accounts (Step 0)
+      { data: reversalEntry, error: null }, // 7 insert reversal
+      { data: null, error: null }, // 8 reversal lines
+      { data: null, error: null }, // 9 post reversal
+      { data: correctedEntry, error: null }, // 10 insert corrected
+      { data: null, error: null }, // 11 corrected lines
+      { data: null, error: null }, // 12 post corrected
+      { data: [{ id: 'orig-1' }], error: null }, // 13 CAS
+      { data: null, error: null }, // 14 relink transactions
+      { data: null, error: null }, // 15 relink documents
+      { data: { ...reversalEntry, lines: [] }, error: null }, // 16 final reversal
+      { data: { ...correctedEntry, lines: [] }, error: null }, // 17 final corrected
     ]
     const supabase = makeClient()
     const result = await recordateEntry(supabase as never, 'company-1', 'user-1', 'orig-1', '2025-07-03')

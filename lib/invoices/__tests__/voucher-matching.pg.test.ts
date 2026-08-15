@@ -14,7 +14,7 @@
  */
 import { describe, it, expect } from 'vitest'
 import { randomUUID } from 'node:crypto'
-import { getClient, getPool } from '@/tests/pg/setup'
+import { getClient, getPool, runAsServiceRole } from '@/tests/pg/setup'
 import {
   insertAuthUser,
   insertCompany,
@@ -70,8 +70,9 @@ async function seedPostedVoucher(params: {
     await client.query(
       `INSERT INTO public.journal_entries
          (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-          entry_date, description, source_type, status)
-       VALUES ($1, $2, $3, $4, $5, 'A', '2026-05-05', 'Inbetalning', 'manual', 'posted')`,
+          entry_date, description, source_type, status, committed_at, commit_method)
+       VALUES ($1, $2, $3, $4, $5, 'A', '2026-05-05', 'Inbetalning', 'manual',
+               'posted', now(), 'legacy')`,
       [id, params.userId, params.companyId, params.fiscalPeriodId, Math.floor(Math.random() * 100000)],
     )
     await client.query(
@@ -112,8 +113,9 @@ async function seedVoucherDebitCredit(params: {
     await client.query(
       `INSERT INTO public.journal_entries
          (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-          entry_date, description, source_type, status)
-       VALUES ($1, $2, $3, $4, $5, 'A', '2026-05-05', 'Inbetalning', 'manual', 'posted')`,
+          entry_date, description, source_type, status, committed_at, commit_method)
+       VALUES ($1, $2, $3, $4, $5, 'A', '2026-05-05', 'Inbetalning', 'manual',
+               'posted', now(), 'legacy')`,
       [id, params.userId, params.companyId, params.fiscalPeriodId, Math.floor(Math.random() * 100000)],
     )
     await client.query(
@@ -615,10 +617,13 @@ describe('link_supplier_invoice_to_voucher RPC payment date', () => {
       creditAccount: '1930',
     })
 
-    const { rows } = await getPool().query<{ result: RpcResult }>(
-      `SELECT public.link_supplier_invoice_to_voucher($1, $2, $3, $4, NULL) AS result`,
-      [supplierInvoiceId, voucherId, userId, companyId],
-    )
+    const rows = await runAsServiceRole(async (client) => {
+      const result = await client.query<{ result: RpcResult }>(
+        `SELECT public.link_supplier_invoice_to_voucher($1, $2, $3, $4, NULL) AS result`,
+        [supplierInvoiceId, voucherId, userId, companyId],
+      )
+      return result.rows
+    })
     expect(rows[0].result.ok).toBe(true)
     expect(rows[0].result.invoice_status).toBe('paid')
 

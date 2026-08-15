@@ -18,10 +18,15 @@
  * handleSkvError, the commit service through mapServiceError.
  */
 import type { ExtensionContext } from '@/lib/extensions/types'
-import type { VatPeriodType } from '@/types'
+import type { VatDeclarationRutor, VatPeriodType } from '@/types'
 import { skvRequest } from './api-client'
 import { writeSkatteverketAudit } from './audit'
 import { buildMomsuppgift } from './declaration-prep'
+import {
+  assertSameVatSubmissionIdentity,
+  createVatSubmissionState,
+  transitionVatSubmissionState,
+} from './vat-submission-state'
 import type { SkatteverketKontroll, SkatteverketKontrollResultat, SkatteverketUtkastResponse } from '../types'
 
 export interface VatSubmitChainParams {
@@ -30,6 +35,7 @@ export interface VatSubmitChainParams {
   period: number
   /** Räkenskapsår for helårsmoms: broken FYs end in their own month, not December. */
   fiscalPeriodId?: string
+  approvedRutor: VatDeclarationRutor
 }
 
 export type VatSubmitChainResult =
@@ -62,8 +68,8 @@ export async function submitVatDeclarationChain(
   options: { validate?: boolean } = {}
 ): Promise<VatSubmitChainResult> {
   const { supabase, userId, companyId } = ctx
-  const { redovisare, redovisningsperiod, momsuppgift } =
-    await buildMomsuppgift(supabase, ctx.companyId, params)
+  const approvedPrep = await buildMomsuppgift(supabase, ctx.companyId, params)
+  const { redovisare, redovisningsperiod, momsuppgift } = approvedPrep
 
   // 0. Optional kontrollera pre-step: SKV validates the arithmetic without
   //    saving anything. ERROR-level findings abort the chain here, before
@@ -96,13 +102,24 @@ export async function submitVatDeclarationChain(
     }
   }
 
+  // The ledger, taxpayer, fiscal bounds, liability cutoff and approved rutor
+  // must still be identical immediately before the first remote write.
+  const currentPrep = await buildMomsuppgift(supabase, ctx.companyId, params)
+  assertSameVatSubmissionIdentity(currentPrep.identity, approvedPrep.identity)
+
   // 1. POST /utkast: save the draft to Eget utrymme. Overwrites any prior
   //    draft for the period, so retry after a mid-chain failure is safe.
   const utkast = await skvRequest(
-    supabase, userId, companyId, 'POST', `/utkast/${redovisare}/${redovisningsperiod}`, momsuppgift,
+    supabase,
+    userId,
+    companyId,
+    'POST',
+    `/utkast/${currentPrep.redovisare}/${currentPrep.redovisningsperiod}`,
+    currentPrep.momsuppgift,
   )
   await writeSkatteverketAudit(ctx, {
-    endpoint: 'declaration/draft', agRegistreradId: redovisare, redovisningsperiod,
+    endpoint: 'declaration/draft', agRegistreradId: currentPrep.redovisare,
+    redovisningsperiod: currentPrep.redovisningsperiod,
     outcome: utkast.ok ? 'ok' : 'skv_error', responseStatus: utkast.status,
   })
   if (!utkast.ok) {
@@ -115,23 +132,24 @@ export async function submitVatDeclarationChain(
   }
   const utkastData = (await utkast.json()) as SkatteverketUtkastResponse
 
-  // periodType/year/period ride along so the VAT kvittens cron can complete
-  // the period's moms deadline without reverse-parsing redovisningsperiod.
+  const draftState = createVatSubmissionState(
+    currentPrep.identity,
+    'draft_saved',
+    { kontrollresultat: utkastData.kontrollResultat },
+  )
   await ctx.settings.set(
-    `submission_${redovisningsperiod}`,
-    JSON.stringify({
-      status: 'draft_saved', redovisare, redovisningsperiod,
-      periodType: params.periodType, year: params.year, period: params.period,
-      kontrollresultat: utkastData.kontrollResultat, updatedAt: new Date().toISOString(),
-    }),
+    `submission_${currentPrep.redovisningsperiod}`,
+    JSON.stringify(draftState),
   )
 
   // 2. PUT /las: lock for signing; returns the BankID signeringslänk.
   const las = await skvRequest(
-    supabase, userId, companyId, 'PUT', `/las/${redovisare}/${redovisningsperiod}`,
+    supabase, userId, companyId, 'PUT',
+    `/las/${currentPrep.redovisare}/${currentPrep.redovisningsperiod}`,
   )
   await writeSkatteverketAudit(ctx, {
-    endpoint: 'declaration/lock', agRegistreradId: redovisare, redovisningsperiod,
+    endpoint: 'declaration/lock', agRegistreradId: currentPrep.redovisare,
+    redovisningsperiod: currentPrep.redovisningsperiod,
     outcome: las.ok ? 'ok' : 'skv_error', responseStatus: las.status,
   })
   if (!las.ok) {
@@ -151,21 +169,24 @@ export async function submitVatDeclarationChain(
     }
   }
 
-  // Persist locked state so the UI/poller can resume (mirrors /declaration/lock).
+  const lockedState = transitionVatSubmissionState(
+    draftState,
+    'draft_locked',
+    {
+      kontrollresultat: utkastData.kontrollResultat,
+      signeringsLank: lasData.signeringsLank,
+    },
+  )
   await ctx.settings.set(
-    `submission_${redovisningsperiod}`,
-    JSON.stringify({
-      status: 'draft_locked', redovisare, redovisningsperiod,
-      periodType: params.periodType, year: params.year, period: params.period,
-      signeringsLank: lasData.signeringsLank, updatedAt: new Date().toISOString(),
-    }),
+    `submission_${currentPrep.redovisningsperiod}`,
+    JSON.stringify(lockedState),
   )
 
   return {
     ok: true,
     signingUrl: lasData.signeringsLank,
-    redovisare,
-    redovisningsperiod,
+    redovisare: currentPrep.redovisare,
+    redovisningsperiod: currentPrep.redovisningsperiod,
     kontrollresultat: utkastData.kontrollResultat ?? null,
   }
 }

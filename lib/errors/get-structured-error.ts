@@ -24,7 +24,11 @@ import {
 } from './structured-errors'
 import {
   AccountsNotInChartError,
+  AmbiguousJournalCommitError,
   BookkeepingDatabaseError,
+  DurableAccountingConflictError,
+  DurableAccountingIdentityError,
+  DurableAccountingPartialError,
   CannotCorrectNonPostedError,
   CannotReverseNonPostedError,
   CannotReverseStornoError,
@@ -40,6 +44,7 @@ import {
   MeaninglessCorrectionError,
   NoOpenPeriodForDateError,
   TargetPeriodClosedError,
+  SupplierPaymentAccountingChangedError,
   TargetPeriodLockedError,
   isBookkeepingError,
 } from '../bookkeeping/errors'
@@ -435,6 +440,40 @@ function extractBookkeepingDetails(err: unknown): { code: string; details?: unkn
   }
   if (err instanceof EntryAlreadyReversedError) return { code: err.code }
   if (err instanceof CurrencyRevaluationAlreadyExistsError) return { code: err.code }
+  if (err instanceof AmbiguousJournalCommitError) {
+    return {
+      code: err.code,
+      details: {
+        journal_entry_id: err.journalEntryId,
+        voucher_number: err.voucherNumber,
+      },
+    }
+  }
+  if (
+    err instanceof DurableAccountingConflictError ||
+    err instanceof DurableAccountingPartialError ||
+    err instanceof DurableAccountingIdentityError
+  ) {
+    return {
+      code: err.code,
+      details: {
+        operation: err.operation,
+        ...err.recovery,
+        ...(err instanceof DurableAccountingConflictError
+          ? { reason: err.reason }
+          : {}),
+      },
+    }
+  }
+  if (err instanceof SupplierPaymentAccountingChangedError) {
+    return {
+      code: err.code,
+      details: {
+        root_journal_entry_id: err.rootJournalEntryId,
+        journal_entry_id: err.journalEntryId,
+      },
+    }
+  }
   if (err instanceof InvalidMappingResultError) {
     return {
       code: err.code,

@@ -1,7 +1,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import { resolveSekAmount } from '@/lib/bookkeeping/currency-utils'
-import { fetchPaymentsAsOf, outstandingAsOf, todayIsoDate, type PaymentsAsOf } from './reskontra-payments'
+import { reconstructReskontraAsOf, todayIsoDate, type ReskontraAsOf } from './reskontra-payments'
 
 export interface SupplierLedgerEntry {
   supplier_id: string
@@ -27,6 +27,21 @@ export interface SupplierLedgerReport {
    */
   unconverted_fx_count: number
 }
+interface SupplierLedgerInvoiceRow {
+  id: string
+  supplier_id: string
+  supplier: { id: string; name: string } | null
+  invoice_date: string
+  due_date: string
+  status: string
+  total: number | string | null
+  remaining_amount: number | string | null
+  paid_at: string | null
+  currency: string | null
+  exchange_rate: number | string | null
+  is_credit_note: boolean
+  registration_journal_entry_id?: string | null
+}
 
 /**
  * Generate supplier ledger (leverantörsreskontra) with aging analysis.
@@ -46,23 +61,19 @@ export async function generateSupplierLedger(
   // today/future the stored open-invoice state IS the as-of state.
   const isHistorical = !!asOfDate && asOfDate < todayIsoDate()
 
-  // Fetch the ledger population. Live view: open invoices only. Historical
-  // view: also invoices paid since the as-of date, restricted to invoice
-  // dates on or before it. Disputed/credited/reversed invoices stay excluded,
-  // matching the live view's semantics.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let invoices: any[]
-  let payments: PaymentsAsOf | null = null
+  // Historical population is intentionally status-independent: current
+  // credited/reversed state cannot decide whether the document existed at the
+  // selected cutoff. Immutable registration lineage decides below.
+  let invoices: SupplierLedgerInvoiceRow[]
+  let reconstruction: ReskontraAsOf | null = null
   try {
-    invoices = await fetchAllRows(({ from, to }) => {
+    invoices = await fetchAllRows<SupplierLedgerInvoiceRow>(({ from, to }) => {
       let query = supabase
         .from('supplier_invoices')
         .select('*, supplier:suppliers(id, name)')
         .eq('company_id', companyId)
       query = isHistorical
-        ? query
-            .in('status', ['registered', 'approved', 'partially_paid', 'overdue', 'paid'])
-            .lte('invoice_date', asOfDate!)
+        ? query.lte('invoice_date', asOfDate!)
         : query.in('status', ['registered', 'approved', 'partially_paid', 'overdue'])
       return query
         // Stable total order for correct paging (see fetch-all.ts).
@@ -71,12 +82,26 @@ export async function generateSupplierLedger(
     })
 
     if (isHistorical) {
-      payments = await fetchPaymentsAsOf(
+      reconstruction = await reconstructReskontraAsOf(
         supabase,
+        companyId,
+        asOfDate!,
         'supplier_invoice_payments',
         'supplier_invoice_id',
-        companyId,
-        asOfDate!
+        invoices.map((invoice) => ({
+          id: invoice.id,
+          total: Math.abs(Number(invoice.total) || 0),
+          liveOutstanding: Math.abs(Number(invoice.remaining_amount) || 0),
+          paidAt: invoice.paid_at,
+          sign: invoice.is_credit_note ? -1 : 1,
+          registrationEvidence: Object.prototype.hasOwnProperty.call(
+            invoice,
+            'registration_journal_entry_id',
+          )
+            ? 'required'
+            : 'optional',
+          registrationJournalEntryId: invoice.registration_journal_entry_id,
+        })),
       )
     }
   } catch {
@@ -93,7 +118,7 @@ export async function generateSupplierLedger(
   // Group by supplier and calculate aging
   const bySupplier = new Map<string, SupplierLedgerEntry>()
   let unconvertedFxCount = 0
-  let settledSkipped = 0
+  let unpaidCount = 0
 
   for (const inv of invoices) {
     const supplierId = inv.supplier_id
@@ -109,20 +134,16 @@ export async function generateSupplierLedger(
       continue
     }
 
-    // Outstanding in invoice currency: live view trusts the stored
-    // remaining_amount; a historical view recomputes it from the payment
-    // history as of the reconstruction date.
-    const liveOutstanding = Number(inv.remaining_amount) || 0
-    const outstandingRaw = payments
-      ? outstandingAsOf(inv, Number(inv.total) || 0, liveOutstanding, payments, asOfDate!)
+    const liveOutstanding =
+      Math.abs(Number(inv.remaining_amount) || 0) * (inv.is_credit_note ? -1 : 1)
+    const outstandingRaw = reconstruction && inv.id
+      ? reconstruction.outstandingByInvoice.get(inv.id)
       : liveOutstanding
 
-    // Historical view: 'paid' invoices are only fetched to catch ones still
-    // open at the as-of date. One already settled by then adds nothing.
-    if (payments && inv.status === 'paid' && outstandingRaw === 0) {
-      settledSkipped += 1
-      continue
-    }
+    // Missing means the immutable registration was not economically effective
+    // at this cutoff. Zero means it was already settled by then.
+    if (outstandingRaw == null || outstandingRaw === 0) continue
+    unpaidCount += 1
 
     if (!bySupplier.has(supplierId)) {
       bySupplier.set(supplierId, {
@@ -142,7 +163,12 @@ export async function generateSupplierLedger(
     const daysOverdue = Math.floor((refDate.getTime() - dueDate.getTime()) / (1000 * 60 * 60 * 24))
     // Outstanding is in invoice currency. The 2440 GL line was posted in SEK
     // at the invoice-date rate, so we convert here for the reconciliation.
-    const amount = resolveSekAmount(outstandingRaw, null, inv.currency, inv.exchange_rate)
+    const amount = resolveSekAmount(
+      outstandingRaw,
+      null,
+      inv.currency,
+      inv.exchange_rate == null ? null : Number(inv.exchange_rate),
+    )
 
     if (daysOverdue <= 0) {
       entry.current += amount
@@ -171,7 +197,7 @@ export async function generateSupplierLedger(
     total_outstanding: Math.round(total_outstanding * 100) / 100,
     total_current: Math.round(total_current * 100) / 100,
     total_overdue: Math.round(total_overdue * 100) / 100,
-    unpaid_count: invoices.length - settledSkipped,
+    unpaid_count: isHistorical ? unpaidCount : invoices.length,
     unconverted_fx_count: unconvertedFxCount,
   }
 }

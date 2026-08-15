@@ -27,7 +27,12 @@ interface ColumnRow {
   column_name: string
 }
 
+interface TableRow {
+  table_name: string
+}
+
 let columnsByTable: Map<string, Set<string>>
+let accountingPrivateTables: string[]
 
 beforeAll(async () => {
   const { rows } = await getPool().query<ColumnRow>(`
@@ -47,6 +52,15 @@ beforeAll(async () => {
     }
     set.add(row.column_name)
   }
+
+  const { rows: privateRows } = await getPool().query<TableRow>(`
+    SELECT table_name
+    FROM information_schema.tables
+    WHERE table_schema = 'accounting_private'
+      AND table_type = 'BASE TABLE'
+    ORDER BY table_name
+  `)
+  accountingPrivateTables = privateRows.map((row) => row.table_name)
 })
 
 function companyScopedTables(): string[] {
@@ -56,7 +70,49 @@ function companyScopedTables(): string[] {
     .sort()
 }
 
+const F68_ARCHIVE_TABLES: Record<string, { file: string; orderBy: string }> = {
+  accounting_publications: {
+    file: 'accounting_publications.json',
+    orderBy: 'created_at',
+  },
+  accounting_publication_subscribers: {
+    file: 'accounting_publication_subscribers.json',
+    orderBy: 'created_at',
+  },
+  supplier_invoice_payment_history: {
+    file: 'supplier_invoice_payment_history.json',
+    orderBy: 'reversed_at',
+  },
+  supplier_payment_reversals: {
+    file: 'supplier_payment_reversals.json',
+    orderBy: 'applied_at',
+  },
+  transaction_categorization_compensations: {
+    file: 'transaction_categorization_compensations.json',
+    orderBy: 'applied_at',
+  },
+}
+
 describe('full-archive coverage contract', () => {
+  it('dumps every F68 table as complete rows with default id paging', () => {
+    for (const [name, expected] of Object.entries(F68_ARCHIVE_TABLES)) {
+      expect(MASTER_DATA_DUMP_TABLES.find((table) => table.name === name)).toEqual({
+        name,
+        ...expected,
+      })
+    }
+  })
+
+  it('keeps accounting_private tables outside the public archive model', () => {
+    expect(accountingPrivateTables.length).toBeGreaterThan(0)
+    const classified = new Set([
+      ...MASTER_DATA_DUMP_TABLES.map((table) => table.name),
+      ...Object.keys(ARCHIVE_COVERED_ELSEWHERE_TABLES),
+      ...Object.keys(ARCHIVE_EXCLUDED_TABLES),
+    ])
+    expect(accountingPrivateTables.filter((table) => classified.has(table))).toEqual([])
+  })
+
   it('classifies every company-scoped table (new tables must be triaged)', () => {
     const dumped = new Set(MASTER_DATA_DUMP_TABLES.map((t) => t.name))
     const covered = new Set(Object.keys(ARCHIVE_COVERED_ELSEWHERE_TABLES))

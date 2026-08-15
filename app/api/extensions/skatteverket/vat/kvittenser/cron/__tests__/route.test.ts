@@ -81,6 +81,14 @@ function makeRequest() {
   })
 }
 
+const APPROVED_RUTOR = Object.fromEntries([
+  'ruta05', 'ruta06', 'ruta07', 'ruta08', 'ruta10', 'ruta11', 'ruta12',
+  'ruta20', 'ruta21', 'ruta22', 'ruta23', 'ruta24', 'ruta30', 'ruta31',
+  'ruta32', 'ruta35', 'ruta36', 'ruta37', 'ruta38', 'ruta39', 'ruta40',
+  'ruta41', 'ruta42', 'ruta48', 'ruta49', 'ruta50', 'ruta60', 'ruta61',
+  'ruta62',
+].map((key) => [key, 0]))
+
 const LOCKED_STATE = {
   status: 'draft_locked',
   redovisare: '165560000000',
@@ -88,6 +96,17 @@ const LOCKED_STATE = {
   periodType: 'monthly',
   year: 2026,
   period: 6,
+  resolvedPeriodStart: '2026-06-01',
+  resolvedPeriodEnd: '2026-06-30',
+  originalPeriodStart: '2026-06-01',
+  originalPeriodEnd: '2026-06-30',
+  fiscalPeriodId: null,
+  fiscalPeriodStart: null,
+  fiscalPeriodEnd: null,
+  vatLiabilityStartDate: null,
+  approvedRutor: APPROVED_RUTOR,
+  approvedMomsuppgift: { summaMoms: 0 },
+  updatedAt: '2026-06-30T12:00:00.000Z',
   signeringsLank: 'https://skv.test/sign/abc',
 }
 
@@ -107,7 +126,11 @@ function makeSupabaseStub(
         isUpdate = true
         return chain
       })
-      chain.maybeSingle = vi.fn().mockResolvedValue(resolved)
+      chain.maybeSingle = vi.fn().mockImplementation(async () =>
+        isUpdate && result.updateError
+          ? { data: null, error: result.updateError }
+          : resolved,
+      )
       chain.single = vi.fn().mockResolvedValue(resolved)
       chain.then = (resolve: (v: unknown) => void) =>
         resolve(isUpdate && result.updateError ? { data: null, error: result.updateError } : resolved)
@@ -122,6 +145,16 @@ function stubHappyTables(state: Record<string, unknown> = LOCKED_STATE) {
       data: [{ company_id: 'comp-1', key: 'submission_202606', value: JSON.stringify(state) }],
     },
     skatteverket_tokens: { data: { user_id: 'user-1', status: 'active' } },
+    company_settings: {
+      data: { moms_period: 'monthly', vat_liability_start_date: null },
+    },
+    fiscal_periods: {
+      data: {
+        id: '11111111-1111-4111-8111-111111111111',
+        period_start: '2025-07-01',
+        period_end: '2026-06-30',
+      },
+    },
   })
 }
 
@@ -177,16 +210,28 @@ describe('VAT kvittenser cron', () => {
     const res = await GET(makeRequest())
     const body = await res.json()
 
-    expect(body.signed).toBe(1)
+    expect(body.signed, JSON.stringify(
+      { body, errors: errorSpy.mock.calls },
+      (_key, value) => value instanceof Error ? value.message : value,
+    )).toBe(1)
     expect(body.errors).toBe(0)
     expect(body.results[0]).toMatchObject({ companyId: 'comp-1', period: '202606', status: 'signed' })
 
     expect(mockCompleteTaxDeadline).toHaveBeenCalledWith(
       expect.anything(),
       'comp-1',
-      ['moms_monthly', 'moms_quarterly'],
+      ['moms_monthly'],
       '2026-06',
       'confirmed',
+      {
+        year: 2026,
+        month: 6,
+        start: '2026-06-01',
+        end: '2026-06-30',
+        original_start: '2026-06-01',
+        original_end: '2026-06-30',
+        vat_liability_start_date: null,
+      },
     )
     expect(mockSendKvittensNotification).toHaveBeenCalledWith(
       expect.anything(),
@@ -200,9 +245,37 @@ describe('VAT kvittenser cron', () => {
     expect(errorSpy).not.toHaveBeenCalled()
   })
 
+  it('keeps receipt reconciliation retryable when the exact deadline is unavailable', async () => {
+    mockCreateClient.mockReturnValueOnce(stubHappyTables())
+    mockSkvRequest.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ kvittensnummer: 'KV-123' }),
+    } as any)
+    mockCompleteTaxDeadline.mockResolvedValueOnce({ completed: 0 })
+
+    const res = await GET(makeRequest())
+    const body = await res.json()
+
+    expect(body.signed).toBe(0)
+    expect(body.errors).toBe(1)
+    expect(body.results[0]).toMatchObject({
+      companyId: 'comp-1',
+      period: '202606',
+      status: 'error',
+    })
+    expect(mockSendKvittensNotification).not.toHaveBeenCalled()
+  })
+
   it('quarterly picker params produce a YYYY-QN tax period', async () => {
     mockCreateClient.mockReturnValueOnce(
-      stubHappyTables({ ...LOCKED_STATE, periodType: 'quarterly', period: 2 }),
+      stubHappyTables({
+        ...LOCKED_STATE,
+        periodType: 'quarterly',
+        period: 2,
+        resolvedPeriodStart: '2026-04-01',
+        originalPeriodStart: '2026-04-01',
+      }),
     )
     mockSkvRequest.mockResolvedValueOnce({
       ok: true,
@@ -213,14 +286,40 @@ describe('VAT kvittenser cron', () => {
     await GET(makeRequest())
 
     expect(mockCompleteTaxDeadline).toHaveBeenCalledWith(
-      expect.anything(), 'comp-1', ['moms_monthly', 'moms_quarterly'], '2026-Q2', 'confirmed',
+      expect.anything(), 'comp-1', ['moms_quarterly'], '2026-Q2', 'confirmed',
+      {
+        year: 2026,
+        quarter: 2,
+        start: '2026-04-01',
+        end: '2026-06-30',
+        original_start: '2026-04-01',
+        original_end: '2026-06-30',
+        vat_liability_start_date: null,
+      },
     )
   })
 
-  it('yearly picker params complete the moms_yearly deadline with the fiscal-year label', async () => {
-    mockCreateClient.mockReturnValueOnce(
-      stubHappyTables({ ...LOCKED_STATE, periodType: 'yearly', period: 12 }),
-    )
+  it('completes the exact linked annual fiscal-period deadline', async () => {
+    const linkedReportPeriod = {
+      fiscal_period_id: '11111111-1111-4111-8111-111111111111',
+      fiscal_period_start: '2025-07-01',
+      fiscal_period_end: '2026-06-30',
+      start: '2025-07-01',
+      end: '2026-06-30',
+      original_start: '2025-07-01',
+      original_end: '2026-06-30',
+      vat_liability_start_date: null,
+    }
+    mockCreateClient.mockReturnValueOnce(stubHappyTables({
+      ...LOCKED_STATE,
+      periodType: 'yearly',
+      period: 1,
+      resolvedPeriodStart: '2025-07-01',
+      originalPeriodStart: '2025-07-01',
+      fiscalPeriodId: '11111111-1111-4111-8111-111111111111',
+      fiscalPeriodStart: '2025-07-01',
+      fiscalPeriodEnd: '2026-06-30',
+    }))
     mockSkvRequest.mockResolvedValueOnce({
       ok: true,
       status: 200,
@@ -229,28 +328,32 @@ describe('VAT kvittenser cron', () => {
 
     await GET(makeRequest())
 
-    // Calendar FY (company_settings unstubbed → default start month 1):
-    // the moms_yearly tax_period is the plain year label.
     expect(mockCompleteTaxDeadline).toHaveBeenCalledWith(
-      expect.anything(), 'comp-1', ['moms_yearly'], '2026', 'confirmed',
+      expect.anything(),
+      'comp-1',
+      ['moms_yearly'],
+      '2025/2026',
+      'confirmed',
+      linkedReportPeriod,
     )
   })
 
-  it('legacy state without picker params still flips status but skips the deadline', async () => {
-    const { periodType: _pt, year: _y, period: _p, ...legacyState } = LOCKED_STATE
+  it('fails closed on legacy state without the immutable identity', async () => {
+    const { approvedRutor: _rutor, ...legacyState } = LOCKED_STATE
     mockCreateClient.mockReturnValueOnce(stubHappyTables(legacyState))
-    mockSkvRequest.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({ kvittensnummer: 'KV-789' }),
-    } as any)
 
     const res = await GET(makeRequest())
     const body = await res.json()
 
-    expect(body.signed).toBe(1)
+    expect(body.processed).toBe(0)
+    expect(body.message).toBe('No locked drafts')
+    expect(mockSkvRequest).not.toHaveBeenCalled()
     expect(mockCompleteTaxDeadline).not.toHaveBeenCalled()
-    expect(mockSendKvittensNotification).toHaveBeenCalled()
+    expect(mockSendKvittensNotification).not.toHaveBeenCalled()
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[vat-kvittenser-cron] Invalid submission state',
+      expect.objectContaining({ companyId: 'comp-1' }),
+    )
   })
 
   it('records still_pending on 404 without touching state', async () => {
@@ -305,7 +408,7 @@ describe('VAT kvittenser cron', () => {
     expect(errorSpy).toHaveBeenCalledTimes(1)
   })
 
-  it('a failing signed-state update yields an error row and skips deadline + notification', async () => {
+  it('keeps exact deadline completion idempotent when signed-state persistence fails', async () => {
     mockCreateClient.mockReturnValueOnce(
       makeSupabaseStub({
         extension_data: {
@@ -313,6 +416,9 @@ describe('VAT kvittenser cron', () => {
           updateError: { message: 'connection reset', code: '08006' },
         },
         skatteverket_tokens: { data: { user_id: 'user-1', status: 'active' } },
+        company_settings: {
+          data: { moms_period: 'monthly', vat_liability_start_date: null },
+        },
       }),
     )
     mockSkvRequest.mockResolvedValueOnce({
@@ -332,7 +438,7 @@ describe('VAT kvittenser cron', () => {
       status: 'error',
       error: 'Failed to persist signed state: connection reset',
     })
-    expect(mockCompleteTaxDeadline).not.toHaveBeenCalled()
+    expect(mockCompleteTaxDeadline).toHaveBeenCalledTimes(1)
     expect(mockSendKvittensNotification).not.toHaveBeenCalled()
     expect(errorSpy).toHaveBeenCalledTimes(1)
   })
@@ -346,6 +452,9 @@ describe('VAT kvittenser cron', () => {
         ],
       },
       skatteverket_tokens: { data: { user_id: 'user-1', status: 'active' } },
+      company_settings: {
+        data: { moms_period: 'monthly', vat_liability_start_date: null },
+      },
     })
   }
 

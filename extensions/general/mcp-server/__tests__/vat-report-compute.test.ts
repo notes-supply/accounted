@@ -1,318 +1,242 @@
-/**
- * Focused tests for computeVatReport: the shared VAT computation used by
- * gnubok_get_vat_report and gnubok_vat_review_widget. These exist because the
- * tools/call integration tests can't reach into the rutor math; this file
- * mocks Supabase to feed synthetic journal entry lines and asserts the rutor
- * shape, ruta48 inclusion of 2647, ruta49 formula, and the one-sided
- * reverse-charge warning.
- */
-import { describe, it, expect } from 'vitest'
-import { computeVatReport, tools } from '../server'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { VatDeclarationRutor } from '@/types'
 
-interface MockLine {
-  account_number: string
-  debit_amount: number
-  credit_amount: number
-  journal_entry_id?: string
-  journal_entries?: { source_type: string | null }
-}
-
-function mockSupabaseWithLines(lines: MockLine[]) {
-  // computeVatReport uses the two-step entry-lines fetch
-  // (lib/bookkeeping/entry-lines.ts): journal_entries is queried first, then
-  // journal_entry_lines by parent id, and the parent is reattached under
-  // `journal_entries`. Both steps page with `.order('id').range(from, to)`,
-  // so `.range()` is the terminal; one short page (always < the 1000-row
-  // PAGE_SIZE for these fixtures) ends the paging loop.
-  //
-  // Fixtures stay line-shaped for readability; the parent rows are derived
-  // from them here.
-  const entries = [
-    ...new Map(
-      lines.map((l, i) => {
-        const id = l.journal_entry_id ?? `entry-${i}`
-        return [id, { id, source_type: l.journal_entries?.source_type ?? null }]
-      }),
-    ).values(),
-  ]
-  const bareLines = lines.map((l, i) => ({
-    id: `line-${String(i).padStart(4, '0')}`,
-    journal_entry_id: l.journal_entry_id ?? `entry-${i}`,
-    account_number: l.account_number,
-    debit_amount: l.debit_amount,
-    credit_amount: l.credit_amount,
-  }))
-
-  const makeChain = (rows: unknown[]) => {
-    const chain: Record<string, () => unknown> = {}
-    chain.range = () => ({ data: rows, error: null })
-    for (const m of ['order', 'lte', 'gte', 'neq', 'in', 'not', 'eq', 'select', 'limit', 'contains', 'filter']) {
-      chain[m] = () => chain
-    }
-    return chain
-  }
-
+const mockCalculateVatDeclaration = vi.fn()
+vi.mock('@/lib/reports/vat-declaration', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>()
   return {
-    // chart_of_accounts feeds fetchDynamicRuta05Accounts (the company's own
-    // ruta 05 konton). Empty here: these fixtures are plain BAS charts, and the
-    // dynamic path has its own coverage in lib/reports/__tests__.
-    from: (table: string) => {
-      if (table === 'journal_entries') return makeChain(entries)
-      if (table === 'chart_of_accounts') return makeChain([])
-      return makeChain(bareLines)
-    },
-  } as never
+    ...actual,
+    calculateVatDeclaration: (...args: unknown[]) =>
+      mockCalculateVatDeclaration(...args),
+  }
+})
+
+import { computeVatReport } from '../server'
+
+function makeRutor(partial: Partial<VatDeclarationRutor> = {}): VatDeclarationRutor {
+  return {
+    ruta05: 0, ruta06: 0, ruta07: 0, ruta08: 0,
+    ruta10: 0, ruta11: 0, ruta12: 0,
+    ruta20: 0, ruta21: 0, ruta22: 0, ruta23: 0, ruta24: 0,
+    ruta30: 0, ruta31: 0, ruta32: 0,
+    ruta35: 0, ruta36: 0, ruta37: 0, ruta38: 0,
+    ruta39: 0, ruta40: 0, ruta41: 0, ruta42: 0,
+    ruta48: 0, ruta49: 0,
+    ruta50: 0, ruta60: 0, ruta61: 0, ruta62: 0,
+    ...partial,
+  }
 }
+
+const MONTHLY_PERIOD = {
+  type: 'monthly',
+  year: 2026,
+  period: 1,
+  start: '2026-01-15',
+  end: '2026-01-31',
+  originalStart: '2026-01-01',
+  originalEnd: '2026-01-31',
+  fiscalPeriodId: null,
+  fiscalPeriodStart: null,
+  fiscalPeriodEnd: null,
+  vatLiabilityStartDate: '2026-01-15',
+} as const
+
+function setDeclaration(
+  rutor: VatDeclarationRutor,
+  rcInputAccountTotals: Record<string, { debit: number; credit: number }> = {
+    '2645': { debit: 0, credit: 0 },
+    '2647': { debit: 0, credit: 0 },
+  },
+): void {
+  mockCalculateVatDeclaration.mockResolvedValue({
+    period: MONTHLY_PERIOD,
+    rutor,
+    rcInputAccountTotals,
+    rcBasisByRate: { r25: 0, r12: 0, r6: 0 },
+  })
+}
+
+const supabase = {} as never
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  setDeclaration(makeRutor())
+})
 
 describe('computeVatReport', () => {
-  it('aggregates 2611 → ruta10, 2641 → ruta48, includes 2647 → ruta48', async () => {
-    const lines: MockLine[] = [
-      // Domestic 25% sale: 1000 + 250 VAT
-      { account_number: '3001', debit_amount: 0, credit_amount: 1000 },
-      { account_number: '2611', debit_amount: 0, credit_amount: 250 },
-      // Domestic input VAT 25%
-      { account_number: '2641', debit_amount: 100, credit_amount: 0 },
-      // Domestic reverse-charge input VAT (2647)
-      { account_number: '2647', debit_amount: 50, credit_amount: 0 },
-    ]
+  it('projects one canonical core declaration without a second VAT snapshot', async () => {
+    const rutor = makeRutor({
+      ruta05: -1000,
+      ruta10: -250,
+      ruta48: 100,
+      ruta49: 150,
+    })
+    setDeclaration(rutor)
 
-    const result = await computeVatReport(
+    const report = await computeVatReport(
       { period_type: 'monthly', year: 2026, period: 1 },
       'company-1',
-      mockSupabaseWithLines(lines)
+      supabase,
     )
 
-    expect(result.rutor.ruta05).toBe(1000)
-    expect(result.rutor.ruta10).toBe(250)
-    expect(result.rutor.ruta11).toBe(0)
-    expect(result.rutor.ruta12).toBe(0)
-    // Ruta 48 = 2641 (100) + 2647 (50) = 150
-    expect(result.rutor.ruta48).toBe(150)
-    // Ruta 49 = 250 - 150 = 100 (positive = pay)
-    expect(result.rutor.ruta49).toBe(100)
-    expect(result.summary).toContain('Moms att betala')
-    expect(result.warnings).toEqual([])
-  })
-
-  it('aggregates reverse-charge output VAT into ruta30/31/32 and the ruta49 formula', async () => {
-    const lines: MockLine[] = [
-      // Reverse-charge purchase 25%: both sides booked correctly
-      { account_number: '2614', debit_amount: 0, credit_amount: 500 },  // ruta30
-      { account_number: '2645', debit_amount: 500, credit_amount: 0 },  // matching input → ruta48
-      // Reverse-charge purchase 6%
-      { account_number: '2634', debit_amount: 0, credit_amount: 30 },   // ruta32
-      { account_number: '2645', debit_amount: 30, credit_amount: 0 },
-    ]
-
-    const result = await computeVatReport(
-      { period_type: 'quarterly', year: 2026, period: 1 },
+    expect(mockCalculateVatDeclaration).toHaveBeenCalledTimes(1)
+    expect(mockCalculateVatDeclaration).toHaveBeenCalledWith(
+      supabase,
       'company-1',
-      mockSupabaseWithLines(lines)
+      'monthly',
+      2026,
+      1,
+      undefined,
     )
-
-    expect(result.rutor.ruta30).toBe(500)
-    expect(result.rutor.ruta31).toBe(0)
-    expect(result.rutor.ruta32).toBe(30)
-    expect(result.rutor.ruta48).toBe(530) // 500 + 30 from 2645
-    // Ruta 49 = (10+11+12+30+31+32) - 48 = 0+0+0+500+0+30 - 530 = 0
-    expect(result.rutor.ruta49).toBe(0)
-    expect(result.warnings).toEqual([])
+    expect(report.rutor).toMatchObject({
+      ruta05: 1000,
+      ruta10: 250,
+      ruta48: 100,
+      ruta49: 150,
+    })
+    expect(report.summary).toBe('Moms att betala: 150 kr')
   })
 
-  it('emits a one-sided-reverse-charge warning when 2614 is booked without 2645 OR 2647', async () => {
-    const lines: MockLine[] = [
-      // Output booked but matching input missing (the most common reverse-charge error)
-      { account_number: '2614', debit_amount: 0, credit_amount: 500 },
-      // Neither 2645 nor 2647 present
-    ]
-
-    const result = await computeVatReport(
+  it('propagates liability clipping and original statutory bounds', async () => {
+    const report = await computeVatReport(
       { period_type: 'monthly', year: 2026, period: 1 },
       'company-1',
-      mockSupabaseWithLines(lines)
+      supabase,
     )
 
-    expect(result.rutor.ruta30).toBe(500)
-    expect(result.rutor.ruta48).toBe(0)
-    // Without the matching input, ruta49 is inflated by 500: the warning surfaces this.
-    expect(result.rutor.ruta49).toBe(500)
-    expect(result.warnings.length).toBe(1)
-    expect(result.warnings[0]).toMatch(/Omvänd betalningsskyldighet/)
-    // Both 2645 (EU) and 2647 (domestic) are mentioned so users know what to look for.
-    expect(result.warnings[0]).toMatch(/2645/)
-    expect(result.warnings[0]).toMatch(/2647/)
+    expect(report.period).toEqual({
+      type: 'monthly',
+      year: 2026,
+      period: 1,
+      start: '2026-01-15',
+      end: '2026-01-31',
+      original_period_start: '2026-01-01',
+      original_period_end: '2026-01-31',
+      fiscal_period_id: null,
+      fiscal_period_start: null,
+      fiscal_period_end: null,
+      vat_liability_start_date: '2026-01-15',
+    })
   })
 
-  it('does NOT warn when reverse-charge output is balanced by 2647 (domestic, no 2645)', async () => {
-    // Domestic reverse charge per ML 16:13 (byggtjänster, electronics > 100k SEK):     // matching input lands on 2647, not 2645. The earlier check missed this.
-    const lines: MockLine[] = [
-      { account_number: '2614', debit_amount: 0, credit_amount: 500 },  // ruta30
-      { account_number: '2647', debit_amount: 500, credit_amount: 0 },  // domestic input → ruta48
-    ]
+  it('warns when reverse-charge output has no canonical 2645 or 2647 input', async () => {
+    setDeclaration(makeRutor({ ruta30: 250, ruta49: 250 }))
 
-    const result = await computeVatReport(
+    const report = await computeVatReport(
       { period_type: 'monthly', year: 2026, period: 1 },
       'company-1',
-      mockSupabaseWithLines(lines)
+      supabase,
     )
 
-    expect(result.rutor.ruta30).toBe(500)
-    expect(result.rutor.ruta48).toBe(500)
-    expect(result.rutor.ruta49).toBe(0)
-    // No warning: the domestic mirror is correctly booked.
-    expect(result.warnings).toEqual([])
+    expect(report.warnings).toHaveLength(1)
+    expect(report.warnings[0]).toMatch(/2645 EU.*2647 inhemsk/)
   })
 
-  it('expanded ruta05 includes alternative BAS revenue accounts (3041/3051/3071) AND taxable EU goods (3106)', async () => {
-    const lines: MockLine[] = [
-      { account_number: '3001', debit_amount: 0, credit_amount: 1000 },
-      { account_number: '3041', debit_amount: 0, credit_amount: 500 },  // service 25%
-      { account_number: '3051', debit_amount: 0, credit_amount: 300 },  // goods 25%
-      { account_number: '3071', debit_amount: 0, credit_amount: 200 },  // other domestic
-      { account_number: '3106', debit_amount: 0, credit_amount: 100 },  // momspliktig EU goods
-    ]
+  it('does not warn when canonical 2647 input backs reverse-charge output', async () => {
+    setDeclaration(
+      makeRutor({ ruta30: 250, ruta48: 250, ruta49: 0 }),
+      {
+        '2645': { debit: 0, credit: 0 },
+        '2647': { debit: 250, credit: 0 },
+      },
+    )
 
-    const result = await computeVatReport(
+    const report = await computeVatReport(
+      { period_type: 'monthly', year: 2026, period: 1 },
+      'company-1',
+      supabase,
+    )
+
+    expect(report.warnings).toEqual([])
+  })
+
+  it('propagates the exact annual fiscal-period identity', async () => {
+    const fiscalPeriodId = '33333333-3333-4333-8333-333333333333'
+    mockCalculateVatDeclaration.mockResolvedValue({
+      period: {
+        type: 'yearly',
+        year: 2026,
+        period: 1,
+        start: '2025-07-01',
+        end: '2026-06-30',
+        originalStart: '2025-07-01',
+        originalEnd: '2026-06-30',
+        fiscalPeriodId,
+        fiscalPeriodStart: '2025-07-01',
+        fiscalPeriodEnd: '2026-06-30',
+        vatLiabilityStartDate: null,
+      },
+      rutor: makeRutor(),
+      rcInputAccountTotals: {},
+      rcBasisByRate: { r25: 0, r12: 0, r6: 0 },
+    })
+
+    const report = await computeVatReport(
+      { period_type: 'yearly', year: 2026, period: 1, fiscal_period_id: fiscalPeriodId },
+      'company-1',
+      supabase,
+    )
+
+    expect(report.period).toMatchObject({
+      fiscal_period_id: fiscalPeriodId,
+      fiscal_period_start: '2025-07-01',
+      fiscal_period_end: '2026-06-30',
+      original_period_start: '2025-07-01',
+      original_period_end: '2026-06-30',
+    })
+  })
+
+  it('rejects an annual fiscal-period identity drift', async () => {
+    const requestedId = '33333333-3333-4333-8333-333333333333'
+    mockCalculateVatDeclaration.mockResolvedValue({
+      period: {
+        ...MONTHLY_PERIOD,
+        type: 'yearly',
+        year: 2026,
+        period: 1,
+        start: '2025-07-01',
+        end: '2026-06-30',
+        originalStart: '2025-07-01',
+        originalEnd: '2026-06-30',
+        fiscalPeriodId: '44444444-4444-4444-8444-444444444444',
+        fiscalPeriodStart: '2025-07-01',
+        fiscalPeriodEnd: '2026-06-30',
+        vatLiabilityStartDate: null,
+      },
+      rutor: makeRutor(),
+    })
+
+    await expect(computeVatReport(
+      { period_type: 'yearly', year: 2026, period: 1, fiscal_period_id: requestedId },
+      'company-1',
+      supabase,
+    )).rejects.toThrow(/fiscal period identity mismatch/i)
+  })
+
+  it('requires a fiscal-period ID for yearly requests', async () => {
+    await expect(computeVatReport(
       { period_type: 'yearly', year: 2026, period: 1 },
       'company-1',
-      mockSupabaseWithLines(lines)
-    )
-
-    expect(result.rutor.ruta05).toBe(2100)
+      supabase,
+    )).rejects.toThrow(/fiscal_period_id is required/)
+    expect(mockCalculateVatDeclaration).not.toHaveBeenCalled()
   })
 
-  it('excludes 3004 (momsfri) from ruta05: exempt sales must NOT be in the taxable base', async () => {
-    const lines: MockLine[] = [
-      { account_number: '3001', debit_amount: 0, credit_amount: 1000 },
-      { account_number: '3004', debit_amount: 0, credit_amount: 500 }, // exempt: must be excluded
-    ]
-
-    const result = await computeVatReport(
-      { period_type: 'yearly', year: 2026, period: 1 },
+  it('rejects invalid period types, ranges, and years before projection', async () => {
+    await expect(computeVatReport(
+      { period_type: 'weekly', year: 2026, period: 1 },
       'company-1',
-      mockSupabaseWithLines(lines)
-    )
-
-    expect(result.rutor.ruta05).toBe(1000)
-  })
-
-  it('aggregates 3108 → ruta35 (EU intra-community goods, momsfri leverans till EU)', async () => {
-    const lines: MockLine[] = [
-      // Domestic taxable sale
-      { account_number: '3001', debit_amount: 0, credit_amount: 1000 },
-      // EU goods supply, momsfri (zero-rated to EU customer with valid VAT number)
-      { account_number: '3108', debit_amount: 0, credit_amount: 5000 },
-    ]
-
-    const result = await computeVatReport(
-      { period_type: 'quarterly', year: 2026, period: 1 },
+      supabase,
+    )).rejects.toThrow(/period_type/)
+    await expect(computeVatReport(
+      { period_type: 'monthly', year: 2026, period: 13 },
       'company-1',
-      mockSupabaseWithLines(lines)
-    )
-
-    expect(result.rutor.ruta05).toBe(1000)        // 3108 NOT in ruta05 (it's reported separately)
-    expect(result.rutor.ruta35).toBe(5000)        // The new ruta we just added
-    expect(result.rutor.ruta39).toBe(0)
-    expect(result.rutor.ruta40).toBe(0)
-  })
-
-  it('excludes a manual settlement-shaped entry from the rutor (#984)', async () => {
-    const lines: MockLine[] = [
-      // Business activity on e1.
-      { journal_entry_id: 'e1', account_number: '3001', debit_amount: 0, credit_amount: 1000, journal_entries: { source_type: 'invoice_created' } },
-      { journal_entry_id: 'e1', account_number: '2611', debit_amount: 0, credit_amount: 250, journal_entries: { source_type: 'invoice_created' } },
-      // Manual momsomföring on e2 (no vat_settlement tag): would zero ruta10.
-      { journal_entry_id: 'e2', account_number: '2611', debit_amount: 250, credit_amount: 0, journal_entries: { source_type: 'manual' } },
-      { journal_entry_id: 'e2', account_number: '2650', debit_amount: 0, credit_amount: 250, journal_entries: { source_type: 'manual' } },
-    ]
-
-    const result = await computeVatReport(
-      { period_type: 'monthly', year: 2026, period: 1 },
+      supabase,
+    )).rejects.toThrow(/1-12/)
+    await expect(computeVatReport(
+      { period_type: 'monthly', year: 1900, period: 1 },
       'company-1',
-      mockSupabaseWithLines(lines)
-    )
-
-    expect(result.rutor.ruta05).toBe(1000)
-    expect(result.rutor.ruta10).toBe(250)
-    expect(result.rutor.ruta49).toBe(250)
-  })
-
-  it('settlement-shape exclusion covers stornos and exempts opening balances', async () => {
-    const lines: MockLine[] = [
-      // Storno of a settlement: must be excluded from ruta10.
-      { journal_entry_id: 'e3', account_number: '2611', debit_amount: 0, credit_amount: 100, journal_entries: { source_type: 'storno' } },
-      { journal_entry_id: 'e3', account_number: '2650', debit_amount: 100, credit_amount: 0, journal_entries: { source_type: 'storno' } },
-      // Opening balance carrying undeclared input VAT and a prior VAT debt:
-      // stays IN the projection.
-      { journal_entry_id: 'ib', account_number: '2641', debit_amount: 500, credit_amount: 0, journal_entries: { source_type: 'opening_balance' } },
-      { journal_entry_id: 'ib', account_number: '2650', debit_amount: 0, credit_amount: 300, journal_entries: { source_type: 'opening_balance' } },
-    ]
-
-    const result = await computeVatReport(
-      { period_type: 'monthly', year: 2026, period: 1 },
-      'company-1',
-      mockSupabaseWithLines(lines)
-    )
-
-    expect(result.rutor.ruta10).toBe(0)
-    expect(result.rutor.ruta48).toBe(500)
-    expect(result.rutor.ruta49).toBe(-500)
-  })
-
-  it('refund summary string when ruta49 is negative', async () => {
-    const lines: MockLine[] = [
-      { account_number: '2641', debit_amount: 100, credit_amount: 0 },
-      // No output VAT; pure refund position.
-    ]
-
-    const result = await computeVatReport(
-      { period_type: 'monthly', year: 2026, period: 1 },
-      'company-1',
-      mockSupabaseWithLines(lines)
-    )
-
-    expect(result.rutor.ruta49).toBe(-100)
-    expect(result.summary).toContain('Moms att få tillbaka')
-  })
-
-  it('exposes a rich outputSchema on both VAT tools (not bare {type:object})', () => {
-    for (const name of ['gnubok_get_vat_report', 'gnubok_vat_review_widget']) {
-      const tool = tools.find((t) => t.name === name)
-      expect(tool, `tool ${name}`).toBeDefined()
-      const schema = tool!.outputSchema as Record<string, unknown> | undefined
-      expect(schema).toBeDefined()
-      expect(schema!.type).toBe('object')
-      const props = schema!.properties as Record<string, unknown>
-      // The schema must declare period, period_label, rutor, summary, warnings.
-      expect(props).toHaveProperty('period')
-      expect(props).toHaveProperty('rutor')
-      expect(props).toHaveProperty('summary')
-      expect(props).toHaveProperty('warnings')
-      // rutor must declare each ruta the runtime returns.
-      const rutorProps = (props.rutor as { properties: Record<string, unknown> }).properties
-      for (const r of ['ruta05', 'ruta10', 'ruta11', 'ruta12', 'ruta30', 'ruta31', 'ruta32', 'ruta35', 'ruta39', 'ruta40', 'ruta48', 'ruta49']) {
-        expect(rutorProps, `tool ${name} rutor.${r}`).toHaveProperty(r)
-      }
-    }
-  })
-
-  it('rejects bad period_type / out-of-range period / out-of-range year', async () => {
-    const supabase = mockSupabaseWithLines([])
-
-    await expect(
-      computeVatReport({ period_type: 'weekly', year: 2026, period: 1 }, 'c', supabase)
-    ).rejects.toThrow(/period_type/)
-
-    await expect(
-      computeVatReport({ period_type: 'monthly', year: 2026, period: 13 }, 'c', supabase)
-    ).rejects.toThrow(/period must be 1-12/)
-
-    await expect(
-      computeVatReport({ period_type: 'quarterly', year: 2026, period: 5 }, 'c', supabase)
-    ).rejects.toThrow(/period must be 1-4/)
-
-    await expect(
-      computeVatReport({ period_type: 'monthly', year: 1900, period: 1 }, 'c', supabase)
-    ).rejects.toThrow(/year must be between/)
+      supabase,
+    )).rejects.toThrow(/year must be between/)
   })
 })

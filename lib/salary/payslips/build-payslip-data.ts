@@ -7,6 +7,7 @@
  */
 import type { PayslipData, PayslipLineItem } from '@/lib/salary/pdf/payslip-template'
 import { decryptPersonnummer, maskPersonnummer } from '@/lib/salary/personnummer'
+import { roundOre } from '@/lib/money'
 
 const EMPLOYMENT_LABELS: Record<string, string> = {
   employee: 'Anställd',
@@ -45,7 +46,13 @@ export function buildPayslipData(params: {
 }): PayslipData {
   const { run, sre, employee: emp, company } = params
 
-  const lineItems: PayslipLineItem[] = ((sre.line_items || []) as Array<Record<string, unknown>>)
+  const sourceLineItems = (sre.line_items || []) as Array<Record<string, unknown>>
+  const mileageTaxfree = roundOre(
+    sourceLineItems
+      .filter(li => li.item_type === 'mileage_taxfree' && Number(li.amount) > 0)
+      .reduce((sum, li) => sum + Number(li.amount), 0)
+  )
+  const lineItems: PayslipLineItem[] = sourceLineItems
     .sort((a, b) => ((a.sort_order as number) || 0) - ((b.sort_order as number) || 0))
     .map(li => ({
       description: li.description as string,
@@ -127,7 +134,13 @@ export function buildPayslipData(params: {
     avgifterAmount: effectiveAvgifter,
     vacationAccrual,
     vacationAccrualAvgifter,
-    totalEmployerCost: grossSalary + effectiveAvgifter + vacationAccrual + vacationAccrualAvgifter,
+    totalEmployerCost: roundOre(
+      grossSalary +
+        effectiveAvgifter +
+        vacationAccrual +
+        vacationAccrualAvgifter +
+        mileageTaxfree
+    ),
     ytdGross: sre.ytd_gross as number,
     ytdTax: sre.ytd_tax as number,
     ytdNet: sre.ytd_net as number,

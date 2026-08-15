@@ -1,6 +1,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { evaluateMappingRules } from '@/lib/bookkeeping/mapping-engine'
-import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
+import { coordinateTransactionSettlement } from '@/lib/transactions/settlement-attachment'
+import type { SettlementCoordinatorResult } from '@/lib/transactions/settlement-attachment'
 import { upsertCounterpartyTemplate } from '@/lib/bookkeeping/counterparty-templates'
 import { getBestInvoiceMatch } from '@/lib/invoices/invoice-matching'
 import { findSupplierInvoiceMatch } from '@/lib/invoices/supplier-invoice-matching'
@@ -443,23 +444,43 @@ export async function ingestTransactions(
     data?.forEach(r => existingExternalIds.add(r.external_id))
   }
 
-  // Resolve the cash account this batch settled on, once. Every row in one
-  // ingest call shares a settlement account: enable-banking calls this per
-  // account (settlementAccount = account.ledger_account), CSV import passes the
-  // single account the user picked. cash_accounts.ledger_account is unique per
-  // company, so this is a single-row lookup. Tolerate a miss: the row stays
-  // unbound (cash_account_id NULL) and reconciliation falls back to currency.
-  // We never auto-create a cash account here; that would race upsertFromPsd2's
-  // seed-promotion logic in lib/cash-accounts/service.ts.
+  // Resolve supplied provenance before the first transaction insert. A caller
+  // that names a settlement ledger has made an explicit accounting choice:
+  // an error, missing row, empty ledger, or tenant mismatch must fail the whole
+  // batch envelope rather than persist accountless rows that later look legacy.
+  const hasSuppliedSettlementAccount =
+    options !== undefined &&
+    Object.prototype.hasOwnProperty.call(options, 'settlementAccount')
+  const suppliedSettlementAccount = options?.settlementAccount
   let cashAccountId: string | null = null
-  if (options?.settlementAccount) {
-    const { data: ca } = await supabase
+  if (hasSuppliedSettlementAccount) {
+    if (
+      typeof suppliedSettlementAccount !== 'string' ||
+      suppliedSettlementAccount.trim().length === 0
+    ) {
+      result.errors = rawTransactions.length
+      result.first_error = {
+        message: 'Det angivna avräkningskontot saknas.',
+        code: 'SETTLEMENT_ACCOUNT_UNRESOLVED',
+      }
+      return result
+    }
+    const { data: ca, error: cashAccountError } = await supabase
       .from('cash_accounts')
-      .select('id')
+      .select('id, ledger_account')
       .eq('company_id', companyId)
-      .eq('ledger_account', options.settlementAccount)
+      .eq('ledger_account', suppliedSettlementAccount)
       .maybeSingle()
-    cashAccountId = (ca?.id as string | undefined) ?? null
+    if (cashAccountError || !ca?.id || ca.ledger_account !== suppliedSettlementAccount) {
+      result.errors = rawTransactions.length
+      result.first_error = {
+        message: `Avräkningskontot "${suppliedSettlementAccount}" kunde inte kopplas till företaget.`,
+        code: 'SETTLEMENT_ACCOUNT_UNRESOLVED',
+        details: cashAccountError?.message ?? null,
+      }
+      return result
+    }
+    cashAccountId = ca.id as string
   }
 
   // ── Shadow-mode same-feed scope-drift precompute (measure only) ──────────
@@ -1076,24 +1097,34 @@ export async function ingestTransactions(
         )
 
         if (mappingResult.confidence >= 0.8 && !mappingResult.requires_review) {
-          const journalEntry = await createTransactionJournalEntry(
-            supabase,
-            companyId,
-            userId,
-            newTransaction as Transaction,
-            mappingResult
-          )
+          let settlement: SettlementCoordinatorResult
+          try {
+            settlement = await coordinateTransactionSettlement({
+              supabase,
+              companyId,
+              userId,
+              transaction: newTransaction as Transaction,
+              mappingResult,
+              category: mappingResult.default_private
+                ? 'private'
+                : (newTransaction.category as Transaction['category']),
+              isBusiness: !mappingResult.default_private,
+              settlementAccount: suppliedSettlementAccount ?? '1930',
+            })
+          } catch (error) {
+            result.errors++
+            if (!result.first_error) {
+              result.first_error = {
+                message: error instanceof Error ? error.message : 'Auto-categorization failed.',
+                code: 'AUTO_CATEGORIZATION_FAILED',
+              }
+            }
+            continue
+          }
 
-          if (journalEntry) {
-            await supabase
-              .from('transactions')
-              .update({
-                journal_entry_id: journalEntry.id,
-                is_business: !mappingResult.default_private,
-              })
-              .eq('id', newTransaction.id)
-
-            // Upsert counterparty template (auto-learned, lower confidence)
+          if (settlement.kind === 'attached' && settlement.created) {
+            // Learning is valid only after M4 returned or exact readback proved
+            // the authoritative transaction, journal, cash, and business state.
             try {
               await upsertCounterpartyTemplate(
                 supabase, companyId, newTransaction as Transaction,
@@ -1102,12 +1133,24 @@ export async function ingestTransactions(
             } catch {
               // Non-critical
             }
-
             result.auto_categorized++
+          } else if (settlement.kind !== 'attached') {
+            result.errors++
+            if (!result.first_error) {
+              result.first_error = {
+                message: settlement.message,
+                code: settlement.code,
+                details: JSON.stringify({
+                  posted_ids: settlement.postedIds,
+                  publication_ids:
+                    settlement.kind === 'partial' ? settlement.publicationIds : [],
+                }),
+              }
+            }
           }
         }
       } catch {
-        // Non-critical: continue processing
+        // Mapping evaluation is advisory and must not fail transaction ingestion.
       }
     }
   }

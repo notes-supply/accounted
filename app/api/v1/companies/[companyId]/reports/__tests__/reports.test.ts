@@ -56,9 +56,13 @@ vi.mock('@/lib/reports/income-statement', () => ({
 vi.mock('@/lib/reports/sie-export', () => ({
   generateSIEExport: mocks.generateSIEExport,
 }))
-vi.mock('@/lib/reports/vat-declaration', () => ({
-  calculateVatDeclaration: mocks.calculateVatDeclaration,
-}))
+vi.mock('@/lib/reports/vat-declaration', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/reports/vat-declaration')>()
+  return {
+    ...actual,
+    calculateVatDeclaration: mocks.calculateVatDeclaration,
+  }
+})
 
 import { validateApiKey, createServiceClientNoCookies } from '@/lib/auth/api-keys'
 import { GET as balanceSheet } from '../balance-sheet/route'
@@ -422,7 +426,7 @@ describe('GET /reports/vat-declaration', () => {
       companyParams(COMPANY_ID),
     )
 
-    expect(res.status).toBe(200)
+    expect(res.status, JSON.stringify(await res.clone().json())).toBe(200)
     const body = await res.json()
     expect(body.data.rutor.ruta49).toBe(0)
     expect(mocks.calculateVatDeclaration).toHaveBeenCalledWith(
@@ -431,6 +435,7 @@ describe('GET /reports/vat-declaration', () => {
       'monthly',
       2026,
       4,
+      { fiscalPeriodId: undefined },
     )
   })
 })

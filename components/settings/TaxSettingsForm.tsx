@@ -13,8 +13,12 @@ import {
 } from '@/components/settings/SettingsRows'
 import type { CompanySettings } from '@/types'
 
+type CompanySettingsWithVatIdentity = CompanySettings & {
+  vat_liability_start_date?: string | null
+}
+
 interface TaxSettingsFormProps {
-  settings: CompanySettings
+  settings: CompanySettingsWithVatIdentity
   /** Ledger-derived signal: EU sales postings exist (3108/3308/3107). */
   euSalesDetected?: boolean
   /** Ledger-derived signal: utdelning/ägarlån postings exist (2898/2393/2893). */
@@ -162,6 +166,19 @@ export function TaxSettingsForm({
                 {t('period_yearly')}
               </option>
             </SettingsSelect>
+          </SettingsRow>
+
+          <SettingsRow
+            label={t('vat_liability_start_label')}
+            htmlFor="vat_liability_start_date"
+            help={t('vat_liability_start_help')}
+          >
+            <SettingsInput
+              id="vat_liability_start_date"
+              name="vat_liability_start_date"
+              type="date"
+              defaultValue={settings.vat_liability_start_date || ''}
+            />
           </SettingsRow>
 
           <SettingsRow

@@ -160,6 +160,11 @@ function against(
 }
 
 describe('schema replay (parser fidelity)', () => {
+  it('does not model private-schema tables as public archive tables', () => {
+    expect(schema.tables.has('accounting_private')).toBe(false)
+    expect(schema.tables.has('accounting_command_capabilities')).toBe(false)
+  })
+
   // If the replay is wrong the whole guard is wrong, in either direction: a
   // missed column invents accusations, an invented column hides real ones. These
   // anchors are facts established independently of the parser.

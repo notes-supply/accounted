@@ -4,11 +4,11 @@
  * Categorize a transaction and create the corresponding journal entry. This
  * is a thin v1 surface over the same orchestration the internal dashboard
  * route uses: same mapping engine, same booking templates, same SI-match
- * suggestion intercept, same CAS race guard.
+ * suggestion intercept, and the same atomic settlement attachment guard.
  *
- * Already-categorized fast path: if the transaction already has a journal
- * entry, only the is_business / category flags are updated. The JE is left
- * intact (it's immutable post-commit per BFL 5 kap 6 §).
+ * Already-categorized fast path: the coordinator verifies the immutable
+ * category, business flag, settlement provenance, and journal lines. Only an
+ * exact match returns as a no-op; mismatches are conflicts.
  *
  * Dry-runnable: returns the resolved mapping (debit/credit + VAT lines)
  * without inserting the journal entry or mutating the transaction.
@@ -27,20 +27,13 @@ import {
   buildMappingResultFromTemplate,
   validateTemplateForEntity,
 } from '@/lib/bookkeeping/booking-templates'
-import {
-  upsertCounterpartyTemplate,
-  buildMappingResultFromCounterpartyTemplate,
-} from '@/lib/bookkeeping/counterparty-templates'
-import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
-import { recordVoucherGapExplanation } from '@/lib/bookkeeping/cancel-orphaned-entry'
-import { reverseEntry } from '@/lib/bookkeeping/engine'
+import { buildMappingResultFromCounterpartyTemplate } from '@/lib/bookkeeping/counterparty-templates'
+import { categorizeResolvedTransaction } from '@/lib/transactions/categorize-core'
+import { hasLiveJournalEntryLink } from '@/lib/transactions/link-journal-entry'
 import { saveUserMappingRule, applySettlementAccount } from '@/lib/bookkeeping/mapping-engine'
 import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
-import { AccountsNotInChartError, isBookkeepingError } from '@/lib/bookkeeping/errors'
+import { AccountsNotInChartError } from '@/lib/bookkeeping/errors'
 import { collectMappingResultAccounts, findUnresolvableAccounts } from '@/lib/bookkeeping/account-validation'
-import { propagateUnderlagForBookedTransaction } from '@/lib/transactions/inbox-underlag'
-import { getErrorMessage } from '@/lib/errors/get-error-message'
-import { eventBus } from '@/lib/events'
 import type {
   CategorizationTemplate,
   EntityType,
@@ -71,7 +64,7 @@ registerEndpoint({
     'Matching a payment to an invoice: use `:match-invoice` or `:match-supplier-invoice`, which storno any conflicting JE first. Uncategorizing: `:uncategorize`.',
   pitfalls: [
     'A bank payment that looks like an invoice payment will be flagged via TX_CATEGORIZE_SUGGEST_SI_MATCH: pass `confirm_no_match: true` to override and force-categorize as direct expense (e.g. when the supplier invoice was already booked).',
-    'Already-categorized fast path: if the transaction already has a journal_entry_id, only flags get updated. The JE is immutable post-commit.',
+    'Already-categorized fast path: a live journal_entry_id succeeds only when its immutable settlement snapshot exactly matches the request.',
     'account_override must exist in the chart of accounts; an unknown account returns TX_CATEGORIZE_INVALID_ACCOUNT.',
   ],
   example: {
@@ -147,30 +140,14 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
 
     const txLog = ctx.log.child({ transactionId: txId })
 
-    // Already-categorized fast path: just flip flags. Skip on dry-run so the
-    // caller can preview the full mapping that would be applied to a fresh tx.
-    if (transaction.journal_entry_id && !ctx.dryRun) {
-      const finalCat: TransactionCategory = is_business
-        ? category || 'uncategorized'
-        : 'private'
-      const { error: updateErr } = await ctx.supabase
-        .from('transactions')
-        .update({ is_business, category: finalCat })
-        .eq('id', txId)
-        .eq('company_id', ctx.companyId!)
-      if (updateErr) return v1ErrorResponse(updateErr, txLog, { requestId: ctx.requestId })
-      return ok(
-        {
-          success: true,
-          journal_entry_created: false,
-          journal_entry_id: transaction.journal_entry_id as string,
-          journal_entry_error: null,
-          category: finalCat,
-          already_had_journal_entry: true,
-        },
-        { requestId: ctx.requestId },
-      )
-    }
+    const existingCategorization = Boolean(
+      transaction.journal_entry_id &&
+      await hasLiveJournalEntryLink(
+        ctx.supabase,
+        ctx.companyId!,
+        transaction.journal_entry_id,
+      ),
+    )
 
     const { data: settings } = await ctx.supabase
       .from('company_settings')
@@ -316,11 +293,10 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     // Pre-validate every account in the mapping against the company's
     // chart_of_accounts. Template / counterparty-template / category paths
     // all bypass the older account_override check; without this catch they
-    // would reach the engine and throw AccountsNotInChartError mid-flight,
-    // leaving the legacy partial-success branch to silently mark the row as
-    // bokförd with no verifikation. We validate in both live AND dry-run
-    // paths so previews surface the same actionable error. Standard BAS
-    // accounts merely absent from the chart pass: the engine seeds them.
+    // would otherwise reach the engine and fail during posting. Validate in
+    // both live and dry-run paths so previews surface the same actionable
+    // error. Standard BAS accounts merely absent from the chart pass: the
+    // engine seeds them.
     const missingAccounts = await findUnresolvableAccounts(
       ctx.supabase,
       ctx.companyId!,
@@ -345,8 +321,8 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
             vat_lines: mappingResult.vat_lines,
             all_lines_complete: mappingResult.all_lines_complete ?? false,
           },
-          would_create_journal_entry: !transaction.journal_entry_id,
-          already_had_journal_entry: !!transaction.journal_entry_id,
+          would_create_journal_entry: !existingCategorization,
+          already_had_journal_entry: existingCategorization,
         },
         { requestId: ctx.requestId, log: ctx.log },
       )
@@ -372,43 +348,47 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       })
     }
 
-    // Live path: create the journal entry. The internal route runs a
-    // duplicate-payment guard (Prong B) here that surfaces SI-match
-    // suggestions; we preserve that behavior so v1 and the dashboard
-    // diverge on neither booking outcomes nor compliance.
-    let journalEntryId: string | null = null
-    let journalEntryError: string | null = null
-    try {
-      const journalEntry = await createTransactionJournalEntry(
-        ctx.supabase,
-        ctx.companyId!,
-        ctx.userId,
-        transaction as Transaction,
+    const categorization = await categorizeResolvedTransaction(
+      ctx.supabase,
+      ctx.userId,
+      ctx.companyId!,
+      {
+        transaction: transaction as Transaction,
         mappingResult,
-      )
-      if (journalEntry) journalEntryId = journalEntry.id
-    } catch (err) {
-      txLog.error('transactions.categorize: journal entry creation failed', err as Error)
-      // AccountsNotInChartError means an account was deactivated between our
-      // pre-validation and the engine call (race). Don't fall through to the
-      // partial-success path that would mark the row bokförd with no
-      // verifikation: return a structured 400 so the row stays in the
-      // categorization queue and the caller can retry after re-activating.
-      if (err instanceof AccountsNotInChartError) {
-        return v1ErrorResponse(err, txLog, { requestId: ctx.requestId })
+        category: finalCategory,
+        isBusiness: is_business,
+        settlementAccount,
+        existingCategorization,
+      },
+    )
+
+    if (categorization.error) {
+      if (categorization.partialPostedIds) {
+        return v1ErrorResponse(new Error(categorization.error), txLog, {
+          requestId: ctx.requestId,
+          status: categorization.status ?? 500,
+          details: {
+            code: categorization.errorCode,
+            posted_ids: categorization.partialPostedIds,
+            publication_ids: categorization.partialPublicationIds ?? [],
+          },
+        })
       }
-      if (isBookkeepingError(err)) {
-        journalEntryError = getErrorMessage(err, { context: 'transaction' })
-      } else {
-        journalEntryError = err instanceof Error ? err.message : 'Unknown error'
-      }
+      return v1ErrorResponseFromCode('TX_CATEGORIZE_RACE', txLog, {
+        requestId: ctx.requestId,
+        details: { code: categorization.errorCode },
+      })
     }
 
-    // Best-effort: save mapping rule + upsert counterparty template. These
-    // are user-experience polish (faster future categorization) and never
-    // fail the request. direction_mismatch = a mirrored refund/repayment
-    // booking; learning it as a rule would store backwards accounts.
-    if (is_business && transaction.merchant_name && !mappingResult.direction_mismatch) {
+    const journalEntryId = categorization.data?.journal_entry_id as string
+    const alreadyHadJournalEntry =
+      categorization.data?.already_had_journal_entry === true
+    if (
+      !alreadyHadJournalEntry &&
+      is_business &&
+      transaction.merchant_name &&
+      !mappingResult.direction_mismatch
+    ) {
       try {
         await saveUserMappingRule(
           ctx.supabase,
@@ -421,131 +401,18 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
           body.template_id,
         )
       } catch (err) {
-        txLog.warn('save mapping rule failed (non-critical)', err as Error)
+        txLog.warn('save mapping rule failed after verified attachment', err as Error)
       }
-    }
-    try {
-      await upsertCounterpartyTemplate(
-        ctx.supabase,
-        ctx.companyId!,
-        transaction as Transaction,
-        mappingResult,
-        'user_approved',
-      )
-    } catch (err) {
-      txLog.warn('counterparty template upsert failed (non-critical)', err as Error)
-    }
-
-    // CAS guard: another request must not have categorized this transaction
-    // between fetch and write.
-    const { data: updateResult, error: updateErr } = await ctx.supabase
-      .from('transactions')
-      .update({
-        is_business,
-        category: finalCategory,
-        journal_entry_id: journalEntryId,
-      })
-      .eq('id', txId)
-      .eq('company_id', ctx.companyId!)
-      .is('journal_entry_id', null)
-      .select('id')
-
-    if (updateErr) return v1ErrorResponse(updateErr, txLog, { requestId: ctx.requestId })
-
-    if ((!updateResult || updateResult.length === 0) && journalEntryId) {
-      // Lost the race. The orphan JE was created with status='posted' by the
-      // engine, so the immutability trigger blocks a direct status flip to
-      // 'cancelled'. BFL 5 kap 5 § requires corrections via a reversing
-      // entry (storno): issue one. The pair (orphan + storno) keeps the
-      // verifikationsnummer series unbroken; no voucher_gap_explanations row
-      // is needed because there's no gap.
-      try {
-        await reverseEntry(ctx.supabase, ctx.companyId!, ctx.userId, journalEntryId)
-      } catch (revErr) {
-        // Storno failure on the orphan is rare but creates an unreconcilable
-        // ledger state (posted JE with no reversal). BFL 5 kap 5 § requires
-        // every correction be traceable. Document the gap explicitly so a
-        // human can reconcile manually rather than losing the trail to logs.
-        txLog.error('TX_CATEGORIZE_RACE: failed to storno orphaned JE', revErr as Error, {
-          orphanJournalEntryId: journalEntryId,
-        })
-        try {
-          const { data: orphan } = await ctx.supabase
-            .from('journal_entries')
-            .select('fiscal_period_id, voucher_series, voucher_number')
-            .eq('id', journalEntryId)
-            .eq('company_id', ctx.companyId!)
-            .single()
-          if (orphan && orphan.voucher_series) {
-            // Skip the gap row when the engine didn't tag a series on the
-            // orphan. Filing under a fallback series (previously 'A') would
-            // index the gap explanation under the wrong key, hiding it from
-            // series-specific audit queries (BFL 5 kap 6 §). A missing series
-            // is logged above already; a human will reconcile via that trail.
-            //
-            // The insert itself lives in the shared helper: it owns the real
-            // voucher_gap_explanations column set (gap_start/gap_end/user_id)
-            // and logs a failed insert loudly instead of swallowing it.
-            await recordVoucherGapExplanation(ctx.supabase, {
-              companyId: ctx.companyId!,
-              userId: ctx.userId,
-              fiscalPeriodId: orphan.fiscal_period_id,
-              voucherSeries: orphan.voucher_series,
-              voucherNumber: orphan.voucher_number,
-              explanation:
-                'CAS-race orphan; automatisk storno misslyckades. Manuell reconciliation krävs.',
-            })
-          }
-        } catch (gapErr) {
-          txLog.error(
-            'TX_CATEGORIZE_RACE: failed to look up the orphan for its gap explanation',
-            gapErr as Error,
-            { orphanJournalEntryId: journalEntryId },
-          )
-        }
-      }
-      return v1ErrorResponseFromCode('TX_CATEGORIZE_RACE', txLog, {
-        requestId: ctx.requestId,
-      })
-    }
-
-    // Propagate the underlag onto the new verifikat: anchor the transaction's
-    // pinned document and stamp matched inbox items so they leave the active
-    // inbox. Same shared step the dashboard categorize, /book and bulk-book
-    // paths run; without it a v1 booking of a tx with attached underlag reads
-    // "Underlag saknas" forever. Best-effort by contract (logged inside),
-    // never fails the booking. Runs only when THIS request won the CAS write.
-    if (journalEntryId) {
-      await propagateUnderlagForBookedTransaction(
-        ctx.supabase,
-        ctx.companyId!,
-        txId,
-        journalEntryId,
-      )
-    }
-
-    try {
-      await eventBus.emit({
-        type: 'transaction.categorized',
-        payload: {
-          transaction: transaction as Transaction,
-          account: mappingResult.debit_account,
-          taxCode: mappingResult.vat_lines[0]?.account_number || '',
-          userId: ctx.userId,
-          companyId: ctx.companyId!,
-        },
-      })
-    } catch (err) {
-      txLog.warn('transaction.categorized emit failed (non-critical)', err as Error)
     }
 
     return ok(
       {
         success: true,
-        journal_entry_created: !!journalEntryId,
+        journal_entry_created: !alreadyHadJournalEntry,
         journal_entry_id: journalEntryId,
-        journal_entry_error: journalEntryError,
+        journal_entry_error: null,
         category: finalCategory,
+        ...(alreadyHadJournalEntry ? { already_had_journal_entry: true } : {}),
       },
       { requestId: ctx.requestId },
     )

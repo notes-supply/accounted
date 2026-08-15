@@ -82,11 +82,80 @@ describe('POST /api/mileage/book', () => {
     expect(bookMileagePeriod).not.toHaveBeenCalled()
   })
 
-  it('returns 409 when a concurrent booking claimed the trips first', async () => {
+  it('returns a retryable 409 envelope when another booking wins the claim', async () => {
     authed()
     vi.mocked(bookMileagePeriod).mockResolvedValue({ ok: false, code: 'CLAIM_LOST' })
     const res = await POST(postReq(VALID_BODY), params)
     expect(res.status).toBe(409)
+    const body = await res.json()
+    expect(body.error).toMatchObject({
+      code: 'MILEAGE_CLAIM_CONFLICT',
+      details: { retryable: true },
+    })
+  })
+
+  it('returns a non-retryable envelope for incomplete claim release', async () => {
+    authed()
+    vi.mocked(bookMileagePeriod).mockResolvedValue({
+      ok: false,
+      code: 'RELEASE_INCOMPLETE',
+    })
+    const res = await POST(postReq(VALID_BODY), params)
+    expect(res.status).toBe(500)
+    const body = await res.json()
+    expect(body.error).toMatchObject({
+      code: 'MILEAGE_CLAIM_RELEASE_INCOMPLETE',
+      details: { retryable: false },
+    })
+    expect(JSON.stringify(body)).not.toContain('trip-')
+  })
+
+  it('preserves durable journal identity for ambiguous post-commit outcomes', async () => {
+    authed()
+    vi.mocked(bookMileagePeriod).mockResolvedValue({
+      ok: false,
+      code: 'POST_COMMIT_IDENTITY_AMBIGUOUS',
+      journalEntryId: 'je-1',
+      voucherNumber: 42,
+      voucherSeries: 'A',
+    })
+    const res = await POST(postReq(VALID_BODY), params)
+    expect(res.status).toBe(500)
+    const body = await res.json()
+    expect(body.error).toMatchObject({
+      code: 'MILEAGE_POST_COMMIT_IDENTITY_AMBIGUOUS',
+      details: {
+        journal_entry_id: 'je-1',
+        voucher_number: 42,
+        voucher_series: 'A',
+        retryable: false,
+      },
+    })
+    expect(JSON.stringify(body)).not.toContain('trip-')
+  })
+
+  it('returns the committed identity but no trip IDs when stamping is incomplete', async () => {
+    authed()
+    vi.mocked(bookMileagePeriod).mockResolvedValue({
+      ok: false,
+      code: 'STAMP_FAILED',
+      journalEntryId: 'je-1',
+      voucherNumber: 42,
+      voucherSeries: 'A',
+    })
+    const res = await POST(postReq(VALID_BODY), params)
+    expect(res.status).toBe(500)
+    const body = await res.json()
+    expect(body.error).toMatchObject({
+      code: 'MILEAGE_STAMP_INCOMPLETE',
+      details: {
+        journal_entry_id: 'je-1',
+        voucher_number: 42,
+        voucher_series: 'A',
+        retryable: false,
+      },
+    })
+    expect(JSON.stringify(body)).not.toContain('trip-')
   })
 
   it('returns 400 when the period spans several employees', async () => {

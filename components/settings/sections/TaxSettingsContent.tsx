@@ -90,17 +90,26 @@ export function TaxSettingsContent() {
 
   if (isLoading) return <SettingsLoadingSkeleton />
   if (!settings) return <SettingsLoadError onRetry={refetch} />
+  const loadedSettings = settings as CompanySettings & {
+    vat_liability_start_date?: string | null
+  }
 
   function handleSave(formData: FormData) {
     const vatRegistered = formData.get('vat_registered') === 'true'
     const paysSalaries = formData.get('pays_salaries') === 'true'
     const employerRegistered = formData.get('employer_registered') === 'true'
+    const liabilityStartInput = formData.get('vat_liability_start_date')
+    const storedLiabilityStart = loadedSettings.vat_liability_start_date
 
     const updates: Record<string, unknown> = {
       f_skatt: formData.get('f_skatt') === 'true',
       vat_registered: vatRegistered,
       vat_number: vatRegistered ? ((formData.get('vat_number') as string) || null) : null,
       moms_period: vatRegistered ? ((formData.get('moms_period') as string) || null) : null,
+      vat_liability_start_date:
+        typeof liabilityStartInput === 'string'
+          ? liabilityStartInput || null
+          : storedLiabilityStart ?? null,
       vat_taxable_base_over_40m:
         vatRegistered && formData.get('vat_taxable_base_over_40m') === 'true',
       vat_has_eu_trade: vatRegistered && formData.get('vat_has_eu_trade') === 'true',

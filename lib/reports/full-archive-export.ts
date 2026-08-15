@@ -859,6 +859,16 @@ export const MASTER_DATA_DUMP_TABLES: MasterDataTableSpec[] = [
     denormalize: { prefix: 'supplier_invoice_', columns: ['currency', 'exchange_rate'] },
   },
   { name: 'supplier_invoice_payments', file: 'supplier_invoice_payments.json' },
+  {
+    name: 'supplier_invoice_payment_history',
+    file: 'supplier_invoice_payment_history.json',
+    orderBy: 'reversed_at',
+  },
+  {
+    name: 'supplier_payment_reversals',
+    file: 'supplier_payment_reversals.json',
+    orderBy: 'applied_at',
+  },
   // Payment batches (betalfil): the immutable instruction snapshots a
   // generated bank payment file derives from; underlag for the payments it
   // initiated, so they leave with the archive.
@@ -913,6 +923,11 @@ export const MASTER_DATA_DUMP_TABLES: MasterDataTableSpec[] = [
   { name: 'webshop_orders', file: 'webshop_orders.json', orderBy: 'order_date' },
   { name: 'webshop_store_settings', file: 'webshop_store_settings.json' },
   { name: 'transaction_voucher_links', file: 'transaction_voucher_links.json' },
+  {
+    name: 'transaction_categorization_compensations',
+    file: 'transaction_categorization_compensations.json',
+    orderBy: 'applied_at',
+  },
   { name: 'bank_file_imports', file: 'bank_file_imports.json', orderBy: 'created_at' },
   { name: 'cash_accounts', file: 'cash_accounts.json' },
   { name: 'mapping_rules', file: 'mapping_rules.json' },
@@ -953,6 +968,16 @@ export const MASTER_DATA_DUMP_TABLES: MasterDataTableSpec[] = [
   { name: 'projects', file: 'projects.json', orderBy: 'created_at' },
   { name: 'account_dimension_rules', file: 'account_dimension_rules.json' },
   // Compliance records
+  {
+    name: 'accounting_publications',
+    file: 'accounting_publications.json',
+    orderBy: 'created_at',
+  },
+  {
+    name: 'accounting_publication_subscribers',
+    file: 'accounting_publication_subscribers.json',
+    orderBy: 'created_at',
+  },
   { name: 'voucher_gap_explanations', file: 'voucher_gap_explanations.json', orderBy: 'created_at' },
   // Inline rättelse trail (BFL 5 kap 5 § / 9 §): holds the struck original
   // lines and the old description/date, i.e. the preserved side of every

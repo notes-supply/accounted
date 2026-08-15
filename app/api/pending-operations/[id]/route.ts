@@ -4,9 +4,12 @@ import { ensureInitialized } from '@/lib/init'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { buildMappingResultFromCategory, getCategoryAccountMapping } from '@/lib/bookkeeping/category-mapping'
 import { applySettlementAccount } from '@/lib/bookkeeping/mapping-engine'
+import { applyAccountOverride } from '@/lib/bookkeeping/account-override'
 import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
 import { buildTransactionEntryLines } from '@/lib/bookkeeping/transaction-entries'
 import { getVatRate } from '@/lib/bookkeeping/vat-entries'
+import { resolveTransactionAmountSek } from '@/lib/transactions/booking-duplicate-detection'
+import { coerceDimensionsBag } from '@/lib/bookkeeping/dimension-resolver'
 import type { EntityType, Transaction, TransactionCategory, VatTreatment } from '@/types'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
 
@@ -36,6 +39,47 @@ const VAT_TREATMENTS = [
   'standard_25', 'reduced_12', 'reduced_6',
   'reverse_charge', 'export', 'exempt',
 ] as const satisfies readonly VatTreatment[]
+
+interface SettlementSnapshotLine {
+  account_number: string
+  debit_amount: number
+  credit_amount: number
+  line_description: string | null
+  dimensions: Record<string, string>
+}
+
+interface PendingSettlementSnapshot {
+  companyId: string
+  transactionId: string
+  expectedJournalEntryId: string | null
+  cashAccountId: string | null
+  settlementAccount: string
+  amountSek: number
+  category: TransactionCategory
+  isBusiness: boolean
+  lines: SettlementSnapshotLine[]
+}
+
+function canonicalDimensions(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter((entry): entry is [string, string] => typeof entry[1] === 'string')
+      .sort(([left], [right]) => left.localeCompare(right)),
+  )
+}
+
+function snapshotLines(
+  lines: ReturnType<typeof buildTransactionEntryLines>,
+): SettlementSnapshotLine[] {
+  return lines.map((line) => ({
+    account_number: line.account_number,
+    debit_amount: Math.round(line.debit_amount * 100) / 100,
+    credit_amount: Math.round(line.credit_amount * 100) / 100,
+    line_description: line.line_description ?? null,
+    dimensions: canonicalDimensions(line.dimensions),
+  }))
+}
 
 const PatchSchema = z
   .object({
@@ -170,16 +214,31 @@ export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
       )
     }
 
+    let settlementAccount: string
+    const accountOverride =
+      typeof oldParams.account_override === 'string'
+        ? oldParams.account_override
+        : undefined
     try {
-      const settlementAccount = await resolveSettlementAccount(
+      settlementAccount = await resolveSettlementAccount(
         supabase,
         companyId,
         (tx as Transaction).cash_account_id,
         log,
       )
       mapping = applySettlementAccount(mapping, settlementAccount)
+      if (accountOverride) {
+        mapping = await applyAccountOverride(
+          supabase,
+          companyId,
+          accountOverride,
+          (tx as Transaction).amount,
+          mapping,
+          newVatTreatment != null || newVatAmount != null,
+        )
+      }
     } catch (err) {
-      log.error('pending-operation edit: settlement account lookup failed', err as Error, {
+      log.error('pending-operation edit: settlement snapshot resolution failed', err as Error, {
         operationId: id,
         transactionId: txId,
       })
@@ -196,33 +255,67 @@ export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
       )
     }
 
+    const amountSek = resolveTransactionAmountSek(tx as Transaction)
+    if (amountSek === null) {
+      return NextResponse.json(
+        {
+          error:
+            'Transaktionen saknar ett verifierat SEK-belopp. Uppdatera växelkursen och stagea om kategoriseringen.',
+        },
+        { status: 409 },
+      )
+    }
+
+    const dimensions = coerceDimensionsBag(oldParams.dimensions)
+    if (dimensions && Object.keys(dimensions).length > 0) {
+      mapping.dimensions = dimensions
+    }
+    const lines = snapshotLines(buildTransactionEntryLines(tx as Transaction, mapping))
+    const settlementSnapshot: PendingSettlementSnapshot = {
+      companyId,
+      transactionId: txId,
+      expectedJournalEntryId: (tx as Transaction).journal_entry_id ?? null,
+      cashAccountId: (tx as Transaction).cash_account_id ?? null,
+      settlementAccount,
+      amountSek,
+      category: newCategory,
+      isBusiness,
+      lines,
+    }
     const oldPreview = (op.preview_data as Record<string, unknown>) ?? {}
     const newPreview = {
-      ...oldPreview,
       debit_account: mapping.debit_account,
       credit_account: mapping.credit_account,
+      ...(accountOverride ? { account_override: accountOverride } : {}),
       amount: Math.abs((tx as Transaction).amount),
       currency: (tx as Transaction).currency,
-      // Re-derive the exact journal lines (net cost line, VAT, gross bank):
-      // spreading oldPreview would otherwise leave stale lines from staging.
-      lines: buildTransactionEntryLines(tx as Transaction, mapping).map((l) => ({
-        account_number: l.account_number,
-        debit_amount: l.debit_amount,
-        credit_amount: l.credit_amount,
-        description: l.line_description ?? '',
-      })),
-      vat_lines: (mapping.vat_lines ?? []).map((v) => ({
-        account: v.account_number,
-        amount: v.debit_amount || v.credit_amount,
+      lines,
+      vat_lines: (mapping.vat_lines ?? []).map((vatLine) => ({
+        account: vatLine.account_number,
+        amount: vatLine.debit_amount || vatLine.credit_amount,
       })),
       category: newCategory,
+      settlement_snapshot: settlementSnapshot,
+      ...(oldPreview.underlag !== undefined ? { underlag: oldPreview.underlag } : {}),
+      ...(dimensions ? { dimensions } : {}),
+      ...(oldPreview.dimension_resolutions !== undefined
+        ? { dimension_resolutions: oldPreview.dimension_resolutions }
+        : {}),
     }
 
     const newParams = {
-      ...oldParams,
+      transaction_id: txId,
       category: newCategory,
       vat_treatment: newVatTreatment ?? null,
       vat_amount: newVatAmount,
+      account_override: accountOverride ?? null,
+      notes:
+        typeof oldParams.notes === 'string' && oldParams.notes.trim().length > 0
+          ? oldParams.notes.trim()
+          : null,
+      allow_duplicate: oldParams.allow_duplicate === true,
+      ...(dimensions ? { dimensions } : {}),
+      settlement_snapshot: settlementSnapshot,
     }
 
     const { data: updated, error } = await supabase
@@ -230,9 +323,16 @@ export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
       .update({ params: newParams, preview_data: newPreview })
       .eq('id', id)
       .eq('company_id', companyId)
+      .eq('status', 'pending')
       .select('id, params, preview_data, title, status')
-      .single()
+      .maybeSingle()
     if (error) return NextResponse.json({ error: getUserErrorMessage(error) }, { status: 500 })
+    if (!updated) {
+      return NextResponse.json(
+        { error: 'Operationen ändrades eller godkändes samtidigt. Ladda om innan du försöker igen.' },
+        { status: 409 },
+      )
+    }
 
     return NextResponse.json({ data: updated })
   },

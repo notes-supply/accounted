@@ -24,6 +24,7 @@ import {
   insertCompany,
   insertFiscalPeriod,
   insertPostedJournalEntry as insertAtomicPostedJournalEntry,
+  insertReversedJournalEntryGraph,
   insertTransaction,
 } from './fixtures'
 
@@ -116,17 +117,22 @@ describe('get_account_gl_lines_for_matching RPC: N:1 candidates', () => {
       userId, companyId, fiscalPeriodId,
       entryDate: '2026-01-01', sourceType: 'opening_balance', voucherNumber: 1, amount: 50000,
     })
-    await insertPostedJournalEntry({
-      userId, companyId, fiscalPeriodId,
-      entryDate: '2026-05-02', sourceType: 'storno', voucherNumber: 2, amount: 25000,
-    })
-    await insertPostedJournalEntry({
-      userId, companyId, fiscalPeriodId,
-      entryDate: '2026-05-02', sourceType: 'correction', voucherNumber: 3, amount: 25000,
+    await insertReversedJournalEntryGraph({
+      userId,
+      companyId,
+      fiscalPeriodId,
+      entryDate: '2026-05-02',
+      voucherNumber: 2,
+      description: 'Corrected bank posting',
+      lines: [
+        { accountNumber: '1930', debitAmount: 25000, creditAmount: 0 },
+        { accountNumber: '2091', debitAmount: 0, creditAmount: 25000 },
+      ],
+      correction: { voucherNumber: 4 },
     })
     const bankEntry = await insertPostedJournalEntry({
       userId, companyId, fiscalPeriodId,
-      entryDate: '2026-05-03', sourceType: 'bank_transaction', voucherNumber: 4, amount: 1500,
+      entryDate: '2026-05-03', sourceType: 'bank_transaction', voucherNumber: 5, amount: 1500,
     })
 
     const { rows } = await getPool().query(

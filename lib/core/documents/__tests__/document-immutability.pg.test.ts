@@ -3,10 +3,11 @@ import { describe, expect, it } from 'vitest'
 import { getPool, withUserContext } from '@/tests/pg/setup'
 import {
   insertAuthUser,
-  insertBalancedLines,
   insertCompany,
   insertCompanyMember,
   insertDraftJournalEntry,
+  insertPostedJournalEntry,
+  insertReversedJournalEntryGraph,
   seedCompany,
 } from '@/tests/pg/fixtures'
 
@@ -51,9 +52,8 @@ async function insertDocument(params: {
   return id
 }
 
-// Insert a draft, balance it, and walk through the legal state-machine
-// transitions to land on the requested status. enforce_journal_entry_immutability
-// only allows draft→posted and posted→reversed, so the path matters.
+// Insert a complete durable state for the requested status. Reversed entries
+// always include their posted storno and reciprocal reverse pointer.
 async function insertEntryAtStatus(params: {
   userId: string
   companyId: string
@@ -61,24 +61,11 @@ async function insertEntryAtStatus(params: {
   voucherNumber: number
   status?: 'posted' | 'reversed'
 }): Promise<string> {
-  const entryId = await insertDraftJournalEntry({
-    userId: params.userId,
-    companyId: params.companyId,
-    fiscalPeriodId: params.fiscalPeriodId,
-    voucherNumber: params.voucherNumber,
-  })
-  await insertBalancedLines(entryId)
-  await getPool().query(
-    `UPDATE public.journal_entries SET status = 'posted' WHERE id = $1`,
-    [entryId],
-  )
   if (params.status === 'reversed') {
-    await getPool().query(
-      `UPDATE public.journal_entries SET status = 'reversed' WHERE id = $1`,
-      [entryId],
-    )
+    const { originalId } = await insertReversedJournalEntryGraph(params)
+    return originalId
   }
-  return entryId
+  return insertPostedJournalEntry(params)
 }
 
 describe('document-immutability.pg: BFL retention bypass guards', () => {

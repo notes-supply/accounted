@@ -490,6 +490,45 @@ export function getErrorMessage(
         return 'Verifikationen kunde inte sparas. Försök igen.'
       }
 
+      if (structured.code === 'AMBIGUOUS_JOURNAL_COMMIT') {
+        const details = structured.details as
+          | { journal_entry_id?: string; voucher_number?: number | null }
+          | undefined
+        const identity = details?.journal_entry_id
+          ? ` Verifikations-id: ${details.journal_entry_id}.`
+          : ''
+        return `Det går inte att fastställa om verifikationen bokfördes. Bokför inte samma händelse igen innan utfallet har kontrollerats.${identity}`
+      }
+
+      if (
+        structured.code === 'DURABLE_ACCOUNTING_PARTIAL' ||
+        structured.code === 'DURABLE_ACCOUNTING_IDENTITY_INVALID' ||
+        structured.code === 'DURABLE_ACCOUNTING_CONFLICT'
+      ) {
+        const details = structured.details as
+          | {
+              original_journal_entry_id?: string
+              reversal_journal_entry_id?: string | null
+            }
+          | undefined
+        const ids = [
+          details?.original_journal_entry_id,
+          details?.reversal_journal_entry_id,
+        ].filter((id): id is string => typeof id === 'string' && id.length > 0)
+        const identity = ids.length > 0 ? ` Verifikations-id: ${ids.join(', ')}.` : ''
+        if (structured.code === 'DURABLE_ACCOUNTING_CONFLICT') {
+          return `Den bokförda återställningen stämmer inte med den begärda händelsen.${identity}`
+        }
+        if (structured.code === 'DURABLE_ACCOUNTING_PARTIAL') {
+          return `En del av bokföringen är redan beständig. Bokför inte händelsen igen.${identity}`
+        }
+        return `Bokföringen sparades men dess beständiga identiteter kunde inte verifieras. Försök samma idempotenta återställningsanrop igen.${identity}`
+      }
+
+      if (structured.code === 'SUPPLIER_PAYMENT_ACCOUNTING_CHANGED') {
+        return 'En betalning av en leverantörsfaktura får bara rättas genom datum eller beskrivning. Belopp, konton, valuta, momskod och dimensioner måste vara oförändrade.'
+      }
+
       if (locale === 'en' && typeof structured.message_en === 'string' && structured.message_en.trim()) {
         return structured.message_en
       }

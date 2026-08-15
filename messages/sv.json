@@ -2319,6 +2319,8 @@
     "period_quarterly": "Kvartal",
     "period_yearly": "År",
     "moms_period_help": "Enligt beslut från Skatteverket.",
+    "vat_liability_start_label": "Startdatum för momsskyldighet",
+    "vat_liability_start_help": "Ange datumet i företagets beslut om momsregistrering. Händelser före datumet tas inte med i momsdeklarationen.",
     "vat_taxable_base_over_40m_label": "Beskattningsunderlag för moms över 40 miljoner kronor per år",
     "vat_taxable_base_over_40m_help": "Kräver månadsmoms och flyttar deklarationsdagen för både moms och arbetsgivardeklaration till den 26:e. Avdragen skatt och arbetsgivaravgifter ska ändå vara betalda den 12:e. Markera även rutan om Skatteverket har beslutat att företaget ska deklarera enligt dessa tidpunkter trots lägre underlag.",
     "vat_has_eu_trade_label": "Handel med andra EU-länder",

@@ -319,6 +319,60 @@ describe('GET /api/v1/companies/:companyId/supplier-invoices/:id', () => {
     expect(siSelect).toBeDefined()
     expect(siSelect!.columns).toMatch(/items:supplier_invoice_items\([^)]*apply_slp/)
   })
+  it('?expand=payments returns active and retained reversal metadata', async () => {
+    const activePayment = {
+      id: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+      payment_date: '2026-05-20',
+      amount: 500,
+      currency: 'SEK',
+      exchange_rate: null,
+      exchange_rate_difference: null,
+      journal_entry_id: JE_ID,
+      transaction_id: null,
+      notes: null,
+      created_at: '2026-05-20T10:00:00Z',
+    }
+    const retainedPayment = {
+      ...activePayment,
+      id: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
+      reversed_at: '2026-05-22T10:00:00Z',
+      reversed_by_journal_entry_id: '99999999-9999-4999-8999-999999999999',
+    }
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        supplier_invoices: {
+          data: { ...SAMPLE_SI, payments: [activePayment] },
+          error: null,
+        },
+        supplier_invoice_payment_history: { data: [retainedPayment], error: null },
+      }),
+    )
+
+    const res = await getSI(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/supplier-invoices/${SI_ID}?expand=payments`,
+      ),
+      detailParams(COMPANY_ID, SI_ID),
+    )
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.data.payments).toEqual([
+      expect.objectContaining({
+        id: activePayment.id,
+        retained: false,
+        reversed_at: null,
+        reversed_by_journal_entry_id: null,
+      }),
+      expect.objectContaining({
+        id: retainedPayment.id,
+        retained: true,
+        reversed_at: retainedPayment.reversed_at,
+        reversed_by_journal_entry_id: retainedPayment.reversed_by_journal_entry_id,
+      }),
+    ])
+  })
+
 })
 
 describe('POST /api/v1/companies/:companyId/supplier-invoices', () => {

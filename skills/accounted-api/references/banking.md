@@ -281,7 +281,7 @@ Resolves the BAS account mapping for the transaction (via category, booking temp
 
 **Pitfalls:**
 - A bank payment that looks like an invoice payment will be flagged via TX_CATEGORIZE_SUGGEST_SI_MATCH: pass `confirm_no_match: true` to override and force-categorize as direct expense (e.g. when the supplier invoice was already booked).
-- Already-categorized fast path: if the transaction already has a journal_entry_id, only flags get updated. The JE is immutable post-commit.
+- Already-categorized fast path: a live journal_entry_id succeeds only when its immutable settlement snapshot exactly matches the request.
 - account_override must exist in the chart of accounts; an unknown account returns TX_CATEGORIZE_INVALID_ACCOUNT.
 
 | Parameter | In | Type | Required | Notes |

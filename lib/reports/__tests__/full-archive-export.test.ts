@@ -119,6 +119,7 @@ describe('generateFullArchive', () => {
   let supabase: ReturnType<typeof createQueuedMockSupabase>['supabase']
   let enqueueMany: ReturnType<typeof createQueuedMockSupabase>['enqueueMany']
   let findCall: ReturnType<typeof createQueuedMockSupabase>['findCall']
+  let findCalls: (table: string, method: string) => unknown[][]
 
   beforeEach(() => {
     vi.clearAllMocks()
@@ -127,6 +128,7 @@ describe('generateFullArchive', () => {
     supabase = mock.supabase
     enqueueMany = mock.enqueueMany
     findCall = mock.findCall
+    findCalls = mock.findCalls
   })
 
   describe('scope: period', () => {
@@ -605,12 +607,98 @@ describe('generateFullArchive', () => {
         created_at: '2024-11-01T09:55:00Z',
       }
 
+      const accountingPublication = {
+        id: 'publication-1',
+        company_id: 'company-1',
+        publication_key: 'journal-entry:entry-1:committed',
+        event_type: 'journal_entry.committed',
+        entity_id: 'entry-1',
+        user_id: 'user-1',
+        payload: { journal_entry_id: 'entry-1' },
+        subscriber_count: 1,
+        event_log_sequence: 42,
+        created_at: '2024-11-02T10:00:00Z',
+        published_at: '2024-11-02T10:00:01Z',
+      }
+      const accountingPublicationSubscriber = {
+        id: 'subscriber-1',
+        publication_id: accountingPublication.id,
+        company_id: 'company-1',
+        webhook_id: 'webhook-1',
+        api_version: '2026-08-15',
+        created_at: '2024-11-02T10:00:00Z',
+      }
+      const supplierPaymentHistory = {
+        id: 'supplier-payment-1',
+        original_payment_id: 'supplier-payment-1',
+        company_id: 'company-1',
+        supplier_invoice_id: 'supplier-invoice-1',
+        allocation_owner_user_id: 'user-1',
+        payment_date: '2024-10-31',
+        amount: 1250.75,
+        currency: 'EUR',
+        exchange_rate: 11.25,
+        exchange_rate_difference: -3.5,
+        payment_exchange_rate: 11.22,
+        journal_entry_id: 'entry-1',
+        transaction_id: 'transaction-1',
+        notes: 'Partial allocation before reversal',
+        allocation_created_at: '2024-10-31T12:00:00Z',
+        lineage_root_journal_entry_id: 'entry-root',
+        reversed_live_journal_entry_id: 'entry-live',
+        reversed_by_journal_entry_id: 'entry-storno',
+        reversal_command_id: 'supplier-reversal-1',
+        reversed_at: '2024-11-02T11:00:00Z',
+        reversal_actor_type: 'user',
+        reversal_actor_id: 'user-2',
+        reversal_actor_label: 'Reviewer',
+      }
+      const supplierPaymentReversal = {
+        id: 'supplier-reversal-1',
+        company_id: 'company-1',
+        requested_journal_entry_id: 'entry-1',
+        root_journal_entry_id: 'entry-root',
+        allocation_owner_journal_entry_id: 'entry-1',
+        live_journal_entry_id: 'entry-live',
+        reversal_journal_entry_id: 'entry-storno',
+        reversal_date: '2024-11-02',
+        reversal_fiscal_period_id: PERIOD_2024.id,
+        publication_user_id: 'user-1',
+        actor_type: 'user',
+        actor_id: 'user-2',
+        actor_label: 'Reviewer',
+        allocation_count: 1,
+        committed_publication_id: 'publication-1',
+        reversed_publication_id: 'publication-2',
+        applied_at: '2024-11-02T11:00:00Z',
+      }
+      const categorizationCompensation = {
+        id: 'compensation-1',
+        company_id: 'company-1',
+        transaction_id: 'transaction-1',
+        root_journal_entry_id: 'entry-root',
+        original_journal_entry_id: 'entry-1',
+        reversal_journal_entry_id: 'entry-storno',
+        publication_user_id: 'user-1',
+        actor_type: 'user',
+        actor_id: 'user-2',
+        actor_label: 'Reviewer',
+        committed_publication_id: 'publication-1',
+        reversed_publication_id: 'publication-2',
+        applied_at: '2024-11-02T11:00:00Z',
+      }
+
       // Master-data dump runs sequentially over MASTER_DATA_DUMP_TABLES.
       // Direct tables issue one query; via-tables issue a parent-id query and,
       // when parents exist, one chunked child query.
       const masterDataQueue = buildMasterDataQueue({
         direct: {
           customers: [{ id: 'cust-1', name: 'Acme AB' }],
+          accounting_publications: [accountingPublication],
+          accounting_publication_subscribers: [accountingPublicationSubscriber],
+          supplier_invoice_payment_history: [supplierPaymentHistory],
+          supplier_payment_reversals: [supplierPaymentReversal],
+          transaction_categorization_compensations: [categorizationCompensation],
           company_settings: [COMPANY_ROW],
         },
         via: {
@@ -655,6 +743,45 @@ describe('generateFullArchive', () => {
 
       const customers = JSON.parse(await zip.file('data/customers.json')!.async('text'))
       expect(customers).toEqual([{ id: 'cust-1', name: 'Acme AB' }])
+
+      expect(
+        JSON.parse(await zip.file('data/accounting_publications.json')!.async('text'))
+      ).toEqual([accountingPublication])
+      expect(
+        JSON.parse(
+          await zip.file('data/accounting_publication_subscribers.json')!.async('text')
+        )
+      ).toEqual([accountingPublicationSubscriber])
+      expect(
+        JSON.parse(
+          await zip.file('data/supplier_invoice_payment_history.json')!.async('text')
+        )
+      ).toEqual([supplierPaymentHistory])
+      expect(
+        JSON.parse(await zip.file('data/supplier_payment_reversals.json')!.async('text'))
+      ).toEqual([supplierPaymentReversal])
+      expect(
+        JSON.parse(
+          await zip
+            .file('data/transaction_categorization_compensations.json')!
+            .async('text')
+        )
+      ).toEqual([categorizationCompensation])
+
+      for (const [table, orderBy] of [
+        ['accounting_publications', 'created_at'],
+        ['accounting_publication_subscribers', 'created_at'],
+        ['supplier_invoice_payment_history', 'reversed_at'],
+        ['supplier_payment_reversals', 'applied_at'],
+        ['transaction_categorization_compensations', 'applied_at'],
+      ] as const) {
+        expect(findCall(table, 'select')).toEqual(['*'])
+        expect(findCall(table, 'eq')).toEqual(['company_id', 'company-1'])
+        expect(findCalls(table, 'order')).toEqual([
+          [orderBy, { ascending: true }],
+          ['id', { ascending: true }],
+        ])
+      }
 
       // Child table fetched via parent ids (invoice_items has no company_id).
       // A SEK company's rows are unchanged apart from the appended unit.

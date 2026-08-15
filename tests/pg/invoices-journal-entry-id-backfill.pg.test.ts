@@ -2,7 +2,11 @@ import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { seedCompany, insertDraftJournalEntry } from '@/tests/pg/fixtures'
+import {
+  insertDraftJournalEntry,
+  insertReversedJournalEntryGraph,
+  seedCompany,
+} from '@/tests/pg/fixtures'
 import { getPool } from '@/tests/pg/setup'
 
 /**
@@ -125,11 +129,10 @@ describe('invoices.journal_entry_id backfill: Pass 1 (registration entries)', ()
   it('skips reversed and draft registration entries (invoice stays NULL)', async () => {
     const { userId, companyId, fiscalPeriodId } = await seedCompany()
     const invoiceId = await insertInvoice({ userId, companyId })
-    await insertDraftJournalEntry({
+    await insertReversedJournalEntryGraph({
       userId,
       companyId,
       fiscalPeriodId,
-      status: 'reversed',
       sourceType: 'invoice_created',
       sourceId: invoiceId,
     })

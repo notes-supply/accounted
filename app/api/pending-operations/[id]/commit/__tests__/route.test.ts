@@ -5,7 +5,6 @@ import {
   parseJsonResponse,
   createQueuedMockSupabase,
   makeTransaction,
-  makeCompanySettings,
 } from '@/tests/helpers'
 import { eventBus } from '@/lib/events/bus'
 import { AccountsNotInChartError } from '@/lib/bookkeeping/errors'
@@ -25,16 +24,39 @@ vi.mock('@/lib/auth/require-write', () => ({
   requireWritePermission: vi.fn().mockResolvedValue({ ok: true }),
 }))
 
-// Mock the counterparty templates (non-critical side effect)
-vi.mock('@/lib/bookkeeping/counterparty-templates', () => ({
-  upsertCounterpartyTemplate: vi.fn().mockResolvedValue(undefined),
-}))
+const mockCategorizeMatchedTransaction = vi.fn()
+vi.mock('@/lib/transactions/categorize-core', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>()
+  return {
+    ...actual,
+    categorizeMatchedTransaction: (...args: unknown[]) =>
+      mockCategorizeMatchedTransaction(...args),
+  }
+})
 
-// Mock createTransactionJournalEntry
-const mockCreateJournalEntry = vi.fn()
-vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
-  createTransactionJournalEntry: (...args: unknown[]) => mockCreateJournalEntry(...args),
-}))
+const canonicalLines = [
+  {
+    account_number: '6110',
+    debit_amount: 500,
+    credit_amount: 0,
+    line_description: 'Test',
+    dimensions: {},
+  },
+  {
+    account_number: '1930',
+    debit_amount: 0,
+    credit_amount: 500,
+    line_description: 'Test',
+    dimensions: {},
+  },
+]
+vi.mock('@/lib/bookkeeping/transaction-entries', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>()
+  return {
+    ...actual,
+    buildTransactionEntryLines: vi.fn(() => canonicalLines),
+  }
+})
 
 // Mock VAT validation
 vi.mock('@/lib/vat/vies-client', () => ({
@@ -58,7 +80,9 @@ describe('POST /api/pending-operations/:id/commit', () => {
     eventBus.clear()
     reset()
     mockSupabase.auth.getUser.mockResolvedValue({ data: { user: mockUser } })
-    mockCreateJournalEntry.mockResolvedValue({ id: 'je-1' })
+    mockCategorizeMatchedTransaction.mockResolvedValue({
+      data: { journal_entry_id: 'je-1' },
+    })
   })
 
   it('returns 401 when not authenticated', async () => {
@@ -106,6 +130,18 @@ describe('POST /api/pending-operations/:id/commit', () => {
   })
 
   describe('categorize_transaction', () => {
+    const settlementSnapshot = {
+      companyId: 'company-1',
+      transactionId: 'tx-1',
+      expectedJournalEntryId: null,
+      cashAccountId: null,
+      settlementAccount: '1930',
+      amountSek: 500,
+      category: 'expense_office',
+      isBusiness: true,
+      lines: canonicalLines,
+    }
+
     const pendingOp = {
       id: 'op-1',
       user_id: 'user-1',
@@ -116,23 +152,19 @@ describe('POST /api/pending-operations/:id/commit', () => {
         transaction_id: 'tx-1',
         category: 'expense_office',
         vat_treatment: null,
+        settlement_snapshot: settlementSnapshot,
       },
       preview_data: {},
     }
 
     it('commits successfully', async () => {
       const tx = makeTransaction({ id: 'tx-1', amount: -500, journal_entry_id: null })
-      const settings = makeCompanySettings()
 
       enqueueMany([
         { data: pendingOp },                         // fetch pending op
         { data: { id: 'op-1' } },                    // CAS claim
-        { data: tx },                                 // fetch transaction
-        { data: settings },                           // fetch company settings
-        { data: [{ id: 'fp-1' }] },                  // fiscal period check
-        { data: null, error: null },                  // update transaction
-        { data: null, error: null },                  // upsert counterparty template
-        { data: null, error: null },                  // update pending op status
+        { data: tx },                                // verify approved settlement snapshot
+        { data: null, error: null },                 // update pending op status
       ])
 
       const request = createMockRequest('/api/pending-operations/op-1/commit', { method: 'POST' })
@@ -141,7 +173,53 @@ describe('POST /api/pending-operations/:id/commit', () => {
 
       expect(status).toBe(200)
       expect(body.data.journal_entry_id).toBe('je-1')
-      expect(mockCreateJournalEntry).toHaveBeenCalledTimes(1)
+      expect(mockCategorizeMatchedTransaction).toHaveBeenCalledTimes(1)
+      expect(mockCategorizeMatchedTransaction).toHaveBeenCalledWith(
+        expect.anything(),
+        'user-1',
+        'company-1',
+        'tx-1',
+        expect.objectContaining({
+          approvedSettlementSnapshot: settlementSnapshot,
+        }),
+      )
+    })
+
+    it('rejects when the linked cash account resolves to a different ledger at commit', async () => {
+      const tx = makeTransaction({
+        id: 'tx-1',
+        amount: -500,
+        cash_account_id: 'cash-1',
+        journal_entry_id: null,
+      })
+      const driftedOp = {
+        ...pendingOp,
+        params: {
+          ...pendingOp.params,
+          settlement_snapshot: {
+            ...settlementSnapshot,
+            cashAccountId: 'cash-1',
+            settlementAccount: '1931',
+          },
+        },
+      }
+
+      enqueueMany([
+        { data: driftedOp },                         // fetch pending op
+        { data: { id: 'op-1' } },                   // CAS claim
+        { data: tx },                                // verify approved settlement snapshot
+        { data: { entity_type: 'aktiebolag' } },      // current mapping settings
+        { data: { ledger_account: '1932' } },        // current linked cash-account ledger
+        { data: null, error: null },                 // auto-reject update
+      ])
+
+      const request = createMockRequest('/api/pending-operations/op-1/commit', { method: 'POST' })
+      const response = await POST(request, routeParams)
+      const { status, body } = await parseJsonResponse<{ error: string }>(response)
+
+      expect(status).toBe(409)
+      expect(body.error).toBe('En konflikt uppstod. Ladda om sidan och försök igen.')
+      expect(mockCategorizeMatchedTransaction).not.toHaveBeenCalled()
     })
 
     it('returns the structured ACCOUNTS_NOT_IN_CHART envelope when the chart lacks accounts', async () => {
@@ -152,16 +230,15 @@ describe('POST /api/pending-operations/:id/commit', () => {
       // with code + account_numbers so the chat can offer activation: NOT a
       // raw error string.
       const tx = makeTransaction({ id: 'tx-1', amount: -500, journal_entry_id: null })
-      const settings = makeCompanySettings()
-      mockCreateJournalEntry.mockRejectedValueOnce(new AccountsNotInChartError(['2645', '2614']))
+      mockCategorizeMatchedTransaction.mockRejectedValueOnce(
+        new AccountsNotInChartError(['2645', '2614']),
+      )
 
       enqueueMany([
         { data: pendingOp },                         // route fetch op
-        { data: { id: 'op-1' } },                    // CAS claim (pending -> committing)
-        { data: tx },                                 // fetch transaction
-        { data: settings },                           // fetch company settings
-        { data: [{ id: 'fp-1' }] },                  // fiscal period exists
-        { data: null, error: null },                  // dispatcher releases op back to 'pending'
+        { data: { id: 'op-1' } },                    // CAS claim
+        { data: tx },                                // verify approved settlement snapshot
+        { data: null, error: null },                 // release op back to pending
       ])
 
       const request = createMockRequest('/api/pending-operations/op-1/commit', { method: 'POST' })
@@ -177,13 +254,32 @@ describe('POST /api/pending-operations/:id/commit', () => {
     })
 
     it('returns 409 when transaction already categorized', async () => {
-      const tx = makeTransaction({ id: 'tx-1', journal_entry_id: 'existing-je' })
+      const existingJournalEntryId = '33333333-3333-4333-8333-333333333333'
+      const tx = makeTransaction({
+        id: 'tx-1',
+        amount: -500,
+        journal_entry_id: existingJournalEntryId,
+      })
+      mockCategorizeMatchedTransaction.mockResolvedValueOnce({
+        error: 'Transaction already has a journal entry: it was categorized in the meantime.',
+        status: 409,
+      })
 
       enqueueMany([
-        { data: pendingOp },                         // fetch pending op
+        {
+          data: {
+            ...pendingOp,
+            params: {
+              ...pendingOp.params,
+              settlement_snapshot: {
+                ...settlementSnapshot,
+                expectedJournalEntryId: existingJournalEntryId,
+              },
+            },
+          },
+        },                                            // fetch pending op
         { data: { id: 'op-1' } },                    // CAS claim
-        { data: tx },                                 // fetch transaction (already has JE)
-        { data: { status: 'posted' } },              // hasLiveJournalEntryLink: existing JE is live
+        { data: tx },                                 // verify approved settlement snapshot
         { data: null, error: null },                  // auto-reject update
       ])
 

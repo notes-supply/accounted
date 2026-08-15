@@ -10,6 +10,7 @@ import { ensureSandboxAgentProfile } from '@/lib/sandbox/ensure-agent'
 import { encryptPersonnummer } from '@/lib/salary/personnummer'
 import { getBASReference } from '@/lib/bookkeeping/bas-reference'
 import { markEntriesNoDocRequired } from '@/lib/bookkeeping/no-doc-required'
+import { createJournalEntry } from '@/lib/bookkeeping/engine'
 import { buildSandboxCustomers } from './customers'
 import { buildSandboxPendingOperations } from './pending-operations'
 import { buildSandboxArticles } from './articles'
@@ -482,11 +483,8 @@ export async function POST(request: Request) {
     // line: Resultatrapport, Balansrapport, Nyckeltal and Momsrapport all read
     // as broken rather than empty.
     //
-    // Seeded BEFORE the invoice and payroll vouchers below on purpose.
-    // next_voucher_number hands out numbers in call order, so seeding January
-    // last would have produced A-1 dated in July followed by A-3 dated in
-    // January: a gap-free sequence that runs backwards through the year, which
-    // is not what BFNAR 2013:2 means by a chronological verifikationsserie.
+    // Seed history before the current invoice and payroll vouchers so the
+    // engine assigns the A-series numbers in chronological order.
     const ledgerHistory = buildSandboxLedgerHistory({
       userId,
       companyId,
@@ -495,78 +493,31 @@ export async function POST(request: Request) {
       accountMap,
     })
 
-    // One RPC per voucher: next_voucher_number is a counter table with a row
-    // lock (not MAX+1), so sequential calls are safe and gap-free. The two
-    // writes are batched rather than run per entry, which is what turns ~130
-    // round trips into ~45 for a seed that runs on every sandbox visit.
-    const historyVoucherNumbers: number[] = []
-    for (const historyEntry of ledgerHistory.entries) {
-      const { data: historyVoucherNumber, error: historyVoucherError } = await supabase.rpc(
-        'next_voucher_number',
+    const historyEntryIds: string[] = []
+    for (const [index, historyEntry] of ledgerHistory.entries.entries()) {
+      const entry = await createJournalEntry(
+        supabase,
+        companyId,
+        userId,
         {
-          p_company_id: companyId,
-          p_fiscal_period_id: fiscalPeriod.id,
-          p_series: historyEntry.voucher_series,
+          fiscal_period_id: historyEntry.fiscal_period_id,
+          entry_date: historyEntry.entry_date,
+          description: historyEntry.description,
+          source_type: 'manual',
+          source_id: historyEntry.source_id ?? undefined,
+          voucher_series: historyEntry.voucher_series,
+          lines: ledgerHistory.linesByEntryIndex[index].map(line => ({
+            account_number: line.account_number,
+            debit_amount: line.debit_amount,
+            credit_amount: line.credit_amount,
+            line_description: line.line_description,
+            dimensions: line.dimensions,
+          })),
         },
+        'sandbox_seed',
       )
-      if (historyVoucherError) throw historyVoucherError
-      historyVoucherNumbers.push(historyVoucherNumber as number)
+      historyEntryIds.push(entry.id)
     }
-
-    // Inserted as draft and posted after the lines land: PostgREST autocommits
-    // each request, and check_balance_on_posted_insert (migration
-    // 20260806130000) rejects a posted header whose transaction carries no
-    // lines. The draft-to-posted UPDATE below fires check_balance_on_post
-    // against the finished verifikat instead.
-    //
-    // committed_at note: this route runs under the requester's authenticated
-    // client, and set_committed_at() (migration 20260806160000) preserves a
-    // preset committed_at only for trusted roles, so any backdated
-    // committed_at supplied here is overwritten with now() at posting. That
-    // is deliberate: an end-user role must never control the audit timestamp,
-    // and sandbox companies are disposable.
-    const { data: insertedHistoryEntries, error: historyEntryError } = await supabase
-      .from('journal_entries')
-      .insert(
-        ledgerHistory.entries.map((historyEntry, index) => ({
-          ...historyEntry,
-          voucher_number: historyVoucherNumbers[index],
-          status: 'draft',
-        })),
-      )
-      .select('id, voucher_number')
-    if (historyEntryError) throw historyEntryError
-
-    // Match on voucher_number, not on array position: PostgREST does not
-    // promise the returned rows come back in insertion order, and
-    // (company_id, fiscal_period_id, voucher_series, voucher_number) is unique.
-    const historyIdByVoucher = new Map(
-      (insertedHistoryEntries ?? []).map(row => [row.voucher_number as number, row.id as string]),
-    )
-
-    const historyEntryIds = historyVoucherNumbers.map(voucherNumber => {
-      const entryId = historyIdByVoucher.get(voucherNumber)
-      if (!entryId) {
-        throw new Error(`Sandbox seed: ledger history voucher ${voucherNumber} was not inserted`)
-      }
-      return entryId
-    })
-
-    const { error: historyLinesError } = await supabase
-      .from('journal_entry_lines')
-      .insert(
-        ledgerHistory.linesByEntryIndex.flatMap((lines, index) =>
-          lines.map(line => ({ ...line, journal_entry_id: historyEntryIds[index] })),
-        ),
-      )
-    if (historyLinesError) throw historyLinesError
-
-    const { error: historyPostError } = await supabase
-      .from('journal_entries')
-      .update({ status: 'posted' })
-      .in('id', historyEntryIds)
-      .eq('company_id', companyId)
-    if (historyPostError) throw historyPostError
 
     // The history is the company's books from before it arrived in Accounted:
     // its kvitton live in the previous system's binder, not here. Left
@@ -584,131 +535,71 @@ export async function POST(request: Request) {
       'Historisk bokföring: underlag arkiverade i det tidigare systemet.',
     )
 
-    // 10. Invoice vouchers (inserted directly, not via engine, to avoid event emission)
-    const { data: voucherNum1 } = await supabase.rpc('next_voucher_number', {
-      p_company_id: companyId,
-      p_fiscal_period_id: fiscalPeriod.id,
-      p_series: 'A',
-    })
-
-    const { data: je1, error: je1Error } = await supabase
-      .from('journal_entries')
-      .insert({
-        user_id: userId,
-        company_id: companyId,
+    // 10. Invoice vouchers
+    const revenueDims = { '1': 'BUTIK', '6': 'P001' }
+    await createJournalEntry(
+      supabase,
+      companyId,
+      userId,
+      {
         fiscal_period_id: fiscalPeriod.id,
-        voucher_number: voucherNum1 ?? 1,
-        voucher_series: 'A',
         entry_date: toDateStr(thirtyDaysAgo),
         description: 'Faktura F-2026001, Björk & Partner AB',
         source_type: 'invoice_created',
         source_id: invoiceMap['F-2026001'],
-        // Draft until the lines exist; see the ledger-history comment above.
-        status: 'draft',
-        committed_at: toDateStr(thirtyDaysAgo),
-      })
-      .select('id')
-      .single()
-
-    if (je1Error) throw je1Error
-
-    const { data: voucherNum2 } = await supabase.rpc('next_voucher_number', {
-      p_company_id: companyId,
-      p_fiscal_period_id: fiscalPeriod.id,
-      p_series: 'A',
-    })
-
-    const { data: je2, error: je2Error } = await supabase
-      .from('journal_entries')
-      .insert({
-        user_id: userId,
-        company_id: companyId,
-        fiscal_period_id: fiscalPeriod.id,
-        voucher_number: voucherNum2 ?? 2,
         voucher_series: 'A',
+        lines: [
+          {
+            account_number: '1510',
+            debit_amount: 18750,
+            credit_amount: 0,
+            dimensions: {},
+          },
+          {
+            account_number: '3001',
+            debit_amount: 0,
+            credit_amount: 15000,
+            dimensions: revenueDims,
+          },
+          {
+            account_number: '2611',
+            debit_amount: 0,
+            credit_amount: 3750,
+            dimensions: {},
+          },
+        ],
+      },
+      'sandbox_seed',
+    )
+
+    const invoicePaidEntry = await createJournalEntry(
+      supabase,
+      companyId,
+      userId,
+      {
+        fiscal_period_id: fiscalPeriod.id,
         entry_date: toDateStr(fifteenDaysAgo),
         description: 'Betalning faktura F-2026001, Björk & Partner AB',
         source_type: 'invoice_paid',
         source_id: invoiceMap['F-2026001'],
-        // Draft until the lines exist; see the ledger-history comment above.
-        status: 'draft',
-        committed_at: toDateStr(fifteenDaysAgo),
-      })
-      .select('id')
-      .single()
-
-    if (je2Error) throw je2Error
-
-    // 10. Create journal entry lines. The P&L line carries demo dimensions
-    // ({"1":"BUTIK","6":"P001"}) so the register's "antal taggade rader",
-    // voucher-detail badges, and the dimension P&L report light up in the
-    // sandbox. cost_center/project are GENERATED from the bag since the PR9
-    // cutover: writing them explicitly would error.
-    const revenueDims = { '1': 'BUTIK', '6': 'P001' }
-    const { error: jelError } = await supabase
-      .from('journal_entry_lines')
-      .insert([
-        // JE1: Invoice creation, Debit AR, Credit Revenue + VAT
-        // NB: `dimensions` must be set explicitly on EVERY row: same PostgREST
-        // bulk-insert normalization as paid_amount below: omitting it on some
-        // rows while one row sets it sends null (violating NOT NULL) instead
-        // of falling through to the schema default '{}'.
-        {
-          journal_entry_id: je1.id,
-          account_number: '1510',
-          account_id: accountMap['1510'] ?? null,
-          debit_amount: 18750,
-          credit_amount: 0,
-          sort_order: 0,
-          dimensions: {},
-        },
-        {
-          journal_entry_id: je1.id,
-          account_number: '3001',
-          account_id: accountMap['3001'] ?? null,
-          debit_amount: 0,
-          credit_amount: 15000,
-          sort_order: 1,
-          dimensions: revenueDims,
-        },
-        {
-          journal_entry_id: je1.id,
-          account_number: '2611',
-          account_id: accountMap['2611'] ?? null,
-          debit_amount: 0,
-          credit_amount: 3750,
-          sort_order: 2,
-          dimensions: {},
-        },
-        // JE2: Invoice payment, Debit Bank, Credit AR
-        {
-          journal_entry_id: je2.id,
-          account_number: '1930',
-          account_id: accountMap['1930'] ?? null,
-          debit_amount: 18750,
-          credit_amount: 0,
-          sort_order: 0,
-          dimensions: {},
-        },
-        {
-          journal_entry_id: je2.id,
-          account_number: '1510',
-          account_id: accountMap['1510'] ?? null,
-          debit_amount: 0,
-          credit_amount: 18750,
-          sort_order: 1,
-          dimensions: {},
-        },
-      ])
-
-    if (jelError) throw jelError
-
-    const { error: invoicePostError } = await supabase
-      .from('journal_entries')
-      .update({ status: 'posted' })
-      .in('id', [je1.id, je2.id])
-      .eq('company_id', companyId)
-    if (invoicePostError) throw invoicePostError
+        voucher_series: 'A',
+        lines: [
+          {
+            account_number: '1930',
+            debit_amount: 18750,
+            credit_amount: 0,
+            dimensions: {},
+          },
+          {
+            account_number: '1510',
+            debit_amount: 0,
+            credit_amount: 18750,
+            dimensions: {},
+          },
+        ],
+      },
+      'sandbox_seed',
+    )
 
     // 11. Create transactions
     const { data: txRows, error: txError } = await supabase
@@ -760,7 +651,7 @@ export async function POST(request: Request) {
           category: 'income_services',
           is_business: true,
           invoice_id: invoiceMap['F-2026001'],
-          journal_entry_id: je2.id,
+          journal_entry_id: invoicePaidEntry.id,
           merchant_name: 'Björk & Partner AB',
         },
         // Private transaction
@@ -1170,9 +1061,7 @@ export async function POST(request: Request) {
 
     // 21. Verifikat for the BOOKED run. A run in status 'booked' that posted
     // nothing would be a lie: the real path (bookPaidSalaryRun) always writes
-    // these through the engine before advancing the status. The seed inserts
-    // journal rows directly to avoid event emission, so ./salary-vouchers
-    // mirrors the engine's account structure instead.
+    // these through the engine before advancing the status.
     const bookedPeriod = resolveSandboxSalaryPeriods(today).booked
     const salaryVouchers = buildSandboxSalaryVouchers({
       userId,
@@ -1195,50 +1084,28 @@ export async function POST(request: Request) {
 
     const runEntryLinks: Record<string, string> = {}
     for (const voucher of salaryVouchers) {
-      const { data: salaryVoucherNumber, error: salaryVoucherError } = await supabase.rpc(
-        'next_voucher_number',
+      const entry = await createJournalEntry(
+        supabase,
+        companyId,
+        userId,
         {
-          p_company_id: companyId,
-          p_fiscal_period_id: fiscalPeriod.id,
-          p_series: voucher.entry.voucher_series,
-        },
-      )
-      // A posted verifikat with no voucher number is a hole in the
-      // verifikationsserie (BFNAR 2013:2), so a failed counter read has to stop
-      // the seed rather than insert one.
-      if (salaryVoucherError) throw salaryVoucherError
-      if (salaryVoucherNumber == null) {
-        throw new Error('Sandbox seed: next_voucher_number returned no number for a salary voucher')
-      }
-
-      const { data: insertedSalaryEntry, error: salaryEntryError } = await supabase
-        .from('journal_entries')
-        // Draft until the lines exist; see the ledger-history comment above.
-        .insert({ ...voucher.entry, voucher_number: salaryVoucherNumber, status: 'draft' })
-        .select('id')
-        .single()
-      if (salaryEntryError) throw salaryEntryError
-
-      const { error: salaryEntryLinesError } = await supabase
-        .from('journal_entry_lines')
-        .insert(
-          voucher.lines.map(line => ({
-            ...line,
-            account_id: accountMap[line.account_number] ?? null,
-            journal_entry_id: insertedSalaryEntry.id,
+          fiscal_period_id: voucher.entry.fiscal_period_id,
+          entry_date: voucher.entry.entry_date,
+          description: voucher.entry.description,
+          source_type: voucher.entry.source_type,
+          source_id: voucher.entry.source_id,
+          voucher_series: voucher.entry.voucher_series,
+          lines: voucher.lines.map(line => ({
+            account_number: line.account_number,
+            debit_amount: line.debit_amount,
+            credit_amount: line.credit_amount,
+            dimensions: line.dimensions,
           })),
-        )
-      if (salaryEntryLinesError) throw salaryEntryLinesError
-
-      runEntryLinks[voucher.runColumn] = insertedSalaryEntry.id
+        },
+        'sandbox_seed',
+      )
+      runEntryLinks[voucher.runColumn] = entry.id
     }
-
-    const { error: salaryPostError } = await supabase
-      .from('journal_entries')
-      .update({ status: 'posted' })
-      .in('id', Object.values(runEntryLinks))
-      .eq('company_id', companyId)
-    if (salaryPostError) throw salaryPostError
 
     const { error: linkRunError } = await supabase
       .from('salary_runs')

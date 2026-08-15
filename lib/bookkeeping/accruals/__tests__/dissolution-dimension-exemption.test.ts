@@ -52,6 +52,7 @@ function buildSupabase(tables: Record<string, TableMock>) {
   const inserts: Record<string, unknown[]> = {}
   const updates: Record<string, unknown[]> = {}
   const cursor: Record<string, number> = {}
+  let commitSucceeded = false
 
   const nextRows = (table: string): Result => {
     const list = tables[table]?.rows ?? []
@@ -74,11 +75,27 @@ function buildSupabase(tables: Record<string, TableMock>) {
       ;(updates[table] ??= []).push(payload)
       return chain
     })
-    const single = vi.fn().mockImplementation(async () => ({
-      data: null,
-      error: null,
-      ...(tables[table]?.row ?? {}),
-    }))
+    const single = vi.fn().mockImplementation(async () => {
+      const configured = {
+        data: null,
+        error: null,
+        ...(tables[table]?.row ?? {}),
+      }
+      const configuredData = configured.data
+      if (
+        table === 'journal_entries' &&
+        commitSucceeded &&
+        configuredData !== null &&
+        typeof configuredData === 'object' &&
+        !Array.isArray(configuredData)
+      ) {
+        return {
+          ...configured,
+          data: { ...configuredData, status: 'posted', voucher_number: 1 },
+        }
+      }
+      return configured
+    })
     chain.single = single
     chain.maybeSingle = single
     chain.then = (resolve: (value: unknown) => void) => resolve(nextRows(table))
@@ -87,7 +104,10 @@ function buildSupabase(tables: Record<string, TableMock>) {
 
   const supabase = {
     from,
-    rpc: vi.fn().mockResolvedValue({ data: null, error: null }),
+    rpc: vi.fn().mockImplementation(async () => {
+      commitSucceeded = true
+      return { data: { voucher_number: 1 }, error: null }
+    }),
   }
 
   return { supabase, inserts, updates, queriedTables: () => from.mock.calls.map((c) => c[0] as string) }

@@ -16,9 +16,13 @@ import { createQueuedMockSupabase } from '@/tests/helpers'
 import { eventBus } from '@/lib/events'
 
 const mockDetectDup = vi.fn()
-vi.mock('@/lib/transactions/booking-duplicate-detection', () => ({
-  detectBookingDuplicate: (...args: unknown[]) => mockDetectDup(...args),
-}))
+vi.mock('@/lib/transactions/booking-duplicate-detection', async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>
+  return {
+    ...actual,
+    detectBookingDuplicate: (...args: unknown[]) => mockDetectDup(...args),
+  }
+})
 
 import { tools } from '../server'
 
@@ -155,7 +159,7 @@ describe('gnubok_categorize_transaction: account_override', () => {
       'company-1',
       'user-1',
       supabase as never,
-      { type: 'api_key' },
+      { type: 'api_key', id: 'key-1', label: 'Categorization agent' },
     )) as { staged: boolean; operation_id?: string; preview: Record<string, unknown> }
 
     expect(result.staged).toBe(true)
@@ -169,7 +173,45 @@ describe('gnubok_categorize_transaction: account_override', () => {
     // on it after approval.
     const insertArgs = findCall('pending_operations', 'insert')
     expect(insertArgs).toBeDefined()
-    const payload = (insertArgs as unknown[])[0] as { params?: { account_override?: string | null } }
+    const payload = (insertArgs as unknown[])[0] as {
+      params?: {
+        account_override?: string | null
+        settlement_snapshot?: Record<string, unknown>
+      }
+      preview_data?: { settlement_snapshot?: Record<string, unknown> }
+      actor_type?: string
+      actor_id?: string | null
+      actor_label?: string | null
+    }
     expect(payload.params?.account_override).toBe('4020')
+    expect(payload.params?.settlement_snapshot).toEqual(
+      expect.objectContaining({
+        companyId: 'company-1',
+        transactionId: TX_ID,
+        expectedJournalEntryId: null,
+        cashAccountId: null,
+        settlementAccount: '1930',
+        amountSek: 479,
+        category: 'expense_other',
+        isBusiness: true,
+        lines: expect.arrayContaining([
+          expect.objectContaining({
+            account_number: expect.any(String),
+            debit_amount: expect.any(Number),
+            credit_amount: expect.any(Number),
+            line_description: expect.anything(),
+            dimensions: expect.any(Object),
+          }),
+        ]),
+      }),
+    )
+    expect(payload.params?.settlement_snapshot).toEqual(
+      payload.preview_data?.settlement_snapshot,
+    )
+    expect(payload).toMatchObject({
+      actor_type: 'api_key',
+      actor_id: 'key-1',
+      actor_label: 'Categorization agent',
+    })
   })
 })

@@ -29,6 +29,7 @@ import {
   insertCompany,
   insertCompanyMember,
   insertFiscalPeriod,
+  insertReversedJournalEntryGraph,
 } from './fixtures'
 
 // Mirrors the arrays lib/reports/vat-declaration.ts passes in.
@@ -70,13 +71,10 @@ async function insertEntry(params: {
   fiscalPeriodId: string
   voucherNumber: number
   entryDate: string
-  status?: 'posted' | 'reversed'
   sourceType?: string
-  reversesId?: string | null
   lines: Array<{ account: string; debit: number; credit: number }>
 }): Promise<string> {
   const id = randomUUID()
-  const status = params.status ?? 'posted'
   const client = await getPool().connect()
   // Inserted directly, bypassing commit_journal_entry's voucher sequencing:
   // this is a read-side aggregate that only reads lines and account numbers.
@@ -85,8 +83,9 @@ async function insertEntry(params: {
     await client.query(
       `INSERT INTO public.journal_entries
          (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-          entry_date, description, source_type, status, reverses_id)
-       VALUES ($1, $2, $3, $4, $5, 'A', $6, 'VAT closing-entry test', $7, $8, $9)`,
+          entry_date, description, source_type, status, committed_at, commit_method)
+       VALUES ($1, $2, $3, $4, $5, 'A', $6, 'VAT closing-entry test', $7,
+               'posted', now(), 'legacy')`,
       [
         id,
         params.userId,
@@ -95,8 +94,6 @@ async function insertEntry(params: {
         params.voucherNumber,
         params.entryDate,
         params.sourceType ?? 'manual',
-        status,
-        params.reversesId ?? null,
       ],
     )
     for (const line of params.lines) {
@@ -107,9 +104,7 @@ async function insertEntry(params: {
         [id, line.account, line.debit, line.credit],
       )
     }
-    if (status === 'posted') {
-      await client.query('SET CONSTRAINTS check_balance_on_posted_insert IMMEDIATE')
-    }
+    await client.query('SET CONSTRAINTS check_balance_on_posted_insert IMMEDIATE')
     await client.query('COMMIT')
     return id
   } catch (error) {
@@ -154,17 +149,32 @@ async function seedClosedYear(closingStatus: 'posted' | 'reversed') {
     ],
   })
 
-  const closingEntryId = await insertEntry({
-    ...ctx,
-    voucherNumber: 2,
-    entryDate: '2026-12-31',
-    sourceType: 'year_end',
-    status: closingStatus,
-    lines: [
-      { account: '3308', debit: 800_000, credit: 0 },
-      { account: '2099', debit: 0, credit: 800_000 },
-    ],
-  })
+  const closingLines = [
+    { account: '3308', debit: 800_000, credit: 0 },
+    { account: '2099', debit: 0, credit: 800_000 },
+  ]
+  const closingEntryId =
+    closingStatus === 'posted'
+      ? await insertEntry({
+          ...ctx,
+          voucherNumber: 2,
+          entryDate: '2026-12-31',
+          sourceType: 'year_end',
+          lines: closingLines,
+        })
+      : (
+          await insertReversedJournalEntryGraph({
+            ...ctx,
+            voucherNumber: 2,
+            entryDate: '2026-12-31',
+            sourceType: 'year_end',
+            lines: closingLines.map((line) => ({
+              accountNumber: line.account,
+              debitAmount: line.debit,
+              creditAmount: line.credit,
+            })),
+          })
+        ).originalId
   await getPool().query(
     `UPDATE public.fiscal_periods SET closing_entry_id = $1 WHERE id = $2`,
     [closingEntryId, fiscalPeriodId],
@@ -201,24 +211,7 @@ describe('get_vat_declaration_totals: year-end closing entry', () => {
   })
 
   it('keeps a reversed closing entry so it still nets against its storno', async () => {
-    const { companyId, fiscalPeriodId, closingEntryId, userId } =
-      await seedClosedYear('reversed')
-
-    // Undo year-end: the closing entry is reversed and a posted storno mirrors
-    // it. Both must be counted, or the storno alone negates turnover again.
-    await insertEntry({
-      userId,
-      companyId,
-      fiscalPeriodId,
-      voucherNumber: 3,
-      entryDate: '2026-12-31',
-      sourceType: 'storno',
-      reversesId: closingEntryId,
-      lines: [
-        { account: '3308', debit: 0, credit: 800_000 },
-        { account: '2099', debit: 800_000, credit: 0 },
-      ],
-    })
+    const { companyId } = await seedClosedYear('reversed')
 
     const december = await callRpc(companyId, '2026-12-01', '2026-12-31')
 

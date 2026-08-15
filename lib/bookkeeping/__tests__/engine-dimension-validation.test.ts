@@ -37,6 +37,7 @@ interface TableResult {
  */
 function buildSupabase(tables: Record<string, TableResult>) {
   const inserts: Record<string, unknown[]> = {}
+  let commitSucceeded = false
   const updates: Record<string, unknown[]> = {}
 
   // commitEntry's mandatory-dimension check uses the two-step entry-lines
@@ -59,7 +60,16 @@ function buildSupabase(tables: Record<string, TableResult>) {
 
   const from = vi.fn().mockImplementation((table: string) => {
     const result = tables[table] ?? {}
-    const resolved = { data: result.data ?? null, error: result.error ?? null }
+    const configuredData = result.data ?? null
+    const data =
+      table === 'journal_entries' &&
+      commitSucceeded &&
+      configuredData !== null &&
+      typeof configuredData === 'object' &&
+      !Array.isArray(configuredData)
+        ? { ...configuredData, status: 'posted', voucher_number: 1 }
+        : configuredData
+    const resolved = { data, error: result.error ?? null }
     const chain: Record<string, unknown> = {}
     for (const m of ['select', 'eq', 'in', 'delete', 'order', 'limit', 'lte', 'gte']) {
       chain[m] = vi.fn().mockReturnValue(chain)
@@ -85,7 +95,10 @@ function buildSupabase(tables: Record<string, TableResult>) {
 
   const supabase = {
     from,
-    rpc: vi.fn().mockResolvedValue({ data: null, error: null }),
+    rpc: vi.fn().mockImplementation(async () => {
+      commitSucceeded = true
+      return { data: { voucher_number: 1 }, error: null }
+    }),
   }
 
   const queriedTables = () => from.mock.calls.map((call) => call[0] as string)

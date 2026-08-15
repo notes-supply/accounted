@@ -14,6 +14,7 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 import { getLineItemAccount } from '@/lib/salary/account-mapping'
 import { roundOre } from '@/lib/money'
 import type { SalaryLineItemType } from '@/types'
+import { deleteDraftSalaryObjectWithMileageRelease } from '@/lib/mileage/mileage-service'
 
 export type RunEmployeeResult<T> =
   | { ok: true; data: T }
@@ -216,16 +217,24 @@ export async function removeEmployeeFromRun(
     return { ok: true, data: { deleted: true, employee_id: args.employeeId } }
   }
 
-  // Cascades to salary_line_items via ON DELETE CASCADE.
-  const { error } = await supabase
-    .from('salary_run_employees')
-    .delete()
-    .eq('salary_run_id', args.salaryRunId)
-    .eq('employee_id', args.employeeId)
-    .eq('company_id', args.companyId)
-
-  if (error) {
-    return { ok: false, code: 'INTERNAL_ERROR', details: { message: error.message } }
+  const deletion = await deleteDraftSalaryObjectWithMileageRelease(
+    supabase,
+    args.companyId,
+    args.salaryRunId,
+    { kind: 'run_employee', id: sre.id as string },
+  )
+  if (!deletion.ok) {
+    if (deletion.code === 'NOT_FOUND') {
+      return { ok: false, code: 'SALARY_RUN_EMPLOYEE_NOT_FOUND' }
+    }
+    if (deletion.code === 'NOT_DRAFT') {
+      return {
+        ok: false,
+        code: 'SALARY_RUN_EMPLOYEES_NOT_DRAFT',
+        details: deletion.details,
+      }
+    }
+    return deletion
   }
   return { ok: true, data: { deleted: true, employee_id: args.employeeId } }
 }

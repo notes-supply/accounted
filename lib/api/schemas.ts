@@ -1863,6 +1863,7 @@ export const UpdateSettingsSchema = z.object({
     .nullable()
     .optional(),
   moms_period: MomsPeriodSchema.nullable().optional(),
+  vat_liability_start_date: saneIsoDate.nullable().optional(),
   vat_taxable_base_over_40m: z.boolean().optional(),
   vat_has_eu_trade: z.boolean().optional(),
   vat_filing_method: TaxFilingMethodSchema.optional(),

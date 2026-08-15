@@ -29,7 +29,7 @@ import {
   Send,
   ShieldAlert,
 } from 'lucide-react'
-import type { VatPeriodType } from '@/types'
+import type { VatDeclarationRutor, VatPeriodType } from '@/types'
 import { formatRedovisare, formatRedovisningsperiod } from '@/lib/skatteverket/format'
 import { useCapability } from '@/contexts/CompanyContext'
 import { CAPABILITY } from '@/lib/entitlements/keys'
@@ -80,6 +80,7 @@ interface SkatteverketPanelProps {
    */
   fiscalPeriodId?: string
   fiscalYearEnd?: { year: number; month: number }
+  approvedRutor?: VatDeclarationRutor
   hasData: boolean
   /**
    * True when the momsdeklaration's filing gate is closed. Blocks
@@ -149,6 +150,7 @@ function SkatteverketPanelInner({
   period,
   fiscalPeriodId,
   fiscalYearEnd,
+  approvedRutor,
   hasData,
   localBlocked,
 }: SkatteverketPanelProps) {
@@ -156,6 +158,14 @@ function SkatteverketPanelInner({
   // so the `year` prop is stale (stuck at the current year). Every SKV call
   // must target the FY-end year instead.
   const effectiveYear = periodType === 'yearly' && fiscalYearEnd ? fiscalYearEnd.year : year
+  const submissionPayload = {
+    periodType,
+    year: effectiveYear,
+    period,
+    fiscalPeriodId,
+    approvedRutor,
+  }
+  const submissionBlocked = localBlocked || !approvedRutor
   const hasSkvCapability = useCapability(CAPABILITY.skatteverket)
   const { dialogProps, confirm } = useDestructiveConfirm()
   const [status, setStatus] = useState<SkatteverketStatus | null>(null)
@@ -273,7 +283,7 @@ function SkatteverketPanelInner({
   }
 
   const handleValidate = async () => {
-    if (localBlocked) {
+    if (submissionBlocked) {
       setNotice({
         kind: 'error',
         text:
@@ -289,7 +299,7 @@ function SkatteverketPanelInner({
       const res = await fetch('/api/extensions/ext/skatteverket/declaration/validate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ periodType, year: effectiveYear, period, fiscalPeriodId }),
+        body: JSON.stringify(submissionPayload),
       })
       const result = await res.json()
       if (applyApiError(result)) {
@@ -327,7 +337,7 @@ function SkatteverketPanelInner({
   }
 
   const handleSaveDraft = async () => {
-    if (localBlocked) {
+    if (submissionBlocked) {
       setNotice({
         kind: 'error',
         text:
@@ -342,7 +352,7 @@ function SkatteverketPanelInner({
       const res = await fetch('/api/extensions/ext/skatteverket/declaration/draft', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ periodType, year: effectiveYear, period, fiscalPeriodId }),
+        body: JSON.stringify(submissionPayload),
       })
       const result = await res.json()
       if (applyApiError(result)) {
@@ -418,7 +428,7 @@ function SkatteverketPanelInner({
    * only the lock step needs a retry (available under Fler åtgärder).
    */
   const handleSubmit = async () => {
-    if (localBlocked) {
+    if (submissionBlocked) {
       setNotice({
         kind: 'error',
         text:
@@ -434,7 +444,7 @@ function SkatteverketPanelInner({
       const res = await fetch('/api/extensions/ext/skatteverket/declaration/submit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ periodType, year: effectiveYear, period, fiscalPeriodId }),
+        body: JSON.stringify(submissionPayload),
       })
       const result = await res.json()
 

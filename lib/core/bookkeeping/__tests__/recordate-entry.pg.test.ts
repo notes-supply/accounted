@@ -1,6 +1,7 @@
+import type { PoolClient } from 'pg'
 import { describe, expect, it } from 'vitest'
 import { randomUUID } from 'node:crypto'
-import { getPool } from '@/tests/pg/setup'
+import { getClient, getPool } from '@/tests/pg/setup'
 import { seedCompany, insertFiscalPeriod } from '@/tests/pg/fixtures'
 
 /**
@@ -18,7 +19,7 @@ import { seedCompany, insertFiscalPeriod } from '@/tests/pg/fixtures'
  *      DB backstop behind recordateEntry's pre-flight TargetPeriodLockedError.
  */
 describe('recordate (pg-real)', () => {
-  async function insertDraft(opts: {
+  async function insertDraft(client: PoolClient, opts: {
     userId: string
     companyId: string
     fiscalPeriodId: string
@@ -28,7 +29,7 @@ describe('recordate (pg-real)', () => {
     correctionOfId?: string | null
   }): Promise<string> {
     const id = randomUUID()
-    await getPool().query(
+    await client.query(
       `INSERT INTO public.journal_entries
          (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
           entry_date, description, source_type, status, reverses_id, correction_of_id)
@@ -48,8 +49,8 @@ describe('recordate (pg-real)', () => {
     return id
   }
 
-  async function insertLines(entryId: string, debitAcc: string, creditAcc: string, amount: number) {
-    await getPool().query(
+  async function insertLines(client: PoolClient, entryId: string, debitAcc: string, creditAcc: string, amount: number) {
+    await client.query(
       `INSERT INTO public.journal_entry_lines
          (journal_entry_id, account_number, debit_amount, credit_amount)
        VALUES ($1, $2, $3, 0), ($1, $4, 0, $3)`,
@@ -57,16 +58,16 @@ describe('recordate (pg-real)', () => {
     )
   }
 
-  async function commit(companyId: string, entryId: string): Promise<number> {
-    const { rows } = await getPool().query<{ voucher_number: number }>(
-      `SELECT voucher_number FROM public.commit_journal_entry($1::uuid, $2::uuid)`,
+  async function commit(client: PoolClient, companyId: string, entryId: string): Promise<number> {
+    const { rows } = await client.query<{ voucher_number: number }>(
+      `SELECT voucher_number FROM public.commit_journal_entry($1::uuid, $2::uuid, 'legacy')`,
       [companyId, entryId],
     )
     return rows[0]!.voucher_number
   }
 
-  async function markReversed(entryId: string, reversedById: string) {
-    await getPool().query(
+  async function markReversed(client: PoolClient, entryId: string, reversedById: string) {
+    await client.query(
       `UPDATE public.journal_entries
           SET status = 'reversed', reversed_by_id = $2
         WHERE id = $1 AND status = 'posted'`,
@@ -83,20 +84,23 @@ describe('recordate (pg-real)', () => {
       periodStart: '2025-01-01',
       periodEnd: '2025-12-31',
     })
+    const client = await getClient()
+    await client.query('BEGIN')
+    try {
 
     // Original booked on the wrong year (2026-07-03, should be 2025-07-03).
-    const originalId = await insertDraft({
+    const originalId = await insertDraft(client, {
       userId,
       companyId,
       fiscalPeriodId: fp2026,
       entryDate: '2026-07-03',
       sourceType: 'manual',
     })
-    await insertLines(originalId, '6230', '1930', 1008.75)
-    await commit(companyId, originalId)
+    await insertLines(client, originalId, '6230', '1930', 1008.75)
+    await commit(client, companyId, originalId)
 
     // Storno in the original period (nets 2026 to zero for this entry).
-    const stornoId = await insertDraft({
+    const stornoId = await insertDraft(client, {
       userId,
       companyId,
       fiscalPeriodId: fp2026,
@@ -104,12 +108,12 @@ describe('recordate (pg-real)', () => {
       sourceType: 'storno',
       reversesId: originalId,
     })
-    await insertLines(stornoId, '1930', '6230', 1008.75) // swapped legs
-    await commit(companyId, stornoId)
-    await markReversed(originalId, stornoId)
+    await insertLines(client, stornoId, '1930', '6230', 1008.75) // swapped legs
+    await commit(client, companyId, stornoId)
+    await markReversed(client, originalId, stornoId)
 
     // Corrected re-booking in the *target* year with the right date.
-    const correctedId = await insertDraft({
+    const correctedId = await insertDraft(client, {
       userId,
       companyId,
       fiscalPeriodId: fp2025,
@@ -117,10 +121,11 @@ describe('recordate (pg-real)', () => {
       sourceType: 'correction',
       correctionOfId: originalId,
     })
-    await insertLines(correctedId, '6230', '1930', 1008.75)
-    const correctedVoucher = await commit(companyId, correctedId)
+    await insertLines(client, correctedId, '6230', '1930', 1008.75)
+    const correctedVoucher = await commit(client, companyId, correctedId)
 
     expect(correctedVoucher).toBeGreaterThan(0)
+    await client.query('COMMIT')
 
     const { rows } = await getPool().query<{
       id: string
@@ -153,6 +158,12 @@ describe('recordate (pg-real)', () => {
       entry_date: '2025-07-03',
       correction_of_id: originalId,
     })
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw error
+    } finally {
+      client.release()
+    }
   })
 
   it('enforce_period_lock rejects re-booking into a locked target period', async () => {
@@ -169,15 +180,21 @@ describe('recordate (pg-real)', () => {
       [fp2025],
     )
 
-    // The trigger fires on INSERT, so even staging the corrected draft fails.
-    await expect(
-      insertDraft({
-        userId,
-        companyId,
-        fiscalPeriodId: fp2025,
-        entryDate: '2025-07-03',
-        sourceType: 'correction',
-      }),
-    ).rejects.toThrow(/locked\/closed fiscal period/)
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      await expect(
+        insertDraft(client, {
+          userId,
+          companyId,
+          fiscalPeriodId: fp2025,
+          entryDate: '2025-07-03',
+          sourceType: 'correction',
+        }),
+      ).rejects.toThrow(/locked\/closed fiscal period/)
+    } finally {
+      await client.query('ROLLBACK').catch(() => {})
+      client.release()
+    }
   })
 })

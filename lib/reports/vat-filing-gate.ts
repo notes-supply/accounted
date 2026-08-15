@@ -151,6 +151,28 @@ export function rcBasisTotalsByRate(
 export interface RcGapDowngradeEvidence {
   rutor: VatDeclarationRutor
   rcBasisByRate: RcBasisTotalsByRate
+  rcInputAccountTotals?: VatCheckAccountTotals
+}
+
+function reverseChargeEvidenceRequired(evidence: RcGapDowngradeEvidence): boolean {
+  if (!evidence.rcInputAccountTotals) return true
+  const amounts = [
+    evidence.rutor.ruta20,
+    evidence.rutor.ruta21,
+    evidence.rutor.ruta22,
+    evidence.rutor.ruta23,
+    evidence.rutor.ruta24,
+    evidence.rutor.ruta30,
+    evidence.rutor.ruta31,
+    evidence.rutor.ruta32,
+    evidence.rcBasisByRate.r25,
+    evidence.rcBasisByRate.r12,
+    evidence.rcBasisByRate.r6,
+    ...[...evidence.rcInputAccountTotals.values()].flatMap(
+      (total) => [total.debit, total.credit],
+    ),
+  ]
+  return amounts.some((amount) => !Number.isFinite(amount) || amount !== 0)
 }
 
 /**
@@ -217,21 +239,17 @@ export function rcBasisGapFinding(gapCount: number): VatDeclarationCheck {
 }
 
 /**
- * Shown when the per-verifikat scan could not run. A WARNING, not an ERROR: a
- * network hiccup must not lock a user out of a statutory filing deadline, and
- * there is nothing for them to correct. But it must exist, because an empty
- * check list renders as "Inga fel hittades i underlaget för perioden", and
- * that is a claim we have not earned when the scan never answered.
+ * Required per-voucher reverse-charge evidence could not be read. Filing must
+ * stop because an unavailable scan cannot establish a complete declaration.
  */
 export function rcBasisScanUnavailableFinding(): VatDeclarationCheck {
   return {
     code: 'RC_BASIS_MISSING',
-    status: 'WARNING',
+    status: 'ERROR',
     message:
-      'Kontrollen av enskilda verifikationer kunde inte köras, så vi vet inte ' +
-      'om någon verifikation har fiktiv moms (2614/2624/2634) utan basbelopp ' +
-      'på 44xx/45xx. Ladda om sidan för att försöka igen. Om listan nedan ' +
-      'innehåller verifikationer ska de korrigeras innan du lämnar in.',
+      'Kontrollen av enskilda verifikationer kunde inte köras, så deklarationen ' +
+      'kan inte lämnas in säkert. Ladda om sidan och försök igen. Om problemet ' +
+      'kvarstår behöver underlaget kontrolleras innan deklarationen lämnas in.',
     rutor: ['ruta20', 'ruta21', 'ruta22', 'ruta23', 'ruta24', 'ruta30', 'ruta31', 'ruta32'],
   }
 }
@@ -250,7 +268,11 @@ export function withRcBasisGapFindings(
   // twice, and don't stack a "could not check" note on top of a live finding.
   if (checks.some((c) => c.code === 'RC_BASIS_MISSING')) return checks
   if (scan.status === 'pending') return checks
-  if (scan.status === 'unavailable') return [...checks, rcBasisScanUnavailableFinding()]
+  if (scan.status === 'unavailable') {
+    return evidence && !reverseChargeEvidenceRequired(evidence)
+      ? checks
+      : [...checks, rcBasisScanUnavailableFinding()]
+  }
   if (scan.gapCount <= 0) return checks
   // Tier the finding by the per-rate identity (see rcBasisPerRateConsistent).
   // RC_OUTPUT_MISSING in the list refuses the downgrade outright: that ERROR

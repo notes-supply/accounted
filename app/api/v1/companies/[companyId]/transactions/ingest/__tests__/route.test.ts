@@ -19,7 +19,12 @@ vi.mock('@supabase/supabase-js', async () => {
   return { ...actual, createClient: vi.fn().mockReturnValue({}) }
 })
 
-const { ingestMock, createTxJE, findMissingAccountsMock } = vi.hoisted(() => ({
+const {
+  ingestMock,
+  createTxJE,
+  findMissingAccountsMock,
+  coordinateSettlementMock,
+} = vi.hoisted(() => ({
   ingestMock: vi.fn().mockResolvedValue({
     imported: 2,
     duplicates: 1,
@@ -36,6 +41,7 @@ const { ingestMock, createTxJE, findMissingAccountsMock } = vi.hoisted(() => ({
   // accounts as missing and short-circuit every item with ACCOUNTS_NOT_IN_CHART.
   // Stub it to "no missing accounts" so the happy path is exercised.
   findMissingAccountsMock: vi.fn().mockResolvedValue([]),
+  coordinateSettlementMock: vi.fn(),
 }))
 
 vi.mock('@/lib/transactions/ingest', () => ({
@@ -43,6 +49,9 @@ vi.mock('@/lib/transactions/ingest', () => ({
 }))
 vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
   createTransactionJournalEntry: createTxJE,
+}))
+vi.mock('@/lib/transactions/settlement-attachment', () => ({
+  coordinateTransactionSettlement: coordinateSettlementMock,
 }))
 vi.mock('@/lib/bookkeeping/account-validation', async () => {
   const actual = await vi.importActual<typeof import('@/lib/bookkeeping/account-validation')>(
@@ -102,6 +111,42 @@ function makeRequest(url: string, body: unknown): Request {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  coordinateSettlementMock.mockImplementation(async (input: {
+    supabase: unknown
+    companyId: string
+    userId: string
+    transaction: { cash_account_id: string | null }
+    mappingResult: unknown
+    category: string
+    isBusiness: boolean
+  }) => {
+    const entry = await createTxJE(
+      input.supabase,
+      input.companyId,
+      input.userId,
+      input.transaction,
+      input.mappingResult,
+    )
+    return {
+      kind: 'attached',
+      created: true,
+      journalEntry: entry,
+      publication: {
+        publication_id: `pub-${entry.id}`,
+        event_key: `journal:${entry.id}:committed`,
+        event_type: 'journal_entry.committed',
+      },
+      readback: {
+        transaction: {
+          journalEntryId: entry.id,
+          cashAccountId: input.transaction.cash_account_id,
+          category: input.category,
+          isBusiness: input.isBusiness,
+        },
+        journalEntry: { id: entry.id },
+      },
+    }
+  })
   mockValidate.mockResolvedValue({
     userId: 'user-1',
     companyId: COMPANY_ID,

@@ -166,6 +166,58 @@ describe('advanceAndBookSalaryRun', () => {
       expect.objectContaining({ type: 'salary_run.booked' }),
     )
   })
+
+  it('books a mileage-only payout instead of classifying it as nollkörning', async () => {
+    const { supabase, enqueueMany } = createQueuedMockSupabase()
+    enqueueMany([
+      {
+        data: makeRun({
+          status: 'paid',
+          total_gross: 0,
+          total_tax: 0,
+          total_net: 250,
+          total_avgifter: 0,
+        }),
+      },
+      {
+        data: [
+          makeSre({
+            gross_salary: 0,
+            tax_withheld: 0,
+            net_salary: 250,
+            avgifter_amount: 0,
+            vacation_accrual: 0,
+            vacation_accrual_avgifter: 0,
+            line_items: [
+              {
+                item_type: 'mileage_taxfree',
+                amount: 250,
+                account_number: '7331',
+                is_net_deduction: false,
+                is_gross_deduction: false,
+              },
+            ],
+          }),
+        ],
+      },
+      { data: { id: 'run-1', status: 'booked', avgifter_entry_id: null } },
+    ])
+    vi.mocked(createSalaryRunEntries).mockResolvedValueOnce({
+      salaryEntry: { id: 'je-mileage' },
+      avgifterEntry: null,
+      vacationEntry: null,
+      pensionEntry: null,
+    } as never)
+
+    const result = await advanceAndBookSalaryRun(supabase as never, ARGS)
+
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      expect(result.data.nollkorning).toBe(false)
+      expect(result.data.entryIds).toEqual(['je-mileage'])
+    }
+    expect(createSalaryRunEntries).toHaveBeenCalledOnce()
+  })
 })
 
 describe('bookPaidSalaryRun', () => {

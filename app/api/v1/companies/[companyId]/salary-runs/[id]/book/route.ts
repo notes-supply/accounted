@@ -236,7 +236,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       }> | null
     }
     let salaryEntry: { id: string; voucher_number: string }
-    let avgifterEntry: { id: string }
+    let avgifterEntry: { id: string } | null
     let vacationEntry: { id: string } | null
     let pensionEntry: { id: string } | null
     try {
@@ -317,13 +317,16 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     //    would have re-posted JEs (a real bug: we'd have orphans), but
     //    the engine's atomicity makes that a no-op race that just won't
     //    commit the second status flip.
-    const entryIds = [salaryEntry.id, avgifterEntry.id]
+    const entryIds = [salaryEntry.id]
     const updates: Record<string, unknown> = {
       status: 'booked',
       salary_entry_id: salaryEntry.id,
-      avgifter_entry_id: avgifterEntry.id,
       booked_at: new Date().toISOString(),
       booked_by: ctx.userId,
+    }
+    if (avgifterEntry) {
+      updates.avgifter_entry_id = avgifterEntry.id
+      entryIds.push(avgifterEntry.id)
     }
     if (vacationEntry) {
       updates.vacation_entry_id = vacationEntry.id

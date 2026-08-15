@@ -45,6 +45,29 @@ const agiSubmit = tools.find((t) => t.name === 'gnubok_agi_submit')!
 const agiStatus = tools.find((t) => t.name === 'gnubok_agi_status')!
 
 const ALL = [validate, vatSubmit, vatStatus, agiSubmit, agiStatus]
+function enqueueVatProjection(
+  enqueue: (result: { data?: unknown; error?: unknown; count?: number | null }) => void,
+) {
+  enqueue({ data: { vat_liability_start_date: null } })
+  enqueue({ data: [] })
+  enqueue({
+    data: {
+      totals: [],
+      settlement_shaped_entries: [],
+      source_type_counts: {},
+    },
+  })
+  enqueue({ data: [] })
+}
+function enqueueCleanCompletenessScan(
+  enqueue: (result: { data?: unknown; error?: unknown; count?: number | null }) => void,
+) {
+  enqueue({ data: { vat_liability_start_date: null } })
+  enqueue({ data: [] })
+  enqueue({ data: [] })
+}
+
+
 
 let prevEnv: string | undefined
 beforeEach(() => {
@@ -104,7 +127,9 @@ describe('gnubok_vat_declaration_validate', () => {
   it('maps a SkatteverketAuthError(NOT_CONNECTED) to SKATTEVERKET_NOT_CONNECTED', async () => {
     mockBuildMomsuppgift.mockResolvedValue({ redovisare: '165560000000', redovisningsperiod: '202503', momsuppgift: {} })
     mockSkvRequest.mockRejectedValue(new SkatteverketAuthError('ingen anslutning', 'NOT_CONNECTED'))
-    const { supabase } = createQueuedMockSupabase()
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueueVatProjection(enqueue)
+    enqueueCleanCompletenessScan(enqueue)
     let thrown: unknown
     try {
       await validate.execute({ period_type: 'monthly', year: 2025, period: 3 }, 'company-1', 'user-1', supabase as never, { type: 'api_key' })
@@ -117,7 +142,9 @@ describe('gnubok_vat_declaration_validate', () => {
   it('happy path returns kontrollresultat', async () => {
     mockBuildMomsuppgift.mockResolvedValue({ redovisare: '165560000000', redovisningsperiod: '202503', momsuppgift: { summaMoms: 100 } })
     mockSkvRequest.mockResolvedValue({ ok: true, status: 200, json: async () => ({ status: 'OK', resultat: [] }) })
-    const { supabase } = createQueuedMockSupabase()
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueueVatProjection(enqueue)
+    enqueueCleanCompletenessScan(enqueue)
     const result = (await validate.execute(
       { period_type: 'monthly', year: 2025, period: 3 }, 'company-1', 'user-1', supabase as never, { type: 'api_key' },
     )) as { kontrollresultat: { status: string }; redovisningsperiod: string }
@@ -134,6 +161,8 @@ describe('gnubok_vat_declaration_submit', () => {
     mockBuildMomsuppgift.mockResolvedValue({ redovisare: '165560000000', redovisningsperiod: '202503', momsuppgift: { summaMoms: 100 } })
     mockSkvRequest.mockResolvedValue({ ok: true, status: 200, json: async () => ({ status: 'OK' }) })
     const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueueVatProjection(enqueue)
+    enqueueCleanCompletenessScan(enqueue)
     // stagePendingOperation: resolvePeriodStatusForDate (company_settings + fiscal_periods) then insert
     enqueue({ data: null })
     enqueue({ data: null })

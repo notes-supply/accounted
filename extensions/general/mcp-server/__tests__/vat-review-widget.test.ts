@@ -26,15 +26,20 @@ vi.mock('@/lib/auth/api-keys', async (importOriginal) => {
     // loadAtomsAsSkills (select→eq→eq→order) and computeVatReport (select→eq→in→
     // gte→lte→…) without hand-enumerating each chain.
     createServiceClientNoCookies: vi.fn(() => {
-      const makeChain = (): unknown =>
+      const makeChain = (data: unknown = []): unknown =>
         new Proxy(
           {},
           {
             get(_t, prop) {
               if (prop === 'then') {
-                return (resolve: (v: unknown) => void) => resolve({ data: [], error: null, count: 0 })
+                return (resolve: (v: unknown) => void) =>
+                  resolve({
+                    data,
+                    error: null,
+                    count: Array.isArray(data) ? data.length : null,
+                  })
               }
-              return () => makeChain()
+              return () => makeChain(data)
             },
           },
         )
@@ -57,7 +62,18 @@ vi.mock('@/lib/auth/api-keys', async (importOriginal) => {
         }
       )
       return {
-        from: (table: string) => (table === 'company_members' ? membershipChain : makeChain()),
+        from: (table: string) => {
+          if (table === 'company_members') return membershipChain
+          if (table === 'company_settings') {
+            return makeChain({ vat_liability_start_date: null })
+          }
+          return makeChain()
+        },
+        rpc: () => makeChain({
+          totals: [],
+          settlement_shaped_entries: [],
+          source_type_counts: {},
+        }),
       }
     }),
   }

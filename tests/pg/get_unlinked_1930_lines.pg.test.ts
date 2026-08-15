@@ -14,6 +14,7 @@ import {
   insertCompany,
   insertFiscalPeriod,
   insertPostedJournalEntry as insertAtomicPostedJournalEntry,
+  insertReversedJournalEntryGraph,
 } from './fixtures'
 
 async function insertPostedJournalEntry(params: {
@@ -106,17 +107,20 @@ describe('get_unlinked_gl_lines RPC: opening_balance exclusion', () => {
       periodEnd: '2026-12-31',
     })
 
-    // A storno and a correction voucher on 1930 (the products of the correctEntry
-    // flow), plus a normal bank voucher. Stornos/corrections are book-only
-    // reversals with no bank-feed counterpart: they must be EXCLUDED so a
-    // reconciled period doesn't show them as omatchade verifikationer.
-    await insertPostedJournalEntry({
-      userId, companyId, fiscalPeriodId,
-      entryDate: '2026-05-02', sourceType: 'storno', voucherNumber: 20, amount: 25000,
-    })
-    await insertPostedJournalEntry({
-      userId, companyId, fiscalPeriodId,
-      entryDate: '2026-05-02', sourceType: 'correction', voucherNumber: 21, amount: 25000,
+    // The complete correction graph mirrors correctEntry(): the reversed
+    // original, its storno, and its live correction become durable together.
+    await insertReversedJournalEntryGraph({
+      userId,
+      companyId,
+      fiscalPeriodId,
+      entryDate: '2026-05-02',
+      voucherNumber: 19,
+      description: 'Corrected bank posting',
+      lines: [
+        { accountNumber: '1930', debitAmount: 25000, creditAmount: 0 },
+        { accountNumber: '2091', debitAmount: 0, creditAmount: 25000 },
+      ],
+      correction: { voucherNumber: 21 },
     })
     const bankEntryId = await insertPostedJournalEntry({
       userId, companyId, fiscalPeriodId,

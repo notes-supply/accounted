@@ -1,7 +1,20 @@
 import { describe, expect, it, beforeEach, vi } from 'vitest'
-import { isPaymentSourceType, syncInvoiceStatusFromPaymentEntry } from '@/lib/bookkeeping/payment-sync'
+import {
+  applySupplierPaymentReversal,
+  isPaymentSourceType,
+  resolveSupplierPaymentLineage,
+  syncInvoiceStatusFromPaymentEntry,
+} from '@/lib/bookkeeping/payment-sync'
+import {
+  BookkeepingDatabaseError,
+  DurableAccountingIdentityError,
+} from '@/lib/bookkeeping/errors'
 import { createQueuedMockSupabase } from '@/tests/helpers'
-import type { JournalEntry } from '@/types'
+import type {
+  DurableJournalReversalOutcome,
+  JournalEntry,
+  SupplierPaymentLineage,
+} from '@/types'
 
 /**
  * A Supabase mock that records the table + method + args of every chained call
@@ -95,45 +108,6 @@ describe('syncInvoiceStatusFromPaymentEntry', () => {
     expect(supabase.from).not.toHaveBeenCalled()
   })
 
-  it('reverts a fully-paid supplier invoice back to approved', async () => {
-    const { supabase, enqueueMany } = createQueuedMockSupabase()
-    enqueueMany([
-      { data: { amount: 1000 } },
-      // Fully paid before deletion: paid_amount === total
-      { data: { paid_amount: 1000, total: 1000, due_date: '2099-12-31' } },
-      { data: null }, // UPDATE result
-    ])
-
-    await syncInvoiceStatusFromPaymentEntry(supabase as never, 'co-1', entry())
-
-    const fromCalls = (supabase.from as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0])
-    // After the status update the helper now also deletes the stale payment row
-    // and releases any linked bank transaction back to the inbox.
-    expect(fromCalls).toEqual([
-      'supplier_invoice_payments', // select amount
-      'supplier_invoices', // select
-      'supplier_invoices', // update status/paid/remaining
-      'supplier_invoice_payments', // select transaction_id
-      'supplier_invoice_payments', // delete payment row
-      'transactions', // release linked bank line
-    ])
-  })
-
-  it('reverts a partially-paid supplier invoice to partially_paid when paid_amount remains', async () => {
-    const { supabase, enqueueMany } = createQueuedMockSupabase()
-    enqueueMany([
-      { data: { amount: 500 } }, // payment being reversed
-      // Started with 1000 paid (multiple payments), reversing 500
-      { data: { paid_amount: 1000, total: 1500, due_date: '2099-12-31' } },
-      { data: null },
-    ])
-
-    await syncInvoiceStatusFromPaymentEntry(supabase as never, 'co-1', entry())
-
-    // select payment, select invoice, update invoice, select payment tx,
-    // delete payment row, release linked transaction.
-    expect((supabase.from as ReturnType<typeof vi.fn>).mock.calls.length).toBe(6)
-  })
 
   it('routes customer invoice entries through the invoices table', async () => {
     const { supabase, enqueueMany } = createQueuedMockSupabase()
@@ -179,36 +153,6 @@ describe('syncInvoiceStatusFromPaymentEntry', () => {
     expect(fromCalls[1]).toBe('invoices')
   })
 
-  it('handles supplier_invoice_cash_payment the same way as supplier_invoice_paid', async () => {
-    const { supabase, enqueueMany } = createQueuedMockSupabase()
-    enqueueMany([
-      { data: { amount: 1000 } },
-      { data: { paid_amount: 1000, total: 1000, due_date: '2099-12-31' } },
-      { data: null },
-    ])
-
-    await syncInvoiceStatusFromPaymentEntry(
-      supabase as never,
-      'co-1',
-      entry({ source_type: 'supplier_invoice_cash_payment' })
-    )
-
-    const fromCalls = (supabase.from as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0])
-    expect(fromCalls[0]).toBe('supplier_invoice_payments')
-    expect(fromCalls[1]).toBe('supplier_invoices')
-  })
-
-  it('does not error when no payment row exists for the supplier entry', async () => {
-    const { supabase, enqueueMany } = createQueuedMockSupabase()
-    enqueueMany([
-      { data: null }, // no payment row
-      { data: { paid_amount: 1000, total: 1000, due_date: '2099-12-31' } },
-    ])
-
-    await expect(
-      syncInvoiceStatusFromPaymentEntry(supabase as never, 'co-1', entry())
-    ).resolves.toBeUndefined()
-  })
 
   // Regression for the stuck-invoice deadlock (F-2026080): reversing a cash
   // payment left the invoice at status='paid' / remaining_amount=total because
@@ -300,157 +244,605 @@ describe('syncInvoiceStatusFromPaymentEntry', () => {
     expect(byId?.args).toEqual(['id', ['tx-9']])
   })
 
-  // Supplier-side parity: remaining_amount was already reset; now the payment
-  // row is deleted and the bank line released too.
-  it('supplier reversal deletes the payment row and releases the bank line', async () => {
-    const { supabase, updatePayload, wasDeleted, tablesUpdated } = createRecordingSupabase([
-      { data: { amount: 1000 } }, // supplier_invoice_payments select amount
-      { data: { paid_amount: 1000, total: 1000, due_date: '2099-12-31' } }, // supplier_invoices select
-      { data: null }, // supplier_invoices update
-      { data: [{ transaction_id: 'tx-7' }] }, // supplier_invoice_payments select transaction_id
-      { data: null }, // supplier_invoice_payments delete
-      { data: null }, // transactions update by journal_entry_id
-      { data: null }, // transactions update by id
-    ])
+})
 
-    await syncInvoiceStatusFromPaymentEntry(
-      supabase,
-      'co-1',
-      entry({ source_type: 'supplier_invoice_paid', source_id: 'supplier-invoice-1' }),
-    )
-
-    expect(updatePayload('supplier_invoices')).toMatchObject({
-      status: 'approved',
-      paid_amount: 0,
-      remaining_amount: 1000, // total - 0 paid = full amount owed again
-    })
-    expect(wasDeleted('supplier_invoice_payments')).toBe(true)
-    const resetPayload = tablesUpdated('transactions')[0].ops.find((o) => o.method === 'update')?.args[0]
-    expect(resetPayload).toEqual({
-      journal_entry_id: null,
-      supplier_invoice_id: null,
-      is_business: null,
-      category: null,
-    })
-  })
-
-  // Regression for the Greptile finding on PR #666: the supplier branch
-  // required a payment row before restoring status/amounts, so reversing a
-  // supplier_invoice_cash_payment (which books NO payment row: cash entries
-  // are only ever full payments) deleted nothing visible but left the invoice
-  // permanently at status='paid' / remaining_amount=0: the same deadlock the
-  // customer branch fix closed.
-  it('supplier cash-payment reversal restores status without a payment row', async () => {
-    const { supabase, updatePayload } = createRecordingSupabase([
-      { data: null }, // supplier_invoice_payments select amount → none (cash entry)
-      { data: { paid_amount: 1000, total: 1000, due_date: '2099-12-31' } }, // supplier_invoices select
-      { data: null }, // supplier_invoices update
-      { data: [] }, // supplier_invoice_payments select transaction_id
-      { data: null }, // supplier_invoice_payments delete
-      { data: null }, // transactions update by journal_entry_id
-    ])
-
-    await syncInvoiceStatusFromPaymentEntry(
-      supabase,
-      'co-1',
-      entry({ source_type: 'supplier_invoice_cash_payment', source_id: 'supplier-invoice-1' }),
-    )
-
-    expect(updatePayload('supplier_invoices')).toMatchObject({
-      status: 'approved',
-      paid_amount: 0,
-      remaining_amount: 1000,
-      paid_at: null,
-      payment_journal_entry_id: null,
-    })
-  })
-
-  // Regression: the supplier branch selected `total_amount`, a column
-  // supplier_invoices has never had (the real one is `total`). PostgREST
-  // rejected the whole select, so the restore was skipped while the payment-row
-  // delete and the bank-line release still ran: the invoice stayed 'paid' with
-  // a stale paid_amount and nothing behind it. Asserted on the projection
-  // string because a queued mock happily returns rows for columns that do not
-  // exist, which is how the bug survived the earlier tests.
-  it('selects supplier_invoices.total, never the non-existent total_amount', async () => {
-    const { supabase, calls } = createRecordingSupabase([
-      { data: { amount: 1000 } }, // supplier_invoice_payments select amount
-      { data: { paid_amount: 1000, total: 1000, due_date: '2099-12-31' } }, // supplier_invoices select
-      { data: null }, // supplier_invoices update
-      { data: [] }, // supplier_invoice_payments select transaction_id
-      { data: null }, // supplier_invoice_payments delete
-      { data: null }, // transactions update
-    ])
-
-    await syncInvoiceStatusFromPaymentEntry(supabase, 'co-1', entry())
-
-    const projection = calls
-      .find((c) => c.table === 'supplier_invoices')
-      ?.ops.find((o) => o.method === 'select')?.args[0] as string
-    expect(projection).toBe('paid_amount, total, due_date')
-    expect(projection).not.toContain('total_amount')
-  })
-
-  // The state-level half of the same regression: with the wrong column the row
-  // carries no `total`, so remaining_amount was computed from undefined (NaN)
-  // and the AP ledger lost the amount still owed.
-  it('recomputes remaining_amount from total on a partial supplier reversal', async () => {
-    const { supabase, updatePayload } = createRecordingSupabase([
-      { data: { amount: 500 } }, // supplier_invoice_payments select amount
-      { data: { paid_amount: 1500, total: 2000, due_date: '2099-12-31' } }, // supplier_invoices select
-      { data: null }, // supplier_invoices update
-      { data: [] }, // supplier_invoice_payments select transaction_id
-      { data: null }, // supplier_invoice_payments delete
-      { data: null }, // transactions update
-    ])
-
-    await syncInvoiceStatusFromPaymentEntry(supabase, 'co-1', entry())
-
-    expect(updatePayload('supplier_invoices')).toMatchObject({
-      status: 'partially_paid',
-      paid_amount: 1000,
-      remaining_amount: 1000,
-    })
-  })
-
-  // If the supplier invoice cannot be read we do not know the state we are
-  // about to overwrite, so nothing destructive may run: deleting the payment
-  // row and releasing the bank line would strand the invoice on 'paid' with no
-  // payment behind it. Bail out and leave the reversal safely re-runnable.
-  it('aborts the whole sync when the supplier invoice read errors', async () => {
-    const { supabase, calls, wasDeleted, tablesUpdated } = createRecordingSupabase([
-      { data: { amount: 1000 } }, // supplier_invoice_payments select amount
+describe('durable supplier payment reversal', () => {
+  const genericEnvelope = {
+    valid: true,
+    company_id: 'co-1',
+    requested_root_count: 1,
+    row_count: 3,
+    max_depth: 1,
+    max_correction_depth: 1,
+    terminal_storno_depth: 1,
+    rows: [
       {
-        data: null,
-        error: { code: '42703', message: 'column supplier_invoices.total_amount does not exist' },
+        root_id: 'root-1',
+        parent_id: null,
+        edge_kind: 'root',
+        id: 'root-1',
+        company_id: 'co-1',
+        entry_date: '2026-08-01',
+        status: 'reversed',
+        source_type: 'supplier_invoice_paid',
+        correction_of_id: null,
+        reverses_id: null,
+        reversed_by_id: 'storno-root',
+        committed_at: '2026-08-01T10:00:00Z',
+        depth: 0,
+        path: ['root-1'],
+        cycle: false,
       },
+      {
+        root_id: 'root-1',
+        parent_id: 'root-1',
+        edge_kind: 'correction',
+        id: 'entry-1',
+        company_id: 'co-1',
+        entry_date: '2026-08-02',
+        status: 'posted',
+        source_type: 'correction',
+        correction_of_id: 'root-1',
+        reverses_id: null,
+        reversed_by_id: null,
+        committed_at: '2026-08-02T10:00:00Z',
+        depth: 1,
+        path: ['root-1', 'entry-1'],
+        cycle: false,
+      },
+      {
+        root_id: 'root-1',
+        parent_id: 'root-1',
+        edge_kind: 'storno',
+        id: 'storno-root',
+        company_id: 'co-1',
+        entry_date: '2026-08-01',
+        status: 'posted',
+        source_type: 'storno',
+        correction_of_id: null,
+        reverses_id: 'root-1',
+        reversed_by_id: null,
+        committed_at: '2026-08-01T10:01:00Z',
+        depth: 1,
+        path: ['root-1', 'storno-root'],
+        cycle: false,
+      },
+    ],
+  }
+
+  const lineage: SupplierPaymentLineage = {
+    company_id: 'co-1',
+    requested_journal_entry_id: 'entry-1',
+    root_journal_entry_id: 'root-1',
+    live_journal_entry_id: 'entry-1',
+    allocation_owner_journal_entry_id: 'entry-1',
+    is_supplier_payment: true,
+    nodes: [
+      {
+        journal_entry_id: 'root-1',
+        parent_journal_entry_id: null,
+        relation: 'root',
+        depth: 0,
+        source_type: 'supplier_invoice_paid',
+        has_supplier_payment_allocation: false,
+      },
+      {
+        journal_entry_id: 'entry-1',
+        parent_journal_entry_id: 'root-1',
+        relation: 'correction',
+        depth: 1,
+        source_type: 'correction',
+        has_supplier_payment_allocation: true,
+      },
+      {
+        journal_entry_id: 'storno-root',
+        parent_journal_entry_id: 'root-1',
+        relation: 'storno',
+        depth: 1,
+        source_type: 'storno',
+        has_supplier_payment_allocation: false,
+      },
+    ],
+  }
+
+  const outcome: DurableJournalReversalOutcome = {
+    status: 'applied',
+    company_id: 'co-1',
+    root_journal_entry_id: 'root-1',
+    original_journal_entry_id: 'entry-1',
+    reversal_journal_entry_id: 'storno-1',
+    actor_type: 'api_key',
+    actor_id: 'key-1',
+    actor_label: 'Integration key',
+    publications: [
+      {
+        publication_id: 'publication-committed',
+        event_key: 'journal:storno-1:committed',
+        event_type: 'journal_entry.committed',
+      },
+      {
+        publication_id: 'publication-reversed',
+        event_key: 'journal:entry-1:reversed',
+        event_type: 'journal_entry.reversed',
+      },
+    ],
+  }
+
+  it('resolves a correction through the single generic M2 lineage RPC', async () => {
+    const { supabase, enqueueMany, findCalls } = createQueuedMockSupabase()
+    enqueueMany([
+      {
+        data: {
+          id: 'entry-1',
+          company_id: 'co-1',
+          source_type: 'correction',
+          correction_of_id: 'root-1',
+        },
+      },
+      {
+        data: {
+          id: 'root-1',
+          company_id: 'co-1',
+          source_type: 'supplier_invoice_paid',
+          correction_of_id: null,
+        },
+      },
+      { data: genericEnvelope },
+      { data: [{ id: 'allocation-1', journal_entry_id: 'entry-1' }] },
+      { data: [] },
     ])
 
-    await syncInvoiceStatusFromPaymentEntry(supabase, 'co-1', entry())
+    const result = await resolveSupplierPaymentLineage(
+      supabase as never,
+      'co-1',
+      'entry-1',
+    )
 
-    expect(calls.map((c) => c.table)).toEqual(['supplier_invoice_payments', 'supplier_invoices'])
-    expect(tablesUpdated('supplier_invoices').length).toBe(0)
-    expect(wasDeleted('supplier_invoice_payments')).toBe(false)
-    expect(tablesUpdated('transactions').length).toBe(0)
+    expect(result).toEqual(lineage)
+    expect(supabase.rpc).toHaveBeenCalledWith('get_journal_lineage', {
+      p_company_id: 'co-1',
+      p_root_ids: ['root-1'],
+    })
+    expect(findCalls('journal_entries', 'eq')).toEqual([
+      ['company_id', 'co-1'],
+      ['id', 'entry-1'],
+      ['company_id', 'co-1'],
+      ['id', 'root-1'],
+    ])
+    expect(findCalls('supplier_invoice_payments', 'eq')).toContainEqual([
+      'company_id',
+      'co-1',
+    ])
+    expect(findCalls('supplier_invoice_payment_history', 'eq')).toContainEqual([
+      'company_id',
+      'co-1',
+    ])
   })
 
-  // "No row" is not a read failure: the invoice is genuinely gone, so there is
-  // nothing to restore and the orphan payment row plus the bank line still have
-  // to be cleaned up.
-  it('still cleans up when the supplier invoice row no longer exists (PGRST116)', async () => {
-    const { supabase, wasDeleted, tablesUpdated } = createRecordingSupabase([
-      { data: { amount: 1000 } }, // supplier_invoice_payments select amount
-      { data: null, error: { code: 'PGRST116', message: 'no rows returned' } },
-      { data: [{ transaction_id: 'tx-3' }] }, // supplier_invoice_payments select transaction_id
-      { data: null }, // supplier_invoice_payments delete
-      { data: null }, // transactions update by journal_entry_id
-      { data: null }, // transactions update by id
+  it('keeps a root-owned retained allocation distinct from the requested correction', async () => {
+    const { supabase, enqueueMany } = createQueuedMockSupabase()
+    enqueueMany([
+      {
+        data: {
+          id: 'entry-1',
+          company_id: 'co-1',
+          source_type: 'correction',
+          correction_of_id: 'root-1',
+        },
+      },
+      {
+        data: {
+          id: 'root-1',
+          company_id: 'co-1',
+          source_type: 'supplier_invoice_paid',
+          correction_of_id: null,
+        },
+      },
+      { data: genericEnvelope },
+      { data: [] },
+      { data: [{ id: 'allocation-1', journal_entry_id: 'root-1' }] },
     ])
 
-    await syncInvoiceStatusFromPaymentEntry(supabase, 'co-1', entry())
+    const result = await resolveSupplierPaymentLineage(
+      supabase as never,
+      'co-1',
+      'entry-1',
+    )
 
-    expect(tablesUpdated('supplier_invoices').length).toBe(0)
-    expect(wasDeleted('supplier_invoice_payments')).toBe(true)
-    expect(tablesUpdated('transactions').length).toBe(2)
+    expect(result).toMatchObject({
+      root_journal_entry_id: 'root-1',
+      requested_journal_entry_id: 'entry-1',
+      allocation_owner_journal_entry_id: 'root-1',
+    })
+    expect(
+      result.nodes.find((node) => node.journal_entry_id === 'root-1'),
+    ).toMatchObject({ has_supplier_payment_allocation: true })
+    expect(
+      result.nodes.find((node) => node.journal_entry_id === 'entry-1'),
+    ).toMatchObject({ has_supplier_payment_allocation: false })
+  })
+
+  it('rejects allocation evidence split across root and requested correction owners', async () => {
+    const { supabase, enqueueMany } = createQueuedMockSupabase()
+    enqueueMany([
+      {
+        data: {
+          id: 'entry-1',
+          company_id: 'co-1',
+          source_type: 'correction',
+          correction_of_id: 'root-1',
+        },
+      },
+      {
+        data: {
+          id: 'root-1',
+          company_id: 'co-1',
+          source_type: 'supplier_invoice_paid',
+          correction_of_id: null,
+        },
+      },
+      { data: genericEnvelope },
+      { data: [{ id: 'active-allocation', journal_entry_id: 'root-1' }] },
+      { data: [{ id: 'retained-allocation', journal_entry_id: 'entry-1' }] },
+    ])
+
+    await expect(
+      resolveSupplierPaymentLineage(supabase as never, 'co-1', 'entry-1'),
+    ).rejects.toMatchObject({
+      code: 'DURABLE_ACCOUNTING_IDENTITY_INVALID',
+      message: expect.stringContaining('multiple journal entry owners'),
+    })
+  })
+
+  it('rejects an allocation owned by an arbitrary earlier correction', async () => {
+    const correction = genericEnvelope.rows[1]!
+    const rootStorno = genericEnvelope.rows[2]!
+    const deeperEnvelope = {
+      ...genericEnvelope,
+      row_count: 5,
+      max_depth: 2,
+      max_correction_depth: 2,
+      terminal_storno_depth: 2,
+      rows: [
+        genericEnvelope.rows[0]!,
+        {
+          ...correction,
+          status: 'reversed',
+          reversed_by_id: 'storno-entry-1',
+        },
+        rootStorno,
+        {
+          ...correction,
+          parent_id: 'entry-1',
+          id: 'entry-2',
+          correction_of_id: 'entry-1',
+          depth: 2,
+          path: ['root-1', 'entry-1', 'entry-2'],
+        },
+        {
+          ...rootStorno,
+          parent_id: 'entry-1',
+          id: 'storno-entry-1',
+          reverses_id: 'entry-1',
+          depth: 2,
+          path: ['root-1', 'entry-1', 'storno-entry-1'],
+        },
+      ],
+    }
+    const { supabase, enqueueMany } = createQueuedMockSupabase()
+    enqueueMany([
+      {
+        data: {
+          id: 'entry-2',
+          company_id: 'co-1',
+          source_type: 'correction',
+          correction_of_id: 'entry-1',
+        },
+      },
+      {
+        data: {
+          id: 'entry-1',
+          company_id: 'co-1',
+          source_type: 'correction',
+          correction_of_id: 'root-1',
+        },
+      },
+      {
+        data: {
+          id: 'root-1',
+          company_id: 'co-1',
+          source_type: 'supplier_invoice_paid',
+          correction_of_id: null,
+        },
+      },
+      { data: deeperEnvelope },
+      { data: [{ id: 'allocation-1', journal_entry_id: 'entry-1' }] },
+      { data: [] },
+    ])
+
+    await expect(
+      resolveSupplierPaymentLineage(supabase as never, 'co-1', 'entry-2'),
+    ).rejects.toMatchObject({
+      code: 'DURABLE_ACCOUNTING_IDENTITY_INVALID',
+      message: expect.stringContaining(
+        'neither the lineage root nor the requested correction',
+      ),
+    })
+  })
+
+  it('rejects a contradictory generic M2 envelope before allocation reads', async () => {
+    const { supabase, enqueueMany } = createQueuedMockSupabase()
+    enqueueMany([
+      {
+        data: {
+          id: 'entry-1',
+          company_id: 'co-1',
+          source_type: 'correction',
+          correction_of_id: 'root-1',
+        },
+      },
+      {
+        data: {
+          id: 'root-1',
+          company_id: 'co-1',
+          source_type: 'supplier_invoice_paid',
+          correction_of_id: null,
+        },
+      },
+      { data: { ...genericEnvelope, row_count: 2 } },
+    ])
+
+    await expect(
+      resolveSupplierPaymentLineage(supabase as never, 'co-1', 'entry-1'),
+    ).rejects.toMatchObject({
+      code: 'DURABLE_ACCOUNTING_IDENTITY_INVALID',
+      message: expect.stringContaining('generic lineage RPC'),
+    })
+    expect(supabase.from).toHaveBeenCalledTimes(2)
+  })
+
+  it('passes exact actor and reversal arguments to the M3 command', async () => {
+    const rpc = vi.fn().mockResolvedValue({ data: outcome, error: null })
+    const result = await applySupplierPaymentReversal(
+      { rpc } as never,
+      {
+        companyId: 'co-1',
+        requestedJournalEntryId: 'entry-1',
+        reversalDate: '2026-08-15',
+        actor: {
+          actor_type: 'api_key',
+          actor_id: 'key-1',
+          actor_label: 'Integration key',
+        },
+        lineage,
+      },
+    )
+
+    expect(result).toEqual(outcome)
+    expect(rpc).toHaveBeenCalledWith('apply_supplier_payment_reversal', {
+      p_company_id: 'co-1',
+      p_root_journal_entry_id: 'root-1',
+      p_original_journal_entry_id: 'entry-1',
+      p_reversal_date: '2026-08-15',
+      p_actor_type: 'api_key',
+      p_actor_id: 'key-1',
+      p_actor_label: 'Integration key',
+    })
+  })
+
+  it.each([
+    [
+      'wrong company',
+      { ...lineage, company_id: 'co-2' },
+    ],
+    [
+      'wrong requested identity',
+      { ...lineage, requested_journal_entry_id: 'entry-2' },
+    ],
+    [
+      'wrong live identity',
+      { ...lineage, live_journal_entry_id: 'entry-2' },
+    ],
+    [
+      'empty root identity',
+      { ...lineage, root_journal_entry_id: '' },
+    ],
+    [
+      'wrong root identity',
+      { ...lineage, root_journal_entry_id: 'root-2' },
+    ],
+    [
+      'node set without the root identity',
+      {
+        ...lineage,
+        nodes: lineage.nodes.filter(
+          (node) => node.journal_entry_id !== lineage.root_journal_entry_id,
+        ),
+      },
+    ],
+    [
+      'node set without the requested identity',
+      {
+        ...lineage,
+        nodes: lineage.nodes.filter(
+          (node) => node.journal_entry_id !== lineage.requested_journal_entry_id,
+        ),
+      },
+    ],
+  ] satisfies Array<[string, SupplierPaymentLineage]>)(
+    'rejects %s lineage before the M3 RPC',
+    async (_caseName, contradictoryLineage) => {
+      const rpc = vi.fn()
+
+      await expect(
+        applySupplierPaymentReversal(
+          { rpc } as never,
+          {
+            companyId: 'co-1',
+            requestedJournalEntryId: 'entry-1',
+            reversalDate: '2026-08-15',
+            actor: {
+              actor_type: 'api_key',
+              actor_id: 'key-1',
+              actor_label: 'Integration key',
+            },
+            lineage: contradictoryLineage,
+          },
+        ),
+      ).rejects.toMatchObject({
+        code: 'DURABLE_ACCOUNTING_IDENTITY_INVALID',
+        operation: 'apply_supplier_payment_reversal',
+        recovery: {
+          company_id: 'co-1',
+          original_journal_entry_id: 'entry-1',
+          reversal_journal_entry_id: null,
+          publication_ids: [],
+        },
+      } satisfies Partial<DurableAccountingIdentityError>)
+      expect(rpc).not.toHaveBeenCalled()
+    },
+  )
+
+  it('retries through the recorded storno and returns the stored identities', async () => {
+    const storedOutcome = {
+      ...outcome,
+      status: 'already_applied' as const,
+      actor_type: 'user' as const,
+      actor_id: 'original-user',
+      actor_label: null,
+    }
+    const rpc = vi.fn()
+      .mockResolvedValueOnce({
+        data: null,
+        error: { message: 'connection lost after commit' },
+      })
+      .mockResolvedValueOnce({ data: storedOutcome, error: null })
+
+    const result = await applySupplierPaymentReversal(
+      { rpc } as never,
+      {
+        companyId: 'co-1',
+        requestedJournalEntryId: 'entry-1',
+        reversalDate: '2026-08-15',
+        actor: {
+          actor_type: 'api_key',
+          actor_id: 'retrying-key',
+          actor_label: 'Retrying key',
+        },
+        lineage,
+      },
+    )
+
+    expect(rpc).toHaveBeenCalledTimes(2)
+    const expectedArgs = {
+      p_company_id: 'co-1',
+      p_root_journal_entry_id: 'root-1',
+      p_original_journal_entry_id: 'entry-1',
+      p_reversal_date: '2026-08-15',
+      p_actor_type: 'api_key',
+      p_actor_id: 'retrying-key',
+      p_actor_label: 'Retrying key',
+    }
+    expect(rpc).toHaveBeenNthCalledWith(
+      1,
+      'apply_supplier_payment_reversal',
+      expectedArgs,
+    )
+    expect(rpc).toHaveBeenNthCalledWith(
+      2,
+      'apply_supplier_payment_reversal',
+      expectedArgs,
+    )
+    expect(rpc.mock.calls[1]![1]).toBe(rpc.mock.calls[0]![1])
+    expect(result).toEqual(storedOutcome)
+  })
+
+  it('returns a stable conflict with the recorded storno identity', async () => {
+    const rpc = vi.fn().mockResolvedValue({
+      data: {
+        status: 'conflict',
+        reversal_journal_entry_id: 'different-storno',
+        reason: 'requested root differs from retained allocation root',
+      },
+      error: null,
+    })
+
+    await expect(
+      applySupplierPaymentReversal(
+        { rpc } as never,
+        {
+          companyId: 'co-1',
+          requestedJournalEntryId: 'entry-1',
+          reversalDate: '2026-08-15',
+          actor: {
+            actor_type: 'api_key',
+            actor_id: 'key-1',
+            actor_label: 'Integration key',
+          },
+          lineage,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'DURABLE_ACCOUNTING_CONFLICT',
+      reason: 'requested root differs from retained allocation root',
+      recovery: {
+        company_id: 'co-1',
+        original_journal_entry_id: 'entry-1',
+        reversal_journal_entry_id: 'different-storno',
+        publication_ids: [],
+      },
+    })
+  })
+
+  it('fails closed with every recoverable identity on malformed publication', async () => {
+    const malformed = {
+      ...outcome,
+      publications: [outcome.publications[0], outcome.publications[0]],
+    }
+    const rpc = vi.fn().mockResolvedValue({ data: malformed, error: null })
+
+    await expect(
+      applySupplierPaymentReversal(
+        { rpc } as never,
+        {
+          companyId: 'co-1',
+          requestedJournalEntryId: 'entry-1',
+          reversalDate: '2026-08-15',
+          actor: {
+            actor_type: 'api_key',
+            actor_id: 'key-1',
+            actor_label: 'Integration key',
+          },
+          lineage,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'DURABLE_ACCOUNTING_IDENTITY_INVALID',
+      recovery: {
+        company_id: 'co-1',
+        original_journal_entry_id: 'entry-1',
+        reversal_journal_entry_id: 'storno-1',
+        publication_ids: [
+          'publication-committed',
+          'publication-committed',
+        ],
+      },
+    } satisfies Partial<DurableAccountingIdentityError>)
+  })
+
+  it('forbids the former supplier table-write fallback', async () => {
+    const from = vi.fn()
+    await expect(
+      syncInvoiceStatusFromPaymentEntry(
+        { from } as never,
+        'co-1',
+        {
+          id: 'entry-1',
+          source_type: 'supplier_invoice_paid',
+          source_id: 'supplier-invoice-1',
+        },
+      ),
+    ).rejects.toBeInstanceOf(BookkeepingDatabaseError)
+    expect(from).not.toHaveBeenCalled()
   })
 })

@@ -25,6 +25,7 @@ import type { CreateSalaryLineItemSchema, UpdateSalaryLineItemSchema } from '@/l
 import { getLineItemAccount } from '@/lib/salary/account-mapping'
 import { roundOre } from '@/lib/money'
 import type { SalaryLineItemType } from '@/types'
+import { deleteDraftSalaryObjectWithMileageRelease } from '@/lib/mileage/mileage-service'
 
 export type PayslipLineResult<T> =
   | { ok: true; data: T }
@@ -268,14 +269,24 @@ export async function deletePayslipLine(
     return { ok: true, data: { deleted: true, salary_line_item_id: args.lineId } }
   }
 
-  const { error } = await supabase
-    .from('salary_line_items')
-    .delete()
-    .eq('id', args.lineId)
-    .eq('company_id', args.companyId)
-
-  if (error) {
-    return { ok: false, code: 'INTERNAL_ERROR', details: { message: error.message } }
+  const deletion = await deleteDraftSalaryObjectWithMileageRelease(
+    supabase,
+    args.companyId,
+    args.salaryRunId,
+    { kind: 'line_item', id: args.lineId },
+  )
+  if (!deletion.ok) {
+    if (deletion.code === 'NOT_FOUND') {
+      return { ok: false, code: 'SALARY_LINE_NOT_FOUND' }
+    }
+    if (deletion.code === 'NOT_DRAFT') {
+      return {
+        ok: false,
+        code: 'SALARY_RUN_LINE_NOT_DRAFT',
+        details: deletion.details,
+      }
+    }
+    return deletion
   }
   return { ok: true, data: { deleted: true, salary_line_item_id: args.lineId } }
 }

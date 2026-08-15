@@ -2,6 +2,7 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 import {
   commitAssetDisposal,
   createDraftEntry,
+  type CommitAssetDisposalInput,
 } from '@/lib/bookkeeping/engine'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import { fetchEntryLines, type EntryLinesQuery } from '@/lib/bookkeeping/entry-lines'
@@ -13,7 +14,6 @@ import type {
   AssetCategory,
   WritableDepreciationMethod,
   AssetDisposalType,
-  DepreciationMethod,
   FiscalPeriod,
   K3Component,
   CreateJournalEntryLineInput,
@@ -546,6 +546,17 @@ export interface DisposalResult {
   gain_or_loss: number
 }
 
+export interface AssetDisposalClients {
+  /** Authenticated client used only for authorization-scoped planning and draft creation. */
+  plannerClient: SupabaseClient
+  /** Cookie-less service-role client used only for the atomic final commit. */
+  commitClient: SupabaseClient
+}
+
+type VersionBoundAssetDisposalCommitInput = CommitAssetDisposalInput & {
+  expected_asset_updated_at: string
+}
+
 export class AssetNotFoundError extends Error {
   readonly code = 'ASSET_NOT_FOUND'
 }
@@ -806,13 +817,14 @@ export function buildAssetDisposalPlan(args: {
 }
 
 export async function disposeAsset(
-  supabase: SupabaseClient,
+  clients: AssetDisposalClients,
   companyId: string,
   userId: string,
   assetId: string,
   input: DisposeAssetInput,
 ): Promise<DisposalResult> {
-  const asset = await getAsset(supabase, companyId, assetId)
+  const { plannerClient, commitClient } = clients
+  const asset = await getAsset(plannerClient, companyId, assetId)
   if (!asset) throw new AssetNotFoundError()
   if (asset.disposed_at) throw new AssetAlreadyDisposedError()
 
@@ -825,7 +837,7 @@ export async function disposeAsset(
     ;[periods, scheduleRows] = await Promise.all([
       fetchAllRows<Pick<FiscalPeriod, 'id' | 'period_start' | 'period_end'>>(
         ({ from, to }) =>
-          supabase
+          plannerClient
             .from('fiscal_periods')
             .select('id, period_start, period_end')
             .eq('company_id', companyId)
@@ -834,7 +846,7 @@ export async function disposeAsset(
             .range(from, to),
       ),
       fetchAllRows<DisposalScheduleRow>(({ from, to }) =>
-        supabase
+        plannerClient
           .from('depreciation_schedules')
           .select('fiscal_period_id, planned_depreciation, journal_entry_id')
           .eq('company_id', companyId)
@@ -874,7 +886,7 @@ export async function disposeAsset(
 
   let draft: JournalEntry | null = null
   if (plan.lines.length > 0) {
-    draft = await createDraftEntry(supabase, companyId, userId, {
+    draft = await createDraftEntry(plannerClient, companyId, userId, {
       fiscal_period_id: input.fiscal_period_id,
       entry_date: input.disposed_at,
       description: `Avyttring av tillgång: ${asset.name}`,
@@ -884,44 +896,34 @@ export async function disposeAsset(
     })
   }
 
-  let disposalEntry: JournalEntry | null
-  try {
-    disposalEntry = await commitAssetDisposal(
-      supabase,
-      companyId,
-      userId,
-      draft?.id ?? null,
-      {
-        asset_id: assetId,
-        fiscal_period_id: input.fiscal_period_id,
-        disposal_type: input.disposal_type,
-        disposed_at: input.disposed_at,
-        disposed_proceeds: plan.proceedsGross,
-        proceeds_vat: plan.proceedsVat,
-        vat_treatment: plan.vatTreatment,
-        current_depreciation: plan.currentDepreciation,
-        jamkning_amount: plan.jamkning.amount,
-        jamkning_direction: plan.jamkning.direction,
-        jamkning_remaining_years: plan.jamkning.remainingYears ?? null,
-        jamkning_total_years: plan.jamkning.totalYears || null,
-        jamkning_original_input_vat: input.jamkning_original_input_vat ?? null,
-        jamkning_original_deduction_percent:
-          input.jamkning_original_deduction_percent ?? null,
-        jamkning_new_deduction_percent: plan.jamkning.newDeductionPercent,
-      },
-    )
-  } catch (error) {
-    if (draft) {
-      await supabase
-        .from('journal_entries')
-        .update({ status: 'cancelled' })
-        .eq('id', draft.id)
-        .eq('status', 'draft')
-    }
-    throw error
+  const commitInput: VersionBoundAssetDisposalCommitInput = {
+    asset_id: assetId,
+    fiscal_period_id: input.fiscal_period_id,
+    disposal_type: input.disposal_type,
+    disposed_at: input.disposed_at,
+    disposed_proceeds: plan.proceedsGross,
+    proceeds_vat: plan.proceedsVat,
+    vat_treatment: plan.vatTreatment,
+    current_depreciation: plan.currentDepreciation,
+    jamkning_amount: plan.jamkning.amount,
+    jamkning_direction: plan.jamkning.direction,
+    jamkning_remaining_years: plan.jamkning.remainingYears ?? null,
+    jamkning_total_years: plan.jamkning.totalYears || null,
+    jamkning_original_input_vat: input.jamkning_original_input_vat ?? null,
+    jamkning_original_deduction_percent:
+      input.jamkning_original_deduction_percent ?? null,
+    jamkning_new_deduction_percent: plan.jamkning.newDeductionPercent,
+    expected_asset_updated_at: asset.updated_at,
   }
+  const disposalEntry = await commitAssetDisposal(
+    commitClient,
+    companyId,
+    userId,
+    draft?.id ?? null,
+    commitInput,
+  )
 
-  const updated = (await getAsset(supabase, companyId, assetId)) ?? {
+  const updated = (await getAsset(plannerClient, companyId, assetId)) ?? {
     ...asset,
     disposed_at: input.disposed_at,
     disposed_proceeds: plan.proceedsGross,

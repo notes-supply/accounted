@@ -534,6 +534,43 @@ describe('getExpectedUpcomingDeadlineKeys: banking-day handling', () => {
     expect(keys.has('kvarskatt:notice:notice-1:2030-03-31')).toBe(true)
     expect(keys.has('kvarskatt:notice:notice-1:2030-04-01')).toBe(false)
   })
+
+  it('suppresses calendar VAT obligations ending before liability starts', () => {
+    const keys = getExpectedUpcomingDeadlineKeys(
+      { ...SETTINGS, vat_liability_start_date: '2030-03-15' },
+      [2030],
+      new Date(2030, 0, 1),
+    )
+    const vatKeys = [...keys].filter((key) => key.startsWith('moms_monthly:'))
+
+    expect(vatKeys.some((key) => key.includes(':2030-01:'))).toBe(false)
+    expect(vatKeys.some((key) => key.includes(':2030-02:'))).toBe(false)
+    expect(vatKeys.some((key) => key.includes(':2030-03:'))).toBe(true)
+  })
+
+  it('enumerates annual VAT from actual fiscal periods and suppresses old periods', () => {
+    const keys = getExpectedUpcomingDeadlineKeys({
+      ...SETTINGS,
+      moms_period: 'yearly',
+      vat_liability_start_date: '2030-09-01',
+      fiscal_periods: [
+        {
+          id: '11111111-1111-4111-8111-111111111111',
+          period_start: '2028-07-01',
+          period_end: '2029-06-30',
+        },
+        {
+          id: '22222222-2222-4222-8222-222222222222',
+          period_start: '2029-07-03',
+          period_end: '2030-12-31',
+        },
+      ],
+    }, [2030, 2031], new Date(2030, 11, 1))
+    const vatKeys = [...keys].filter((key) => key.startsWith('moms_yearly:'))
+
+    expect(vatKeys.some((key) => key.includes(':2028/2029:'))).toBe(false)
+    expect(vatKeys.some((key) => key.includes(':2029-07-03/2030-12-31:'))).toBe(true)
+  })
 })
 
 describe('findSettingsMissingUpcomingDeadlines', () => {

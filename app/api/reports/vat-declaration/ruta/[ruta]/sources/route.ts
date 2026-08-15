@@ -2,11 +2,20 @@ import { withRouteContext } from '@/lib/api/with-route-context'
 import { NextResponse } from 'next/server'
 import {
   ACCOUNT_RUTA,
+  createSharedLineageVatConsumer,
+  parseVatPeriodInput,
+  resolveControlledInputVatProjection,
   resolvePeriodDates,
+  type VatControlledInputLineageConsumer,
+  type VatPeriodInput,
 } from '@/lib/reports/vat-declaration'
 import { fetchDynamicVatAccounts } from '@/lib/reports/vat-revenue-accounts'
 import type { ReportSourceLine } from '@/lib/reports/source-lines'
-import type { VatDeclarationRutor, VatPeriodType } from '@/types'
+import { fetchAllRows } from '@/lib/supabase/fetch-all'
+import type { VatDeclarationRutor } from '@/types'
+import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+import { ISO_DATE_RE } from '@/lib/invariants'
+import { roundOre } from '@/lib/money'
 
 /**
  * GET /api/reports/vat-declaration/ruta/[ruta]/sources
@@ -27,9 +36,139 @@ import type { VatDeclarationRutor, VatPeriodType } from '@/types'
 const PAGE_LIMIT = 500
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
-export const GET = withRouteContext<{ params: Promise<{ ruta: string }> }>(
-  'report.vat_declaration.ruta_sources',
-  async (request, { supabase, companyId }, { params }) => {
+interface SourceRow {
+  line_id: string
+  journal_entry_id: string
+  voucher_number: number
+  voucher_series: string | null
+  entry_date: string
+  description: string | null
+  debit_amount: number
+  credit_amount: number
+}
+
+function compareSourceRows(left: SourceRow, right: SourceRow): number {
+  return left.entry_date.localeCompare(right.entry_date)
+    || left.voucher_number - right.voucher_number
+    || left.journal_entry_id.localeCompare(right.journal_entry_id)
+    || left.line_id.localeCompare(right.line_id)
+}
+
+function isAfterCursor(
+  row: SourceRow,
+  cursor: {
+    date: string | null
+    voucherNumber: number | null
+    entryId: string | null
+    lineId: string | null
+  },
+): boolean {
+  if (!cursor.date || cursor.voucherNumber === null) return true
+  const cursorRow: SourceRow = {
+    line_id: cursor.lineId ?? '',
+    journal_entry_id: cursor.entryId ?? '',
+    voucher_number: cursor.voucherNumber,
+    voucher_series: null,
+    entry_date: cursor.date,
+    description: null,
+    debit_amount: 0,
+    credit_amount: 0,
+  }
+  return compareSourceRows(row, cursorRow) > 0
+}
+
+async function fetchControlledSourceRows(
+  supabase: Parameters<typeof resolveControlledInputVatProjection>[0],
+  companyId: string,
+  acceptedEntryIds: string[],
+  start: string,
+  end: string,
+): Promise<SourceRow[]> {
+  if (acceptedEntryIds.length === 0) return []
+  const accepted = new Set(acceptedEntryIds)
+  const entries = await fetchAllRows<{
+    id: string
+    voucher_number: number
+    voucher_series: string | null
+    entry_date: string
+    description: string | null
+    vat_lines: Array<{
+      id: string
+      account_number: string
+      debit_amount: number
+      credit_amount: number
+    }>
+  }>(({ from, to }) =>
+    supabase
+      .from('journal_entries')
+      .select(`
+        id, voucher_number, voucher_series, entry_date, description,
+        vat_lines:journal_entry_lines!inner(
+          id, account_number, debit_amount, credit_amount
+        )
+      `)
+      .eq('company_id', companyId)
+      .in('id', acceptedEntryIds)
+      .in('status', ['posted', 'reversed'])
+      .in('source_type', ['year_end', 'correction', 'storno'])
+      .eq('vat_lines.account_number', '2648')
+      .order('entry_date', { ascending: true })
+      .order('voucher_number', { ascending: true })
+      .order('id', { ascending: true })
+      .range(from, to),
+  )
+  const seen = new Set<string>()
+  const rows: SourceRow[] = []
+  for (const entry of entries) {
+    if (
+      !accepted.has(entry.id)
+      || !Number.isInteger(entry.voucher_number)
+      || typeof entry.entry_date !== 'string'
+      || !ISO_DATE_RE.test(entry.entry_date)
+      || entry.entry_date < start
+      || entry.entry_date > end
+      || !Array.isArray(entry.vat_lines)
+      || entry.vat_lines.length === 0
+    ) {
+      throw new Error('Controlled ruta 48 source evidence changed')
+    }
+    seen.add(entry.id)
+    for (const line of entry.vat_lines) {
+      if (
+        line.account_number !== '2648'
+        || typeof line.id !== 'string'
+        || typeof line.debit_amount !== 'number'
+        || !Number.isFinite(line.debit_amount)
+        || typeof line.credit_amount !== 'number'
+        || !Number.isFinite(line.credit_amount)
+      ) {
+        throw new Error('Controlled ruta 48 source evidence changed')
+      }
+      rows.push({
+        line_id: line.id,
+        journal_entry_id: entry.id,
+        voucher_number: entry.voucher_number,
+        voucher_series: entry.voucher_series,
+        entry_date: entry.entry_date,
+        description: entry.description,
+        debit_amount: line.debit_amount,
+        credit_amount: line.credit_amount,
+      })
+    }
+  }
+  if (seen.size !== accepted.size) {
+    throw new Error('Controlled ruta 48 source evidence changed')
+  }
+  return rows
+}
+
+export function createVatRutaSourcesGet(
+  controlledInputVatConsumer?: VatControlledInputLineageConsumer,
+) {
+  return withRouteContext<{ params: Promise<{ ruta: string }> }>(
+    'report.vat_declaration.ruta_sources',
+    async (request, { supabase, companyId }, { params }) => {
+
   const { ruta: rutaParam } = await params
 
   const { searchParams } = new URL(request.url)
@@ -60,60 +199,30 @@ export const GET = withRouteContext<{ params: Promise<{ ruta: string }> }>(
     )
   }
 
-  // Resolve the period. The periodType form is primary and resolves through
-  // `resolvePeriodDates`, the same helper the declaration itself uses, with
-  // fiscal_period_id threaded through exactly as the sibling vat-declaration
-  // routes do. Helårsmoms is filed per räkenskapsår (SFL 26 kap 10-11 §§) and
-  // a räkenskapsår is not always a calendar year (a first/changed year runs up
-  // to 18 months, BFL 3 kap 3 §), so a plain Jan-Dec span would list a
-  // different set of verifikat than the declaration was computed from.
-  // Monthly/quarterly are calendar periods and resolve identically to before.
-  // The fiscal_period_id-only form (no periodType) still selects the span from
-  // the fiscal period's own bounds.
-  const periodType = searchParams.get('periodType') as VatPeriodType | null
-  const yearStr = searchParams.get('year')
-  const periodStr = searchParams.get('period')
   const fiscalPeriodId = searchParams.get('fiscal_period_id')
-
-  let start: string
-  let end: string
-  if (periodType && yearStr && periodStr) {
-    if (!['monthly', 'quarterly', 'yearly'].includes(periodType)) {
-      return NextResponse.json({ error: 'Invalid periodType' }, { status: 400 })
-    }
-    const year = parseInt(yearStr, 10)
-    const periodNum = parseInt(periodStr, 10)
-    if (isNaN(year) || isNaN(periodNum)) {
-      return NextResponse.json({ error: 'Invalid period' }, { status: 400 })
-    }
-    const dates = await resolvePeriodDates(
-      supabase,
-      companyId,
-      periodType,
-      year,
-      periodNum,
-      fiscalPeriodId ?? undefined
-    )
-    start = dates.start
-    end = dates.end
-  } else if (fiscalPeriodId) {
-    const { data: period } = await supabase
-      .from('fiscal_periods')
-      .select('period_start, period_end')
-      .eq('id', fiscalPeriodId)
-      .eq('company_id', companyId)
-      .maybeSingle()
-    if (!period) {
-      return NextResponse.json({ error: 'Period saknas' }, { status: 404 })
-    }
-    start = period.period_start
-    end = period.period_end
-  } else {
+  let parsed: VatPeriodInput
+  try {
+    parsed = parseVatPeriodInput({
+      periodType: searchParams.get('periodType'),
+      year: searchParams.get('year'),
+      period: searchParams.get('period'),
+      fiscalPeriodId,
+    })
+  } catch (error) {
     return NextResponse.json(
-      { error: 'periodType/year/period or fiscal_period_id is required' },
-      { status: 400 }
+      { error: getUserErrorMessage(error) },
+      { status: 400 },
     )
   }
+  const dates = await resolvePeriodDates(
+    supabase,
+    companyId,
+    parsed.periodType,
+    parsed.year,
+    parsed.period,
+    parsed.fiscalPeriodId,
+  )
+  const { start, end } = dates
 
   // New cursors include entry and line IDs so multiple rows with the same
   // date and voucher number are paged without gaps. Two-part legacy cursors
@@ -132,7 +241,7 @@ export const GET = withRouteContext<{ params: Promise<{ ruta: string }> }>(
       !validShape ||
       !validIds ||
       !cd ||
-      !/^\d{4}-\d{2}-\d{2}$/.test(cd) ||
+      !ISO_DATE_RE.test(cd) ||
       isNaN(cursorVoucherNum)
     ) {
       return NextResponse.json({ error: 'Invalid cursor' }, { status: 400 })
@@ -140,6 +249,44 @@ export const GET = withRouteContext<{ params: Promise<{ ruta: string }> }>(
     cursorDate = cd
     cursorEntryId = ce ?? null
     cursorLineId = cl ?? null
+  }
+
+  let controlledRows: SourceRow[] = []
+  if (rutaKey === 'ruta48') {
+    const projection = await resolveControlledInputVatProjection(
+      supabase,
+      companyId,
+      start,
+      end,
+      controlledInputVatConsumer ?? createSharedLineageVatConsumer(supabase),
+    )
+    controlledRows = (await fetchControlledSourceRows(
+      supabase,
+      companyId,
+      projection.acceptedEntryIds,
+      start,
+      end,
+    )).filter((row) => isAfterCursor(row, {
+      date: cursorDate,
+      voucherNumber: cursorVoucherNum,
+      entryId: cursorEntryId,
+      lineId: cursorLineId,
+    }))
+    const controlledDebit = roundOre(
+      controlledRows.reduce((sum, row) => sum + row.debit_amount, 0),
+    )
+    const controlledCredit = roundOre(
+      controlledRows.reduce((sum, row) => sum + row.credit_amount, 0),
+    )
+    if (
+      cursorDate === null
+      && (
+        controlledDebit !== projection.debit
+        || controlledCredit !== projection.credit
+      )
+    ) {
+      throw new Error('Controlled ruta 48 source evidence changed')
+    }
   }
 
   // The RPC orders and limits at the database. The old PostgREST join loaded
@@ -163,16 +310,9 @@ export const GET = withRouteContext<{ params: Promise<{ ruta: string }> }>(
     })
   }
 
-  const pageRows = (rows ?? []).slice(0, PAGE_LIMIT) as Array<{
-    line_id: string
-    journal_entry_id: string
-    voucher_number: number
-    voucher_series: string | null
-    entry_date: string
-    description: string | null
-    debit_amount: number
-    credit_amount: number
-  }>
+  const ordinaryRows = (rows ?? []) as SourceRow[]
+  const combinedRows = [...ordinaryRows, ...controlledRows].sort(compareSourceRows)
+  const pageRows = combinedRows.slice(0, PAGE_LIMIT)
 
   const lines: ReportSourceLine[] = pageRows.map((row) => ({
     journal_entry_id: row.journal_entry_id,
@@ -180,12 +320,12 @@ export const GET = withRouteContext<{ params: Promise<{ ruta: string }> }>(
     voucher_series: row.voucher_series || 'A',
     date: row.entry_date,
     description: row.description || '',
-    debit: Math.round((Number(row.debit_amount) || 0) * 100) / 100,
-    credit: Math.round((Number(row.credit_amount) || 0) * 100) / 100,
+    debit: roundOre(Number(row.debit_amount) || 0),
+    credit: roundOre(Number(row.credit_amount) || 0),
   }))
 
   let next_cursor: string | null = null
-  if ((rows?.length ?? 0) > PAGE_LIMIT && pageRows.length > 0) {
+  if (combinedRows.length > PAGE_LIMIT && pageRows.length > 0) {
     const last = pageRows[pageRows.length - 1]
     next_cursor = [
       last.entry_date,
@@ -202,4 +342,8 @@ export const GET = withRouteContext<{ params: Promise<{ ruta: string }> }>(
       next_cursor,
     },
   })
-})
+    },
+  )
+}
+
+export const GET = createVatRutaSourcesGet()

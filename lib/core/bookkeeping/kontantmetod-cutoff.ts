@@ -38,6 +38,7 @@ import type {
   VatTreatment,
 } from '@/types'
 import { getRevenueAccount } from '@/lib/bookkeeping/invoice-entries'
+import { getVatTreatmentForRate } from '@/lib/invoices/vat-rules'
 import {
   generateReverseChargeBasisLines,
   generateReverseChargeLines,
@@ -48,6 +49,7 @@ import { createJournalEntry, reverseEntry } from '@/lib/bookkeeping/engine'
 import { createLogger } from '@/lib/logger'
 import { ORE_TOLERANCE, roundOre } from '@/lib/money'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
+import { reconstructReskontraAsOf } from '@/lib/reports/reskontra-payments'
 
 const log = createLogger('kontantmetod-cutoff')
 
@@ -85,6 +87,13 @@ export interface CutoffReceivable {
   outstanding: number
   /** The moms share of `outstanding`. */
   vat: number
+  /** Frozen item-level revenue account and VAT composition. */
+  components?: Array<{
+    revenueAccount: string
+    vatTreatment: VatTreatment
+    net: number
+    vat: number
+  }>
 }
 
 /** A supplier invoice still outstanding at period end. Amounts are SEK. */
@@ -235,10 +244,9 @@ export function buildCutoffLines(
   const receivableLines: CreateJournalEntryLineInput[] = []
   const payableLines: CreateJournalEntryLineInput[] = []
 
-  // ---- Fordringar -------------------------------------------------------
-  // Group by VAT treatment: the revenue account and the vilande moms account
-  // both follow from it.
-  const revenueByTreatment = new Map<VatTreatment, number>()
+  // Item-aware rows carry their frozen revenue account. Legacy rows still use
+  // the treatment-derived account.
+  const revenueByAccount = new Map<string, number>()
   const outputVatByTreatment = new Map<VatTreatment, number>()
   let receivableOre = 0
 
@@ -251,12 +259,30 @@ export function buildCutoffLines(
     const netOre = outstandingOre - vatOre
 
     receivableOre += outstandingOre
-    revenueByTreatment.set(row.vatTreatment, (revenueByTreatment.get(row.vatTreatment) ?? 0) + netOre)
-    if (vatOre !== 0) {
-      outputVatByTreatment.set(
-        row.vatTreatment,
-        (outputVatByTreatment.get(row.vatTreatment) ?? 0) + vatOre,
-      )
+    if (row.components && row.components.length > 0) {
+      const netShares = distributeOre(netOre, row.components.map((component) => component.net))
+      const vatShares = distributeOre(vatOre, row.components.map((component) => component.vat))
+      row.components.forEach((component, index) => {
+        revenueByAccount.set(
+          component.revenueAccount,
+          (revenueByAccount.get(component.revenueAccount) ?? 0) + netShares[index]!,
+        )
+        if (vatShares[index] !== 0) {
+          outputVatByTreatment.set(
+            component.vatTreatment,
+            (outputVatByTreatment.get(component.vatTreatment) ?? 0) + vatShares[index]!,
+          )
+        }
+      })
+    } else {
+      const revenueAccount = getRevenueAccount(row.vatTreatment, entityType)
+      revenueByAccount.set(revenueAccount, (revenueByAccount.get(revenueAccount) ?? 0) + netOre)
+      if (vatOre !== 0) {
+        outputVatByTreatment.set(
+          row.vatTreatment,
+          (outputVatByTreatment.get(row.vatTreatment) ?? 0) + vatOre,
+        )
+      }
     }
   }
 
@@ -268,10 +294,10 @@ export function buildCutoffLines(
       'Kundfordringar vid räkenskapsårets utgång (kontantmetoden)',
     ))
 
-    for (const [treatment, netOre] of revenueByTreatment) {
+    for (const [account, netOre] of revenueByAccount) {
       if (netOre === 0) continue
       receivableLines.push(signedLine(
-        getRevenueAccount(treatment, entityType),
+        account,
         'credit',
         netOre,
         'Obetalda kundfakturor vid bokslut',
@@ -694,6 +720,87 @@ function resolveHeaderSek(
     `Faktura ${String(row.id ?? '')} i ${currency} saknar användbart SEK-belopp eller valutakurs`,
   )
 }
+interface CustomerCutoffItem {
+  id?: string
+  sort_order: number | null
+  line_total: number | string | null
+  vat_amount: number | string | null
+  vat_rate: number | string | null
+  revenue_account: string | null
+}
+
+function customerCutoffComponents(
+  invoice: Record<string, unknown>,
+  invoiceById: Map<string, Record<string, unknown>>,
+  outstanding: number,
+  scaledVat: number,
+): CutoffReceivable['components'] {
+  const rawItems = Array.isArray(invoice.items)
+    ? invoice.items as CustomerCutoffItem[]
+    : []
+  if (rawItems.length === 0 || rawItems.every((item) => item.vat_rate == null)) {
+    return undefined
+  }
+  if (rawItems.some((item) => item.vat_rate == null)) {
+    throw new Error(`Kundfaktura ${String(invoice.invoice_number ?? invoice.id)} har ofullständig momssats per rad`)
+  }
+
+  const items = [...rawItems].sort(
+    (left, right) =>
+      (Number(left.sort_order) || 0) - (Number(right.sort_order) || 0) ||
+      String(left.id ?? '').localeCompare(String(right.id ?? '')),
+  )
+  const headerTreatment = invoice.vat_treatment as VatTreatment | null
+  const original = invoice.credited_invoice_id
+    ? invoiceById.get(String(invoice.credited_invoice_id))
+    : undefined
+  const originalItems = Array.isArray(original?.items)
+    ? original.items as CustomerCutoffItem[]
+    : []
+  const netShares = distributeOre(
+    toOre(outstanding - scaledVat),
+    items.map((item) => Number(item.line_total) || 0),
+  )
+  const vatShares = distributeOre(
+    toOre(scaledVat),
+    items.map((item) => Number(item.vat_amount) || 0),
+  )
+
+  return items.map((item, index) => {
+    const rate = Number(item.vat_rate)
+    if (![0, 6, 12, 25].includes(rate)) {
+      throw new Error(
+        `Kundfaktura ${String(invoice.invoice_number ?? invoice.id)} har ogiltig momssats ${rate}`,
+      )
+    }
+    const treatment =
+      rate === 0 && (headerTreatment === 'reverse_charge' || headerTreatment === 'export')
+        ? headerTreatment
+        : getVatTreatmentForRate(rate)
+    const special = treatment === 'reverse_charge' || treatment === 'export'
+    let revenueAccount = special ? getRevenueAccount(treatment) : item.revenue_account
+
+    if (!revenueAccount && invoice.credited_invoice_id) {
+      const sameOrder = originalItems.filter(
+        (candidate) => Number(candidate.sort_order) === Number(item.sort_order),
+      )
+      if (sameOrder.length !== 1 || !sameOrder[0]!.revenue_account) {
+        throw new Error(
+          `Kreditfaktura ${String(invoice.invoice_number ?? invoice.id)} saknar entydigt fryst intäktskonto`,
+        )
+      }
+      revenueAccount = sameOrder[0]!.revenue_account
+    }
+    revenueAccount ??= getRevenueAccount(treatment)
+
+    return {
+      revenueAccount,
+      vatTreatment: treatment,
+      net: toKronor(netShares[index]!),
+      vat: toKronor(vatShares[index]!),
+    }
+  })
+}
 
 /**
  * Fetch every invoice still outstanding at `periodEnd`.
@@ -717,7 +824,9 @@ export async function collectKontantmetodCutoff(
       fetchAllRows<Record<string, unknown>>(
         ({ from, to }) => supabase
           .from('invoices')
-          .select('id, invoice_number, invoice_date, status, total, total_sek, vat_amount, vat_amount_sek, vat_treatment, credited_invoice_id, document_type, currency, exchange_rate')
+          .select(
+            'id, invoice_number, invoice_date, status, total, total_sek, vat_amount, vat_amount_sek, vat_treatment, credited_invoice_id, document_type, currency, exchange_rate, journal_entry_id, items:invoice_items(id, sort_order, line_total, vat_amount, vat_rate, revenue_account)',
+          )
           .eq('company_id', companyId)
           .lte('invoice_date', periodEnd)
           .in('status', ['sent', 'overdue', 'partially_paid', 'paid', 'credited'])
@@ -728,10 +837,12 @@ export async function collectKontantmetodCutoff(
       fetchAllRows<Record<string, unknown>>(
         ({ from, to }) => supabase
           .from('supplier_invoices')
-          .select('id, supplier_invoice_number, invoice_date, status, total, total_sek, vat_amount, vat_amount_sek, reverse_charge, is_credit_note, credited_invoice_id, currency, exchange_rate, supplier:suppliers(supplier_type), items:supplier_invoice_items(account_number, line_total, vat_rate, reverse_charge_rate)')
+          .select(
+            'id, supplier_invoice_number, invoice_date, status, total, total_sek, vat_amount, vat_amount_sek, reverse_charge, is_credit_note, credited_invoice_id, currency, exchange_rate, registration_journal_entry_id, payment_journal_entry_id, supplier:suppliers(supplier_type), items:supplier_invoice_items(account_number, line_total, vat_rate, reverse_charge_rate)',
+          )
           .eq('company_id', companyId)
           .lte('invoice_date', periodEnd)
-          .in('status', ['registered', 'approved', 'partially_paid', 'paid', 'credited'])
+          .in('status', ['registered', 'approved', 'partially_paid', 'paid', 'credited', 'reversed'])
           .order('id', { ascending: true })
           .range(from, to),
         { dedupeBy: (row) => row.id as string },
@@ -744,110 +855,127 @@ export async function collectKontantmetodCutoff(
     )
   }
 
-  // Payments ON OR BEFORE period end reduce the outstanding balance; later
-  // ones must not. Amount is stored in the invoice's own currency.
-  let invoicePayments: Array<Record<string, unknown>>
-  let supplierPayments: Array<Record<string, unknown>>
+  let customerAsOf
+  let supplierAsOf
   try {
-    [invoicePayments, supplierPayments] = await Promise.all([
-      fetchAllRows<Record<string, unknown>>(
-        ({ from, to }) => supabase
-          .from('invoice_payments')
-          .select('id, invoice_id, amount, payment_date')
-          .eq('company_id', companyId)
-          .lte('payment_date', periodEnd)
-          .order('id', { ascending: true })
-          .range(from, to),
-        { dedupeBy: (row) => row.id as string },
+    [customerAsOf, supplierAsOf] = await Promise.all([
+      reconstructReskontraAsOf(
+        supabase,
+        companyId,
+        periodEnd,
+        'invoice_payments',
+        'invoice_id',
+        invoices.map((invoice) => {
+          const total = Number(invoice.total) || 0
+          const isCredit = Boolean(invoice.credited_invoice_id) || total < 0
+          return {
+            id: String(invoice.id),
+            total: Math.abs(total),
+            liveOutstanding: Math.abs(total),
+            sign: isCredit ? -1 : 1,
+            registrationEvidence: 'optional' as const,
+            sourceJournalEntryId: isCredit
+              ? invoice.journal_entry_id as string | null
+              : null,
+            excludeWhenSourceEffective: isCredit,
+          }
+        }),
       ),
-      fetchAllRows<Record<string, unknown>>(
-        ({ from, to }) => supabase
-          .from('supplier_invoice_payments')
-          .select('id, supplier_invoice_id, amount, payment_date')
-          .eq('company_id', companyId)
-          .lte('payment_date', periodEnd)
-          .order('id', { ascending: true })
-          .range(from, to),
-        { dedupeBy: (row) => row.id as string },
+      reconstructReskontraAsOf(
+        supabase,
+        companyId,
+        periodEnd,
+        'supplier_invoice_payments',
+        'supplier_invoice_id',
+        supplierInvoices.map((invoice) => {
+          const isCredit = Boolean(invoice.is_credit_note)
+          return {
+            id: String(invoice.id),
+            total: Math.abs(Number(invoice.total) || 0),
+            liveOutstanding: Math.abs(Number(invoice.total) || 0),
+            sign: isCredit ? -1 : 1,
+            registrationEvidence: 'optional' as const,
+            sourceJournalEntryId: isCredit
+              ? (invoice.registration_journal_entry_id ??
+                  invoice.payment_journal_entry_id) as string | null
+              : null,
+            excludeWhenSourceEffective: isCredit,
+          }
+        }),
       ),
     ])
   } catch (err) {
     throw new Error(
-      'Kontantmetodens bokslutsavgränsning kunde inte läsa betalningar: ' +
+      'Kontantmetodens bokslutsavgränsning kunde inte läsa betalningar och bokföringslinjer: ' +
         (err instanceof Error ? err.message : 'okänt fel'),
     )
   }
 
-  const paidByInvoice = new Map<string, number>()
-  for (const row of invoicePayments) {
-    const id = row.invoice_id as string
-    paidByInvoice.set(id, (paidByInvoice.get(id) ?? 0) + Number(row.amount ?? 0))
-  }
-  const paidBySupplierInvoice = new Map<string, number>()
-  for (const row of supplierPayments) {
-    const id = row.supplier_invoice_id as string
-    paidBySupplierInvoice.set(id, (paidBySupplierInvoice.get(id) ?? 0) + Number(row.amount ?? 0))
-  }
-
+  const invoiceById = new Map(invoices.map((invoice) => [String(invoice.id), invoice]))
   const receivables: CutoffReceivable[] = []
   const unknownVatTreatment: string[] = []
   const strayVatOnZeroRate: string[] = []
   for (const row of invoices) {
-    // Credit notes reduce the receivable through their own negative totals;
-    // they are already part of the invoice set, so no special casing beyond
-    // skipping non-invoice document types (offers, delivery notes).
     const documentType = row.document_type as string | null
     if (documentType && documentType !== 'invoice') continue
 
-    const totalOwn = Number(row.total ?? 0)
+    const totalOwn = Number(row.total) || 0
+    const outstandingOwn = customerAsOf.outstandingByInvoice.get(String(row.id))
+    if (outstandingOwn == null) continue
     const total = resolveHeaderSek(row, 'total', 'total_sek')
     const vat = resolveHeaderSek(row, 'vat_amount', 'vat_amount_sek')
-    const paid = paidByInvoice.get(row.id as string) ?? 0
-    const outstandingOwn = roundOre(totalOwn - paid)
-    const outstanding = totalOwn === 0 ? 0 : roundOre(total * (outstandingOwn / totalOwn))
+    const outstanding = totalOwn === 0
+      ? 0
+      : roundOre(total * (outstandingOwn / totalOwn))
     if (Math.abs(outstanding) < ORE_TOLERANCE) continue
 
-    // Never guess the treatment. Defaulting a 12 %/6 %/undantagen invoice to
-    // 25 % would route it to the wrong vilande account AND the wrong revenue
-    // account; the moms impact is deferred but the year-end fordran
-    // composition would be wrong on the balance sheet. Collect and refuse.
-    const treatment = row.vat_treatment as VatTreatment | null
-    const reference = (row.invoice_number as string) ?? ''
-    if (!treatment) {
-      unknownVatTreatment.push(reference || (row.id as string))
-      continue
-    }
-
-    // Scale the moms share to the part still outstanding: a half-paid invoice
-    // carries half its moms into the cut-off.
     const ratio = totalOwn === 0 ? 0 : outstandingOwn / totalOwn
     const scaledVat = roundOre(vat * ratio)
-
-    // Moms on a treatment that cannot carry Swedish output moms is a real
-    // invoicing error. Surface it instead of quietly folding it into revenue:
-    // the verifikat would balance and the mistake would disappear.
-    if (!VILANDE_OUTPUT_VAT_ACCOUNTS[treatment] && Math.abs(scaledVat) >= ORE_TOLERANCE) {
-      strayVatOnZeroRate.push(reference || (row.id as string))
+    const components = customerCutoffComponents(row, invoiceById, outstanding, scaledVat)
+    const treatment =
+      (row.vat_treatment as VatTreatment | null) ??
+      components?.[0]?.vatTreatment ??
+      null
+    const reference = (row.invoice_number as string) ?? ''
+    if (!treatment) {
+      unknownVatTreatment.push(reference || String(row.id))
       continue
     }
+
+    const hasStrayVat = components
+      ? components.some(
+          (component) =>
+            !VILANDE_OUTPUT_VAT_ACCOUNTS[component.vatTreatment] &&
+            Math.abs(component.vat) >= ORE_TOLERANCE,
+        )
+      : !VILANDE_OUTPUT_VAT_ACCOUNTS[treatment] &&
+        Math.abs(scaledVat) >= ORE_TOLERANCE
+    if (hasStrayVat) {
+      strayVatOnZeroRate.push(reference || String(row.id))
+      continue
+    }
+
     receivables.push({
-      id: row.id as string,
+      id: String(row.id),
       reference,
       vatTreatment: treatment,
       outstanding,
       vat: scaledVat,
+      components,
     })
   }
 
   const payables: CutoffPayable[] = []
   for (const row of supplierInvoices) {
     const sign = row.is_credit_note ? -1 : 1
-    const totalOwn = Math.abs(Number(row.total ?? 0)) * sign
+    const totalOwn = Math.abs(Number(row.total) || 0) * sign
+    const outstandingOwn = supplierAsOf.outstandingByInvoice.get(String(row.id))
+    if (outstandingOwn == null) continue
     const total = Math.abs(resolveHeaderSek(row, 'total', 'total_sek')) * sign
     const vat = Math.abs(resolveHeaderSek(row, 'vat_amount', 'vat_amount_sek')) * sign
-    const paid = paidBySupplierInvoice.get(row.id as string) ?? 0
-    const outstandingOwn = roundOre(totalOwn - (paid * sign))
-    const outstanding = totalOwn === 0 ? 0 : roundOre(total * (outstandingOwn / totalOwn))
+    const outstanding = totalOwn === 0
+      ? 0
+      : roundOre(total * (outstandingOwn / totalOwn))
     if (Math.abs(outstanding) < ORE_TOLERANCE) continue
 
     const ratio = totalOwn === 0 ? 0 : outstandingOwn / totalOwn
@@ -887,7 +1015,7 @@ export async function collectKontantmetodCutoff(
       }))
     }
     payables.push({
-      id: row.id as string,
+      id: String(row.id),
       reference: (row.supplier_invoice_number as string) ?? '',
       outstanding,
       vat: roundOre(vat * ratio),
@@ -909,7 +1037,6 @@ export async function collectKontantmetodCutoff(
     receivables: receivables.length,
     payables: payables.length,
   })
-
   if (unknownVatTreatment.length > 0) {
     log.warn('invoices without vat_treatment excluded from the cut-off', {
       companyId,

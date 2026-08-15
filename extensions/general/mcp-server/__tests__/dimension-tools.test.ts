@@ -760,17 +760,17 @@ describe('gnubok_categorize_transaction: dimensions bag', () => {
   it('resolves the bag and stages it as params.dimensions with the echo in the preview', async () => {
     const { supabase, enqueue } = createQueuedMockSupabase()
     const inserts = captureInserts(supabase)
-    const tx = makeTransaction({ id: 'tx-1', amount: -500 })
-    // categorizeTransactionCore: transaction fetch + company_settings
-    enqueue({ data: tx, error: null })
-    enqueue({ data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null })
-    // transaction fetch for the title
-    enqueue({ data: tx, error: null })
-    // resolveDimensionBags: settings → ensure rpc → dimensions → dimension_values
+    const tx = makeTransaction({ id: 'tx-1', amount: -500, currency: 'SEK' })
+    // resolveDimensionBags: settings -> ensure rpc -> dimensions -> dimension_values
     enqueue({ data: { dimensions_enabled: true }, error: null })
     enqueue({ data: null, error: null })
     enqueue({ data: REGISTRY_ROWS, error: null })
     enqueue({ data: VALUE_ROWS, error: null })
+    // categorizeTransactionCore: transaction fetch + company_settings
+    enqueue({ data: tx, error: null })
+    enqueue({ data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null })
+    // transaction fetch for the title and authoritative SEK input
+    enqueue({ data: tx, error: null })
     // resolvePeriodStatusForDate: 2 layers
     enqueue({ data: null, error: null })
     enqueue({ data: null, error: null })

@@ -4,7 +4,8 @@
  */
 
 import type { TaxDeadlineType, EntityType, MomsPeriod, TaxFilingMethod } from '@/types'
-import { isBankingDay } from './swedish-holidays'
+import { adjustDeadlineToNextBankingDay, isBankingDay } from './swedish-holidays'
+import { ISO_DATE_RE } from '@/lib/invariants'
 
 // Condition function type for determining if a deadline applies
 export type DeadlineCondition = (settings: CompanySettingsForDeadlines) => boolean
@@ -23,6 +24,7 @@ export interface CompanySettingsForDeadlines {
   f_skatt: boolean
   preliminary_tax_monthly: number | null
   vat_registered: boolean
+  vat_liability_start_date?: string | null
   pays_salaries: boolean
   // null = never attested; the generator falls back to pays_salaries so
   // rows saved before the registration flag existed keep their deadlines.
@@ -52,6 +54,8 @@ export interface CompanySettingsForDeadlines {
   rot_rut_payment_years?: number[]
   /** Derived from active tax_assessment_notices rows by the generator. */
   tax_assessment_notices?: TaxAssessmentNoticeForDeadline[]
+  /** Company-scoped fiscal periods used for annual VAT obligation identity. */
+  fiscal_periods?: VatDeadlineFiscalPeriod[]
 }
 
 // Configuration for a single tax deadline type
@@ -81,6 +85,7 @@ export interface DeadlineInstance {
   period: string   // e.g., "2025-Q1", "2025-01", "2025"
   periodLabel: string // Human-readable, e.g., "Q1 2025", "januari 2025"
   taxAssessmentNoticeId?: string
+  linkedReportPeriod?: Record<string, unknown>
 }
 
 /**
@@ -111,7 +116,7 @@ function getFiscalYearLabel(fiscalYearEndMonth: number, fiscalYearEndYear: numbe
 function getAnnualVatDeadline(
   fiscalYearEndMonth: number,
   fiscalYearEndYear: number,
-  settings: CompanySettingsForDeadlines,
+  settings: VatDeadlineSettings,
 ): { day: number; month: number; year: number } {
   // Enskild firma (calendar year only, BFL 3 kap.): without EU trade the
   // annual momsdeklaration follows the income tax return (12 May); with EU
@@ -144,6 +149,207 @@ function getAnnualVatDeadline(
     return { day: 12, month: paper ? 2 : 3, year: fiscalYearEndYear + 1 }
   }
   return { day: paper ? 12 : 17, month: paper ? 6 : 7, year: fiscalYearEndYear + 1 }
+}
+
+export type VatDeadlineSettings = Pick<
+  CompanySettingsForDeadlines,
+  | 'entity_type'
+  | 'vat_liability_start_date'
+  | 'vat_taxable_base_over_40m'
+  | 'vat_has_eu_trade'
+  | 'vat_filing_method'
+>
+export interface VatDeadlineFiscalPeriod {
+  id: string
+  period_start: string
+  period_end: string
+}
+
+export interface CanonicalVatDeadline {
+  periodType: 'monthly' | 'quarterly' | 'yearly'
+  year: number
+  period: number
+  originalStart: string
+  originalEnd: string
+  resolvedStart: string
+  resolvedEnd: string
+  fiscalPeriodId: string | null
+  fiscalPeriodStart: string | null
+  fiscalPeriodEnd: string | null
+  vatLiabilityStartDate: string | null
+  taxDeadlineTypes: string[]
+  taxPeriod: string
+  dueDate: string
+  linkedReportPeriod: Record<string, unknown>
+}
+
+function isoDate(year: number, month: number, day: number): string {
+  const date = new Date(year, month - 1, day)
+  return [
+    String(date.getFullYear()).padStart(4, '0'),
+    String(date.getMonth() + 1).padStart(2, '0'),
+    String(date.getDate()).padStart(2, '0'),
+  ].join('-')
+}
+
+function isCanonicalIsoDate(value: unknown): value is string {
+  if (typeof value !== 'string' || !ISO_DATE_RE.test(value)) return false
+  const [year, month, day] = value.split('-').map(Number)
+  const parsed = new Date(Date.UTC(year, month - 1, day))
+  return parsed.getUTCFullYear() === year
+    && parsed.getUTCMonth() === month - 1
+    && parsed.getUTCDate() === day
+}
+
+function annualVatTaxPeriod(start: string, end: string): string {
+  const startYear = Number(start.slice(0, 4))
+  const endYear = Number(end.slice(0, 4))
+  const regularEnd = new Date(Date.UTC(
+    startYear + 1,
+    Number(start.slice(5, 7)) - 1,
+    Number(start.slice(8, 10)),
+  ))
+  regularEnd.setUTCDate(regularEnd.getUTCDate() - 1)
+  if (regularEnd.toISOString().slice(0, 10) !== end) return `${start}/${end}`
+  return startYear === endYear ? `${endYear}` : `${startYear}/${endYear}`
+}
+
+/**
+ * Resolve one VAT obligation from the same settings and banking-day rules used
+ * by generation. This is the canonical filing, deadline and linked-period
+ * identity contract.
+ */
+export function resolveCanonicalVatDeadline(input: {
+  periodType: 'monthly' | 'quarterly' | 'yearly'
+  year: number
+  period: number
+  settings: VatDeadlineSettings
+  fiscalPeriod?: VatDeadlineFiscalPeriod
+}): CanonicalVatDeadline {
+  const { periodType, year, period, settings, fiscalPeriod } = input
+  if (!['monthly', 'quarterly', 'yearly'].includes(periodType)) {
+    throw new Error('Invalid canonical VAT period')
+  }
+  if (
+    !Number.isInteger(year)
+    || year < 2000
+    || year > 2100
+    || !Number.isInteger(period)
+    || (periodType === 'monthly' && (period < 1 || period > 12))
+    || (periodType === 'quarterly' && (period < 1 || period > 4))
+    || (periodType === 'yearly' && period !== 1)
+  ) {
+    throw new Error('Invalid canonical VAT period')
+  }
+  if (
+    settings.vat_liability_start_date === undefined
+    || (settings.vat_liability_start_date !== null
+      && !isCanonicalIsoDate(settings.vat_liability_start_date))
+  ) {
+    throw new Error('VAT liability start date is unavailable or invalid')
+  }
+
+  let originalStart: string
+  let originalEnd: string
+  let fiscalPeriodId: string | null = null
+  let fiscalPeriodStart: string | null = null
+  let fiscalPeriodEnd: string | null = null
+  let rawDeadline: { day: number; month: number; year: number }
+  let taxPeriod: string
+  let taxDeadlineTypes: string[]
+  let linkedReportPeriod: Record<string, unknown>
+
+  if (periodType === 'monthly') {
+    originalStart = isoDate(year, period, 1)
+    originalEnd = isoDate(year, period + 1, 0)
+    const monthOffset = settings.vat_taxable_base_over_40m ? 1 : 2
+    const deadlineMonth = ((period - 1) + monthOffset) % 12
+    const deadlineYear = year + Math.floor(((period - 1) + monthOffset) / 12)
+    rawDeadline = {
+      day: settings.vat_taxable_base_over_40m
+        ? 26
+        : deadlineMonth === 0 || deadlineMonth === 7 ? 17 : 12,
+      month: deadlineMonth,
+      year: deadlineYear,
+    }
+    taxPeriod = `${year}-${String(period).padStart(2, '0')}`
+    taxDeadlineTypes = ['moms_monthly']
+    linkedReportPeriod = { year, month: period }
+  } else if (periodType === 'quarterly') {
+    const startMonth = (period - 1) * 3 + 1
+    originalStart = isoDate(year, startMonth, 1)
+    originalEnd = isoDate(year, startMonth + 3, 0)
+    const deadlineMonth = (period * 3 + 1) % 12
+    const deadlineYear = year + Math.floor((period * 3 + 1) / 12)
+    rawDeadline = {
+      day: deadlineMonth === 0 || deadlineMonth === 7 ? 17 : 12,
+      month: deadlineMonth,
+      year: deadlineYear,
+    }
+    taxPeriod = `${year}-Q${period}`
+    taxDeadlineTypes = ['moms_quarterly']
+    linkedReportPeriod = { year, quarter: period }
+  } else {
+    if (
+      !fiscalPeriod
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(fiscalPeriod.id)
+      || !isCanonicalIsoDate(fiscalPeriod.period_start)
+      || !isCanonicalIsoDate(fiscalPeriod.period_end)
+      || fiscalPeriod.period_start > fiscalPeriod.period_end
+      || Number(fiscalPeriod.period_end.slice(0, 4)) !== year
+    ) {
+      throw new Error('Annual VAT fiscal period identity is unavailable')
+    }
+    originalStart = fiscalPeriod.period_start
+    originalEnd = fiscalPeriod.period_end
+    fiscalPeriodId = fiscalPeriod.id
+    fiscalPeriodStart = fiscalPeriod.period_start
+    fiscalPeriodEnd = fiscalPeriod.period_end
+    rawDeadline = getAnnualVatDeadline(Number(originalEnd.slice(5, 7)), year, settings)
+    taxPeriod = annualVatTaxPeriod(originalStart, originalEnd)
+    taxDeadlineTypes = ['moms_yearly']
+    linkedReportPeriod = {
+      fiscal_period_id: fiscalPeriodId,
+      fiscal_period_start: fiscalPeriodStart,
+      fiscal_period_end: fiscalPeriodEnd,
+    }
+  }
+
+  const resolvedStart =
+    settings.vat_liability_start_date && settings.vat_liability_start_date > originalStart
+      ? settings.vat_liability_start_date
+      : originalStart
+  if (resolvedStart > originalEnd) {
+    throw new Error('VAT liability starts after the requested period')
+  }
+  const common = {
+    start: resolvedStart,
+    end: originalEnd,
+    original_start: originalStart,
+    original_end: originalEnd,
+    vat_liability_start_date: settings.vat_liability_start_date,
+  }
+  linkedReportPeriod = { ...linkedReportPeriod, ...common }
+  const adjusted = adjustDeadlineToNextBankingDay(
+    new Date(rawDeadline.year, rawDeadline.month, rawDeadline.day),
+  )
+  return {
+    periodType,
+    year,
+    period,
+    originalStart,
+    originalEnd,
+    resolvedStart,
+    resolvedEnd: originalEnd,
+    fiscalPeriodId,
+    fiscalPeriodStart,
+    fiscalPeriodEnd,
+    vatLiabilityStartDate: settings.vat_liability_start_date,
+    taxDeadlineTypes,
+    taxPeriod,
+    dueDate: isoDate(adjusted.getFullYear(), adjusted.getMonth() + 1, adjusted.getDate()),
+    linkedReportPeriod,
+  }
 }
 
 function generateAnnualVatDates(

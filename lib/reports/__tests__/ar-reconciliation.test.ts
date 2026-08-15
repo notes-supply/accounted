@@ -319,4 +319,49 @@ describe('generateARReconciliation', () => {
     expect(result.difference).toBe(0)
     expect(result.is_reconciled).toBe(true)
   })
+
+  it('subtracts positive-magnitude customer credit notes from live AR', async () => {
+    results = [
+      {
+        data: [{
+          id: 'credit-1',
+          total: 250,
+          paid_amount: 0,
+          credited_invoice_id: 'invoice-1',
+          currency: 'SEK',
+          exchange_rate: null,
+        }],
+        error: null,
+      },
+      { data: [{ id: 'entry-1' }], error: null },
+      {
+        data: [{ debit_amount: 0, credit_amount: 250, journal_entry_id: 'entry-1' }],
+        error: null,
+      },
+    ]
+
+    const result = await generateARReconciliation(supabase, 'company-1', 'period-1')
+
+    expect(result.ar_ledger_total).toBe(-250)
+    expect(result.account_1510_balance).toBe(-250)
+    expect(result.is_reconciled).toBe(true)
+  })
+
+  it('includes partially paid invoices in the live AR population', async () => {
+    results = [
+      { data: [], error: null },
+      { data: [], error: null },
+    ]
+
+    await generateARReconciliation(supabase, 'company-1', 'period-1')
+    const statusFilters = calls.filter(
+      (call) => call.method === 'in' && call.args[0] === 'status',
+    )
+    expect(statusFilters.map((call) => call.args[1])).toContainEqual([
+      'sent',
+      'overdue',
+      'partially_paid',
+    ])
+  })
+
 })

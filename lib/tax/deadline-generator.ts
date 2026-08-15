@@ -6,13 +6,16 @@ import { SupabaseClient } from '@supabase/supabase-js'
 import { createLogger } from '@/lib/logger'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import type { TaxDeadlineType, DeadlineStatus } from '@/types'
+import { FISCAL_YEAR_RE } from '@/lib/invariants'
 
 const log = createLogger('deadline-generator')
 import {
   getApplicableDeadlineConfigs,
+  resolveCanonicalVatDeadline,
   type CompanySettingsForDeadlines,
   type DeadlineInstance,
   type TaxAssessmentNoticeForDeadline,
+  type VatDeadlineFiscalPeriod,
 } from './deadline-config'
 import { adjustDeadlineToNextBankingDay } from './swedish-holidays'
 
@@ -64,6 +67,7 @@ export const TAX_RELEVANT_FIELDS = [
   'f_skatt',
   'preliminary_tax_monthly',
   'vat_registered',
+  'vat_liability_start_date',
   'pays_salaries',
   'employer_registered',
   'employer_seasonal',
@@ -84,7 +88,7 @@ export const TAX_RELEVANT_FIELDS = [
 ] as const
 
 export const DEADLINE_SETTINGS_SELECT =
-  'company_id, entity_type, moms_period, f_skatt, preliminary_tax_monthly, vat_registered, pays_salaries, employer_registered, employer_seasonal, fiscal_year_start_month, vat_taxable_base_over_40m, vat_has_eu_trade, vat_filing_method, periodisk_sammanstallning_enabled, periodisk_sammanstallning_period, periodisk_sammanstallning_filing_method, kontrolluppgifter_enabled, rot_rut_enabled, oss_enabled, ioss_enabled, intrastat_enabled, punktskatt_enabled, fyllnadsinbetalning_enabled' as const
+  'company_id, entity_type, moms_period, f_skatt, preliminary_tax_monthly, vat_registered, vat_liability_start_date, pays_salaries, employer_registered, employer_seasonal, fiscal_year_start_month, vat_taxable_base_over_40m, vat_has_eu_trade, vat_filing_method, periodisk_sammanstallning_enabled, periodisk_sammanstallning_period, periodisk_sammanstallning_filing_method, kontrolluppgifter_enabled, rot_rut_enabled, oss_enabled, ioss_enabled, intrastat_enabled, punktskatt_enabled, fyllnadsinbetalning_enabled' as const
 
 /**
  * Check if any tax-relevant fields changed
@@ -118,6 +122,7 @@ export function toDeadlineSettings(
     f_skatt: settings.f_skatt ?? true,
     preliminary_tax_monthly: settings.preliminary_tax_monthly ?? null,
     vat_registered: settings.vat_registered ?? false,
+    vat_liability_start_date: settings.vat_liability_start_date ?? null,
     pays_salaries: settings.pays_salaries ?? false,
     employer_registered: settings.employer_registered ?? null,
     employer_seasonal: settings.employer_seasonal ?? false,
@@ -138,7 +143,64 @@ export function toDeadlineSettings(
     punktskatt_enabled: settings.punktskatt_enabled ?? false,
     fyllnadsinbetalning_enabled: settings.fyllnadsinbetalning_enabled ?? false,
     tax_assessment_notices: settings.tax_assessment_notices,
+    fiscal_periods: settings.fiscal_periods,
   }
+}
+
+function annualVatDeadlineInstances(
+  year: number,
+  settings: CompanySettingsForDeadlines,
+): DeadlineInstance[] {
+  return (settings.fiscal_periods ?? [])
+    .filter((fiscalPeriod) =>
+      !settings.vat_liability_start_date
+      || fiscalPeriod.period_end >= settings.vat_liability_start_date,
+    )
+    .map((fiscalPeriod) => {
+      const endYear = Number(fiscalPeriod.period_end.slice(0, 4))
+      const canonical = resolveCanonicalVatDeadline({
+        periodType: 'yearly',
+        year: endYear,
+        period: 1,
+        settings,
+        fiscalPeriod,
+      })
+      const due = new Date(`${canonical.dueDate}T12:00:00`)
+      return {
+        day: due.getDate(),
+        month: due.getMonth(),
+        year: due.getFullYear(),
+        period: canonical.taxPeriod,
+        periodLabel: canonical.taxPeriod,
+        linkedReportPeriod: canonical.linkedReportPeriod,
+      }
+    })
+    .filter((instance) => instance.year === year)
+}
+
+function vatDeadlinePrecedesLiability(
+  type: TaxDeadlineType,
+  instance: DeadlineInstance,
+  settings: CompanySettingsForDeadlines,
+): boolean {
+  const liabilityStart = settings.vat_liability_start_date
+  if (!liabilityStart || !['moms_monthly', 'moms_quarterly'].includes(type)) {
+    return false
+  }
+  const linkedEnd = instance.linkedReportPeriod?.original_end
+  if (typeof linkedEnd === 'string') return linkedEnd < liabilityStart
+
+  if (type === 'moms_monthly') {
+    const [year, month] = instance.period.split('-').map(Number)
+    return formatDateISO(new Date(year, month, 0)) < liabilityStart
+  }
+  if (type === 'moms_quarterly') {
+    const [yearInput, quarterInput] = instance.period.split('-Q')
+    return formatDateISO(
+      new Date(Number(yearInput), Number(quarterInput) * 3, 0),
+    ) < liabilityStart
+  }
+  return false
 }
 
 interface TaxAssessmentNoticeRow {
@@ -192,6 +254,38 @@ async function hydrateTaxAssessmentNotices(
   return settingsRows.map((settings) => ({
     ...settings,
     tax_assessment_notices: byCompany.get(settings.company_id) ?? [],
+  }))
+}
+
+async function hydrateAnnualVatFiscalPeriods(
+  supabase: SupabaseClient,
+  settingsRows: DeadlineSettingsRow[],
+): Promise<DeadlineSettingsRow[]> {
+  const needsAnnualPeriods = settingsRows.some(
+    (settings) => settings.vat_registered && settings.moms_period === 'yearly',
+  )
+  if (!needsAnnualPeriods) return settingsRows
+
+  const fiscalPeriods = await fetchAllRows<VatDeadlineFiscalPeriod & { company_id: string }>(
+    ({ from, to }) =>
+      supabase
+        .from('fiscal_periods')
+        .select('company_id, id, period_start, period_end')
+        .order('company_id', { ascending: true })
+        .order('period_end', { ascending: true })
+        .range(from, to),
+  )
+  const byCompany = new Map<string, VatDeadlineFiscalPeriod[]>()
+  for (const fiscalPeriod of fiscalPeriods) {
+    const current = byCompany.get(fiscalPeriod.company_id) ?? []
+    current.push(fiscalPeriod)
+    byCompany.set(fiscalPeriod.company_id, current)
+  }
+  return settingsRows.map((settings) => ({
+    ...settings,
+    fiscal_periods: settings.vat_registered && settings.moms_period === 'yearly'
+      ? byCompany.get(settings.company_id) ?? []
+      : settings.fiscal_periods,
   }))
 }
 
@@ -296,6 +390,7 @@ export async function generateTaxDeadlinesForUser(
   settings: CompanySettingsForDeadlines,
   years: number[] = []
 ): Promise<{ created: number; deleted: number }> {
+  settings = toDeadlineSettings(settings)
   if (settings.tax_assessment_notices === undefined) {
     const notices = await fetchActiveTaxAssessmentNotices(supabase, companyId)
     settings = {
@@ -343,6 +438,19 @@ export async function generateTaxDeadlinesForUser(
       ),
     }
   }
+
+  const annualVatFiscalPeriods =
+    settings.vat_registered && settings.moms_period === 'yearly'
+      ? await fetchAllRows<VatDeadlineFiscalPeriod>(({ from, to }) =>
+          supabase
+            .from('fiscal_periods')
+            .select('id, period_start, period_end')
+            .eq('company_id', companyId)
+            .order('period_end', { ascending: true })
+            .range(from, to),
+        )
+      : []
+  settings = { ...settings, fiscal_periods: annualVatFiscalPeriods }
 
   // Get applicable deadline configs based on settings
   const applicableConfigs = getApplicableDeadlineConfigs(settings)
@@ -431,9 +539,12 @@ export async function generateTaxDeadlinesForUser(
   for (const config of applicableConfigs) {
     const horizonEnd = horizonEndFor(config.type, today)
     for (const year of years) {
-      const instances = config.generateDates(year, settings)
+      const instances = config.type === 'moms_yearly'
+        ? annualVatDeadlineInstances(year, settings)
+        : config.generateDates(year, settings)
 
       for (const instance of instances) {
+        if (vatDeadlinePrecedesLiability(config.type, instance, settings)) continue
         // Create the raw deadline date
         const rawDate = new Date(instance.year, instance.month, instance.day)
 
@@ -477,7 +588,17 @@ export async function generateTaxDeadlinesForUser(
         const title = config.titleTemplate.replace('{periodLabel}', instance.periodLabel)
 
         // Create linked report period data
-        const linkedReportPeriod = createLinkedReportPeriod(instance, config.type)
+        let linkedReportPeriod = instance.linkedReportPeriod
+          ?? createLinkedReportPeriod(instance, config.type)
+        if (config.type === 'moms_monthly' || config.type === 'moms_quarterly') {
+          const canonical = resolveCanonicalVatDeadline({
+            periodType: config.type === 'moms_monthly' ? 'monthly' : 'quarterly',
+            year: Number(instance.period.slice(0, 4)),
+            period: Number(instance.period.slice(config.type === 'moms_monthly' ? 5 : 6)),
+            settings,
+          })
+          linkedReportPeriod = canonical.linkedReportPeriod
+        }
 
         deadlines.push({
           company_id: companyId,
@@ -608,7 +729,7 @@ function createLinkedReportPeriod(
   }
 
   // Annual: "2025"
-  if (/^\d{4}$/.test(period)) {
+  if (FISCAL_YEAR_RE.test(period)) {
     return { year: parseInt(period) }
   }
 
@@ -678,7 +799,11 @@ export function getExpectedUpcomingDeadlineKeys(
   for (const config of getApplicableDeadlineConfigs(settings)) {
     const horizonEnd = horizonEndFor(config.type, today)
     for (const year of years) {
-      for (const instance of config.generateDates(year, settings)) {
+      const instances = config.type === 'moms_yearly'
+        ? annualVatDeadlineInstances(year, settings)
+        : config.generateDates(year, settings)
+      for (const instance of instances) {
+        if (vatDeadlinePrecedesLiability(config.type, instance, settings)) continue
         const rawDate = new Date(instance.year, instance.month, instance.day)
         const adjustedDate = config.skipBankingDayAdjustment
           ? rawDate
@@ -810,7 +935,8 @@ export async function backfillMissingTaxDeadlines(
         .range(from, to),
     ),
   ])
-  const allSettings = await hydrateTaxAssessmentNotices(supabase, rawSettings)
+  const settingsWithNotices = await hydrateTaxAssessmentNotices(supabase, rawSettings)
+  const allSettings = await hydrateAnnualVatFiscalPeriods(supabase, settingsWithNotices)
 
   const missingSettings = findSettingsMissingUpcomingDeadlines(allSettings, upcomingDeadlineRows)
   let companiesRepaired = 0

@@ -15,10 +15,33 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { eventBus } from '@/lib/events/bus'
 import type { PendingOperation } from '@/types'
 
-const mockDetectBookingDuplicate = vi.fn()
-vi.mock('@/lib/transactions/booking-duplicate-detection', () => ({
-  detectBookingDuplicate: (...args: unknown[]) => mockDetectBookingDuplicate(...args),
+const { duplicateLines } = vi.hoisted(() => ({
+  duplicateLines: [
+    {
+      account_number: '3001',
+      debit_amount: 0,
+      credit_amount: 98565,
+      line_description: 'Test',
+      dimensions: {},
+    },
+    {
+      account_number: '1930',
+      debit_amount: 98565,
+      credit_amount: 0,
+      line_description: 'Test',
+      dimensions: {},
+    },
+  ],
 }))
+
+const mockDetectBookingDuplicate = vi.fn()
+vi.mock('@/lib/transactions/booking-duplicate-detection', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>()
+  return {
+    ...actual,
+    detectBookingDuplicate: (...args: unknown[]) => mockDetectBookingDuplicate(...args),
+  }
+})
 
 const mockFindDupPayments = vi.fn()
 vi.mock('@/lib/invoices/duplicate-payment-candidates', () => ({
@@ -29,6 +52,52 @@ const mockAppendProcessingHistory = vi.fn()
 vi.mock('@/lib/processing-history/append', () => ({
   appendProcessingHistory: (...args: unknown[]) => mockAppendProcessingHistory(...args),
 }))
+
+vi.mock('@/lib/bookkeeping/transaction-entries', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>()
+  return {
+    ...actual,
+    buildTransactionEntryLines: vi.fn(() => duplicateLines),
+  }
+})
+
+vi.mock('@/lib/transactions/settlement-attachment', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>()
+  return {
+    ...actual,
+    coordinateTransactionSettlement: vi.fn(async (input: {
+      transaction: { id: string; cash_account_id?: string | null }
+      companyId: string
+      category: string
+      isBusiness: boolean
+    }) => ({
+      kind: 'attached',
+      created: false,
+      readback: {
+        transaction: {
+          id: input.transaction.id,
+          companyId: input.companyId,
+          journalEntryId: 'je-1',
+          cashAccountId: input.transaction.cash_account_id ?? null,
+          amountSek: 98565,
+          category: input.category,
+          isBusiness: input.isBusiness,
+        },
+        journalEntry: {
+          id: 'je-1',
+          companyId: input.companyId,
+          status: 'posted',
+          sourceType: 'bank_transaction',
+          sourceId: input.transaction.id,
+          category: input.category,
+          isBusiness: input.isBusiness,
+          lines: duplicateLines,
+        },
+        cashAccount: null,
+      },
+    })),
+  }
+})
 
 import { commitPendingOperation } from '../commit'
 
@@ -74,6 +143,38 @@ function makePendingOp(overrides: Partial<PendingOperation>): PendingOperation {
   } as PendingOperation
 }
 
+const duplicateTransaction = {
+  id: 'tx-1',
+  company_id: 'company-1',
+  date: '2026-03-26',
+  amount: 98565,
+  currency: 'SEK',
+  amount_sek: null,
+  exchange_rate: null,
+  cash_account_id: null,
+  journal_entry_id: null,
+  description: 'Inbetalning',
+}
+
+function categorizeParams(allowDuplicate = false): Record<string, unknown> {
+  return {
+    transaction_id: 'tx-1',
+    category: 'income',
+    ...(allowDuplicate ? { allow_duplicate: true } : {}),
+    settlement_snapshot: {
+      companyId: 'company-1',
+      transactionId: 'tx-1',
+      expectedJournalEntryId: null,
+      cashAccountId: null,
+      settlementAccount: '1930',
+      amountSek: 98565,
+      category: 'income',
+      isBusiness: true,
+      lines: duplicateLines,
+    },
+  }
+}
+
 const voucherCandidate = {
   transaction_id: null,
   journal_entry_id: 'je-existing',
@@ -94,13 +195,15 @@ describe('commit duplicate guard: categorize_transaction (reverse / book the ban
     // claim → transaction fetch → reject update
     const supabase = queuedSupabase([
       { data: { id: 'op-1' } },
-      { data: { id: 'tx-1', date: '2026-03-26', amount: 98565, cash_account_id: null, journal_entry_id: null } },
+      { data: duplicateTransaction },
+      { data: { entity_type: 'aktiebolag' } },
+      { data: duplicateTransaction },
       { data: null },
     ])
 
     const op = makePendingOp({
       operation_type: 'categorize_transaction',
-      params: { transaction_id: 'tx-1', category: 'income' },
+      params: categorizeParams(),
     })
 
     const result = await commitPendingOperation(supabase, 'user-1', 'company-1', op)
@@ -118,14 +221,16 @@ describe('commit duplicate guard: categorize_transaction (reverse / book the ban
     // auditor can reconstruct why the duplicate was allowed (BFNAR 2013:2 kap 8).
     const supabase = queuedSupabase([
       { data: { id: 'op-1' } },
-      { data: { id: 'tx-1', date: '2026-03-26', amount: 98565, cash_account_id: null, journal_entry_id: null } },
+      { data: duplicateTransaction },
+      { data: { entity_type: 'aktiebolag' } },
+      { data: duplicateTransaction },
       { data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 } },
       { data: [] },
     ])
 
     const op = makePendingOp({
       operation_type: 'categorize_transaction',
-      params: { transaction_id: 'tx-1', category: 'income', allow_duplicate: true },
+      params: categorizeParams(true),
     })
 
     const result = await commitPendingOperation(supabase, 'user-1', 'company-1', op)
@@ -154,14 +259,16 @@ describe('commit duplicate guard: categorize_transaction (reverse / book the ban
     mockDetectBookingDuplicate.mockResolvedValue(null)
     const supabase = queuedSupabase([
       { data: { id: 'op-1' } },
-      { data: { id: 'tx-1', date: '2026-03-26', amount: 98565, cash_account_id: null, journal_entry_id: null } },
+      { data: duplicateTransaction },
+      { data: { entity_type: 'aktiebolag' } },
+      { data: duplicateTransaction },
       { data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 } },
       { data: [] },
     ])
 
     const op = makePendingOp({
       operation_type: 'categorize_transaction',
-      params: { transaction_id: 'tx-1', category: 'income', allow_duplicate: true },
+      params: categorizeParams(true),
     })
 
     await commitPendingOperation(supabase, 'user-1', 'company-1', op)

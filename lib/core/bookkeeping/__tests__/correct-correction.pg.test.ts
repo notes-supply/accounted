@@ -1,6 +1,7 @@
+import type { PoolClient } from 'pg'
 import { describe, expect, it } from 'vitest'
 import { randomUUID } from 'node:crypto'
-import { getPool } from '@/tests/pg/setup'
+import { getClient, getPool } from '@/tests/pg/setup'
 import { seedCompany } from '@/tests/pg/fixtures'
 
 /**
@@ -25,14 +26,16 @@ describe('chained correction (pg-real)', () => {
   it('accepts a correction whose original is itself a correction', async () => {
     const { userId, companyId, fiscalPeriodId } = await seedCompany()
     const pool = getPool()
-
+    const client: PoolClient = await getClient()
+    await client.query('BEGIN')
+    try {
     async function insertDraft(opts: {
       sourceType: string
       reversesId?: string | null
       correctionOfId?: string | null
     }): Promise<string> {
       const id = randomUUID()
-      await pool.query(
+      await client.query(
         `INSERT INTO public.journal_entries
            (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
             entry_date, description, source_type, status, reverses_id, correction_of_id)
@@ -52,7 +55,7 @@ describe('chained correction (pg-real)', () => {
     }
 
     async function insertLines(entryId: string, debitAcc: string, creditAcc: string, amount: number) {
-      await pool.query(
+      await client.query(
         `INSERT INTO public.journal_entry_lines
            (journal_entry_id, account_number, debit_amount, credit_amount)
          VALUES ($1, $2, $3, 0), ($1, $4, 0, $3)`,
@@ -61,15 +64,15 @@ describe('chained correction (pg-real)', () => {
     }
 
     async function commit(entryId: string): Promise<number> {
-      const { rows } = await pool.query<{ voucher_number: number }>(
-        `SELECT voucher_number FROM public.commit_journal_entry($1::uuid, $2::uuid)`,
+      const { rows } = await client.query<{ voucher_number: number }>(
+        `SELECT voucher_number FROM public.commit_journal_entry($1::uuid, $2::uuid, 'legacy')`,
         [companyId, entryId],
       )
       return rows[0]!.voucher_number
     }
 
     async function markReversed(entryId: string, reversedById: string) {
-      await pool.query(
+      await client.query(
         `UPDATE public.journal_entries
             SET status = 'reversed', reversed_by_id = $2
           WHERE id = $1 AND status = 'posted'`,
@@ -96,7 +99,7 @@ describe('chained correction (pg-real)', () => {
     await commit(correction1Id)
 
     // Sanity: original is reversed, correction1 is posted.
-    const { rows: midRows } = await pool.query<{ id: string; status: string; source_type: string }>(
+    const { rows: midRows } = await client.query<{ id: string; status: string; source_type: string }>(
       `SELECT id, status, source_type FROM public.journal_entries
         WHERE id = ANY($1::uuid[])`,
       [[originalId, correction1Id]],
@@ -123,6 +126,7 @@ describe('chained correction (pg-real)', () => {
     const correction2Voucher = await commit(correction2Id)
 
     expect(correction2Voucher).toBeGreaterThan(0)
+    await client.query('COMMIT')
 
     // === Final assertions: full chain is intact ===
     const { rows: finalRows } = await pool.query<{
@@ -169,5 +173,11 @@ describe('chained correction (pg-real)', () => {
       source_type: 'correction',
       correction_of_id: correction1Id,
     })
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw error
+    } finally {
+      client.release()
+    }
   })
 })

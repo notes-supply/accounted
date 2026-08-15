@@ -593,6 +593,37 @@ describe('PUT /api/settings', () => {
     expect(deadlineMocks.regenerate).toHaveBeenCalledOnce()
   })
 
+  it('persists an explicit null VAT liability date and regenerates deadlines', async () => {
+    const settings = {
+      company_id: 'company-1',
+      entity_type: 'aktiebolag',
+      vat_registered: true,
+      vat_number: 'SE556012579001',
+      moms_period: 'quarterly',
+      vat_taxable_base_over_40m: false,
+      vat_has_eu_trade: false,
+      vat_liability_start_date: '2024-01-01',
+      onboarding_complete: true,
+    }
+    enqueueMany([
+      { data: settings },
+      { data: { ...settings, vat_liability_start_date: null } },
+    ])
+    const request = createMockRequest('/api/settings', {
+      method: 'PUT',
+      body: { vat_liability_start_date: null },
+    })
+
+    const response = await PUT(request, { params: Promise.resolve({}) })
+    const { status, body } = await parseJsonResponse<{
+      data: { vat_liability_start_date: string | null }
+    }>(response)
+
+    expect(status).toBe(200)
+    expect(body.data.vat_liability_start_date).toBeNull()
+    expect(deadlineMocks.regenerate).toHaveBeenCalledOnce()
+  })
+
   it('returns 404 when the settings row does not exist', async () => {
     enqueueMany([
       { data: { onboarding_complete: false } },

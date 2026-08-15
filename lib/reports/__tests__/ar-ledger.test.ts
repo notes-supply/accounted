@@ -572,7 +572,15 @@ describe('generateARLedger: historical as-of reconstruction (#1020)', () => {
       },
       // Query 2: payment rows: the payment is dated after the as-of date
       {
-        data: [{ invoice_id: 'inv-1', amount: 5000, payment_date: '2024-07-01' }],
+        data: [
+          {
+            id: 'pay-1',
+            invoice_id: 'inv-1',
+            amount: 5000,
+            payment_date: '2024-07-01',
+            journal_entry_id: null,
+          },
+        ],
         error: null,
       },
     ]
@@ -596,8 +604,20 @@ describe('generateARLedger: historical as-of reconstruction (#1020)', () => {
       },
       {
         data: [
-          { invoice_id: 'inv-1', amount: 4000, payment_date: '2024-06-10' },
-          { invoice_id: 'inv-1', amount: 6000, payment_date: '2024-07-05' },
+          {
+            id: 'pay-before',
+            invoice_id: 'inv-1',
+            amount: 4000,
+            payment_date: '2024-06-10',
+            journal_entry_id: null,
+          },
+          {
+            id: 'pay-after',
+            invoice_id: 'inv-1',
+            amount: 6000,
+            payment_date: '2024-07-05',
+            journal_entry_id: null,
+          },
         ],
         error: null,
       },

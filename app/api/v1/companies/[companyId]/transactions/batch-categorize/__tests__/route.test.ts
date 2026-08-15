@@ -24,16 +24,25 @@ vi.mock('@supabase/supabase-js', async () => {
   return { ...actual, createClient: vi.fn().mockReturnValue({}) }
 })
 
-const { createTxJE, findMissingAccountsMock, reverseEntryMock } = vi.hoisted(() => ({
+const {
+  createTxJE,
+  findMissingAccountsMock,
+  reverseEntryMock,
+  coordinateSettlementMock,
+} = vi.hoisted(() => ({
   createTxJE: vi.fn().mockResolvedValue({ id: 'je-fresh' }),
   // Default: every mapped account resolves (active, or seedable standard
   // BAS). Per-test overrides simulate the bug surface (inactive/unknown).
   findMissingAccountsMock: vi.fn().mockResolvedValue([]),
   reverseEntryMock: vi.fn().mockResolvedValue(undefined),
+  coordinateSettlementMock: vi.fn(),
 }))
 
 vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
   createTransactionJournalEntry: createTxJE,
+}))
+vi.mock('@/lib/transactions/settlement-attachment', () => ({
+  coordinateTransactionSettlement: coordinateSettlementMock,
 }))
 vi.mock('@/lib/bookkeeping/engine', () => ({
   reverseEntry: reverseEntryMock,
@@ -119,6 +128,48 @@ beforeEach(() => {
   findMissingAccountsMock.mockResolvedValue([])
   reverseEntryMock.mockResolvedValue(undefined)
   createTxJE.mockResolvedValue({ id: 'je-fresh' })
+  coordinateSettlementMock.mockImplementation(async (input: {
+    supabase: unknown
+    companyId: string
+    userId: string
+    transaction: {
+      journal_entry_id: string | null
+      cash_account_id: string | null
+    }
+    mappingResult: unknown
+    category: string
+    isBusiness: boolean
+    existingCategorization: boolean
+  }) => {
+    const entry = input.existingCategorization
+      ? { id: input.transaction.journal_entry_id }
+      : await createTxJE(
+          input.supabase,
+          input.companyId,
+          input.userId,
+          input.transaction,
+          input.mappingResult,
+        )
+    return {
+      kind: 'attached',
+      created: !input.existingCategorization,
+      journalEntry: entry,
+      publication: {
+        publication_id: `pub-${entry.id}`,
+        event_key: `journal:${entry.id}:committed`,
+        event_type: 'journal_entry.committed',
+      },
+      readback: {
+        transaction: {
+          journalEntryId: entry.id,
+          cashAccountId: input.transaction.cash_account_id,
+          category: input.category,
+          isBusiness: input.isBusiness,
+        },
+        journalEntry: { id: entry.id },
+      },
+    }
+  })
   mockValidate.mockResolvedValue({
     userId: 'user-1',
     companyId: COMPANY_ID,
@@ -197,11 +248,10 @@ describe('POST batch-categorize', () => {
       makeFlexibleSupabase({
         company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
         transactions: [
-          txRow(TX_A, null), // item A fetch: unbooked
-          { data: [{ id: TX_A }], error: null }, // item A CAS update: owned
-          txRow(TX_B, 'je-old'), // item B fetch: already booked
-          { data: null, error: null }, // item B flags-flip update
+          txRow(TX_A, null),
+          txRow(TX_B, 'je-old'),
         ],
+        journal_entries: { data: { id: 'je-old', status: 'posted' }, error: null },
         company_settings: { data: { entity_type: 'enskild_firma' }, error: null },
         fiscal_periods: { data: { id: 'period-1', is_closed: false, locked_at: null }, error: null },
       }).supabase,
@@ -402,7 +452,7 @@ describe('POST batch-categorize', () => {
     expect(body.data.summary).toEqual({ total: 1, succeeded: 0, failed: 1 })
   })
 
-  it('documents the stranded voucher with the real voucher_gap_explanations columns when the CAS-race storno fails', async () => {
+  it('preserves compensation identities without a client-side storno fallback', async () => {
     const { supabase, inserts } = makeFlexibleSupabase({
       company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
       transactions: [
@@ -430,9 +480,16 @@ describe('POST batch-categorize', () => {
       voucher_gap_explanations: { data: null, error: null },
     })
     mockServiceClient.mockReturnValue(supabase)
-    // Storno fails: the orphan keeps its number, so the break in the
-    // verifikationsnummerserie must be documented (BFNAR 2013:2).
-    reverseEntryMock.mockRejectedValueOnce(new Error('period locked'))
+    coordinateSettlementMock.mockResolvedValueOnce({
+      kind: 'partial',
+      code: 'SETTLEMENT_ATTACHMENT_PARTIAL',
+      message: 'Attachment readback remained ambiguous.',
+      postedIds: {
+        original_journal_entry_id: 'je-fresh',
+        reversal_journal_entry_id: 'je-storno',
+      },
+      publicationIds: ['pub-compensation-1'],
+    })
 
     const res = await POST(
       makeRequest(
@@ -448,19 +505,15 @@ describe('POST batch-categorize', () => {
 
     expect(res.status).toBe(200)
     const body = await res.json()
-    expect(body.data.results[0].error.code).toBe('TX_CATEGORIZE_RACE')
-
-    const gaps = inserts['voucher_gap_explanations'] as Record<string, unknown>[]
-    expect(gaps).toHaveLength(1)
-    // Exhaustive: no gap_number, no created_by, and every NOT NULL column set.
-    expect(gaps[0]).toEqual({
-      company_id: COMPANY_ID,
-      user_id: 'user-1',
-      fiscal_period_id: 'period-1',
-      voucher_series: 'B',
-      gap_start: 42,
-      gap_end: 42,
-      explanation: 'CAS-race orphan; automatisk storno misslyckades. Manuell reconciliation krävs.',
+    expect(body.data.results[0].error.code).toBe('SETTLEMENT_ATTACHMENT_PARTIAL')
+    expect(body.data.results[0].error.details.posted_ids).toEqual({
+      original_journal_entry_id: 'je-fresh',
+      reversal_journal_entry_id: 'je-storno',
     })
+    expect(body.data.results[0].error.details.publication_ids).toEqual([
+      'pub-compensation-1',
+    ])
+    expect(reverseEntryMock).not.toHaveBeenCalled()
+    expect(inserts.voucher_gap_explanations).toBeUndefined()
   })
 })

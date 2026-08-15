@@ -163,10 +163,10 @@ describe('addEmployeeToRun', () => {
 })
 
 describe('removeEmployeeFromRun', () => {
-  it('removes an attached employee from a draft run', async () => {
+  it('uses the atomic RPC to release claims and remove a draft-run employee', async () => {
     mock.enqueue({ data: { id: RUN_ID, status: 'draft' } })
     mock.enqueue({ data: { id: SRE_ID } })
-    mock.enqueue({ data: null }) // delete
+    mock.enqueue({ data: { outcome: 'deleted', released_trip_count: 2 } })
 
     const result = await removeEmployeeFromRun(supabase, {
       companyId: COMPANY_ID,
@@ -176,6 +176,16 @@ describe('removeEmployeeFromRun', () => {
 
     expect(result.ok).toBe(true)
     if (result.ok) expect(result.data.deleted).toBe(true)
+    expect(mock.supabase.rpc).toHaveBeenCalledWith(
+      'delete_draft_salary_object_with_mileage_release',
+      {
+        p_company_id: COMPANY_ID,
+        p_salary_run_id: RUN_ID,
+        p_target_kind: 'run_employee',
+        p_target_id: SRE_ID,
+      },
+    )
+    expect(mock.findCalls('salary_run_employees', 'delete')).toEqual([])
   })
 
   it('returns SALARY_RUN_EMPLOYEE_NOT_FOUND when not attached', async () => {
@@ -215,5 +225,30 @@ describe('removeEmployeeFromRun', () => {
     expect(result.ok).toBe(true)
     const fromCalls = (mock.supabase.from as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0])
     expect(fromCalls).toEqual(['salary_runs', 'salary_run_employees'])
+  })
+  it('returns a non-retryable release error instead of cascading deletion', async () => {
+    mock.enqueue({ data: { id: RUN_ID, status: 'draft' } })
+    mock.enqueue({ data: { id: SRE_ID } })
+    mock.enqueue({
+      data: {
+        outcome: 'release_incomplete',
+        expected_trip_count: 3,
+        released_trip_count: 2,
+      },
+    })
+
+    const result = await removeEmployeeFromRun(supabase, {
+      companyId: COMPANY_ID,
+      salaryRunId: RUN_ID,
+      employeeId: EMPLOYEE_ID,
+    })
+    expect(result).toEqual({
+      ok: false,
+      code: 'MILEAGE_CLAIM_RELEASE_INCOMPLETE',
+      details: {
+        expected_trip_count: 3,
+        released_trip_count: 2,
+      },
+    })
   })
 })

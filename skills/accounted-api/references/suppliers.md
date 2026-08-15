@@ -171,7 +171,8 @@ Response `200`:
     payment_journal_entry_id: string,
     notes: string,
     created_at: string,
-    updated_at: string
+    updated_at: string,
+    payments?: { id: string, payment_date: string, amount: number, currency: string, exchange_rate: number, exchange_rate_difference: number, journal_entry_id: string, transaction_id: string, notes: string, created_at: string, retained: boolean, reversed_at: string, reversed_by_journal_entry_id: string }[]
   },
   meta: {
     request_id: string,
@@ -245,7 +246,8 @@ Response `200`:
     payment_journal_entry_id: string,
     notes: string,
     created_at: string,
-    updated_at: string
+    updated_at: string,
+    payments?: { id: string, payment_date: string, amount: number, currency: string, exchange_rate: number, exchange_rate_difference: number, journal_entry_id: string, transaction_id: string, notes: string, created_at: string, retained: boolean, reversed_at: string, reversed_by_journal_entry_id: string }[]
   },
   meta: {
     request_id: string,

@@ -12,8 +12,28 @@ import {
   makeInvoice,
   makeFiscalPeriod,
   makeSupplierInvoice,
+  makeTransaction,
 } from '@/tests/helpers'
 import type { PendingOperation } from '@/types'
+
+const { canonicalCategorizeLines } = vi.hoisted(() => ({
+  canonicalCategorizeLines: [
+    {
+      account_number: '6110',
+      debit_amount: 500,
+      credit_amount: 0,
+      line_description: 'Test',
+      dimensions: {},
+    },
+    {
+      account_number: '1930',
+      debit_amount: 0,
+      credit_amount: 500,
+      line_description: 'Test',
+      dimensions: {},
+    },
+  ],
+}))
 
 vi.mock('@/lib/core/bookkeeping/period-service', async () => {
   const actual = await vi.importActual<typeof import('@/lib/core/bookkeeping/period-service')>(
@@ -75,6 +95,14 @@ vi.mock('@/lib/bookkeeping/supplier-invoice-entries', async () => {
   return {
     ...actual,
     createSupplierCreditNoteEntry: vi.fn(),
+  }
+})
+
+vi.mock('@/lib/bookkeeping/transaction-entries', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>()
+  return {
+    ...actual,
+    buildTransactionEntryLines: vi.fn(() => canonicalCategorizeLines),
   }
 })
 
@@ -143,6 +171,34 @@ function makePendingOp(overrides: Partial<PendingOperation>): PendingOperation {
     updated_at: '2026-05-03T00:00:00Z',
     ...overrides,
   } as PendingOperation
+}
+
+const categorizeTransactionFixture = makeTransaction({
+  id: 'tx-1',
+  amount: -500,
+  currency: 'SEK',
+})
+
+function makeCategorizeParams(
+  category: string,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    transaction_id: 'tx-1',
+    category,
+    ...overrides,
+    settlement_snapshot: {
+      companyId: 'company-1',
+      transactionId: 'tx-1',
+      expectedJournalEntryId: null,
+      cashAccountId: null,
+      settlementAccount: '1930',
+      amountSek: 500,
+      category,
+      isBusiness: category !== 'private',
+      lines: canonicalCategorizeLines,
+    },
+  }
 }
 
 beforeEach(() => {
@@ -1295,15 +1351,15 @@ describe('commitPendingOperation: categorize_transaction: dimensions propagation
 
     const { supabase, enqueue } = createQueuedMockSupabase()
     enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({ data: categorizeTransactionFixture, error: null }) // approved settlement transaction
+    enqueue({ data: { entity_type: 'enskild_firma' }, error: null }) // approved mapping settings
     enqueue({ data: null, error: null }) // dispatcher's commit update
 
     const op = makePendingOp({
       operation_type: 'categorize_transaction',
-      params: {
-        transaction_id: 'tx-1',
-        category: 'office_supplies',
+      params: makeCategorizeParams('office_supplies', {
         dimensions: { '1': 'KS01', '6': 'P001' },
-      },
+      }),
     })
 
     const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
@@ -1324,17 +1380,17 @@ describe('commitPendingOperation: categorize_transaction: dimensions propagation
 
     const { supabase, enqueue } = createQueuedMockSupabase()
     enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({ data: categorizeTransactionFixture, error: null }) // approved settlement transaction
+    enqueue({ data: { entity_type: 'enskild_firma' }, error: null }) // approved mapping settings
     enqueue({ data: null, error: null }) // dispatcher's commit update
 
     const op = makePendingOp({
       operation_type: 'categorize_transaction',
-      params: {
-        transaction_id: 'tx-1',
-        category: 'office_supplies',
+      params: makeCategorizeParams('office_supplies', {
         // '0' is not a valid SIE dimension number: the whole bag is rejected
         // and booking proceeds without dimensions.
         dimensions: { '0': 'X' },
-      },
+      }),
     })
 
     const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
@@ -1351,11 +1407,13 @@ describe('commitPendingOperation: categorize_transaction: dimensions propagation
 
     const { supabase, enqueue } = createQueuedMockSupabase()
     enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({ data: categorizeTransactionFixture, error: null }) // approved settlement transaction
+    enqueue({ data: { entity_type: 'enskild_firma' }, error: null }) // approved mapping settings
     enqueue({ data: null, error: null }) // dispatcher's commit update
 
     const op = makePendingOp({
       operation_type: 'categorize_transaction',
-      params: { transaction_id: 'tx-1', category: 'office_supplies' },
+      params: makeCategorizeParams('office_supplies'),
     })
 
     await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
@@ -1397,11 +1455,17 @@ describe('commitPendingOperation: categorize_transaction account_override', () =
 
     const { supabase, enqueue } = createQueuedMockSupabase()
     enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({ data: categorizeTransactionFixture, error: null }) // approved settlement transaction
+    enqueue({ data: { entity_type: 'enskild_firma' }, error: null }) // approved mapping settings
+    enqueue({
+      data: { account_number: '4020', account_class: 4, is_active: true },
+      error: null,
+    }) // approved account override
     enqueue({ data: null, error: null }) // dispatcher's commit update
 
     const op = makePendingOp({
       operation_type: 'categorize_transaction',
-      params: { transaction_id: 'tx-1', category: 'expense_other', account_override: '4020' },
+      params: makeCategorizeParams('expense_other', { account_override: '4020' }),
     })
 
     const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
@@ -1418,11 +1482,13 @@ describe('commitPendingOperation: categorize_transaction account_override', () =
 
     const { supabase, enqueue } = createQueuedMockSupabase()
     enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
+    enqueue({ data: categorizeTransactionFixture, error: null }) // approved settlement transaction
+    enqueue({ data: { entity_type: 'enskild_firma' }, error: null }) // approved mapping settings
     enqueue({ data: null, error: null }) // dispatcher's commit update
 
     const op = makePendingOp({
       operation_type: 'categorize_transaction',
-      params: { transaction_id: 'tx-1', category: 'expense_other', account_override: null },
+      params: makeCategorizeParams('expense_other', { account_override: null }),
     })
 
     await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)

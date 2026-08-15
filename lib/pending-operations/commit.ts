@@ -15,7 +15,10 @@
  */
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { eventBus } from '@/lib/events'
-import { bulkBookMatchedInboxItems, categorizeMatchedTransaction } from '@/lib/transactions/categorize-core'
+import {
+  bulkBookMatchedInboxItems,
+  categorizeMatchedTransaction,
+} from '@/lib/transactions/categorize-core'
 import { getVatRules, getPermittedVatRates } from '@/lib/invoices/vat-rules'
 import { fetchExchangeRate } from '@/lib/currency/riksbanken'
 import {
@@ -35,6 +38,12 @@ import {
   createCreditNoteJournalEntry,
 } from '@/lib/bookkeeping/invoice-entries'
 import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
+import {
+  buildMappingResultFromCategory,
+} from '@/lib/bookkeeping/category-mapping'
+import { applySettlementAccount } from '@/lib/bookkeeping/mapping-engine'
+import { applyAccountOverride } from '@/lib/bookkeeping/account-override'
+import { buildTransactionEntryLines } from '@/lib/bookkeeping/transaction-entries'
 import { cashPartialBlockReason, supplierCreditNoteNeedsJournalEntry } from '@/lib/bookkeeping/booking-mode'
 import { ensureManualCashAccount } from '@/lib/cash-accounts/service'
 import { createJournalEntry, findFiscalPeriod, getSwedishLocalDate, reverseEntry, validateBalance } from '@/lib/bookkeeping/engine'
@@ -77,6 +86,7 @@ import {
   type BatchAllocationResult,
 } from '@/lib/invoices/clear-settled-batch-allocations'
 import { linkTransactionToJournalEntry } from '@/lib/transactions/link-journal-entry'
+import { resolveTransactionAmountSek } from '@/lib/transactions/booking-duplicate-detection'
 import {
   completeInboxItemsForBookedTransaction,
   resolveVoucherLinkedEntryIds,
@@ -193,6 +203,8 @@ export interface CommitResult {
   // callers that do not recognize the code fall back to `error`.
   code?: string
   account_numbers?: string[]
+  /** Explicit retry contract for API and MCP callers. */
+  retryable?: boolean
 }
 
 export interface CommitOptions {
@@ -276,6 +288,251 @@ type ExecutorResult = {
   // the dispatcher then lands the op in 'failed_partial' instead of
   // 'rejected' and persists these ids in result_data.posted_ids (issue #842).
   partialPostedIds?: Record<string, string>
+  // Durable settlement publications already emitted by a partial result.
+  // These identities must survive pending-operation persistence and every
+  // single/bulk response alongside the journal identities above.
+  partialPublicationIds?: string[]
+}
+
+const SettlementSnapshotLineSchema = z.object({
+  account_number: z.string().regex(ACCOUNT_NUMBER_RE),
+  debit_amount: z.number().finite().nonnegative(),
+  credit_amount: z.number().finite().nonnegative(),
+  line_description: z.string().nullable(),
+  dimensions: z.record(z.string(), z.string()),
+}).strict()
+
+const PendingSettlementSnapshotSchema = z.object({
+  companyId: z.string().min(1),
+  transactionId: z.string().min(1),
+  expectedJournalEntryId: z.string().min(1).nullable(),
+  cashAccountId: z.string().min(1).nullable(),
+  settlementAccount: z.string().regex(ACCOUNT_NUMBER_RE),
+  amountSek: z.number().finite().positive(),
+  category: z.string().min(1),
+  isBusiness: z.boolean(),
+  lines: z.array(SettlementSnapshotLineSchema).min(2),
+}).strict()
+
+const PendingInboxSettlementSnapshotSchema = PendingSettlementSnapshotSchema.extend({
+  inboxItemId: z.string().min(1),
+}).strict()
+
+const PendingInboxSettlementSnapshotsSchema =
+  z.array(PendingInboxSettlementSnapshotSchema).min(1)
+
+
+type PendingSettlementSnapshot = z.infer<typeof PendingSettlementSnapshotSchema>
+
+type CategorizeWithApprovedSnapshot = (
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  transactionId: string,
+  options: {
+    category: TransactionCategory
+    vatTreatment?: VatTreatment
+    vatAmount?: number
+    notes?: string
+    allowDuplicate: boolean
+    dimensions?: Record<string, string>
+    accountOverride?: string
+    approvedSettlementSnapshot: PendingSettlementSnapshot
+  },
+) => Promise<ExecutorResult>
+
+function canonicalSettlementDimensions(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter((entry): entry is [string, string] => typeof entry[1] === 'string')
+      .sort(([left], [right]) => left.localeCompare(right)),
+  )
+}
+
+function canonicalSettlementLine(line: {
+  account_number: string
+  debit_amount: number
+  credit_amount: number
+  line_description?: string | null
+  dimensions?: unknown
+}): PendingSettlementSnapshot['lines'][number] {
+  return {
+    account_number: String(line.account_number),
+    debit_amount: roundOre(Number(line.debit_amount)),
+    credit_amount: roundOre(Number(line.credit_amount)),
+    line_description: line.line_description ?? null,
+    dimensions: canonicalSettlementDimensions(line.dimensions),
+  }
+}
+
+function canonicalSettlementLines(
+  lines: PendingSettlementSnapshot['lines'],
+): string[] {
+  return lines
+    .map((line) => JSON.stringify(canonicalSettlementLine(line)))
+    .sort()
+}
+
+function pendingSettlementSnapshotsEqual(
+  left: PendingSettlementSnapshot,
+  right: PendingSettlementSnapshot,
+): boolean {
+  return (
+    left.companyId === right.companyId &&
+    left.transactionId === right.transactionId &&
+    left.expectedJournalEntryId === right.expectedJournalEntryId &&
+    left.cashAccountId === right.cashAccountId &&
+    left.settlementAccount === right.settlementAccount &&
+    roundOre(left.amountSek) === roundOre(right.amountSek) &&
+    left.category === right.category &&
+    left.isBusiness === right.isBusiness &&
+    JSON.stringify(canonicalSettlementLines(left.lines)) ===
+      JSON.stringify(canonicalSettlementLines(right.lines))
+  )
+}
+
+function settlementSnapshotFailure(
+  error: string,
+  errorCode: 'SETTLEMENT_SNAPSHOT_REQUIRED' | 'SETTLEMENT_SNAPSHOT_CONFLICT',
+  status: 400 | 409,
+): { failure: ExecutorResult } {
+  return { failure: { error, errorCode, status } }
+}
+
+async function verifyPendingSettlementSnapshot(
+  supabase: SupabaseClient,
+  companyId: string,
+  transactionId: string,
+  category: TransactionCategory,
+  vatTreatment: VatTreatment | undefined,
+  vatAmount: number | undefined,
+  dimensions: Record<string, string> | undefined,
+  accountOverride: string | undefined,
+  rawSnapshot: unknown,
+): Promise<{ snapshot?: PendingSettlementSnapshot; failure?: ExecutorResult }> {
+  const parsed = PendingSettlementSnapshotSchema.safeParse(rawSnapshot)
+  if (!parsed.success) {
+    return settlementSnapshotFailure(
+      'Den godkända avräkningssnapshoten saknas eller är ogiltig. Avvisa operationen och stagea om kategoriseringen.',
+      'SETTLEMENT_SNAPSHOT_REQUIRED',
+      400,
+    )
+  }
+
+  const snapshot = parsed.data
+  const isBusiness = category !== 'private'
+  if (
+    snapshot.companyId !== companyId ||
+    snapshot.transactionId !== transactionId ||
+    snapshot.category !== category ||
+    snapshot.isBusiness !== isBusiness
+  ) {
+    return settlementSnapshotFailure(
+      'Kategoriseringens godkända avräkningssnapshot matchar inte operationens parametrar.',
+      'SETTLEMENT_SNAPSHOT_CONFLICT',
+      409,
+    )
+  }
+
+  const { data: transaction, error: transactionError } = await supabase
+    .from('transactions')
+    .select('*')
+    .eq('id', transactionId)
+    .eq('company_id', companyId)
+    .maybeSingle()
+  if (transactionError || !transaction || transaction.id !== transactionId) {
+    return settlementSnapshotFailure(
+      'Transaktionen kunde inte verifieras mot den godkända avräkningssnapshoten.',
+      'SETTLEMENT_SNAPSHOT_CONFLICT',
+      409,
+    )
+  }
+
+  const { data: settings, error: settingsError } = await supabase
+    .from('company_settings')
+    .select('entity_type')
+    .eq('company_id', companyId)
+    .maybeSingle()
+  if (settingsError) {
+    return settlementSnapshotFailure(
+      'Företagets konteringsinställningar kunde inte verifieras vid godkännandet.',
+      'SETTLEMENT_SNAPSHOT_CONFLICT',
+      409,
+    )
+  }
+
+  const amountSek = resolveTransactionAmountSek(transaction)
+  if (amountSek === null) {
+    return settlementSnapshotFailure(
+      'Transaktionens auktoritativa SEK-belopp kunde inte verifieras vid godkännandet.',
+      'SETTLEMENT_SNAPSHOT_CONFLICT',
+      409,
+    )
+  }
+
+  try {
+    const entityType =
+      (settings?.entity_type as EntityType | null) ?? 'enskild_firma'
+    let mappingResult = buildMappingResultFromCategory(
+      category,
+      transaction as Transaction,
+      isBusiness,
+      entityType,
+      vatTreatment,
+      vatAmount,
+    )
+    const settlementAccount = await resolveSettlementAccount(
+      supabase,
+      companyId,
+      transaction.cash_account_id,
+      log,
+    )
+    mappingResult = applySettlementAccount(mappingResult, settlementAccount)
+    if (accountOverride) {
+      mappingResult = await applyAccountOverride(
+        supabase,
+        companyId,
+        accountOverride,
+        transaction.amount,
+        mappingResult,
+        vatTreatment != null || vatAmount != null,
+      )
+    }
+    if (dimensions && Object.keys(dimensions).length > 0) {
+      mappingResult.dimensions = dimensions
+    }
+
+    const currentSnapshot: PendingSettlementSnapshot = {
+      companyId,
+      transactionId: transaction.id,
+      expectedJournalEntryId: transaction.journal_entry_id ?? null,
+      cashAccountId: transaction.cash_account_id ?? null,
+      settlementAccount,
+      amountSek,
+      category,
+      isBusiness,
+      lines: buildTransactionEntryLines(
+        transaction as Transaction,
+        mappingResult,
+      ).map(canonicalSettlementLine),
+    }
+    if (!pendingSettlementSnapshotsEqual(snapshot, currentSnapshot)) {
+      return settlementSnapshotFailure(
+        'Transaktionens fullständiga avräkningssnapshot ändrades efter godkännandet.',
+        'SETTLEMENT_SNAPSHOT_CONFLICT',
+        409,
+      )
+    }
+  } catch {
+    return settlementSnapshotFailure(
+      'Avräkningskontot eller konteringen kunde inte längre lösas vid godkännandet.',
+      'SETTLEMENT_SNAPSHOT_CONFLICT',
+      409,
+    )
+  }
+
+  return { snapshot }
 }
 
 async function commitCategorizeTransaction(
@@ -324,16 +581,37 @@ async function commitCategorizeTransaction(
     }
   }
 
-  return categorizeMatchedTransaction(supabase, userId, companyId, txId, {
+  const dimensions = coerceDimensionsBag(params.dimensions)
+  const accountOverride =
+    (rawAccountOverride as string | null | undefined) ?? undefined
+  const verified = await verifyPendingSettlementSnapshot(
+    supabase,
+    companyId,
+    txId,
+    category,
+    vatTreatment,
+    vatAmount,
+    dimensions,
+    accountOverride,
+    params.settlement_snapshot,
+  )
+  if (verified.failure) return verified.failure
+
+  const categorizeWithApprovedSnapshot =
+    categorizeMatchedTransaction as unknown as CategorizeWithApprovedSnapshot
+  return categorizeWithApprovedSnapshot(supabase, userId, companyId, txId, {
     category,
     vatTreatment,
     vatAmount,
     notes,
     allowDuplicate: params.allow_duplicate === true,
     // Dimensions PR7: resolved at staging; coerce is the drift/tamper gate.
-    dimensions: coerceDimensionsBag(params.dimensions),
+    dimensions,
     // Validated against the chart both at staging and inside the core at commit.
-    accountOverride: (rawAccountOverride as string | null | undefined) ?? undefined,
+    accountOverride,
+    // Shared settlement owner contract: the coordinator must recheck this
+    // under its transaction locks before posting and again while attaching.
+    approvedSettlementSnapshot: verified.snapshot!,
   })
 }
 
@@ -5396,12 +5674,99 @@ function handleSkvSubmitResult(result: SkvSubmitResult): ExecutorResult {
     if (result.recoverable) {
       throw new SkatteverketRecoverableError(result.error, result.code, result.http_status)
     }
-    return { error: result.error, status: result.http_status }
+    return { error: result.error, errorCode: result.code, status: result.http_status }
   }
   const data: Record<string, unknown> = { ...result, status: 'awaiting_signature' }
   delete data.ok
   return { data }
 }
+
+const ApprovedVatRutorSchema = z.object({
+  ruta05: z.number().finite(),
+  ruta06: z.number().finite(),
+  ruta07: z.number().finite(),
+  ruta08: z.number().finite(),
+  ruta10: z.number().finite(),
+  ruta11: z.number().finite(),
+  ruta12: z.number().finite(),
+  ruta20: z.number().finite(),
+  ruta21: z.number().finite(),
+  ruta22: z.number().finite(),
+  ruta23: z.number().finite(),
+  ruta24: z.number().finite(),
+  ruta30: z.number().finite(),
+  ruta31: z.number().finite(),
+  ruta32: z.number().finite(),
+  ruta35: z.number().finite(),
+  ruta36: z.number().finite(),
+  ruta37: z.number().finite(),
+  ruta38: z.number().finite(),
+  ruta39: z.number().finite(),
+  ruta40: z.number().finite(),
+  ruta41: z.number().finite(),
+  ruta42: z.number().finite(),
+  ruta48: z.number().finite(),
+  ruta49: z.number().finite(),
+  ruta50: z.number().finite(),
+  ruta60: z.number().finite(),
+  ruta61: z.number().finite(),
+  ruta62: z.number().finite(),
+}).strict()
+
+const ApprovedMomsuppgiftSchema = z
+  .object({})
+  .catchall(z.number().finite().int())
+  .refine((value) => Object.keys(value).length > 0)
+
+const VatSubmissionParamsSchema = z.object({
+  period_type: z.enum(['monthly', 'quarterly', 'yearly']),
+  year: z.number().int(),
+  period: z.number().int().positive(),
+  redovisare: z.string().regex(/^\d{12}$/),
+  redovisningsperiod: z.string().regex(/^\d{6}$/),
+  fiscal_period_id: z.string().uuid().nullable(),
+  fiscal_period_start: z.iso.date().nullable(),
+  fiscal_period_end: z.iso.date().nullable(),
+  original_period_start: z.iso.date(),
+  original_period_end: z.iso.date(),
+  resolved_period_start: z.iso.date(),
+  resolved_period_end: z.iso.date(),
+  vat_liability_start_date: z.iso.date().nullable(),
+  approved_rutor: ApprovedVatRutorSchema,
+  approved_momsuppgift: ApprovedMomsuppgiftSchema,
+}).strict().superRefine((value, ctx) => {
+  const yearly = value.period_type === 'yearly'
+  const fiscalIdentityComplete =
+    value.fiscal_period_id !== null &&
+    value.fiscal_period_start !== null &&
+    value.fiscal_period_end !== null
+  const expectedResolvedStart =
+    value.vat_liability_start_date &&
+    value.vat_liability_start_date > value.original_period_start
+      ? value.vat_liability_start_date
+      : value.original_period_start
+  if (
+    (yearly && !fiscalIdentityComplete) ||
+    (!yearly && (
+      value.fiscal_period_id !== null ||
+      value.fiscal_period_start !== null ||
+      value.fiscal_period_end !== null
+    )) ||
+    (yearly && (
+      value.fiscal_period_start !== value.original_period_start ||
+      value.fiscal_period_end !== value.original_period_end
+    )) ||
+    Number(value.original_period_end.slice(0, 4)) !== value.year ||
+    value.redovisningsperiod !== value.original_period_end.slice(0, 7).replace('-', '') ||
+    value.resolved_period_start !== expectedResolvedStart ||
+    value.resolved_period_end !== value.original_period_end
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      message: 'Momsdeklarationens periodidentitet är inkonsekvent.',
+    })
+  }
+})
 
 async function commitSubmitVatDeclaration(
   supabase: SupabaseClient,
@@ -5409,11 +5774,22 @@ async function commitSubmitVatDeclaration(
   companyId: string,
   params: Record<string, unknown>,
 ): Promise<ExecutorResult> {
-  if (!params.period_type || !params.year || !params.period) {
-    return { error: 'period_type, year och period krävs', status: 400 }
+  const parsed = VatSubmissionParamsSchema.safeParse(params)
+  if (!parsed.success) {
+    return {
+      error:
+        'Den godkända momsdeklarationen saknar fullständig periodidentitet eller canonical snapshot.',
+      errorCode: 'VAT_APPROVED_SNAPSHOT_REQUIRED',
+      status: 400,
+    }
   }
   const services = getSkatteverketServices()
-  const result = await services.commitSubmitVatDeclaration(supabase, userId, companyId, params)
+  const result = await services.commitSubmitVatDeclaration(
+    supabase,
+    userId,
+    companyId,
+    parsed.data,
+  )
   return handleSkvSubmitResult(result)
 }
 
@@ -5599,8 +5975,93 @@ async function commitBulkBookInboxItems(
   if (!parsed.success) {
     return { error: `Invalid bulk_book_inbox_items params: ${parsed.error.message}`, status: 400 }
   }
+  const snapshots = PendingInboxSettlementSnapshotsSchema.safeParse(
+    params.settlement_snapshots,
+  )
+  if (!snapshots.success) {
+    return {
+      error:
+        'Bulkoperationen saknar fullständiga avräkningssnapshotar. Avvisa operationen och stagea om den.',
+      errorCode: 'SETTLEMENT_SNAPSHOT_REQUIRED',
+      status: 400,
+    }
+  }
+  const snapshotIds = new Set(snapshots.data.map((snapshot) => snapshot.inboxItemId))
+  if (
+    snapshotIds.size !== snapshots.data.length ||
+    snapshotIds.size !== parsed.data.item_ids.length ||
+    parsed.data.item_ids.some((itemId) => !snapshotIds.has(itemId))
+  ) {
+    return {
+      error: 'Bulkoperationens underlag och avräkningssnapshotar matchar inte varandra.',
+      errorCode: 'SETTLEMENT_SNAPSHOT_CONFLICT',
+      status: 409,
+    }
+  }
 
-  const { booked, skipped } = await bulkBookMatchedInboxItems(supabase, userId, companyId, parsed.data)
+  const dimensions = coerceDimensionsBag(parsed.data.dimensions)
+  for (const approved of snapshots.data) {
+    const { data: item, error: itemError } = await supabase
+      .from('invoice_inbox_items')
+      .select('id, matched_transaction_id')
+      .eq('id', approved.inboxItemId)
+      .eq('company_id', companyId)
+      .maybeSingle()
+    if (
+      itemError ||
+      !item ||
+      item.id !== approved.inboxItemId ||
+      item.matched_transaction_id !== approved.transactionId
+    ) {
+      return {
+        error: 'Ett underlags matchade transaktion ändrades efter godkännandet.',
+        errorCode: 'SETTLEMENT_SNAPSHOT_CONFLICT',
+        status: 409,
+      }
+    }
+    const verified = await verifyPendingSettlementSnapshot(
+      supabase,
+      companyId,
+      approved.transactionId,
+      parsed.data.category,
+      parsed.data.vat_treatment,
+      parsed.data.vat_amount,
+      dimensions,
+      undefined,
+      approved,
+    )
+    if (verified.failure) return verified.failure
+  }
+
+  type BulkBookFrozenContract = (
+    db: SupabaseClient,
+    actorUserId: string,
+    actorCompanyId: string,
+    input: typeof parsed.data,
+  ) => Promise<{
+    booked: Array<{
+      item_id: string
+      transaction_id: string
+      journal_entry_id: string | null
+    }>
+    skipped: Array<{
+      item_id: string
+      reason: string
+      detail?: string
+      posted_ids?: Record<string, string>
+      publication_ids?: string[]
+    }>
+  }>
+
+  const bulkBook =
+    bulkBookMatchedInboxItems as unknown as BulkBookFrozenContract
+  const result = await bulkBook(
+    supabase,
+    userId,
+    companyId,
+    parsed.data,
+  )
+  const { booked, skipped } = result
 
   log.info('bulk_book_inbox_items committed', {
     companyId,
@@ -5609,6 +6070,39 @@ async function commitBulkBookInboxItems(
     bookedCount: booked.length,
     skippedCount: skipped.length,
   })
+
+  const partialPostedIds: Record<string, string> = {}
+  const partialPublicationIds = new Set<string>()
+  let hasPartial = false
+  for (const item of skipped) {
+    if (item.posted_ids && Object.keys(item.posted_ids).length > 0) {
+      hasPartial = true
+      for (const [key, value] of Object.entries(item.posted_ids)) {
+        if (partialPostedIds[key] === undefined) partialPostedIds[key] = value
+      }
+    }
+    for (const publicationId of item.publication_ids ?? []) {
+      partialPublicationIds.add(publicationId)
+    }
+  }
+  if (hasPartial) {
+    const publicationIds = [...partialPublicationIds]
+    return {
+      error:
+        'Minst en kategorisering gav ett terminalt delresultat. Bokförda verifikat får inte köras om.',
+      errorCode: 'SETTLEMENT_BULK_FAILED_PARTIAL',
+      status: 500,
+      data: {
+        booked_count: booked.length,
+        skipped_count: skipped.length,
+        booked,
+        skipped,
+        ...(publicationIds.length > 0 ? { publication_ids: publicationIds } : {}),
+      },
+      partialPostedIds,
+      partialPublicationIds: publicationIds,
+    }
+  }
 
   return {
     data: {
@@ -5970,7 +6464,12 @@ async function commitPendingOperationInner(
         .update({
           status: 'failed_partial',
           resolved_at: new Date().toISOString(),
-          result_data: { error: err.message, threw: true, posted_ids: err.postedIds },
+          result_data: {
+            error: err.message,
+            threw: true,
+            posted_ids: err.postedIds,
+            retryable: false,
+          },
         })
         .eq('id', pendingOp.id)
       return {
@@ -5978,6 +6477,7 @@ async function commitPendingOperationInner(
         error: err.message,
         http_status: 500,
         code: 'partial_commit',
+        retryable: false,
         data: { posted_ids: err.postedIds },
       }
     }
@@ -5997,6 +6497,7 @@ async function commitPendingOperationInner(
         http_status: 400,
         code: ACCOUNTS_NOT_IN_CHART,
         account_numbers: err.accountNumbers,
+        retryable: true,
       }
     }
     // Recoverable Skatteverket failure (extension disabled, no connection,
@@ -6013,6 +6514,7 @@ async function commitPendingOperationInner(
         error: err.message,
         http_status: err.httpStatus,
         code: err.code,
+        retryable: true,
       }
     }
     const isBkErr = isBookkeepingError(err)
@@ -6025,13 +6527,14 @@ async function commitPendingOperationInner(
       .update({
         status: 'rejected',
         resolved_at: new Date().toISOString(),
-        result_data: { error: message, threw: true },
+        result_data: { error: message, threw: true, retryable: false },
       })
       .eq('id', pendingOp.id)
     return {
       status: 'failed',
       error: message,
       http_status: isBkErr ? 400 : 500,
+      retryable: false,
     }
   }
 
@@ -6045,16 +6548,28 @@ async function commitPendingOperationInner(
       result.partialPostedIds && Object.keys(result.partialPostedIds).length > 0
         ? result.partialPostedIds
         : null
+    const partialPublicationIds = [
+      ...new Set(result.partialPublicationIds ?? []),
+    ]
     if (partialPostedIds) {
+      const partialData = {
+        ...(result.data ?? {}),
+        posted_ids: partialPostedIds,
+        ...(partialPublicationIds.length > 0
+          ? { publication_ids: partialPublicationIds }
+          : {}),
+      }
       await supabase
         .from('pending_operations')
         .update({
           status: 'failed_partial',
           resolved_at: new Date().toISOString(),
           result_data: {
+            ...partialData,
             error: result.error,
             http_status: result.status,
-            posted_ids: partialPostedIds,
+            error_code: result.errorCode ?? 'partial_commit',
+            retryable: false,
           },
         })
         .eq('id', pendingOp.id)
@@ -6063,7 +6578,8 @@ async function commitPendingOperationInner(
         error: result.error,
         http_status: result.status ?? 500,
         code: 'partial_commit',
-        data: { posted_ids: partialPostedIds },
+        retryable: false,
+        data: partialData,
       }
     }
     const isAutoReject = result.status === 404 || result.status === 409
@@ -6073,10 +6589,16 @@ async function commitPendingOperationInner(
         status: 'rejected',
         resolved_at: new Date().toISOString(),
         result_data: isAutoReject
-          ? { auto_rejected: true, reason: result.error }
+          ? {
+              auto_rejected: true,
+              reason: result.error,
+              retryable: false,
+              ...(result.errorCode ? { error_code: result.errorCode } : {}),
+            }
           : {
               error: result.error,
               http_status: result.status,
+              retryable: false,
               ...(result.errorCode ? { error_code: result.errorCode } : {}),
             },
       })
@@ -6087,12 +6609,15 @@ async function commitPendingOperationInner(
         auto_rejected: true,
         error: result.error,
         http_status: result.status,
+        retryable: false,
+        ...(result.errorCode ? { code: result.errorCode } : {}),
       }
     }
     return {
       status: 'failed',
       error: result.error,
       http_status: result.status ?? 500,
+      retryable: false,
       ...(result.errorCode ? { code: result.errorCode } : {}),
     }
   }

@@ -8,22 +8,58 @@ let resultIdx: number
 let results: Array<{ data?: unknown; error?: unknown }>
 let calls: Array<{ method: string; args: unknown[] }>
 
-function makeBuilder() {
+let lineageRows: Array<Record<string, unknown>>
+function makeBuilder(_table: string) {
   const b: Record<string, unknown> = {}
-  for (const m of ['select', 'eq', 'in', 'order', 'range']) {
+  for (const m of ['eq', 'in', 'lte', 'order', 'range']) {
     b[m] = vi.fn().mockImplementation((...args: unknown[]) => {
       calls.push({ method: m, args })
       return b
     })
   }
+  b.select = vi.fn().mockImplementation((...args: unknown[]) => {
+    calls.push({ method: 'select', args })
+    return b
+  })
   b.single = vi.fn().mockImplementation(async () => results[resultIdx++] ?? { data: null, error: null })
-  b.then = (resolve: (v: unknown) => void) => resolve(results[resultIdx++] ?? { data: null, error: null })
+  b.then = (resolve: (v: unknown) => void) =>
+    resolve(results[resultIdx++] ?? { data: null, error: null })
   return b
 }
 
 function makeClient() {
   return {
-    from: vi.fn().mockImplementation(() => makeBuilder()),
+    from: vi.fn().mockImplementation((table: string) => makeBuilder(table)),
+    rpc: vi.fn().mockImplementation(async (
+      _name: string,
+      args: { p_root_ids: string[] },
+    ) => {
+      const rows = lineageRows.filter((row) =>
+        args.p_root_ids.includes(row.root_id as string),
+      )
+      const stornoDepths = rows
+        .filter((row) => row.edge_kind === 'storno')
+        .map((row) => row.depth as number)
+      return {
+        data: {
+          valid: true,
+          company_id: 'company-1',
+          requested_root_count: args.p_root_ids.length,
+          row_count: rows.length,
+          max_depth: Math.max(...rows.map((row) => row.depth as number)),
+          max_correction_depth: Math.max(
+            ...rows
+              .filter((row) => row.edge_kind !== 'storno')
+              .map((row) => row.depth as number),
+          ),
+          terminal_storno_depth: stornoDepths.length > 0
+            ? Math.max(...stornoDepths)
+            : null,
+          rows,
+        },
+        error: null,
+      }
+    }),
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } as any
 }
@@ -37,6 +73,7 @@ beforeEach(() => {
   resultIdx = 0
   results = []
   calls = []
+  lineageRows = []
   supabase = makeClient()
 })
 
@@ -317,5 +354,65 @@ describe('generateReconciliation', () => {
     expect(result.account_2440_balance).toBe(66.67)
     expect(result.difference).toBe(0)
     expect(result.is_reconciled).toBe(true)
+  })
+
+  it('reconstructs signed supplier credits and payments at the supplied cutoff', async () => {
+    results = [
+      {
+        data: [
+          {
+            id: 'si-original', total: 1000, remaining_amount: 0, paid_at: '2027-01-10',
+            currency: 'SEK', exchange_rate: null, is_credit_note: false,
+            registration_journal_entry_id: 'reg-original',
+          },
+          {
+            id: 'si-credit', total: 250, remaining_amount: 250, paid_at: null,
+            currency: 'SEK', exchange_rate: null, is_credit_note: true,
+            registration_journal_entry_id: 'reg-credit',
+          },
+        ],
+        error: null,
+      },
+      {
+        data: [{
+          id: 'pay-later', supplier_invoice_id: 'si-original', amount: 1000,
+          payment_date: '2027-01-10', journal_entry_id: null,
+        }],
+        error: null,
+      },
+      { data: [], error: null },
+      { data: [{ id: 'entry-1' }], error: null },
+      { data: [{ debit_amount: 0, credit_amount: 750, journal_entry_id: 'entry-1' }], error: null },
+    ]
+    lineageRows = ['reg-original', 'reg-credit'].map((id) => ({
+      root_id: id,
+      parent_id: null,
+      edge_kind: 'root',
+      id,
+      company_id: 'company-1',
+      entry_date: '2026-12-01',
+      status: 'posted',
+      source_type: 'supplier_invoice_received',
+      correction_of_id: null,
+      reverses_id: null,
+      reversed_by_id: null,
+      committed_at: '2026-12-01T10:00:00Z',
+      depth: 0,
+      path: [id],
+      cycle: false,
+    }))
+
+    const result = await generateReconciliation(
+      supabase,
+      'company-1',
+      'period-1',
+      '2026-12-31',
+    )
+    expect(result.supplier_ledger_total).toBe(750)
+    expect(result.is_reconciled).toBe(true)
+    const statusFilters = calls.filter(
+      (call) => call.method === 'in' && call.args[0] === 'status',
+    )
+    expect(statusFilters.map((call) => call.args[1])).toEqual([['posted', 'reversed']])
   })
 })
