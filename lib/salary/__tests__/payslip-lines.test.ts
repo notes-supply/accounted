@@ -216,10 +216,12 @@ describe('updatePayslipLine', () => {
 })
 
 describe('deletePayslipLine', () => {
-  it('deletes a line in a draft run', async () => {
+  it('uses the atomic RPC to release exact claims and delete a draft line', async () => {
     mock.enqueue({ data: { id: RUN_ID, status: 'draft' } })
     mock.enqueue({ data: EXISTING_LINE })
-    mock.enqueue({ data: null })
+    mock.enqueue({
+      data: { outcome: 'deleted', released_trip_count: 2 },
+    })
 
     const result = await deletePayslipLine(supabase, {
       companyId: COMPANY_ID,
@@ -232,6 +234,16 @@ describe('deletePayslipLine', () => {
       expect(result.data.deleted).toBe(true)
       expect(result.data.salary_line_item_id).toBe(LINE_ID)
     }
+    expect(mock.supabase.rpc).toHaveBeenCalledWith(
+      'delete_draft_salary_object_with_mileage_release',
+      {
+        p_company_id: COMPANY_ID,
+        p_salary_run_id: RUN_ID,
+        p_target_kind: 'line_item',
+        p_target_id: LINE_ID,
+      },
+    )
+    expect(mock.findCalls('salary_line_items', 'delete')).toEqual([])
   })
 
   it('dry-run verifies gates without deleting', async () => {
@@ -260,5 +272,31 @@ describe('deletePayslipLine', () => {
       lineId: LINE_ID,
     })
     expect(result).toEqual({ ok: false, code: 'SALARY_LINE_NOT_FOUND' })
+  })
+
+  it('fails closed when exact mileage release is incomplete', async () => {
+    mock.enqueue({ data: { id: RUN_ID, status: 'draft' } })
+    mock.enqueue({ data: EXISTING_LINE })
+    mock.enqueue({
+      data: {
+        outcome: 'release_incomplete',
+        expected_trip_count: 2,
+        released_trip_count: 1,
+      },
+    })
+
+    const result = await deletePayslipLine(supabase, {
+      companyId: COMPANY_ID,
+      salaryRunId: RUN_ID,
+      lineId: LINE_ID,
+    })
+    expect(result).toEqual({
+      ok: false,
+      code: 'MILEAGE_CLAIM_RELEASE_INCOMPLETE',
+      details: {
+        expected_trip_count: 2,
+        released_trip_count: 1,
+      },
+    })
   })
 })

@@ -1,8 +1,29 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
-import type { VatPeriodType } from '@/types'
-import { calculateVatDeclaration, resolvePeriodDates } from '@/lib/reports/vat-declaration'
-import { rutorToMomsuppgift, formatRedovisare, formatRedovisningsperiod } from './mappers'
+import type { VatDeclarationRutor, VatPeriodType } from '@/types'
+import {
+  calculateVatDeclaration,
+  type VatResolvedPeriod,
+} from '@/lib/reports/vat-declaration'
+import { runVatDeclarationChecks } from '@/lib/reports/vat-declaration-checks'
+import { findRcBasisGaps } from '@/lib/reports/rc-basis-gaps'
+import {
+  isFilingBlocked,
+  withRcBasisGapFindings,
+  type RcBasisGapScan,
+} from '@/lib/reports/vat-filing-gate'
+import {
+  rutorToMomsuppgift,
+  formatRedovisare,
+  formatRedovisningsperiod,
+} from './mappers'
 import type { SkatteverketMomsuppgift } from '../types'
+import {
+  VatSubmissionConflictError,
+  assertSameVatSubmissionIdentity,
+  canonicalVatRutor,
+  vatSubmissionIdentity,
+  type VatSubmissionIdentity,
+} from './vat-submission-state'
 
 /**
  * Request-free Skatteverket declaration prep.
@@ -22,6 +43,9 @@ export interface VatDeclarationPrep {
   redovisare: string
   redovisningsperiod: string
   momsuppgift: SkatteverketMomsuppgift
+  rutor: VatDeclarationRutor
+  period: VatResolvedPeriod
+  identity: VatSubmissionIdentity
 }
 
 export interface AgiUnderlagPrep {
@@ -56,45 +80,97 @@ export async function resolveRedovisare(
 }
 
 /**
- * Compute the momsuppgift filed to SKV for a period, from the general ledger.
- * Body lifted verbatim from the former parseDeclarationRequest so route and
- * commit paths produce identical payloads.
+ * Compute and verify the exact VAT declaration that may be filed. The approved
+ * rutor come from the rendered declaration. A fresh ledger projection must
+ * still match them before the first Skatteverket write is permitted.
  */
 export async function buildMomsuppgift(
   supabase: SupabaseClient,
   companyId: string,
-  input: { periodType: VatPeriodType; year: number; period: number; fiscalPeriodId?: string },
+  input: {
+    periodType: VatPeriodType
+    year: number
+    period: number
+    fiscalPeriodId?: string
+    approvedRutor?: VatDeclarationRutor
+  },
 ): Promise<VatDeclarationPrep> {
-  const { periodType, year, period, fiscalPeriodId } = input
-
-  const redovisare = await resolveRedovisare(supabase, companyId)
-
-  // Helårsmoms is filed per räkenskapsår (SFL 26 kap 10-11 §§): the SKV
-  // redovisningsperiod is the FY-end month, which for a broken fiscal year is
-  // not December. Resolve the fiscal period's actual bounds so the period
-  // identifier and the figures below always describe the same räkenskapsår.
-  let fiscalYearEnd: { year: number; month: number } | undefined
-  if (periodType === 'yearly') {
-    const { end } = await resolvePeriodDates(
-      supabase, companyId, periodType, year, period, fiscalPeriodId,
-    )
-    fiscalYearEnd = { year: Number(end.slice(0, 4)), month: Number(end.slice(5, 7)) }
-  }
-  const redovisningsperiod = formatRedovisningsperiod(periodType, year, period, fiscalYearEnd)
-
-  // Calculate VAT declaration from the general ledger
-  const declaration = await calculateVatDeclaration(
-    supabase,
-    companyId,
-    periodType,
-    year,
-    period,
-    { fiscalPeriodId },
-  )
-
+  const [redovisare, declaration] = await Promise.all([
+    resolveRedovisare(supabase, companyId),
+    calculateVatDeclaration(
+      supabase,
+      companyId,
+      input.periodType,
+      input.year,
+      input.period,
+      { fiscalPeriodId: input.fiscalPeriodId },
+    ),
+  ])
+  const approvedRutor = input.approvedRutor
+    ? canonicalVatRutor(input.approvedRutor)
+    : declaration.rutor
   const momsuppgift = rutorToMomsuppgift(declaration.rutor)
+  const redovisningsperiod =
+    `${declaration.period.originalEnd.slice(0, 4)}${declaration.period.originalEnd.slice(5, 7)}`
+  const identity = vatSubmissionIdentity({
+    redovisare,
+    redovisningsperiod,
+    period: declaration.period,
+    approvedRutor: declaration.rutor,
+    approvedMomsuppgift: momsuppgift,
+  })
+  const approvedIdentity = vatSubmissionIdentity({
+    redovisare,
+    redovisningsperiod,
+    period: declaration.period,
+    approvedRutor,
+    approvedMomsuppgift: rutorToMomsuppgift(approvedRutor),
+  })
+  assertSameVatSubmissionIdentity(identity, approvedIdentity)
 
-  return { redovisare, redovisningsperiod, momsuppgift }
+  const accountTotals = new Map(
+    Object.entries(declaration.rcInputAccountTotals ?? {}),
+  )
+  let checks = runVatDeclarationChecks(declaration.rutor, accountTotals)
+  let scan: RcBasisGapScan
+  try {
+    const gaps = await findRcBasisGaps(
+      supabase,
+      companyId,
+      input.periodType,
+      input.year,
+      input.period,
+      { fiscalPeriodId: input.fiscalPeriodId },
+    )
+    scan = { status: 'scanned', gapCount: gaps.length }
+  } catch {
+    scan = { status: 'unavailable' }
+  }
+  checks = withRcBasisGapFindings(
+    checks,
+    scan,
+    declaration.rcBasisByRate
+      ? {
+          rutor: declaration.rutor,
+          rcBasisByRate: declaration.rcBasisByRate,
+          rcInputAccountTotals: accountTotals,
+        }
+      : undefined,
+  )
+  if (isFilingBlocked(checks)) {
+    throw new VatSubmissionConflictError(
+      `VAT filing checks failed: ${checks.filter((check) => check.status === 'ERROR').map((check) => check.code).join(', ')}`,
+    )
+  }
+
+  return {
+    redovisare,
+    redovisningsperiod,
+    momsuppgift,
+    rutor: declaration.rutor,
+    period: declaration.period,
+    identity,
+  }
 }
 
 /**

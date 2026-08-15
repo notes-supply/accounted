@@ -12,7 +12,7 @@ vi.mock('@/lib/company/context', () => ({
   requireCompanyId: vi.fn().mockResolvedValue('company-1'),
 }))
 
-import { GET } from '../route'
+import { GET, createVatRutaSourcesGet } from '../route'
 import { resolvePeriodDates } from '@/lib/reports/vat-declaration'
 
 interface SupabaseShape {
@@ -34,7 +34,9 @@ function buildSupabase(
     account_class?: number
     default_vat_rate: number | null
     default_vat_treatment?: string | null
-  }> = []
+  }> = [],
+  controlledCandidates: unknown[] = [],
+  controlledEntries: unknown[] = [],
 ): SupabaseShape {
   const chartResult = {
     data: chartAccounts.map((account) => ({
@@ -44,6 +46,7 @@ function buildSupabase(
     })),
     error: null,
   }
+  let journalQueryCount = 0
   return {
     rpc: vi.fn().mockResolvedValue(linesResult),
     from: vi.fn().mockImplementation((table: string) => {
@@ -60,6 +63,51 @@ function buildSupabase(
           order: vi.fn().mockReturnThis(),
           range: vi.fn().mockResolvedValue(chartResult),
           then: (resolve: (v: unknown) => void) => resolve(chartResult),
+        }
+      }
+      if (table === 'company_settings') {
+        const result = { data: { vat_liability_start_date: null }, error: null }
+        return {
+          select: vi.fn().mockReturnThis(),
+          eq: vi.fn().mockReturnThis(),
+          maybeSingle: vi.fn().mockResolvedValue(result),
+        }
+      }
+      if (table === 'fiscal_periods') {
+        const row = fiscalPeriodResult.data
+          ? {
+              id: '11111111-1111-4111-8111-111111111111',
+              ...(fiscalPeriodResult.data as object),
+            }
+          : null
+        const singleResult = { data: row, error: fiscalPeriodResult.error }
+        const listResult = { data: row ? [row] : [], error: fiscalPeriodResult.error }
+        return {
+          select: vi.fn().mockReturnThis(),
+          eq: vi.fn().mockReturnThis(),
+          gte: vi.fn().mockReturnThis(),
+          lte: vi.fn().mockReturnThis(),
+          order: vi.fn().mockReturnThis(),
+          limit: vi.fn().mockReturnThis(),
+          maybeSingle: vi.fn().mockResolvedValue(singleResult),
+          then: (resolve: (value: unknown) => void) => resolve(listResult),
+        }
+      }
+      if (table === 'journal_entries') {
+        const data = journalQueryCount++ === 0
+          ? controlledCandidates
+          : controlledEntries
+        const result = { data, error: null }
+        return {
+          select: vi.fn().mockReturnThis(),
+          eq: vi.fn().mockReturnThis(),
+          in: vi.fn().mockReturnThis(),
+          gte: vi.fn().mockReturnThis(),
+          lte: vi.fn().mockReturnThis(),
+          order: vi.fn().mockReturnThis(),
+          limit: vi.fn().mockReturnThis(),
+          range: vi.fn().mockResolvedValue(result),
+          then: (resolve: (value: unknown) => void) => resolve(result),
         }
       }
       return {
@@ -239,6 +287,73 @@ describe('GET /api/reports/vat-declaration/ruta/[ruta]/sources', () => {
   })
 })
 
+describe('GET ruta48 sources: controlled 2648 identity', () => {
+  it('includes only the 2648 entries accepted by the shared lineage consumer', async () => {
+    const acceptedEntryId = '11111111-1111-4111-8111-111111111111'
+    const supabase = buildSupabase(
+      {
+        data: [{
+          line_id: '33333333-3333-4333-8333-333333333333',
+          journal_entry_id: '44444444-4444-4444-8444-444444444444',
+          voucher_number: 10,
+          voucher_series: 'A',
+          entry_date: '2026-05-15',
+          description: 'Ordinary input VAT',
+          debit_amount: 100,
+          credit_amount: 0,
+        }],
+        error: null,
+      },
+      { data: null, error: null },
+      [],
+      [
+        { id: acceptedEntryId },
+        { id: '22222222-2222-4222-8222-222222222222' },
+      ],
+      [{
+        id: acceptedEntryId,
+        voucher_number: 11,
+        voucher_series: 'A',
+        entry_date: '2026-05-20',
+        description: 'Controlled cutoff input VAT',
+        vat_lines: [{
+          id: '55555555-5555-4555-8555-555555555555',
+          account_number: '2648',
+          debit_amount: 250,
+          credit_amount: 0,
+        }],
+      }],
+    )
+    authOk(supabase)
+    const handler = createVatRutaSourcesGet({
+      resolveControlledInputVat: vi.fn().mockResolvedValue({
+        entries: [{
+          entryId: acceptedEntryId,
+          entryDate: '2026-05-20',
+          debit: 250,
+          credit: 0,
+        }],
+      }),
+    })
+
+    const req = createMockRequest(
+      '/api/reports/vat-declaration/ruta/48/sources',
+      { searchParams: { periodType: 'monthly', year: '2026', period: '5' } },
+    )
+    const res = await handler(req, createMockRouteParams({ ruta: '48' }))
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {
+      data: { lines: Array<{ journal_entry_id: string }> }
+    }
+    expect(body.data.lines.map((line) => line.journal_entry_id)).toEqual([
+      '44444444-4444-4444-8444-444444444444',
+      acceptedEntryId,
+    ])
+    const rpcArgs = supabase.rpc.mock.calls[0][1] as { p_accounts: string[] }
+    expect(rpcArgs.p_accounts).not.toContain('2648')
+  })
+})
+
 describe('GET /api/reports/vat-declaration/ruta/[ruta]/sources: account overrides', () => {
   /** The p_accounts array the route handed to get_vat_ruta_source_lines. */
   function rpcAccounts(supabase: SupabaseShape): string[] {
@@ -312,35 +427,35 @@ describe('GET /api/reports/vat-declaration/ruta/[ruta]/sources: account override
 })
 
 describe('GET /api/reports/vat-declaration/ruta/[ruta]/sources: period resolution', () => {
-  // A first räkenskapsår may run up to 18 months (BFL 3 kap 3 §), and
-  // helårsmoms is filed per räkenskapsår, not per calendar year
-  // (SFL 26 kap 10-11 §§).
-  const EXTENDED_FIRST_YEAR = { period_start: '2025-07-03', period_end: '2026-12-31' }
-  const CALENDAR_YEAR = { period_start: '2026-01-01', period_end: '2026-12-31' }
-
+  const EXTENDED_FIRST_YEAR = {
+    period_start: '2025-07-03',
+    period_end: '2026-12-31',
+  }
+  const CALENDAR_YEAR = {
+    period_start: '2026-01-01',
+    period_end: '2026-12-31',
+  }
   const noLines = () => ({ data: [], error: null })
 
   function get(searchParams: Record<string, string>, ruta = '05') {
     const req = createMockRequest(
       `/api/reports/vat-declaration/ruta/${ruta}/sources`,
-      { searchParams }
+      { searchParams },
     )
     return GET(req, createMockRouteParams({ ruta }))
   }
 
-  it('yearly: drills into the räkenskapsår, agreeing with the declaration resolver', async () => {
+  it('uses the company-scoped actual fiscal period for yearly VAT', async () => {
     const supabase = buildSupabase(noLines(), { data: EXTENDED_FIRST_YEAR, error: null })
     authOk(supabase)
 
     const res = await get({ periodType: 'yearly', year: '2026', period: '1' })
     expect(res.status).toBe(200)
+    expect(rpcPeriod(supabase)).toEqual({
+      start: '2025-07-03',
+      end: '2026-12-31',
+    })
 
-    // The old calendar-span behaviour would have started 2026-01-01 and hidden
-    // every verifikat from 2025-07-03 to 2025-12-31 that the declaration counts.
-    expect(rpcPeriod(supabase)).toEqual({ start: '2025-07-03', end: '2026-12-31' })
-
-    // And it is the exact span `calculateVatDeclaration` computes the figure
-    // from: both go through resolvePeriodDates with the same arguments.
     const declarationPeriod = await resolvePeriodDates(
       buildSupabase(noLines(), {
         data: EXTENDED_FIRST_YEAR,
@@ -349,12 +464,15 @@ describe('GET /api/reports/vat-declaration/ruta/[ruta]/sources: period resolutio
       'company-1',
       'yearly',
       2026,
-      1
+      1,
     )
-    expect(rpcPeriod(supabase)).toEqual(declarationPeriod)
+    expect(rpcPeriod(supabase)).toEqual({
+      start: declarationPeriod.start,
+      end: declarationPeriod.end,
+    })
   })
 
-  it('yearly: an explicit fiscal_period_id selects that räkenskapsår', async () => {
+  it('accepts a coherent explicit fiscal period identity', async () => {
     const supabase = buildSupabase(noLines(), { data: EXTENDED_FIRST_YEAR, error: null })
     authOk(supabase)
 
@@ -365,69 +483,60 @@ describe('GET /api/reports/vat-declaration/ruta/[ruta]/sources: period resolutio
       fiscal_period_id: '11111111-1111-4111-8111-111111111111',
     })
     expect(res.status).toBe(200)
-    expect(rpcPeriod(supabase)).toEqual({ start: '2025-07-03', end: '2026-12-31' })
+    expect(rpcPeriod(supabase)).toEqual({
+      start: '2025-07-03',
+      end: '2026-12-31',
+    })
   })
 
-  it('yearly: calendar-year company is unchanged (Jan-Dec)', async () => {
+  it('uses an actual calendar fiscal period without a fallback', async () => {
     const supabase = buildSupabase(noLines(), { data: CALENDAR_YEAR, error: null })
     authOk(supabase)
 
     const res = await get({ periodType: 'yearly', year: '2026', period: '1' })
     expect(res.status).toBe(200)
-    expect(rpcPeriod(supabase)).toEqual({ start: '2026-01-01', end: '2026-12-31' })
+    expect(rpcPeriod(supabase)).toEqual({
+      start: '2026-01-01',
+      end: '2026-12-31',
+    })
   })
 
-  it('yearly: falls back to the calendar span when no fiscal period is found', async () => {
+  it('fails closed when the annual fiscal period is unavailable', async () => {
     const supabase = buildSupabase(noLines(), { data: null, error: null })
     authOk(supabase)
 
     const res = await get({ periodType: 'yearly', year: '2026', period: '1' })
-    expect(res.status).toBe(200)
-    expect(rpcPeriod(supabase)).toEqual({ start: '2026-01-01', end: '2026-12-31' })
+    expect(res.status).toBe(500)
   })
 
-  it('monthly: stays a calendar month even for a broken fiscal year', async () => {
-    // kalendermånad per SFL 26 kap: fiscal_period_id must not widen the span.
-    const supabase = buildSupabase(noLines(), { data: EXTENDED_FIRST_YEAR, error: null })
-    authOk(supabase)
-
+  it('rejects a fiscal period id for a monthly request', async () => {
+    authOk(buildSupabase(noLines(), { data: EXTENDED_FIRST_YEAR, error: null }))
     const res = await get({
       periodType: 'monthly',
       year: '2026',
       period: '5',
       fiscal_period_id: '11111111-1111-4111-8111-111111111111',
     })
-    expect(res.status).toBe(200)
-    expect(rpcPeriod(supabase)).toEqual({ start: '2026-05-01', end: '2026-05-31' })
-  })
-
-  it('quarterly: stays a calendar quarter', async () => {
-    const supabase = buildSupabase(noLines(), { data: EXTENDED_FIRST_YEAR, error: null })
-    authOk(supabase)
-
-    const res = await get({ periodType: 'quarterly', year: '2026', period: '2' })
-    expect(res.status).toBe(200)
-    expect(rpcPeriod(supabase)).toEqual({ start: '2026-04-01', end: '2026-06-30' })
-  })
-
-  it('returns 400 for an unknown periodType', async () => {
-    authOk(buildSupabase(noLines()))
-    const res = await get({ periodType: 'weekly', year: '2026', period: '5' })
     expect(res.status).toBe(400)
   })
 
-  it('fiscal_period_id alone still selects the period by its own bounds', async () => {
-    const supabase = buildSupabase(noLines(), { data: EXTENDED_FIRST_YEAR, error: null })
+  it('keeps quarterly VAT on calendar bounds', async () => {
+    const supabase = buildSupabase(noLines())
     authOk(supabase)
-
-    const res = await get({ fiscal_period_id: '11111111-1111-4111-8111-111111111111' })
+    const res = await get({ periodType: 'quarterly', year: '2026', period: '2' })
     expect(res.status).toBe(200)
-    expect(rpcPeriod(supabase)).toEqual({ start: '2025-07-03', end: '2026-12-31' })
+    expect(rpcPeriod(supabase)).toEqual({
+      start: '2026-04-01',
+      end: '2026-06-30',
+    })
   })
 
-  it('returns 404 when fiscal_period_id alone matches no period', async () => {
-    authOk(buildSupabase(noLines(), { data: null, error: null }))
-    const res = await get({ fiscal_period_id: '11111111-1111-4111-8111-111111111111' })
-    expect(res.status).toBe(404)
+  it('rejects incomplete and unknown period identities', async () => {
+    authOk(buildSupabase(noLines()))
+    expect((await get({ periodType: 'weekly', year: '2026', period: '5' })).status)
+      .toBe(400)
+    expect((await get({
+      fiscal_period_id: '11111111-1111-4111-8111-111111111111',
+    })).status).toBe(400)
   })
 })

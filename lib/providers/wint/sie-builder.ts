@@ -119,7 +119,7 @@ function fmtDate(isoDate: string): string {
 }
 
 function quote(text: string): string {
-  return `"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]+/g, ' ')}"`;
+  return `"${text.replace(/"/g, '\\"').replace(/[\r\n]+/g, ' ')}"`;
 }
 
 /**

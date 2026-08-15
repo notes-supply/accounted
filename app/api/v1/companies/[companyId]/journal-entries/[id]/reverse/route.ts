@@ -33,7 +33,6 @@ const ReverseRequest = z
     allow_deep_chain: z.boolean().optional(),
   })
   .strict()
-
 const JournalEntryReversed = z.object({
   reversal_id: z.string().uuid(),
   original_id: z.string().uuid(),
@@ -119,16 +118,6 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     const today = new Date().toISOString().split('T')[0]
     const reversalDate = bodyReversalDate || today
 
-    // Period-lock on the reversal date. Engine + DB trigger are still
-    // authoritative; this gives a structured error instead of a 500.
-    const lockVerdict = await checkPeriodLock(ctx.supabase, ctx.companyId!, reversalDate)
-    if (lockVerdict.locked) {
-      return v1ErrorResponseFromCode('PERIOD_LOCKED', ctx.log, {
-        requestId: ctx.requestId,
-        details: { reason: lockVerdict.reason, fiscal_period_id: lockVerdict.fiscal_period_id, reversal_date: reversalDate },
-      })
-    }
-
     // Pre-flight: confirm the original exists, is posted, and not already reversed.
     const { data: original, error: fetchErr } = await ctx.supabase
       .from('journal_entries')
@@ -148,23 +137,38 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       correction_of_id: string | null
       reverses_id: string | null
     }
-    if (typed.status !== 'posted') {
+    const persistedReversalId =
+      typed.status === 'reversed' && typed.reversed_by_id
+        ? typed.reversed_by_id
+        : undefined
+    if (typed.status !== 'posted' && !persistedReversalId) {
       return v1ErrorResponseFromCode('CANNOT_REVERSE_NON_POSTED', ctx.log, {
         requestId: ctx.requestId,
         details: { current_status: typed.status },
       })
     }
-    if (typed.reversed_by_id) {
-      return v1ErrorResponseFromCode('ENTRY_ALREADY_REVERSED', ctx.log, {
-        requestId: ctx.requestId,
-        details: { existing_reversal_id: typed.reversed_by_id },
-      })
+
+    // A retry that names the persisted storno performs no new accounting
+    // write, so a period locked after the original success must not hide the
+    // durable result. New reversals still receive the normal preflight.
+    if (!persistedReversalId) {
+      const lockVerdict = await checkPeriodLock(ctx.supabase, ctx.companyId!, reversalDate)
+      if (lockVerdict.locked) {
+        return v1ErrorResponseFromCode('PERIOD_LOCKED', ctx.log, {
+          requestId: ctx.requestId,
+          details: {
+            reason: lockVerdict.reason,
+            fiscal_period_id: lockVerdict.fiscal_period_id,
+            reversal_date: reversalDate,
+          },
+        })
+      }
     }
 
     // Chain-depth guard BEFORE the dry-run return: a dry run must give the
     // same verdict the real execution would. reverseEntry re-checks on the
     // real path.
-    if (!bodyAllowDeepChain) {
+    if (!persistedReversalId && !bodyAllowDeepChain) {
       const chain = await correctionChainDepth(ctx.supabase, ctx.companyId!, typed)
       if (chain.depth >= CORRECTION_CHAIN_GUARD_DEPTH) {
         return v1ErrorResponse(
@@ -181,15 +185,35 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
           original_id: entryId,
           reversal_date: reversalDate,
           would_create_reversal_with_status: 'posted',
+          existing_reversal_id: persistedReversalId,
         },
         { requestId: ctx.requestId, log: ctx.log },
       )
     }
 
     try {
-      const reversal = await reverseEntry(ctx.supabase, ctx.companyId!, ctx.userId, entryId, reversalDate, {
-        allowDeepChain: bodyAllowDeepChain,
-      })
+      const actor = ctx.apiKeyId
+        ? {
+            actor_type: 'api_key' as const,
+            actor_id: null,
+            actor_label: ctx.apiKeyName ?? null,
+          }
+        : {
+            actor_type: 'user' as const,
+            actor_id: ctx.userId,
+            actor_label: null,
+          }
+      const reversal = await reverseEntry(
+        ctx.supabase,
+        ctx.companyId!,
+        ctx.userId,
+        entryId,
+        reversalDate,
+        {
+          allowDeepChain: bodyAllowDeepChain,
+          actor,
+        },
+      )
       return ok(
         {
           reversal_id: reversal.id,

@@ -11,8 +11,13 @@ ensureInitialized()
 
 interface BulkCommitItemResult {
   id: string
-  status: 'committed' | 'failed' | 'skipped' | 'rejected'
+  status: 'committed' | 'failed' | 'failed_partial' | 'skipped' | 'rejected'
   error?: string
+  code?: string
+  retryable?: boolean
+  data?: Record<string, unknown>
+  posted_ids?: Record<string, string>
+  publication_ids?: string[]
 }
 
 // Swedish display labels for already-handled operations; the raw enum values
@@ -77,7 +82,15 @@ export const POST = withRouteContext(
         actor: { type: 'user', ...(user.email ? { label: user.email } : {}) },
       })
       if (result.status === 'committed') {
-        results.push({ id, status: 'committed' })
+        const data =
+          result.data && Object.keys(result.data).length > 0
+            ? result.data
+            : undefined
+        results.push({
+          id,
+          status: 'committed',
+          ...(data ? { data } : {}),
+        })
       } else {
         // The executor's error strings mix Swedish user messages with raw
         // Supabase/Zod English: map to Swedish before they land in the
@@ -90,10 +103,21 @@ export const POST = withRouteContext(
         const mapped = getErrorMessage(result.error ?? null, {
           statusCode: result.http_status ?? 500,
         })
-        if (result.status === 'rejected' && result.auto_rejected) {
-          results.push({ id, status: 'rejected', error: mapped })
+        const postedIds = result.data?.posted_ids as Record<string, string> | undefined
+        const publicationIds = result.data?.publication_ids as string[] | undefined
+        const details = {
+          ...(result.code ? { code: result.code } : {}),
+          ...(result.retryable !== undefined ? { retryable: result.retryable } : {}),
+          ...(result.data ? { data: result.data } : {}),
+          ...(postedIds ? { posted_ids: postedIds } : {}),
+          ...(publicationIds ? { publication_ids: publicationIds } : {}),
+        }
+        if (result.code === 'partial_commit') {
+          results.push({ id, status: 'failed_partial', error: mapped, ...details })
+        } else if (result.status === 'rejected' && result.auto_rejected) {
+          results.push({ id, status: 'rejected', error: mapped, ...details })
         } else {
-          results.push({ id, status: 'failed', error: mapped })
+          results.push({ id, status: 'failed', error: mapped, ...details })
         }
       }
     }
@@ -101,7 +125,9 @@ export const POST = withRouteContext(
     const summary = {
       total: results.length,
       committed: results.filter((r) => r.status === 'committed').length,
-      failed: results.filter((r) => r.status === 'failed').length,
+      failed: results.filter(
+        (r) => r.status === 'failed' || r.status === 'failed_partial',
+      ).length,
       skipped: results.filter((r) => r.status === 'skipped').length,
       rejected: results.filter((r) => r.status === 'rejected').length,
     }

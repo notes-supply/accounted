@@ -1,5 +1,8 @@
 import { eventBus } from '@/lib/events/bus'
-import type { CoreEventType } from '@/lib/events/types'
+import {
+  hasDurablePublicationMarker,
+  type CoreEventType,
+} from '@/lib/events/types'
 import { createServiceClientNoCookies } from '@/lib/auth/api-keys'
 import { createLogger } from '@/lib/logger'
 
@@ -200,6 +203,7 @@ async function persistEvent(
 export function registerEventLogHandler(): (() => void)[] {
   return PERSISTED_EVENT_TYPES.map((eventType) =>
     eventBus.on(eventType, async (payload) => {
+      if (hasDurablePublicationMarker(payload)) return
       try {
         const rawPayload = payload as Record<string, unknown>
         const userId = rawPayload.userId as string

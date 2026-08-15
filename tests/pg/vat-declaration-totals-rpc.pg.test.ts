@@ -25,6 +25,7 @@ import {
   insertCompany,
   insertFiscalPeriod,
   insertPostedJournalEntry,
+  insertReversedJournalEntryGraph,
 } from './fixtures'
 
 // Mirrors the TS call site (lib/reports/vat-declaration.ts): a small
@@ -277,20 +278,26 @@ describe('get_vat_declaration_totals RPC', () => {
         { account: VAT_FIXTURE_BALANCING_ACCOUNT, debit: 100, credit: 0 },
       ],
     })
-    // The tagged settlement itself is filtered by source_type; its storno
-    // reversal is untagged and would otherwise re-credit 2611.
-    await insertJournalEntry({
-      ...ctx, voucherNumber: 2, sourceType: 'storno',
+    // The tagged settlement itself is filtered by source_type; its complete
+    // storno reversal is untagged and would otherwise re-credit 2611.
+    const { stornoId } = await insertReversedJournalEntryGraph({
+      ...ctx,
+      voucherNumber: 2,
+      sourceType: 'vat_settlement',
       lines: [
-        { account: '2611', debit: 0, credit: 100 },
-        { account: '2650', debit: 100, credit: 0 },
+        { accountNumber: '2611', debitAmount: 100, creditAmount: 0 },
+        { accountNumber: '2650', debitAmount: 0, creditAmount: 100 },
       ],
     })
 
     const payload = await callRpc(ctx.companyId)
     expect(totalsByAccount(payload).get('2611')).toMatchObject({ debit: 0, credit: 100 })
     expect(payload.settlement_shaped_entries).toHaveLength(1)
-    expect(payload.settlement_shaped_entries[0]).toMatchObject({ source_type: 'storno' })
+    expect(payload.settlement_shaped_entries[0]).toMatchObject({
+      id: stornoId,
+      source_type: 'storno',
+      status: 'posted',
+    })
   })
 
   it('keeps opening-balance entries: carried-in 26xx balances are unsettled VAT', async () => {

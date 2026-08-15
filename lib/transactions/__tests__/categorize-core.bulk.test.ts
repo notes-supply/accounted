@@ -22,8 +22,45 @@ const mockMapping = vi.fn()
 const mockUpsertTemplate = vi.fn()
 const mockLinkToJE = vi.fn()
 
-vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
-  createTransactionJournalEntry: (...args: unknown[]) => mockCreateJE(...args),
+vi.mock('@/lib/transactions/settlement-attachment', () => ({
+  coordinateTransactionSettlement: async (input: {
+    supabase: unknown
+    companyId: string
+    userId: string
+    transaction: { id: string; cash_account_id: string | null }
+    mappingResult: unknown
+    notes?: string
+    category: string
+    isBusiness: boolean
+  }) => {
+    const entry = await mockCreateJE(
+      input.supabase,
+      input.companyId,
+      input.userId,
+      input.transaction,
+      input.mappingResult,
+      input.notes,
+    )
+    return {
+      kind: 'attached',
+      created: true,
+      journalEntry: entry,
+      publication: {
+        publication_id: `pub-${entry.id}`,
+        event_key: `journal:${entry.id}:committed`,
+        event_type: 'journal_entry.committed',
+      },
+      readback: {
+        transaction: {
+          journalEntryId: entry.id,
+          cashAccountId: input.transaction.cash_account_id,
+          category: input.category,
+          isBusiness: input.isBusiness,
+        },
+        journalEntry: { id: entry.id },
+      },
+    }
+  },
 }))
 vi.mock('@/lib/transactions/booking-duplicate-detection', () => ({
   detectBookingDuplicate: (...args: unknown[]) => mockDetectDup(...args),
@@ -531,13 +568,12 @@ describe('bulkBookMatchedInboxItems: WhatsApp channel-context notes threading', 
 })
 
 describe('bulkBookMatchedInboxItems: intra-batch duplicate handling', () => {
-  /** Seven queued from() results for one successfully-booked item. */
+  /** Six queued from() results for one successfully-booked item. */
   const bookableItem = (itemId: string, txId: string, amount: number) => [
     { data: { id: itemId, matched_transaction_id: txId, created_journal_entry_id: null, created_supplier_invoice_id: null } },
     { data: { id: txId, date: '2026-06-01', amount, currency: 'SEK', cash_account_id: null, journal_entry_id: null } },
     { data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 } },
     { data: [{ id: 'fp-1' }] },
-    { error: null },
     { data: { document_id: null } }, // propagation: tx pin lookup
     { data: [] }, // propagation: matched inbox items
   ]

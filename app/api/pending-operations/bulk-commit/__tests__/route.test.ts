@@ -38,6 +38,7 @@ const VALID_ID_2 = '22222222-2222-4222-8222-222222222222'
 const VALID_ID_3 = '33333333-3333-4333-8333-333333333333'
 const VALID_ID_4 = '44444444-4444-4444-8444-444444444444'
 const VALID_ID_5 = '55555555-5555-4555-8555-555555555555'
+const routeContext = { params: Promise.resolve({}) }
 
 function makeOp(overrides: Record<string, unknown> = {}) {
   return {
@@ -76,7 +77,7 @@ describe('POST /api/pending-operations/bulk-commit', () => {
       method: 'POST',
       body: { ids: [VALID_ID_1] },
     })
-    const response = await POST(request)
+    const response = await POST(request, routeContext)
     const { status, body } = await parseJsonResponse(response)
 
     expect(status).toBe(401)
@@ -93,7 +94,7 @@ describe('POST /api/pending-operations/bulk-commit', () => {
       method: 'POST',
       body: { ids: [VALID_ID_1] },
     })
-    const response = await POST(request)
+    const response = await POST(request, routeContext)
     const { status } = await parseJsonResponse(response)
 
     expect(status).toBe(403)
@@ -104,7 +105,7 @@ describe('POST /api/pending-operations/bulk-commit', () => {
       method: 'POST',
       body: { ids: [] },
     })
-    const response = await POST(request)
+    const response = await POST(request, routeContext)
     const { status } = await parseJsonResponse(response)
 
     expect(status).toBe(400)
@@ -116,7 +117,7 @@ describe('POST /api/pending-operations/bulk-commit', () => {
       method: 'POST',
       body: { ids: ['not-a-uuid'] },
     })
-    const response = await POST(request)
+    const response = await POST(request, routeContext)
     const { status } = await parseJsonResponse(response)
 
     expect(status).toBe(400)
@@ -132,7 +133,7 @@ describe('POST /api/pending-operations/bulk-commit', () => {
       method: 'POST',
       body: { ids },
     })
-    const response = await POST(request)
+    const response = await POST(request, routeContext)
     const { status } = await parseJsonResponse(response)
 
     expect(status).toBe(400)
@@ -146,7 +147,7 @@ describe('POST /api/pending-operations/bulk-commit', () => {
       method: 'POST',
       body: { ids: [VALID_ID_1] },
     })
-    const response = await POST(request)
+    const response = await POST(request, routeContext)
     const { status, body } = await parseJsonResponse<{ error: string }>(response)
 
     expect(status).toBe(500)
@@ -161,7 +162,7 @@ describe('POST /api/pending-operations/bulk-commit', () => {
       method: 'POST',
       body: { ids: [VALID_ID_1] },
     })
-    const response = await POST(request)
+    const response = await POST(request, routeContext)
     const { status, body } = await parseJsonResponse<{
       data: {
         results: Array<{ id: string; status: string; error?: string }>
@@ -195,7 +196,7 @@ describe('POST /api/pending-operations/bulk-commit', () => {
       method: 'POST',
       body: { ids: [VALID_ID_1, VALID_ID_2] },
     })
-    const response = await POST(request)
+    const response = await POST(request, routeContext)
     const { status, body } = await parseJsonResponse<{
       data: {
         results: Array<{ id: string; status: string; error?: string }>
@@ -236,7 +237,7 @@ describe('POST /api/pending-operations/bulk-commit', () => {
       method: 'POST',
       body: { ids: [VALID_ID_1, VALID_ID_2] },
     })
-    const response = await POST(request)
+    const response = await POST(request, routeContext)
     const { status, body } = await parseJsonResponse<{
       data: {
         results: Array<{ id: string; status: string }>
@@ -288,7 +289,7 @@ describe('POST /api/pending-operations/bulk-commit', () => {
       method: 'POST',
       body: { ids: [VALID_ID_1] },
     })
-    const response = await POST(request)
+    const response = await POST(request, routeContext)
     const { status, body } = await parseJsonResponse<{
       data: {
         results: Array<{ id: string; status: string; error?: string }>
@@ -322,7 +323,22 @@ describe('POST /api/pending-operations/bulk-commit', () => {
 
     mockCommit
       .mockResolvedValueOnce({ status: 'committed', data: {} })
-      .mockResolvedValueOnce({ status: 'failed', error: 'boom', http_status: 500 })
+      .mockResolvedValueOnce({
+        status: 'failed',
+        error: 'boom',
+        code: 'partial_commit',
+        retryable: false,
+        http_status: 500,
+        data: {
+          posted_ids: {
+            original_journal_entry_id: '22222222-2222-4222-8222-222222222222',
+            root_journal_entry_id: '33333333-3333-4333-8333-333333333333',
+            reversal_journal_entry_id: '44444444-4444-4444-8444-444444444444',
+            returned_journal_entry_id: '55555555-5555-4555-8555-555555555555',
+          },
+          publication_ids: ['pub-original', 'pub-reversal'],
+        },
+      })
       .mockResolvedValueOnce({
         status: 'rejected',
         auto_rejected: true,
@@ -334,7 +350,7 @@ describe('POST /api/pending-operations/bulk-commit', () => {
       method: 'POST',
       body: { ids: [VALID_ID_1, VALID_ID_2, VALID_ID_3, VALID_ID_4, VALID_ID_5] },
     })
-    const response = await POST(request)
+    const response = await POST(request, routeContext)
     const { status, body } = await parseJsonResponse<{
       data: {
         results: Array<{ id: string; status: string; error?: string }>
@@ -347,7 +363,29 @@ describe('POST /api/pending-operations/bulk-commit', () => {
     // fallbacks; skip/not-found strings are now Swedish at the source (#337).
     expect(body.data.results).toEqual([
       { id: VALID_ID_1, status: 'committed' },
-      { id: VALID_ID_2, status: 'failed', error: 'Ett oväntat serverfel uppstod. Försök igen senare.' },
+      {
+        id: VALID_ID_2,
+        status: 'failed_partial',
+        error: 'Ett oväntat serverfel uppstod. Försök igen senare.',
+        code: 'partial_commit',
+        retryable: false,
+        data: {
+          posted_ids: {
+            original_journal_entry_id: '22222222-2222-4222-8222-222222222222',
+            root_journal_entry_id: '33333333-3333-4333-8333-333333333333',
+            reversal_journal_entry_id: '44444444-4444-4444-8444-444444444444',
+            returned_journal_entry_id: '55555555-5555-4555-8555-555555555555',
+          },
+          publication_ids: ['pub-original', 'pub-reversal'],
+        },
+        posted_ids: {
+          original_journal_entry_id: '22222222-2222-4222-8222-222222222222',
+          root_journal_entry_id: '33333333-3333-4333-8333-333333333333',
+          reversal_journal_entry_id: '44444444-4444-4444-8444-444444444444',
+          returned_journal_entry_id: '55555555-5555-4555-8555-555555555555',
+        },
+        publication_ids: ['pub-original', 'pub-reversal'],
+      },
       { id: VALID_ID_3, status: 'skipped', error: 'Redan hanterad (avvisad)' },
       { id: VALID_ID_4, status: 'rejected', error: 'Resursen kunde inte hittas.' },
       { id: VALID_ID_5, status: 'failed', error: 'Åtgärden kunde inte hittas.' },

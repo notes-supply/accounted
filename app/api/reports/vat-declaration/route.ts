@@ -2,11 +2,13 @@ import { NextResponse } from 'next/server'
 import {
   calculateVatDeclaration,
   formatPeriodLabel,
+  parseVatPeriodInput,
+  type VatPeriodInput,
 } from '@/lib/reports/vat-declaration'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
-import type { VatPeriodType } from '@/types'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+import { FISCAL_YEAR_RE } from '@/lib/invariants'
 
 /**
  * GET /api/reports/vat-declaration
@@ -22,68 +24,44 @@ export const GET = withRouteContext(
     const { supabase, companyId, log, requestId } = ctx
 
     const { searchParams } = new URL(request.url)
-    const periodType = searchParams.get('periodType') as VatPeriodType | null
-    const yearStr = searchParams.get('year')
-    const periodStr = searchParams.get('period')
-    // For yearly (helårsmoms) the period is the räkenskapsår, not the calendar
-    // year; the client passes the selected fiscal period so an extended year is
-    // covered in full. Ignored for monthly/quarterly (calendar periods).
+    const periodType = searchParams.get('periodType')
+    const yearInput = searchParams.get('year')
+    const periodInput = searchParams.get('period')
     const fiscalPeriodId = searchParams.get('fiscal_period_id') ?? undefined
 
-    if (!periodType || !yearStr || !periodStr) {
+    if (!periodType || !yearInput || !periodInput) {
       return errorResponseFromCode('VAT_REPORT_MISSING_PARAMS', log, { requestId })
     }
 
-    if (!['monthly', 'quarterly', 'yearly'].includes(periodType)) {
-      return errorResponseFromCode('VAT_REPORT_INVALID_PERIOD_TYPE', log, {
+    let parsed: VatPeriodInput
+    try {
+      parsed = parseVatPeriodInput({
+        periodType,
+        year: yearInput,
+        period: periodInput,
+        fiscalPeriodId,
+      })
+    } catch (error) {
+      const code = !['monthly', 'quarterly', 'yearly'].includes(periodType)
+        ? 'VAT_REPORT_INVALID_PERIOD_TYPE'
+        : !FISCAL_YEAR_RE.test(yearInput)
+            || Number(yearInput) < 2000
+            || Number(yearInput) > 2100
+          ? 'VAT_REPORT_INVALID_YEAR'
+          : 'VAT_REPORT_INVALID_PERIOD'
+      return errorResponseFromCode(code, log, {
         requestId,
-        details: { received: periodType },
+        details: { received: error instanceof Error ? error.message : 'invalid' },
       })
     }
 
-    const year = parseInt(yearStr, 10)
-    const period = parseInt(periodStr, 10)
-
-    if (isNaN(year) || year < 2000 || year > 2100) {
-      return errorResponseFromCode('VAT_REPORT_INVALID_YEAR', log, {
-        requestId,
-        details: { received: yearStr },
-      })
-    }
-
-    if (isNaN(period)) {
-      return errorResponseFromCode('VAT_REPORT_INVALID_PERIOD', log, {
-        requestId,
-        details: { received: periodStr },
-      })
-    }
-
-    if (periodType === 'monthly' && (period < 1 || period > 12)) {
-      return errorResponseFromCode('VAT_REPORT_INVALID_PERIOD', log, {
-        requestId,
-        details: { periodType, received: period, allowed: '1-12' },
-      })
-    }
-    if (periodType === 'quarterly' && (period < 1 || period > 4)) {
-      return errorResponseFromCode('VAT_REPORT_INVALID_PERIOD', log, {
-        requestId,
-        details: { periodType, received: period, allowed: '1-4' },
-      })
-    }
-    if (periodType === 'yearly' && period !== 1) {
-      return errorResponseFromCode('VAT_REPORT_INVALID_PERIOD', log, {
-        requestId,
-        details: { periodType, received: period, allowed: '1' },
-      })
-    }
+    const { year, period } = parsed
 
     try {
-      // No accounting-method argument: the method is baked into journal entry
-      // timing (see the invariant note on calculateVatDeclaration), so no
-      // company_settings round trip is needed here.
+      // Accounting method is already reflected in journal entry timing.
       const declaration = await calculateVatDeclaration(
-        supabase, companyId!, periodType, year, period,
-        { fiscalPeriodId },
+        supabase, companyId!, parsed.periodType, year, period,
+        { fiscalPeriodId: parsed.fiscalPeriodId },
       )
 
       return NextResponse.json({
@@ -91,7 +69,7 @@ export const GET = withRouteContext(
           ...declaration,
           // For yearly the authoritative span is declaration.period.start/end
           // (the räkenskapsår). The label stays a coarse "Helår {year}".
-          periodLabel: formatPeriodLabel(periodType, year, period),
+          periodLabel: formatPeriodLabel(parsed.periodType, year, period),
         },
       })
     } catch (err) {

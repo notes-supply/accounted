@@ -460,11 +460,13 @@ function applyStatement(
     return
   }
 
-  const createTable = /^CREATE\s+(?:UNLOGGED\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:public\.)?"?([A-Za-z_][A-Za-z0-9_$]*)"?/i.exec(
+  const createTable = /^CREATE\s+(?:UNLOGGED\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:(?:"?([A-Za-z_][A-Za-z0-9_$]*)"?\.)?)"?([A-Za-z_][A-Za-z0-9_$]*)"?/i.exec(
     flat
   )
   if (createTable) {
-    const name = createTable[1]
+    const schemaName = createTable[1]?.toLowerCase()
+    if (schemaName && schemaName !== 'public') return
+    const name = createTable[2]
     // `CREATE TABLE x AS SELECT ...` has no column list we can read: treat the
     // table as opaque (a view, for our purposes) rather than guessing.
     const group = balancedParens(flat, createTable[0].length)

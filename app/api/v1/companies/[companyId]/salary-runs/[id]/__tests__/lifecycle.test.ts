@@ -487,6 +487,49 @@ describe('POST /salary-runs/:id/book', () => {
     )
   })
 
+  it('books a mileage-only run without an employer-contribution entry', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        salary_runs: [
+          { data: { ...paidRun, total_gross: 0, total_tax: 0, total_avgifter: 0 }, error: null },
+          {
+            data: {
+              id: RUN_ID, status: 'booked',
+              booked_at: '2026-05-26T09:15:00Z', booked_by: USER_ID,
+              salary_entry_id: 'je_mileage', avgifter_entry_id: null,
+              vacation_entry_id: null, pension_entry_id: null,
+            },
+            error: null,
+          },
+        ],
+        salary_run_employees: { data: [employeeRow], error: null },
+        idempotency_keys: { data: null, error: null },
+      }),
+    )
+    mocks.checkPeriodLock.mockResolvedValue({ locked: false })
+    mocks.createSalaryRunEntries.mockResolvedValue({
+      salaryEntry: { id: 'je_mileage', voucher_number: 'L2026-0024' },
+      avgifterEntry: null,
+      vacationEntry: null,
+      pensionEntry: null,
+    })
+
+    const res = await book(
+      makeRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/salary-runs/${RUN_ID}/book`, {
+        method: 'POST',
+      }),
+      detailParams(COMPANY_ID, RUN_ID),
+    )
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.data.salary_entry_id).toBe('je_mileage')
+    expect(body.data.avgifter_entry_id).toBeNull()
+    expect(body.data.entry_ids).toEqual(['je_mileage'])
+    expect(body.meta.audit.voucher_number).toBe('L2026-0024')
+  })
+
   it('applies review overrides with book-run parity (tax/net reconciled, F-skatt avgifter override ignored)', async () => {
     // Overrides set during dashboard review must reach the ledger the same
     // way no matter which surface books the run: v1 previously ignored them,

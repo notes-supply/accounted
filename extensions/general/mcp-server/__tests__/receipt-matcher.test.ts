@@ -119,9 +119,13 @@ vi.mock('@/lib/transactions/category-suggestions', () => ({
 // The categorize tool runs the booking-time duplicate guard before staging.
 // These tests don't exercise that path, so stub it to "no duplicate": otherwise
 // its detection queries would consume the queued supabase mock results.
-vi.mock('@/lib/transactions/booking-duplicate-detection', () => ({
-  detectBookingDuplicate: vi.fn().mockResolvedValue(null),
-}))
+vi.mock('@/lib/transactions/booking-duplicate-detection', async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>
+  return {
+    ...actual,
+    detectBookingDuplicate: vi.fn().mockResolvedValue(null),
+  }
+})
 
 vi.mock('@/lib/bookkeeping/counterparty-templates', () => ({
   upsertCounterpartyTemplate: vi.fn(),

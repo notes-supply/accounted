@@ -30,6 +30,7 @@ import {
   insertCompany,
   insertCompanyMember,
   insertFiscalPeriod,
+  insertReversedJournalEntryGraph,
 } from './fixtures'
 
 interface AccountSums {
@@ -70,11 +71,9 @@ async function insertJournalEntry(params: {
   companyId: string
   fiscalPeriodId: string
   voucherNumber: number
-  status?: 'draft' | 'posted' | 'reversed'
+  status?: 'draft' | 'posted'
   sourceType?: string
   entryDate?: string
-  reversesId?: string | null
-  correctionOfId?: string | null
   lines: Array<{ account: string; debit: number; credit: number }>
 }): Promise<string> {
   const id = randomUUID()
@@ -87,8 +86,10 @@ async function insertJournalEntry(params: {
     await client.query(
       `INSERT INTO public.journal_entries
          (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-          entry_date, description, source_type, status, reverses_id, correction_of_id)
-       VALUES ($1, $2, $3, $4, $5, 'A', $6, 'KPI RPC test', $7, $8, $9, $10)`,
+          entry_date, description, source_type, status, committed_at, commit_method)
+       VALUES ($1, $2, $3, $4, $5, 'A', $6, 'KPI RPC test', $7, $8,
+               CASE WHEN $8 = 'posted' THEN now() END,
+               CASE WHEN $8 = 'posted' THEN 'legacy' END)`,
       [
         id,
         params.userId,
@@ -98,8 +99,6 @@ async function insertJournalEntry(params: {
         params.entryDate ?? '2026-03-15',
         params.sourceType ?? 'manual',
         status,
-        params.reversesId ?? null,
-        params.correctionOfId ?? null,
       ],
     )
     for (const line of params.lines) {
@@ -169,13 +168,18 @@ async function seedFullScenario() {
       { account: '1930', debit: 0, credit: 3000 },
     ],
   })
-  await insertJournalEntry({
-    ...ctx, voucherNumber: 4, status: 'reversed', entryDate: '2026-02-20',
-    lines: [{ account: '3001', debit: 0, credit: 700 }],
+  await insertReversedJournalEntryGraph({
+    ...ctx,
+    voucherNumber: 4,
+    entryDate: '2026-02-20',
+    lines: [
+      { accountNumber: '1930', debitAmount: 700, creditAmount: 0 },
+      { accountNumber: '3001', debitAmount: 0, creditAmount: 700 },
+    ],
   })
   // March: mixed-sign class 8 lines in the same entry
   await insertJournalEntry({
-    ...ctx, voucherNumber: 5, entryDate: '2026-03-05',
+    ...ctx, voucherNumber: 6, entryDate: '2026-03-05',
     lines: [
       { account: '8310', debit: 0, credit: 200 },
       { account: '8410', debit: 500, credit: 0 },
@@ -186,7 +190,7 @@ async function seedFullScenario() {
 
   // December: posted year_end entry (8999 + 8910)
   await insertJournalEntry({
-    ...ctx, voucherNumber: 6, sourceType: 'year_end', entryDate: '2026-12-31',
+    ...ctx, voucherNumber: 7, sourceType: 'year_end', entryDate: '2026-12-31',
     lines: [
       { account: '8910', debit: 1000, credit: 0 },
       { account: '2512', debit: 0, credit: 1000 },
@@ -194,29 +198,23 @@ async function seedFullScenario() {
       { account: '2099', debit: 0, credit: 5000 },
     ],
   })
-  // Undone year-end chain: reversed year_end + its storno + a correction
-  const reversedYearEndId = await insertJournalEntry({
-    ...ctx, voucherNumber: 7, sourceType: 'year_end', status: 'reversed', entryDate: '2026-12-31',
+  // Undone year-end chain: reversed year_end + its storno + a correction.
+  await insertReversedJournalEntryGraph({
+    ...ctx,
+    voucherNumber: 8,
+    sourceType: 'year_end',
+    entryDate: '2026-12-31',
     lines: [
-      { account: '8999', debit: 400, credit: 0 },
-      { account: '2099', debit: 0, credit: 400 },
+      { accountNumber: '8999', debitAmount: 400, creditAmount: 0 },
+      { accountNumber: '2099', debitAmount: 0, creditAmount: 400 },
     ],
-  })
-  await insertJournalEntry({
-    ...ctx, voucherNumber: 8, sourceType: 'storno', entryDate: '2026-12-31',
-    reversesId: reversedYearEndId,
-    lines: [
-      { account: '8999', debit: 0, credit: 400 },
-      { account: '2099', debit: 400, credit: 0 },
-    ],
-  })
-  await insertJournalEntry({
-    ...ctx, voucherNumber: 9, sourceType: 'correction', entryDate: '2026-12-31',
-    correctionOfId: reversedYearEndId,
-    lines: [
-      { account: '6200', debit: 250, credit: 0 },
-      { account: '1930', debit: 0, credit: 250 },
-    ],
+    correction: {
+      voucherNumber: 10,
+      lines: [
+        { accountNumber: '6200', debitAmount: 250, creditAmount: 0 },
+        { accountNumber: '1930', debitAmount: 0, creditAmount: 250 },
+      ],
+    },
   })
 
   return { ...ctx, obEntryId }
@@ -228,11 +226,11 @@ describe('get_kpi_report_aggregates RPC', () => {
     const payload = await callRpc(ctx.companyId, ctx.fiscalPeriodId, ctx.obEntryId)
     const tb = byAccount(payload.tb)
 
-    // OB entry excluded: 1930 period debit is 12500, not 17500; 2010 absent.
-    expect(tb.get('1930')).toMatchObject({ debit: 12500, credit: 3250 })
+    // OB excluded; the complete manual reversal contributes both original and
+    // storno legs to the plain trial-balance sums.
+    expect(tb.get('1930')).toMatchObject({ debit: 13200, credit: 3950 })
     expect(tb.has('2010')).toBe(false)
-    // Reversed manual entry included (posted + reversed base filter).
-    expect(tb.get('3001')).toMatchObject({ debit: 0, credit: 10700 })
+    expect(tb.get('3001')).toMatchObject({ debit: 700, credit: 10700 })
     expect(tb.get('2611')).toMatchObject({ debit: 0, credit: 2500 })
     expect(tb.get('5010')).toMatchObject({ debit: 3000, credit: 0 })
     // Year-end chain present in the plain tb.
@@ -246,7 +244,7 @@ describe('get_kpi_report_aggregates RPC', () => {
     const ctx = await seedFullScenario()
     const payload = await callRpc(ctx.companyId, ctx.fiscalPeriodId, null)
 
-    expect(byAccount(payload.tb).get('1930')).toMatchObject({ debit: 17500, credit: 3250 })
+    expect(byAccount(payload.tb).get('1930')).toMatchObject({ debit: 18200, credit: 3950 })
     expect(byAccount(payload.tb).get('2010')).toMatchObject({ debit: 0, credit: 5000 })
     expect(payload.ob).toEqual([])
   })
@@ -257,7 +255,7 @@ describe('get_kpi_report_aggregates RPC', () => {
     const tb = byAccount(payload.tb_ex_year_end)
 
     // Ordinary activity retained...
-    expect(tb.get('3001')).toMatchObject({ debit: 0, credit: 10700 })
+    expect(tb.get('3001')).toMatchObject({ debit: 700, credit: 10700 })
     expect(tb.get('5010')).toMatchObject({ debit: 3000, credit: 0 })
     expect(tb.get('8310')).toMatchObject({ debit: 0, credit: 200 })
     expect(tb.get('8410')).toMatchObject({ debit: 500, credit: 0 })
@@ -269,22 +267,18 @@ describe('get_kpi_report_aggregates RPC', () => {
     expect(tb.has('2512')).toBe(false)
     expect(tb.has('6200')).toBe(false)
     // The correction's 1930 credit (250) disappears with it.
-    expect(tb.get('1930')).toMatchObject({ debit: 12500, credit: 3000 })
+    expect(tb.get('1930')).toMatchObject({ debit: 13200, credit: 3700 })
   })
 
   it('keeps stornos/corrections that do not point at a reversed year-end', async () => {
     const ctx = await seedCompany()
-    const plainReversed = await insertJournalEntry({
-      ...ctx, voucherNumber: 1, status: 'reversed', entryDate: '2026-04-01',
-      lines: [{ account: '5010', debit: 100, credit: 0 }],
-    })
-    await insertJournalEntry({
-      ...ctx, voucherNumber: 2, sourceType: 'storno', entryDate: '2026-04-02',
-      reversesId: plainReversed,
+    await insertReversedJournalEntryGraph({
+      ...ctx,
+      voucherNumber: 1,
+      entryDate: '2026-04-01',
       lines: [
-        { account: '5010', debit: 0, credit: 100 },
-        // Keep the posted storno balanced without changing the asserted P&L account.
-        { account: '2999', debit: 100, credit: 0 },
+        { accountNumber: '5010', debitAmount: 100, creditAmount: 0 },
+        { accountNumber: '2999', debitAmount: 0, creditAmount: 100 },
       ],
     })
 
@@ -327,8 +321,9 @@ describe('get_kpi_report_aggregates RPC', () => {
 
     // January: revenue only (class 2 VAT line ignored).
     expect(monthOf(payload, 2026, 1)).toMatchObject({ income: 10000, expenses: 0 })
-    // February: the reversed 3001 entry (700) must NOT appear.
-    expect(monthOf(payload, 2026, 2)).toMatchObject({ income: 0, expenses: 3000 })
+    // February is posted-only: the reversed original is omitted while its
+    // posted storno remains as the reversing movement.
+    expect(monthOf(payload, 2026, 2)).toMatchObject({ income: -700, expenses: 3000 })
     // March: 8310 credit 200 -> income; 8410 debit 500 -> expenses.
     expect(monthOf(payload, 2026, 3)).toMatchObject({ income: 200, expenses: 500 })
     // December: year_end entries ARE excluded from monthly as of migration
@@ -371,7 +366,7 @@ describe('get_kpi_report_aggregates RPC', () => {
       )
       return rows[0].payload as RpcPayload
     })
-    expect(byAccount(asMember.tb).get('3001')).toMatchObject({ debit: 0, credit: 10700 })
+    expect(byAccount(asMember.tb).get('3001')).toMatchObject({ debit: 700, credit: 10700 })
     expect(byAccount(asMember.ob).get('1930')).toMatchObject({ debit: 5000, credit: 0 })
 
     const asOutsider = await withUserContext(outsider.userId, async (client) => {

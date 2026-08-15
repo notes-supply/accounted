@@ -26,14 +26,11 @@ import {
   buildMappingResultFromTemplate,
   validateTemplateForEntity,
 } from '@/lib/bookkeeping/booking-templates'
-import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
-import { recordVoucherGapExplanation } from '@/lib/bookkeeping/cancel-orphaned-entry'
-import { reverseEntry } from '@/lib/bookkeeping/engine'
+import { categorizeResolvedTransaction } from '@/lib/transactions/categorize-core'
+import { hasLiveJournalEntryLink } from '@/lib/transactions/link-journal-entry'
 import { AccountsNotInChartError, isBookkeepingError } from '@/lib/bookkeeping/errors'
 import { collectMappingResultAccounts, findUnresolvableAccounts } from '@/lib/bookkeeping/account-validation'
-import { propagateUnderlagForBookedTransaction } from '@/lib/transactions/inbox-underlag'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
-import { eventBus } from '@/lib/events'
 import type { Logger } from '@/lib/logger'
 import type { EntityType, Transaction, TransactionCategory } from '@/types'
 
@@ -190,8 +187,9 @@ async function categorizeOne(
       input.vat_treatment,
     )
   }
+  let settlementAccount: string
   try {
-    const settlementAccount = await resolveSettlementAccount(
+    settlementAccount = await resolveSettlementAccount(
       supabase,
       companyId,
       transaction.cash_account_id,
@@ -230,14 +228,12 @@ async function categorizeOne(
     }
   }
 
-  // Pre-validate every account in the mapping against the company's
-  // chart_of_accounts. Templates and category defaults can reference accounts
-  // that aren't activated in this company's kontoplan; without this check the
-  // engine throws AccountsNotInChartError mid-flight and the legacy
-  // partial-success branch silently marks the row bokförd with no
-  // verifikation. Validate in both dry-run and live paths so previews
-  // surface the same actionable error. Standard BAS accounts merely absent
-  // from the chart pass: the engine seeds them on demand.
+  // Pre-validate every account in the mapping against the company's chart.
+  // Templates and category defaults can reference inactive custom accounts.
+  // Without this guard they would reach the engine and fail during posting.
+  // Validate in both dry-run and live paths so previews surface the same
+  // actionable error. Standard BAS accounts merely absent from the chart pass
+  // are seeded by the engine on demand.
   const missingAccounts = await findUnresolvableAccounts(
     supabase,
     companyId,
@@ -256,6 +252,11 @@ async function categorizeOne(
     }
   }
 
+  const existingCategorization = Boolean(
+    transaction.journal_entry_id &&
+    await hasLiveJournalEntryLink(supabase, companyId, transaction.journal_entry_id),
+  )
+
   if (dryRun) {
     return {
       ok: true,
@@ -267,45 +268,18 @@ async function categorizeOne(
           debit_account: mappingResult.debit_account,
           credit_account: mappingResult.credit_account,
           vat_lines: mappingResult.vat_lines,
-          would_create_journal_entry: !transaction.journal_entry_id,
+          would_create_journal_entry: !existingCategorization,
         },
       },
     }
   }
 
-  // Already-categorized: just flip flags.
-  if (transaction.journal_entry_id) {
-    const { error: updateErr } = await supabase
-      .from('transactions')
-      .update({ is_business, category: finalCategory })
-      .eq('id', transactionId)
-      .eq('company_id', companyId)
-    if (updateErr) {
-      return {
-        ok: false,
-        request_index: index,
-        transaction_id: transactionId,
-        error: { code: 'INTERNAL_ERROR', message: 'Failed to update flags.' },
-      }
-    }
-    return {
-      ok: true,
-      request_index: index,
-      transaction_id: transactionId,
-      data: {
-        journal_entry_created: false,
-        journal_entry_id: transaction.journal_entry_id,
-        category: finalCategory,
-        already_had_journal_entry: true,
-      },
-    }
-  }
 
   // Period-lock pre-check: same rationale as the single :categorize route.
   // A locked period surfaces as PERIOD_LOCKED on the per-item error rather
   // than a generic INTERNAL_ERROR from the trigger exception.
   const periodLock = await checkPeriodLock(supabase, companyId, transaction.date)
-  if (periodLock.locked) {
+  if (!existingCategorization && periodLock.locked) {
     return {
       ok: false,
       request_index: index,
@@ -322,149 +296,74 @@ async function categorizeOne(
     }
   }
 
-  let journalEntryId: string | null = null
-  let journalEntryError: string | null = null
+  let categorization
   try {
-    const je = await createTransactionJournalEntry(
+    categorization = await categorizeResolvedTransaction(
       supabase,
-      companyId,
       userId,
-      transaction as Transaction,
-      mappingResult,
+      companyId,
+      {
+        transaction: transaction as Transaction,
+        mappingResult,
+        category: finalCategory,
+        isBusiness: is_business,
+        settlementAccount,
+        existingCategorization,
+      },
     )
-    if (je) journalEntryId = je.id
-  } catch (err) {
-    log.error('batch-categorize: journal entry creation failed', err as Error, {
+  } catch (error) {
+    log.error('batch-categorize: verified coordinator failed', error as Error, {
       request_index: index,
       transactionId,
     })
-    // AccountsNotInChartError means an account was deactivated between our
-    // pre-validation and the engine call (rare race). Return the per-item
-    // failure WITHOUT the transaction update below so the row stays in
-    // "Att bokföra": partial-success on a missing-account error would
-    // mark it bokförd with no verifikation.
-    if (err instanceof AccountsNotInChartError) {
-      return {
-        ok: false,
-        request_index: index,
-        transaction_id: transactionId,
-        error: {
-          code: 'ACCOUNTS_NOT_IN_CHART',
-          message: `Följande konton behöver aktiveras: ${err.accountNumbers.join(', ')}`,
-          details: { account_numbers: err.accountNumbers },
-        },
-      }
-    }
-    if (isBookkeepingError(err)) {
-      journalEntryError = getErrorMessage(err, { context: 'transaction' })
-    } else {
-      journalEntryError = err instanceof Error ? err.message : 'Unknown error'
-    }
-  }
-
-  const { data: updated, error: updateErr } = await supabase
-    .from('transactions')
-    .update({
-      is_business,
-      category: finalCategory,
-      journal_entry_id: journalEntryId,
-    })
-    .eq('id', transactionId)
-    .eq('company_id', companyId)
-    .is('journal_entry_id', null)
-    .select('id')
-  if (updateErr) {
     return {
       ok: false,
       request_index: index,
       transaction_id: transactionId,
-      error: { code: 'INTERNAL_ERROR', message: getErrorMessage(updateErr) },
-    }
-  }
-  if ((!updated || updated.length === 0) && journalEntryId) {
-    // CAS race: storno the orphan (BFL 5 kap 5 §). Direct statusflip
-    // would be blocked by enforce_journal_entry_immutability since the
-    // engine writes the JE as posted. Same fix as the single :categorize
-    // route. Storno keeps the verifikationsnummer series unbroken.
-    try {
-      await reverseEntry(supabase, companyId, userId, journalEntryId)
-    } catch (revErr) {
-      log.error('batch-categorize TX_CATEGORIZE_RACE: failed to storno orphaned JE', revErr as Error, {
-        request_index: index,
-        orphanJournalEntryId: journalEntryId,
-      })
-      // Document the gap so the orphan is traceable per BFL 5 kap 5 §.
-      try {
-        const { data: orphan } = await supabase
-          .from('journal_entries')
-          .select('fiscal_period_id, voucher_series, voucher_number')
-          .eq('id', journalEntryId)
-          .eq('company_id', companyId)
-          .single()
-        if (orphan && orphan.voucher_series) {
-          // Same rationale as the single :categorize route: skip the gap row
-          // when no series exists rather than filing under a fallback series
-          // that an audit query won't find. The insert itself lives in the
-          // shared helper, which owns the real voucher_gap_explanations
-          // column set (gap_start/gap_end/user_id) and logs failures loudly.
-          await recordVoucherGapExplanation(supabase, {
-            companyId,
-            userId,
-            fiscalPeriodId: orphan.fiscal_period_id,
-            voucherSeries: orphan.voucher_series,
-            voucherNumber: orphan.voucher_number,
-            explanation:
-              'CAS-race orphan; automatisk storno misslyckades. Manuell reconciliation krävs.',
-          })
-        }
-      } catch (gapErr) {
-        log.error('batch-categorize: failed to look up the orphan for its gap explanation', gapErr as Error, {
-          request_index: index,
-          orphanJournalEntryId: journalEntryId,
-        })
-      }
-    }
-    return {
-      ok: false,
-      request_index: index,
-      transaction_id: transactionId,
-      error: { code: 'TX_CATEGORIZE_RACE', message: 'Concurrent state change.' },
-    }
-  }
-
-  // Propagate the underlag onto the new verifikat: anchor the transaction's
-  // pinned document and stamp matched inbox items. Same shared step as the
-  // single :categorize route and every dashboard booking path; best-effort
-  // by contract (logged inside), never fails the item. Runs only when THIS
-  // item won the CAS write.
-  if (journalEntryId) {
-    await propagateUnderlagForBookedTransaction(supabase, companyId, transactionId, journalEntryId)
-  }
-
-  try {
-    await eventBus.emit({
-      type: 'transaction.categorized',
-      payload: {
-        transaction: transaction as Transaction,
-        account: mappingResult.debit_account,
-        taxCode: mappingResult.vat_lines[0]?.account_number || '',
-        userId,
-        companyId,
+      error: {
+        code: error instanceof AccountsNotInChartError
+          ? 'ACCOUNTS_NOT_IN_CHART'
+          : 'INTERNAL_ERROR',
+        message: isBookkeepingError(error)
+          ? getErrorMessage(error, { context: 'transaction' })
+          : getErrorMessage(error),
+        ...(error instanceof AccountsNotInChartError
+          ? { details: { account_numbers: error.accountNumbers } }
+          : {}),
       },
-    })
-  } catch (err) {
-    log.warn('batch-categorize: event emit failed (non-critical)', err as Error)
+    }
   }
 
+  if (categorization.error) {
+    return {
+      ok: false,
+      request_index: index,
+      transaction_id: transactionId,
+      error: {
+        code: categorization.errorCode ?? 'INTERNAL_ERROR',
+        message: categorization.error,
+        details: categorization.partialPostedIds
+          ? {
+              posted_ids: categorization.partialPostedIds,
+              publication_ids: categorization.partialPublicationIds ?? [],
+            }
+          : undefined,
+      },
+    }
+  }
+
+  const alreadyHadJournalEntry =
+    categorization.data?.already_had_journal_entry === true
   return {
     ok: true,
     request_index: index,
     transaction_id: transactionId,
     data: {
-      journal_entry_created: !!journalEntryId,
-      journal_entry_id: journalEntryId,
-      journal_entry_error: journalEntryError,
+      journal_entry_created: !alreadyHadJournalEntry,
+      journal_entry_id: categorization.data?.journal_entry_id,
+      journal_entry_error: null,
       category: finalCategory,
+      ...(alreadyHadJournalEntry ? { already_had_journal_entry: true } : {}),
     },
   }
 }

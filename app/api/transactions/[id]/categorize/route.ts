@@ -1,16 +1,15 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { NextResponse } from 'next/server'
-import { eventBus } from '@/lib/events'
 import { ensureInitialized } from '@/lib/init'
 import { buildMappingResultFromCategory } from '@/lib/bookkeeping/category-mapping'
 import { getTemplateById, buildMappingResultFromTemplate, validateTemplateForEntity } from '@/lib/bookkeeping/booking-templates'
-import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
-import { cancelOrphanedPaymentEntry } from '@/lib/bookkeeping/cancel-orphaned-entry'
+import { categorizeResolvedTransaction } from '@/lib/transactions/categorize-core'
+import { hasLiveJournalEntryLink } from '@/lib/transactions/link-journal-entry'
 import { detectBookingDuplicate } from '@/lib/transactions/booking-duplicate-detection'
 import { appendProcessingHistory } from '@/lib/processing-history/append'
 import { saveUserMappingRule, applySettlementAccount } from '@/lib/bookkeeping/mapping-engine'
 import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
-import { upsertCounterpartyTemplate, buildMappingResultFromCounterpartyTemplate } from '@/lib/bookkeeping/counterparty-templates'
+import { buildMappingResultFromCounterpartyTemplate } from '@/lib/bookkeeping/counterparty-templates'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponse, errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import {
@@ -29,7 +28,6 @@ import {
 import { resolveTransactionAmountSek } from '@/lib/transactions/booking-duplicate-detection'
 import { AccountsNotInChartError, accountsNotInChartResponse } from '@/lib/bookkeeping/errors'
 import { collectMappingResultAccounts, findUnresolvableAccounts } from '@/lib/bookkeeping/account-validation'
-import { getErrorMessage } from '@/lib/errors/get-error-message'
 import type { Logger } from '@/lib/logger'
 import type { CategorizationTemplate } from '@/types'
 import { validateBody } from '@/lib/api/validate'
@@ -132,30 +130,16 @@ export const POST = withRouteContext(
 
     const txLog = log.child({ transactionId: id })
 
-    // Already-categorized fast path: just update flags, leave the JE alone.
-    if (transaction.journal_entry_id) {
-      const finalCat: TransactionCategory = is_business ? (category || 'uncategorized') : 'private'
+    // A live pointer is not mutable metadata. It is eligible only for the
+    // coordinator's exact immutable no-op check after the requested mapping is
+    // resolved. Stale reversal pointers remain part of M4's expected snapshot.
+    const existingCategorization = Boolean(
+      transaction.journal_entry_id &&
+      await hasLiveJournalEntryLink(supabase, companyId, transaction.journal_entry_id),
+    )
 
-      const { error: updateErr } = await supabase
-        .from('transactions')
-        .update({ is_business, category: finalCat })
-        .eq('id', id)
-
-      if (updateErr) {
-        txLog.error('failed to update already-categorized transaction', updateErr)
-        return errorResponse(updateErr, txLog, { requestId })
-      }
-
-      return NextResponse.json({
-        success: true,
-        journal_entry_created: false,
-        journal_entry_id: transaction.journal_entry_id,
-        journal_entry_error: null,
-        category: finalCat,
-        already_had_journal_entry: true,
-      })
-    }
-
+    let dismissedCandidate: Awaited<ReturnType<typeof detectBookingDuplicate>> = null
+    if (!existingCategorization) {
     // Booking-time duplicate guard: this transaction is about to become a NEW
     // verifikat. If another transaction on the same date+amount+account is
     // already booked, booking this one double-counts one real affärshändelse
@@ -207,40 +191,8 @@ export const POST = withRouteContext(
           requestId,
           dismissedTransactionId: candidate.transaction_id,
         })
-        // Persist the dismissal to behandlingshistorik (BFNAR 2013:2 kap 8):         // booking over a DETECTED possible double-booking is a bookkeeping
-        // decision that needs a durable record. Best-effort; never blocks the
-        // booking.
-        try {
-          await appendProcessingHistory({
-            companyId,
-            correlationId: id,
-            aggregateType: 'BankTransaction',
-            aggregateId: id,
-            eventType: 'BankTransactionDuplicateDismissed',
-            payload: {
-              transaction_id: id,
-              dismissed_transaction_id: candidate.transaction_id,
-              dismissed_journal_entry_id: candidate.journal_entry_id,
-              // Null when the candidate's SEK value could not be established
-              // (a rateless foreign sibling); the foreign figures below then
-              // carry the durable record instead of a fabricated kr amount.
-              amount_ore: candidate.amount != null ? Math.round(candidate.amount * 100) : null,
-              dismissed_currency: candidate.currency,
-              dismissed_amount_in_currency: candidate.amount_in_currency,
-              entry_date: candidate.entry_date,
-              // Whether the user dismissed a confirmed same-amount twin or a
-              // candidate whose kr figure was never established (BFNAR 2013:2
-              // kap 8: the behandlingshistorik has to say which). Parity with
-              // the /book route's dismissal record.
-              amount_verified: candidate.amount_verified,
-              unverified_reason: candidate.unverified_reason,
-            },
-            actor: { type: 'user', id: user.id },
-            occurredAt: new Date(),
-          })
-        } catch (logErr) {
-          txLog.error('failed to append duplicate-dismissal behandlingshistorik', logErr as Error)
-        }
+        // Persist this decision only after exact attachment verification.
+        dismissedCandidate = candidate
       }
     } catch (err) {
       if (body.force) {
@@ -250,6 +202,7 @@ export const POST = withRouteContext(
         })
       }
       txLog.warn('booking-time duplicate detection failed (continuing)', err as Error)
+    }
     }
 
     const { data: settings } = await supabase
@@ -766,45 +719,50 @@ export const POST = withRouteContext(
 
     await ensureFiscalPeriod(supabase, user.id, companyId, transaction.date, fiscalYearStartMonth, txLog)
 
-    let journalEntryCreated = false
-    let journalEntryId: string | null = null
-    let journalEntryError: string | null = null
-    let documentLinkWarning: string | null = null
-
-    try {
-      const journalEntry = await createTransactionJournalEntry(
-        supabase,
-        companyId,
-        user.id,
-        transaction as Transaction,
+    const categorization = await categorizeResolvedTransaction(
+      supabase,
+      user.id,
+      companyId,
+      {
+        transaction: transaction as Transaction,
         mappingResult,
-      )
+        category: finalCategory,
+        isBusiness: is_business,
+        settlementAccount,
+        existingCategorization,
+      },
+    )
 
-      if (journalEntry) {
-        journalEntryCreated = true
-        journalEntryId = journalEntry.id
+    if (categorization.error) {
+      if (categorization.partialPostedIds) {
+        return errorResponse(new Error(categorization.error), txLog, {
+          requestId,
+          status: categorization.status ?? 500,
+          details: {
+            code: categorization.errorCode,
+            posted_ids: categorization.partialPostedIds,
+            publication_ids: categorization.partialPublicationIds ?? [],
+          },
+        })
       }
-    } catch (err) {
-      txLog.error('failed to create transaction journal entry', err as Error)
-      // AccountsNotInChartError means an account was deactivated between our
-      // pre-validation and the engine call (rare race). Don't fall through to
-      // the partial-success path: that would mark the transaction bokförd
-      // with no verifikation and leave the user staring at an unclosable
-      // dialog. Return a structured 400 so the row stays in "Att bokföra"
-      // and the user can re-activate the account and retry.
-      if (err instanceof AccountsNotInChartError) {
-        return accountsNotInChartResponse(err)
-      }
-      // All errors map to Swedish via getErrorMessage: the raw message is
-      // already logged above and must never reach the user verbatim (issue
-      // #337). The categorization is preserved either way so the user can
-      // still re-book the verifikation manually.
-      journalEntryError = getErrorMessage(err, { context: 'transaction' })
+      return errorResponseFromCode('TX_CATEGORIZE_RACE', txLog, {
+        requestId,
+        details: { code: categorization.errorCode },
+      })
     }
 
-    // direction_mismatch = a mirrored refund/repayment booking; learning it
-    // as a rule would store backwards accounts for the merchant.
-    if (is_business && transaction.merchant_name && !mappingResult.direction_mismatch) {
+    const journalEntryId = categorization.data?.journal_entry_id as string
+    const alreadyHadJournalEntry =
+      categorization.data?.already_had_journal_entry === true
+    const journalEntryCreated = !alreadyHadJournalEntry
+
+    // Mapping and duplicate-dismissal learning are post-verification effects.
+    if (
+      journalEntryCreated &&
+      is_business &&
+      transaction.merchant_name &&
+      !mappingResult.direction_mismatch
+    ) {
       try {
         await saveUserMappingRule(
           supabase,
@@ -817,205 +775,50 @@ export const POST = withRouteContext(
           body.template_id,
         )
       } catch (err) {
-        txLog.warn('failed to save mapping rule (non-critical)', err as Error)
+        txLog.warn('failed to save mapping rule after verified attachment', err as Error)
       }
     }
 
-    try {
-      // Templates are company-scoped since the multi-tenant refactor: passing
-      // user.id here broke learning entirely (FK/RLS reject the write).
-      await upsertCounterpartyTemplate(
-        supabase, companyId, transaction as Transaction, mappingResult, 'user_approved',
-      )
-    } catch (err) {
-      txLog.warn('failed to upsert counterparty template (non-critical)', err as Error)
-    }
-
-    if (journalEntryId && transaction.receipt_id) {
+    if (journalEntryCreated && dismissedCandidate) {
       try {
-        const { data: receipt } = await supabase
-          .from('receipts')
-          .select('document_id')
-          .eq('id', transaction.receipt_id)
-          .single()
-
-        if (receipt?.document_id) {
-          await supabase
-            .from('document_attachments')
-            .update({ journal_entry_id: journalEntryId })
-            .eq('id', receipt.document_id)
-            .eq('company_id', companyId)
-        }
-      } catch (linkErr) {
-        txLog.warn('failed to link receipt document (non-critical)', linkErr as Error)
-      }
-    } else if (journalEntryId && transaction.document_id) {
-      // Document was pinned to the transaction (via /attach-document or MCP) before
-      // categorization. Propagate the link to the journal entry so
-      // receipt-on-verifikation (BFL 5 kap 6 §) is satisfied. The journal entry has
-      // already been committed at this point, so we can't roll it back; instead
-      // surface a warning in the response so the UI can prompt the user to retry
-      // the link. Supabase JS returns { error } rather than throwing: destructure
-      // and surface it, never swallow silently.
-      try {
-        const { error: linkErr } = await supabase
-          .from('document_attachments')
-          .update({ journal_entry_id: journalEntryId })
-          .eq('id', transaction.document_id)
-          .eq('company_id', companyId)
-        if (linkErr) {
-          txLog.error('failed to link transaction document', linkErr, {
-            documentId: transaction.document_id,
-          })
-          documentLinkWarning =
-            'Verifikationen skapades men bilagan kunde inte länkas till den. Försök länka om bilagan manuellt.'
-        }
-      } catch (docErr) {
-        txLog.error('failed to link transaction document', docErr as Error, {
-          documentId: transaction.document_id,
+        await appendProcessingHistory({
+          companyId,
+          correlationId: id,
+          aggregateType: 'BankTransaction',
+          aggregateId: id,
+          eventType: 'BankTransactionDuplicateDismissed',
+          payload: {
+            transaction_id: id,
+            dismissed_transaction_id: dismissedCandidate.transaction_id,
+            dismissed_journal_entry_id: dismissedCandidate.journal_entry_id,
+            amount_ore: dismissedCandidate.amount != null
+              ? Math.round(dismissedCandidate.amount * 100)
+              : null,
+            dismissed_currency: dismissedCandidate.currency,
+            dismissed_amount_in_currency: dismissedCandidate.amount_in_currency,
+            entry_date: dismissedCandidate.entry_date,
+            amount_verified: dismissedCandidate.amount_verified,
+            unverified_reason: dismissedCandidate.unverified_reason,
+          },
+          actor: { type: 'user', id: user.id },
+          occurredAt: new Date(),
         })
-        documentLinkWarning =
-          'Verifikationen skapades men bilagan kunde inte länkas till den. Försök länka om bilagan manuellt.'
+      } catch (logErr) {
+        txLog.error(
+          'failed to append duplicate-dismissal history after verified attachment',
+          logErr as Error,
+        )
       }
-    }
-
-    if (body.inbox_item_id && journalEntryId) {
-      try {
-        const { data: inboxItem } = await supabase
-          .from('invoice_inbox_items')
-          .select('document_id')
-          .eq('id', body.inbox_item_id)
-          .eq('company_id', companyId)
-          .single()
-
-        if (inboxItem?.document_id) {
-          await supabase
-            .from('document_attachments')
-            .update({ journal_entry_id: journalEntryId })
-            .eq('id', inboxItem.document_id)
-            .eq('company_id', companyId)
-        }
-
-        // Reflect the booking back onto the inbox row so it stops appearing as
-        // unmatched. Categorizing here puts the underlag on a verifikation,
-        // which is the inbox's "booked" state. Without this the inbox keeps
-        // offering "Matcha mot transaktion" for an underlag that's already on a
-        // posted entry, while the transactions view (which reads the
-        // doc↔verifikat link) already shows it as attached. Mirrors the
-        // backfill that /attach-document does for the manual paperclip path.
-        await supabase
-          .from('invoice_inbox_items')
-          .update({
-            matched_transaction_id: id,
-            created_journal_entry_id: journalEntryId,
-          })
-          .eq('id', body.inbox_item_id)
-          .eq('company_id', companyId)
-      } catch (inboxErr) {
-        txLog.warn('failed to sync inbox item after booking (non-critical)', inboxErr as Error)
-      }
-    }
-
-    const { data: updateResult, error: updateError } = await supabase
-      .from('transactions')
-      .update({
-        is_business,
-        category: finalCategory,
-        journal_entry_id: journalEntryId,
-      })
-      .eq('id', id)
-      .is('journal_entry_id', null)
-      .select('id')
-
-    if (updateError) {
-      txLog.error('failed to update transaction', updateError)
-      return errorResponse(updateError, txLog, { requestId })
-    }
-
-    if ((!updateResult || updateResult.length === 0) && journalEntryId) {
-      // CAS guard: another request set journal_entry_id between our read and
-      // write. Cancel the orphaned entry and document the voucher gap through
-      // the shared helper (BFNAR 2013:2), which owns the correct
-      // voucher_gap_explanations column set and logs failures loudly.
-      await cancelOrphanedPaymentEntry(
-        supabase,
-        companyId,
-        user.id,
-        journalEntryId,
-        'Automatiskt makulerad: dubblettbokning förhindrad av samtidighetsskydd',
-      )
-
-      return errorResponseFromCode('TX_CATEGORIZE_RACE', txLog, { requestId })
-    }
-
-    // Flag any inbox underlag already matched to this transaction as booked.
-    // The block above only fires when the caller passes an explicit
-    // inbox_item_id (booking straight from the inbox flow). Booking the same
-    // transaction from anywhere else (the /transactions list, quick review)
-    // would otherwise leave an attached underlag stuck as "Kopplad" in the
-    // inbox forever. Here we resolve it by the link itself (matched_transaction
-    // _id) so the inbox reflects the booking regardless of entry point. Mirrors
-    // the propagation in lib/pending-operations/commit.ts. Runs post-CAS so we
-    // never stamp the inbox with a journal entry that lost the race.
-    if (journalEntryId) {
-      try {
-        const { data: matchedInboxItems } = await supabase
-          .from('invoice_inbox_items')
-          .select('id, document_id')
-          .eq('company_id', companyId)
-          .eq('matched_transaction_id', id)
-          .is('created_journal_entry_id', null)
-
-        for (const inbox of (matchedInboxItems ?? []) as Array<{
-          id: string
-          document_id: string | null
-        }>) {
-          if (inbox.document_id) {
-            await supabase
-              .from('document_attachments')
-              .update({ journal_entry_id: journalEntryId })
-              .eq('id', inbox.document_id)
-              .eq('company_id', companyId)
-          }
-          await supabase
-            .from('invoice_inbox_items')
-            .update({ created_journal_entry_id: journalEntryId })
-            .eq('id', inbox.id)
-            .eq('company_id', companyId)
-        }
-      } catch (inboxErr) {
-        txLog.warn('failed to flag matched inbox items after booking (non-critical)', inboxErr as Error)
-      }
-    }
-
-    await eventBus.emit({
-      type: 'transaction.categorized',
-      payload: {
-        transaction: transaction as Transaction,
-        account: mappingResult.debit_account,
-        taxCode: mappingResult.vat_lines[0]?.account_number || '',
-        userId: user.id,
-        companyId,
-      },
-    })
-
-    if (journalEntryError) {
-      // Categorization stuck but the verifikation didn't make it through.
-      // Surface as a structured warning: the response below carries the
-      // user-facing message in `journal_entry_error`.
-      txLog.warn('partial outcome: journal entry creation failed', {
-        reason: 'journal_entry_creation_failed',
-        message: journalEntryError,
-      })
     }
 
     return NextResponse.json({
       success: true,
       journal_entry_created: journalEntryCreated,
       journal_entry_id: journalEntryId,
-      journal_entry_error: journalEntryError,
-      document_link_warning: documentLinkWarning,
+      journal_entry_error: null,
+      document_link_warning: null,
       category: finalCategory,
+      ...(alreadyHadJournalEntry ? { already_had_journal_entry: true } : {}),
     })
   },
   { requireWrite: true },

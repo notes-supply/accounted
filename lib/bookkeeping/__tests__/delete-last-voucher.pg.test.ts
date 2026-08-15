@@ -4,43 +4,20 @@ import { getPool, withUserContext } from '@/tests/pg/setup'
 import {
   insertBalancedLines,
   insertDraftJournalEntry,
+  insertPostedJournalEntry,
+  insertReversedJournalEntryGraph,
   seedCompany,
 } from '@/tests/pg/fixtures'
 
-// Set up a posted journal entry with balanced lines, going through draft so
-// the line-immutability trigger is happy. Returns the entry id.
+// Durable posted fixture used by deletion rejection tests.
 async function insertPostedEntryWithLines(params: {
   userId: string
   companyId: string
   fiscalPeriodId: string
   voucherNumber: number
-  reversesId?: string
-  sourceType?: string
 }): Promise<string> {
-  const id = randomUUID()
-  await getPool().query(
-    `INSERT INTO public.journal_entries
-       (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-        entry_date, description, source_type, status, reverses_id)
-     VALUES ($1, $2, $3, $4, $5, 'A', '2026-06-01', 'Test entry', $6, 'draft', $7)`,
-    [
-      id,
-      params.userId,
-      params.companyId,
-      params.fiscalPeriodId,
-      params.voucherNumber,
-      params.sourceType ?? 'manual',
-      params.reversesId ?? null,
-    ],
-  )
-  await insertBalancedLines(id)
-  await getPool().query(
-    `UPDATE public.journal_entries SET status = 'posted' WHERE id = $1`,
-    [id],
-  )
-  return id
+  return insertPostedJournalEntry(params)
 }
-
 // Insert a document_attachment row already linked to a journal entry, so
 // tests can exercise the bidirectional immutability trigger on the
 // journal_entry_id column.
@@ -69,59 +46,41 @@ async function insertDocumentLinkedToEntry(params: {
 }
 
 describe('delete_last_voucher.pg: RPC + immutability trigger interaction', () => {
-  it('deletes the last posted voucher in a series', async () => {
+  it('rejects deleting the last posted voucher', async () => {
     const { userId, companyId, fiscalPeriodId } = await seedCompany()
     const entryId = await insertPostedEntryWithLines({
       userId, companyId, fiscalPeriodId, voucherNumber: 1,
     })
 
-    await withUserContext(userId, async (client) => {
-      await client.query(
-        `SELECT public.delete_last_voucher($1::uuid, $2::uuid)`,
-        [companyId, entryId],
-      )
-      // Verify inside the txn: withUserContext rolls back on exit, so an
-      // outer pool query would see the row again.
-      const after = await client.query(
-        `SELECT 1 FROM public.journal_entries WHERE id = $1`,
-        [entryId],
-      )
-      expect(after.rowCount).toBe(0)
-    })
+    await expect(
+      withUserContext(userId, (client) =>
+        client.query('SELECT delete_last_voucher($1, $2)', [companyId, entryId]),
+      ),
+    ).rejects.toThrow(/Posted and reversed vouchers cannot be deleted/)
   })
 
-  it('flips original from reversed back to posted when its storno is deleted', async () => {
+  it('rejects deleting a storno and leaves its original reversed', async () => {
     const { userId, companyId, fiscalPeriodId } = await seedCompany()
-
-    const originalId = await insertPostedEntryWithLines({
-      userId, companyId, fiscalPeriodId, voucherNumber: 1,
+    const graph = await insertReversedJournalEntryGraph({
+      userId,
+      companyId,
+      fiscalPeriodId,
+      voucherNumber: 1,
     })
 
-    // Storno: insert with reverses_id already set so the immutability trigger
-    // never sees an UPDATE that adds it after the fact.
-    const stornoId = await insertPostedEntryWithLines({
-      userId, companyId, fiscalPeriodId, voucherNumber: 2,
-      sourceType: 'storno', reversesId: originalId,
-    })
+    await expect(
+      withUserContext(userId, (client) =>
+        client.query('SELECT delete_last_voucher($1, $2)', [companyId, graph.stornoId]),
+      ),
+    ).rejects.toThrow(/Posted and reversed vouchers cannot be deleted/)
 
-    // Mark original as reversed: posted → reversed is allowed by the state
-    // machine as long as no other fields change.
-    await getPool().query(
-      `UPDATE public.journal_entries SET status = 'reversed', reversed_by_id = $1 WHERE id = $2`,
-      [stornoId, originalId],
+    const original = await getPool().query(
+      'SELECT status, reversed_by_id FROM public.journal_entries WHERE id = $1',
+      [graph.originalId],
     )
-
-    await withUserContext(userId, async (client) => {
-      await client.query(
-        `SELECT public.delete_last_voucher($1::uuid, $2::uuid)`,
-        [companyId, stornoId],
-      )
-      const restored = await client.query<{ status: string; reversed_by_id: string | null }>(
-        `SELECT status, reversed_by_id FROM public.journal_entries WHERE id = $1`,
-        [originalId],
-      )
-      expect(restored.rows[0]!.status).toBe('posted')
-      expect(restored.rows[0]!.reversed_by_id).toBeNull()
+    expect(original.rows[0]).toMatchObject({
+      status: 'reversed',
+      reversed_by_id: graph.stornoId,
     })
   })
 
@@ -156,64 +115,43 @@ describe('delete_last_voucher.pg: RPC + immutability trigger interaction', () =>
     }
   })
 
-  it('clears journal_entry_id on attached documents and deletes the voucher', async () => {
-    // Regression for the document-immutability triggers ignoring the
-    // gnubok.allow_delete bypass. delete_last_voucher unlinks documents
-    // (UPDATE document_attachments SET journal_entry_id = NULL) before
-    // deleting the entry; if the trigger refused the unlink the whole RPC
-    // would fail and the entry would remain.
+  it('keeps document references when posted deletion is rejected', async () => {
     const { userId, companyId, fiscalPeriodId } = await seedCompany()
     const entryId = await insertPostedEntryWithLines({
       userId, companyId, fiscalPeriodId, voucherNumber: 1,
     })
-    const docId = randomUUID()
-    await getPool().query(
-      `INSERT INTO public.document_attachments
-         (id, user_id, company_id, storage_path, file_name, file_size_bytes,
-          mime_type, sha256_hash, journal_entry_id)
-       VALUES ($1, $2, $3, $4, 'underlag.pdf', 1024, 'application/pdf', $5, $6)`,
-      [
-        docId,
-        userId,
-        companyId,
-        `documents/${userId}/${docId}.pdf`,
-        'a'.repeat(64),
-        entryId,
-      ],
-    )
-
-    await withUserContext(userId, async (client) => {
-      await client.query(
-        `SELECT public.delete_last_voucher($1::uuid, $2::uuid)`,
-        [companyId, entryId],
-      )
-      const entryAfter = await client.query(
-        `SELECT 1 FROM public.journal_entries WHERE id = $1`,
-        [entryId],
-      )
-      expect(entryAfter.rowCount).toBe(0)
-      const docAfter = await client.query<{ journal_entry_id: string | null }>(
-        `SELECT journal_entry_id FROM public.document_attachments WHERE id = $1`,
-        [docId],
-      )
-      expect(docAfter.rows[0]!.journal_entry_id).toBeNull()
+    const documentId = await insertDocumentLinkedToEntry({
+      userId,
+      companyId,
+      journalEntryId: entryId,
     })
+
+    await expect(
+      withUserContext(userId, (client) =>
+        client.query('SELECT delete_last_voucher($1, $2)', [companyId, entryId]),
+      ),
+    ).rejects.toThrow(/Posted and reversed vouchers cannot be deleted/)
+
+    const document = await getPool().query<{ journal_entry_id: string | null }>(
+      'SELECT journal_entry_id FROM public.document_attachments WHERE id = $1',
+      [documentId],
+    )
+    expect(document.rows[0]!.journal_entry_id).toBe(entryId)
   })
 
-  it('blocks reversed → posted UPDATE without the bypass flag', async () => {
+  it('blocks reversed to posted UPDATE without the bypass flag', async () => {
     const { userId, companyId, fiscalPeriodId } = await seedCompany()
-    const entryId = await insertPostedEntryWithLines({
-      userId, companyId, fiscalPeriodId, voucherNumber: 1,
+    const graph = await insertReversedJournalEntryGraph({
+      userId,
+      companyId,
+      fiscalPeriodId,
+      voucherNumber: 1,
     })
-    await getPool().query(
-      `UPDATE public.journal_entries SET status = 'reversed' WHERE id = $1`,
-      [entryId],
-    )
 
     await expect(
       getPool().query(
         `UPDATE public.journal_entries SET status = 'posted' WHERE id = $1`,
-        [entryId],
+        [graph.originalId],
       ),
     ).rejects.toThrow(/Cannot modify a reversed journal entry/i)
   })

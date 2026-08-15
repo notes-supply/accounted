@@ -154,6 +154,52 @@ describe('buildWintSieFile', () => {
     expect(payment?.description).toBe('Inbetalning "1007"');
   });
 
+  it('round-trips backslashes, quotes, and normalized newlines in quoted fields', () => {
+    const slashBeforeQuote = '\\' + '"';
+    const companyName = `Bolag C:\\Arkiv ${slashBeforeQuote}Norr" och "citat"\nAB`;
+    const voucherText = `Verifikat C:\\Temp ${slashBeforeQuote}offert" och "citat"\r\nrad två`;
+    const transactionText = `Rad C:\\Data ${slashBeforeQuote}underlag" och "text"\nrad två`;
+    const objectNo = `P\\01${slashBeforeQuote}A"`;
+    const objectName = `Projekt C:\\Kund ${slashBeforeQuote}Norr"\nEtapp`;
+    const normalized = (value: string) => value.replace(/[\r\n]+/g, ' ');
+
+    const content = buildWintSieFile({
+      ...BASE_OPTIONS,
+      companyName,
+      accounts: [
+        { accountNumber: '1930', name: 'Företagskonto' },
+        { accountNumber: '3010', name: 'Försäljning' },
+      ],
+      vouchers: [voucher({
+        text: voucherText,
+        transactions: [
+          {
+            accountNumber: '1930',
+            amount: 100,
+            text: transactionText,
+            dimensions: [
+              { type: 'Project', shortName: objectNo, name: objectName },
+            ],
+          },
+          { accountNumber: '3010', amount: -100 },
+        ],
+      })],
+      ibByAccount: new Map(),
+    });
+    const parsed = parseSIEFile(content);
+
+    expect(validateSIEFile(parsed).errors).toEqual([]);
+    expect(parsed.header.companyName).toBe(normalized(companyName));
+    expect(parsed.vouchers[0]?.description).toBe(normalized(voucherText));
+    expect(parsed.vouchers[0]?.lines[0]?.description).toBe(normalized(transactionText));
+    expect(parsed.vouchers[0]?.lines[0]?.dimensions).toEqual({ '6': objectNo });
+    expect(parsed.dimensionValues).toContainEqual({
+      sieDimNo: 6,
+      code: objectNo,
+      name: normalized(objectName),
+    });
+  });
+
   it('emits declared #KONTO for every referenced account and orders vouchers per series', () => {
     const content = buildWintSieFile({
       ...BASE_OPTIONS,

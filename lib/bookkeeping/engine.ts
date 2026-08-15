@@ -3,7 +3,11 @@ import { eventBus } from '@/lib/events'
 import { createLogger } from '@/lib/logger'
 import {
   AccountsNotInChartError,
+  AmbiguousJournalCommitError,
   BookkeepingDatabaseError,
+  DurableAccountingConflictError,
+  DurableAccountingIdentityError,
+  DurableAccountingPartialError,
   CannotEditNonDraftError,
   CannotReverseNonPostedError,
   CannotReverseStornoError,
@@ -32,13 +36,23 @@ import {
 } from '@/lib/bookkeeping/dimension-rules'
 import { fetchEntryLines, type EntryLinesQuery } from '@/lib/bookkeeping/entry-lines'
 import { backfillStandardBASAccounts } from '@/lib/bookkeeping/account-backfill'
-import { syncInvoiceStatusFromPaymentEntry, isPaymentSourceType } from '@/lib/bookkeeping/payment-sync'
+import {
+  applySupplierPaymentReversal,
+  isPaymentSourceType,
+  resolveSupplierPaymentLineage,
+  syncInvoiceStatusFromPaymentEntry,
+} from '@/lib/bookkeeping/payment-sync'
 import { getActor } from '@/lib/bookkeeping/actor-context'
 import type {
+  AccountingActor,
+  AccountingActorType,
   AssetDisposalType,
   AssetJamkningDirection,
   CreateJournalEntryInput,
   CreateJournalEntryLineInput,
+  DurableCategorizationCompensationOutcome,
+  DurableJournalReversalOutcome,
+  DurablePublicationIdentity,
   JournalEntry,
   JournalEntryLine,
   JournalEntrySourceType,
@@ -342,6 +356,8 @@ export async function createDraftEntry(
       description: input.description,
       source_type: input.source_type,
       source_id: input.source_id || null,
+      categorization_category: input.categorization_category ?? null,
+      categorization_is_business: input.categorization_is_business ?? null,
       notes: input.notes || null,
       status: 'draft',
     })
@@ -517,6 +533,8 @@ export async function updateDraftEntry(
       description: input.description,
       voucher_series: resolvedSeries,
       notes: input.notes || null,
+      categorization_category: input.categorization_category ?? null,
+      categorization_is_business: input.categorization_is_business ?? null,
     })
     .eq('id', entryId)
     .eq('company_id', companyId)
@@ -574,40 +592,63 @@ export async function updateDraftEntry(
  * the audit_log COMMIT row (migration 20260619120000). No scope → NULLs,
  * identical to pre-attribution behaviour.
  */
+export interface CommitEntryOptions {
+  emitCommittedEvent?: boolean
+}
+
+function rpcVoucherNumber(data: unknown): number | null {
+  const value = Array.isArray(data) ? data[0] : data
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  const voucherNumber = (value as Record<string, unknown>).voucher_number
+  return typeof voucherNumber === 'number' && Number.isFinite(voucherNumber)
+    ? voucherNumber
+    : null
+}
+
+async function readCompleteJournalEntry(
+  supabase: SupabaseClient,
+  companyId: string,
+  entryId: string,
+): Promise<{ entry: JournalEntry | null; error: string | null }> {
+  try {
+    const { data, error } = await supabase
+      .from('journal_entries')
+      .select('*, lines:journal_entry_lines(*)')
+      .eq('id', entryId)
+      .eq('company_id', companyId)
+      .single()
+    return {
+      entry: data ? data as JournalEntry : null,
+      error: error?.message ?? (data ? null : 'journal entry was not returned'),
+    }
+  } catch (error) {
+    return {
+      entry: null,
+      error: error instanceof Error ? error.message : String(error),
+    }
+  }
+}
 export async function commitEntry(
   supabase: SupabaseClient,
   companyId: string,
   userId: string,
   entryId: string,
   commitMethod?: string,
-  rubricVersion?: string
+  rubricVersion?: string,
+  options: CommitEntryOptions = {},
 ): Promise<JournalEntry> {
   const actor = getActor()
 
   // Mandatory dimension rules (dimensions PR10): 'required' rules bite when
-  // the verifikat is about to become immutable — drafts may be incomplete,
-  // posting may not. Zero active rules (the default) skips the line fetch
-  // entirely; a failed rule fetch fails open (transient DB errors must not
-  // block bookkeeping). Reversal/correction paths never pass through
-  // commitEntry, so history always reverses regardless of policy.
+  // the verifikat is about to become immutable. Reversal/correction paths do
+  // not pass through commitEntry, so history always remains reversible.
   const rules = await fetchActiveDimensionRules(supabase, companyId)
   if (rules === null) {
-    // Deliberate fail-open, but LOUD: a transient policy-table error must not
-    // block month-end bookings company-wide, yet a silently skipped control
-    // is invisible — the warning makes the degradation observable.
-    log.warn('dimension rule fetch failed — mandatory enforcement skipped (fail-open)', {
+    log.warn('dimension rule fetch failed: mandatory enforcement skipped (fail-open)', {
       companyId,
       entityId: entryId,
     })
-  } else if (rules.some((r) => r.rule_type === 'required')) {
-    // READ ONLY: this is a pre-commit policy check, not a write. The two-step
-    // fetch (lib/bookkeeping/entry-lines.ts) replaces a
-    // `journal_entries!inner(source_type)` embed so no query in the commit
-    // path can compile to the correlated LATERAL join that scans every
-    // tenant's journal_entry_lines. The parent is reattached under the same
-    // `journal_entries` key, so the exemption read below is unchanged. The
-    // entry-side company_id filter is defense in depth (repo convention);
-    // commitEntry is always called with the entry's own company.
+  } else if (rules.some((rule) => rule.rule_type === 'required')) {
     type RuleLine = {
       account_number: string
       dimensions: Record<string, string>
@@ -619,40 +660,42 @@ export async function commitEntry(
         supabase,
         entryColumns: 'source_type',
         lineColumns: 'account_number, dimensions',
-        filterEntries: (q: EntryLinesQuery) => q.eq('id', entryId).eq('company_id', companyId),
+        filterEntries: (query: EntryLinesQuery) =>
+          query.eq('id', entryId).eq('company_id', companyId),
       })
     } catch {
       typedLines = null
     }
     if (!typedLines) {
-      log.warn('line fetch for mandatory dimension check failed — enforcement skipped (fail-open)', {
+      log.warn('line fetch for mandatory dimension check failed: enforcement skipped (fail-open)', {
         companyId,
         entityId: entryId,
       })
-    } else {
-      // System/correction sources are exempt — see
-      // DIMENSION_RULE_EXEMPT_SOURCE_TYPES (imported history, bokslut
-      // mechanics and credit instruments must never be blocked by policy).
-      // source_type is a HEADER column (journal_entries) — the join repeats
-      // the same value on every line, so reading lines[0] IS reading the
-      // entry header; lines cannot mix source types.
-      if (!isDimensionRuleExemptSource(typedLines[0]?.journal_entries?.source_type)) {
-        assertMandatoryDimensions(typedLines, rules)
-      }
+    } else if (!isDimensionRuleExemptSource(typedLines[0]?.journal_entries?.source_type)) {
+      assertMandatoryDimensions(typedLines, rules)
     }
   }
 
-  // Atomic: increment voucher sequence + update status in one transaction.
-  // Rolls back the sequence if the balance trigger or any constraint fails.
-  const { data: rpcResult, error: commitError } = await supabase.rpc('commit_journal_entry', {
-    p_company_id: companyId,
-    p_entry_id: entryId,
-    p_commit_method: commitMethod ?? null,
-    p_rubric_version: rubricVersion ?? null,
-    p_actor_type: actor?.type ?? null,
-    p_actor_label: actor?.label ?? null,
-  })
+  let rpcResult: unknown = null
+  let commitError: { message: string; code?: string; details?: string; hint?: string } | null = null
+  try {
+    const response = await supabase.rpc('commit_journal_entry', {
+      p_company_id: companyId,
+      p_entry_id: entryId,
+      p_commit_method: commitMethod ?? null,
+      p_rubric_version: rubricVersion ?? null,
+      p_actor_type: actor?.type ?? null,
+      p_actor_label: actor?.label ?? null,
+    })
+    rpcResult = response.data
+    commitError = response.error
+  } catch (error) {
+    commitError = {
+      message: error instanceof Error ? error.message : String(error),
+    }
+  }
 
+  const readback = await readCompleteJournalEntry(supabase, companyId, entryId)
   if (commitError) {
     log.error('commit_journal_entry RPC failed', commitError, {
       operation: 'commit_entry',
@@ -661,32 +704,45 @@ export async function commitEntry(
       entityType: 'journal_entry',
       entityId: entryId,
       commitMethod: commitMethod ?? null,
-      pgCode: (commitError as { code?: string }).code,
-      pgDetails: (commitError as { details?: string }).details,
-      pgHint: (commitError as { hint?: string }).hint,
+      pgCode: commitError.code,
+      pgDetails: commitError.details,
+      pgHint: commitError.hint,
     })
-    throw new BookkeepingDatabaseError('commit_entry', commitError.message)
+    if (
+      readback.entry?.status === 'draft' &&
+      readback.entry.voucher_number === 0
+    ) {
+      throw new BookkeepingDatabaseError('commit_entry', commitError.message)
+    }
+    if (readback.entry?.status !== 'posted') {
+      throw new AmbiguousJournalCommitError(
+        entryId,
+        readback.entry?.voucher_number || rpcVoucherNumber(rpcResult),
+        readback.error ?? commitError.message,
+      )
+    }
   }
 
-  // Fetch complete posted entry with lines
-  const { data: completeEntry } = await supabase
-    .from('journal_entries')
-    .select('*, lines:journal_entry_lines(*)')
-    .eq('id', entryId)
-    .single()
+  if (!readback.entry || readback.entry.status !== 'posted') {
+    throw new AmbiguousJournalCommitError(
+      entryId,
+      readback.entry?.voucher_number || rpcVoucherNumber(rpcResult),
+      readback.error ?? `unexpected durable status ${readback.entry?.status ?? 'missing'}`,
+    )
+  }
 
-  const result = completeEntry as JournalEntry
-
-  await eventBus.emit({
-    type: 'journal_entry.committed',
-    payload: { entry: result, userId, companyId },
-  })
-
-  return result
+  if (options.emitCommittedEvent !== false) {
+    await eventBus.emit({
+      type: 'journal_entry.committed',
+      payload: { entry: readback.entry, userId, companyId },
+    })
+  }
+  return readback.entry
 }
 
 export interface CommitAssetDisposalInput {
   asset_id: string
+  expected_asset_updated_at: string
   fiscal_period_id: string
   disposal_type: AssetDisposalType
   disposed_at: string
@@ -717,10 +773,11 @@ export async function commitAssetDisposal(
   input: CommitAssetDisposalInput,
 ): Promise<JournalEntry | null> {
   const actor = getActor()
-  const { error } = await supabase.rpc('commit_asset_disposal', {
+  const { data: rpcResult, error } = await supabase.rpc('commit_asset_disposal', {
     p_company_id: companyId,
     p_asset_id: input.asset_id,
     p_entry_id: entryId,
+    p_expected_asset_updated_at: input.expected_asset_updated_at,
     p_fiscal_period_id: input.fiscal_period_id,
     p_disposal_type: input.disposal_type,
     p_disposed_at: input.disposed_at,
@@ -786,11 +843,10 @@ export async function commitAssetDisposal(
         journalEntryId: entryId,
       },
     )
-    throw new BookkeepingDatabaseError(
-      'fetch_asset_disposal_entry',
-      `disposal voucher is committed but could not be reloaded: ${
-        lastFetchError?.message ?? 'posted entry not found'
-      }`,
+    throw new AmbiguousJournalCommitError(
+      entryId,
+      rpcVoucherNumber(rpcResult),
+      lastFetchError?.message ?? 'posted entry not found',
     )
   }
 
@@ -818,20 +874,28 @@ export async function createJournalEntry(
   userId: string,
   input: CreateJournalEntryInput,
   commitMethod?: string,
-  rubricVersion?: string
+  rubricVersion?: string,
+  options: CommitEntryOptions = {},
 ): Promise<JournalEntry> {
   const draft = await createDraftEntry(supabase, companyId, userId, input)
   try {
-    return await commitEntry(supabase, companyId, userId, draft.id, commitMethod, rubricVersion)
+    return await commitEntry(
+      supabase,
+      companyId,
+      userId,
+      draft.id,
+      commitMethod,
+      rubricVersion,
+      options,
+    )
   } catch (commitError) {
-    // CAS guard: only cancel if still in draft. If the RPC actually posted
-    // before failing downstream, immutability trigger blocks draft→cancelled
-    // on a posted row anyway: the filter just avoids firing the trigger.
+    if (commitError instanceof AmbiguousJournalCommitError) throw commitError
     try {
       const { error: cancelError } = await supabase
         .from('journal_entries')
         .update({ status: 'cancelled' })
         .eq('id', draft.id)
+        .eq('company_id', companyId)
         .eq('status', 'draft')
       if (cancelError) {
         log.error('orphan draft cleanup failed (phantom draft remains)', cancelError, {
@@ -842,9 +906,8 @@ export async function createJournalEntry(
           pgCode: (cancelError as { code?: string }).code,
         })
       }
-    } catch (cleanupErr) {
-      // Surface the original commit error, but don't lose the cleanup signal.
-      log.error('orphan draft cleanup threw (phantom draft remains)', cleanupErr as Error, {
+    } catch (cleanupError) {
+      log.error('orphan draft cleanup threw (phantom draft remains)', cleanupError as Error, {
         operation: 'create_journal_entry.cleanup',
         companyId,
         entityType: 'journal_entry',
@@ -1035,6 +1098,285 @@ export function getSwedishLocalDate(): string {
   return new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Stockholm' }).format(new Date())
 }
 
+function accountingActor(
+  userId: string,
+  explicit: AccountingActor | undefined,
+): AccountingActor {
+  if (explicit) return explicit
+  const ambient = getActor()
+  if (ambient) {
+    return {
+      actor_type: ambient.type,
+      actor_id: ambient.type === 'user' ? userId : null,
+      actor_label: ambient.label ?? null,
+    }
+  }
+  return {
+    actor_type: 'user',
+    actor_id: userId,
+    actor_label: null,
+  }
+}
+
+function publicationMarker(publication: DurablePublicationIdentity) {
+  return {
+    persisted: true as const,
+    publication_id: publication.publication_id,
+    event_key: publication.event_key,
+  }
+}
+
+async function hydrateDurableReversal(
+  supabase: SupabaseClient,
+  outcome: DurableJournalReversalOutcome,
+): Promise<{ original: JournalEntry; reversal: JournalEntry }> {
+  const [originalReadback, reversalReadback] = await Promise.all([
+    readCompleteJournalEntry(
+      supabase,
+      outcome.company_id,
+      outcome.original_journal_entry_id,
+    ),
+    readCompleteJournalEntry(
+      supabase,
+      outcome.company_id,
+      outcome.reversal_journal_entry_id,
+    ),
+  ])
+  const original = originalReadback.entry
+  const reversal = reversalReadback.entry
+  if (
+    !original ||
+    !reversal ||
+    original.status !== 'reversed' ||
+    original.reversed_by_id !== outcome.reversal_journal_entry_id ||
+    reversal.status !== 'posted' ||
+    reversal.source_type !== 'storno' ||
+    reversal.reverses_id !== outcome.original_journal_entry_id
+  ) {
+    throw new DurableAccountingIdentityError(
+      'verify_durable_accounting_identity',
+      {
+        company_id: outcome.company_id,
+        original_journal_entry_id: outcome.original_journal_entry_id,
+        reversal_journal_entry_id: outcome.reversal_journal_entry_id,
+        publication_ids: outcome.publications.map(
+          (publication) => publication.publication_id,
+        ),
+      },
+      originalReadback.error ??
+        reversalReadback.error ??
+        'journal readback did not match the exact original and storno links',
+    )
+  }
+  return { original, reversal }
+}
+
+async function emitDurableReversalEvents(
+  outcome: DurableJournalReversalOutcome,
+  entries: { original: JournalEntry; reversal: JournalEntry },
+  userId: string,
+): Promise<void> {
+  await eventBus.emit({
+    type: 'journal_entry.committed',
+    payload: {
+      entry: entries.reversal,
+      userId,
+      companyId: outcome.company_id,
+      durablePublication: publicationMarker(outcome.publications[0]),
+    },
+  })
+  await eventBus.emit({
+    type: 'journal_entry.reversed',
+    payload: {
+      originalEntry: entries.original,
+      reversalEntry: entries.reversal,
+      userId,
+      companyId: outcome.company_id,
+      durablePublication: publicationMarker(outcome.publications[1]),
+    },
+  })
+}
+
+function durableRpcRow(data: unknown): Record<string, unknown> | null {
+  const value = Array.isArray(data) ? data[0] : data
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+const ACCOUNTING_ACTOR_TYPE: Record<AccountingActorType, true> = {
+  user: true,
+  api_key: true,
+  mcp_oauth: true,
+  cron: true,
+  system: true,
+  agent_chat: true,
+}
+
+function isAccountingActorType(value: unknown): value is AccountingActorType {
+  return typeof value === 'string' && value in ACCOUNTING_ACTOR_TYPE
+}
+
+function isDurablePublicationIdentity(
+  value: unknown,
+): value is DurablePublicationIdentity {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+  const publication = value as Record<string, unknown>
+  return (
+    typeof publication.publication_id === 'string' &&
+    publication.publication_id.length > 0 &&
+    typeof publication.event_key === 'string' &&
+    publication.event_key.length > 0 &&
+    (
+      publication.event_type === 'journal_entry.committed' ||
+      publication.event_type === 'journal_entry.reversed'
+    )
+  )
+}
+
+function parseCategorizationCompensation(
+  data: unknown,
+  companyId: string,
+  transactionId: string,
+  originalJournalEntryId: string,
+): DurableCategorizationCompensationOutcome | null {
+  const row = durableRpcRow(data)
+  if (
+    !row ||
+    (row.status !== 'applied' && row.status !== 'already_applied') ||
+    row.company_id !== companyId ||
+    row.transaction_id !== transactionId ||
+    typeof row.root_journal_entry_id !== 'string' ||
+    row.original_journal_entry_id !== originalJournalEntryId ||
+    typeof row.reversal_journal_entry_id !== 'string' ||
+    row.reversal_journal_entry_id.length === 0 ||
+    !isAccountingActorType(row.actor_type) ||
+    (row.actor_id !== null && typeof row.actor_id !== 'string') ||
+    (row.actor_label !== null && typeof row.actor_label !== 'string') ||
+    !Array.isArray(row.publications) ||
+    row.publications.length !== 2 ||
+    !row.publications.every(isDurablePublicationIdentity)
+  ) {
+    return null
+  }
+  const publications = row.publications as DurablePublicationIdentity[]
+  if (
+    publications[0]!.event_type !== 'journal_entry.committed' ||
+    publications[1]!.event_type !== 'journal_entry.reversed' ||
+    publications[0]!.publication_id === publications[1]!.publication_id ||
+    publications[0]!.event_key === publications[1]!.event_key
+  ) {
+    return null
+  }
+  return row as unknown as DurableCategorizationCompensationOutcome
+}
+
+export async function compensateTransactionCategorization(
+  supabase: SupabaseClient,
+  params: {
+    companyId: string
+    userId: string
+    transactionId: string
+    originalJournalEntryId: string
+    actor?: AccountingActor
+  },
+): Promise<{
+  outcome: DurableCategorizationCompensationOutcome
+  originalEntry: JournalEntry
+  reversalEntry: JournalEntry
+}> {
+  const actor = accountingActor(params.userId, params.actor)
+  const rpcArgs = {
+    p_company_id: params.companyId,
+    p_transaction_id: params.transactionId,
+    p_original_journal_entry_id: params.originalJournalEntryId,
+    p_actor_type: actor.actor_type,
+    p_actor_id: actor.actor_id,
+    p_actor_label: actor.actor_label,
+  }
+  let data: unknown = null
+  let lastError: { message: string } | null = null
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await supabase.rpc(
+        'compensate_transaction_categorization',
+        rpcArgs,
+      )
+      data = response.data
+      lastError = response.error
+    } catch (error) {
+      lastError = {
+        message: error instanceof Error ? error.message : String(error),
+      }
+    }
+    if (!lastError) break
+  }
+  if (lastError) {
+    throw new DurableAccountingPartialError(
+      'compensate_transaction_categorization',
+      {
+        company_id: params.companyId,
+        original_journal_entry_id: params.originalJournalEntryId,
+        reversal_journal_entry_id: null,
+        publication_ids: [],
+      },
+      lastError.message,
+    )
+  }
+
+  const row = durableRpcRow(data)
+  if (row?.status === 'conflict') {
+    throw new DurableAccountingConflictError(
+      'compensate_transaction_categorization',
+      {
+        company_id: params.companyId,
+        original_journal_entry_id: params.originalJournalEntryId,
+        reversal_journal_entry_id:
+          typeof row.reversal_journal_entry_id === 'string'
+            ? row.reversal_journal_entry_id
+            : null,
+        publication_ids: [],
+      },
+      typeof row.reason === 'string' ? row.reason : 'persisted state differs',
+    )
+  }
+
+  const outcome = parseCategorizationCompensation(
+    data,
+    params.companyId,
+    params.transactionId,
+    params.originalJournalEntryId,
+  )
+  if (!outcome) {
+    const publications = Array.isArray(row?.publications)
+      ? row.publications.filter(isDurablePublicationIdentity)
+      : []
+    throw new DurableAccountingIdentityError(
+      'compensate_transaction_categorization',
+      {
+        company_id: params.companyId,
+        original_journal_entry_id: params.originalJournalEntryId,
+        reversal_journal_entry_id:
+          typeof row?.reversal_journal_entry_id === 'string'
+            ? row.reversal_journal_entry_id
+            : null,
+        publication_ids: publications.map(
+          (publication) => publication.publication_id,
+        ),
+      },
+      'M5 compensation RPC returned malformed or contradictory identities',
+    )
+  }
+
+  const entries = await hydrateDurableReversal(supabase, outcome)
+  await emitDurableReversalEvents(outcome, entries, params.userId)
+  return {
+    outcome,
+    originalEntry: entries.original,
+    reversalEntry: entries.reversal,
+  }
+}
+
 /**
  * Create a reversal entry for an existing journal entry
  * Sets reversed_by_id/reverses_id links for compliance tracking
@@ -1047,11 +1389,12 @@ export async function reverseEntry(
   reversalDate?: string,
   options?: {
     /**
-     * Bypass the correction-chain depth guard: reversing an entry that is
-     * already CORRECTION_CHAIN_GUARD_DEPTH+ links deep throws
-     * CorrectionChainTooDeepError unless set (see storno-service correctEntry).
+     * Bypass the correction-chain depth guard for ordinary entries. Supplier
+     * reversal depth and lineage are always enforced by M2/M3.
      */
     allowDeepChain?: boolean
+    /** Verified API-key/MCP actor metadata for service-role calls. */
+    actor?: AccountingActor
   }
 ): Promise<JournalEntry> {
 
@@ -1065,6 +1408,36 @@ export async function reverseEntry(
 
   if (error || !original) {
     throw new JournalEntryNotFoundError()
+  }
+
+  const lineage = await resolveSupplierPaymentLineage(supabase, companyId, entryId)
+  if (lineage.is_supplier_payment) {
+    const outcome = await applySupplierPaymentReversal(supabase, {
+      companyId,
+      requestedJournalEntryId: entryId,
+      reversalDate: reversalDate ?? original.entry_date,
+      actor: accountingActor(userId, options?.actor),
+      lineage,
+    })
+    const entries = await hydrateDurableReversal(supabase, outcome)
+    await emitDurableReversalEvents(outcome, entries, userId)
+    return entries.reversal
+  }
+  if (
+    !lineage.is_supplier_payment &&
+    original.source_type.startsWith('supplier_invoice') &&
+    isPaymentSourceType(original.source_type)
+  ) {
+    throw new DurableAccountingIdentityError(
+      'resolve_supplier_payment_lineage',
+      {
+        company_id: companyId,
+        original_journal_entry_id: entryId,
+        reversal_journal_entry_id: original.reversed_by_id ?? null,
+        publication_ids: [],
+      },
+      'typed supplier payment was not bound to an M2 supplier lineage',
+    )
   }
 
   if (original.status !== 'posted') {

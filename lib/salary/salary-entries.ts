@@ -132,7 +132,7 @@ export async function createSalaryRunEntries(
   run: SalaryRunData
 ): Promise<{
   salaryEntry: JournalEntry
-  avgifterEntry: JournalEntry
+  avgifterEntry: JournalEntry | null
   vacationEntry: JournalEntry | null
   pensionEntry: JournalEntry | null
 }> {
@@ -148,15 +148,23 @@ export async function createSalaryRunEntries(
 
   await ensureSalaryAccountsExist(supabase, companyId, userId, postingRun)
 
-  // ─── Entry 1: Salary (brutto, skatt, netto) ───
+  // ─── Entry 1: Salary (brutto, skatt, netto, reimbursements) ───
   const salaryEntry = await createSalaryEntry(
     supabase, companyId, userId, postingRun, fiscalPeriodId, desc
   )
 
-  // ─── Entry 2: Arbetsgivaravgifter ───
-  const avgifterEntry = await createAvgifterEntry(
-    supabase, companyId, userId, postingRun, fiscalPeriodId, desc
+  // A mileage-only run has a real payout voucher but no social charges. Never
+  // create a zero-amount avgifter voucher: posted entries require both sides
+  // to be positive.
+  const totalAvgifter = roundOre(
+    postingRun.employees.reduce((sum, employee) => sum + employee.avgifter_amount, 0)
   )
+  const avgifterEntry =
+    totalAvgifter !== 0
+      ? await createAvgifterEntry(
+          supabase, companyId, userId, postingRun, fiscalPeriodId, desc
+        )
+      : null
 
   // ─── Entry 3: Vacation accrual (if any) ───
   let vacationEntry: JournalEntry | null = null
@@ -239,13 +247,13 @@ async function createSalaryEntry(
     const BENEFIT_TYPES = ['benefit_car', 'benefit_housing', 'benefit_meals', 'benefit_wellness', 'benefit_bike', 'benefit_other']
     let lineItemTotal = 0
     for (const li of emp.line_items) {
-      // Öresavrundning: part of the payout (the 1930 credit uses the rounded
-      // net) but NOT part of gross salary, so it must stay out of
-      // lineItemTotal: the baseRemainder below reconciles line items against
-      // gross_salary, and counting the rounding there would shrink the base
-      // salary debit by the same amount and unbalance the entry.
-      if (li.item_type === 'oresavrundning') {
-        const account = li.account_number || getLineItemAccount('oresavrundning', emp.employment_type)
+      // Öresavrundning and tax-free mileage are additional payout expenses,
+      // not gross salary. Book their dedicated expense lines without reducing
+      // the gross-salary remainder below.
+      if (li.item_type === 'oresavrundning' || li.item_type === 'mileage_taxfree') {
+        const account =
+          li.account_number ||
+          getLineItemAccount(li.item_type as 'oresavrundning' | 'mileage_taxfree', emp.employment_type)
         addExpense(account, dimensions, li.amount)
         continue
       }

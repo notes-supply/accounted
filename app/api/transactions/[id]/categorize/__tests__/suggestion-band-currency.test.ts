@@ -93,6 +93,11 @@ vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
   createTransactionJournalEntry: (...args: unknown[]) => mockCreateTransactionJournalEntry(...args),
 }))
 
+const mockCoordinateSettlement = vi.fn()
+vi.mock('@/lib/transactions/settlement-attachment', () => ({
+  coordinateTransactionSettlement: (...args: unknown[]) => mockCoordinateSettlement(...args),
+}))
+
 // Only the DB-backed detector is stubbed; the pure helpers the route imports
 // from this module (resolveTransactionAmountSek) keep their real behaviour.
 const mockDetectDup = vi.fn()
@@ -191,6 +196,42 @@ describe('POST /api/transactions/[id]/categorize: suggestion band units', () => 
     vi.clearAllMocks()
     eventBus.clear()
     mockDetectDup.mockResolvedValue(null)
+    mockCoordinateSettlement.mockImplementation(async (input: {
+      supabase: unknown
+      companyId: string
+      userId: string
+      transaction: { cash_account_id: string | null }
+      mappingResult: unknown
+      category: string
+      isBusiness: boolean
+    }) => {
+      const entry = await mockCreateTransactionJournalEntry(
+        input.supabase,
+        input.companyId,
+        input.userId,
+        input.transaction,
+        input.mappingResult,
+      )
+      return {
+        kind: 'attached',
+        created: true,
+        journalEntry: entry,
+        publication: {
+          publication_id: `pub-${entry.id}`,
+          event_key: `journal:${entry.id}:committed`,
+          event_type: 'journal_entry.committed',
+        },
+        readback: {
+          transaction: {
+            journalEntryId: entry.id,
+            cashAccountId: input.transaction.cash_account_id,
+            category: input.category,
+            isBusiness: input.isBusiness,
+          },
+          journalEntry: { id: entry.id },
+        },
+      }
+    })
     mockBuildMappingResultFromCategory.mockReturnValue(baseMapping)
   })
 

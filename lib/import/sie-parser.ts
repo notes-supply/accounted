@@ -300,7 +300,7 @@ function splitSIELine(line: string): string[] {
       continue
     }
 
-    if (char === '\\') {
+    if (char === '\\' && line[i + 1] === '"') {
       escaped = true
       current += char
       continue

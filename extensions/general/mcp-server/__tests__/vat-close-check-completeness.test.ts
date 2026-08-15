@@ -76,20 +76,34 @@ function mockSupabase(lines: MockLine[], chartAccounts: MockChartAccount[] = [])
     debit_amount: l.debit_amount ?? 0,
     credit_amount: l.credit_amount ?? 0,
   }))
+  const totalsByAccount = new Map<string, { debit: number; credit: number }>()
+  for (const line of bareLines) {
+    const total = totalsByAccount.get(line.account_number) ?? { debit: 0, credit: 0 }
+    total.debit += line.debit_amount
+    total.credit += line.credit_amount
+    totalsByAccount.set(line.account_number, total)
+  }
+  const totals = [...totalsByAccount].map(([account_number, amounts]) => ({
+    account_number,
+    ...amounts,
+  }))
+
 
   const makeChain = (rows: unknown[]): Record<string, unknown> => {
     const chain: Record<string, unknown> = {}
     const settled = { data: rows, error: null, count: rows.length }
     chain.range = () => settled
-    chain.single = async () => ({ data: null, error: null })
-    chain.maybeSingle = async () => ({ data: null, error: null })
+    chain.single = async () => ({ data: rows[0] ?? null, error: null })
+    chain.maybeSingle = async () => ({ data: rows[0] ?? null, error: null })
     chain.then = (resolve: (v: unknown) => void) => resolve(settled)
     for (const m of [
-      'order', 'lte', 'gte', 'neq', 'in', 'eq', 'is', 'select',
+      'order', 'lte', 'gte', 'neq', 'in', 'is', 'select',
       'limit', 'contains', 'filter', 'not', 'or',
     ]) {
       chain[m] = () => chain
     }
+    chain.eq = (column: string) =>
+      column === 'vat_lines.account_number' ? makeChain([]) : chain
     return chain
   }
 
@@ -98,16 +112,33 @@ function mockSupabase(lines: MockLine[], chartAccounts: MockChartAccount[] = [])
       if (table === 'journal_entries') return makeChain(entries)
       if (table === 'journal_entry_lines') return makeChain(bareLines)
       if (table === 'chart_of_accounts') return makeChain(chartAccounts)
+      if (table === 'company_settings') {
+        return makeChain([{ vat_liability_start_date: null }])
+      }
       return makeChain([])
     },
-    // The missing-underlag blocker reads the verifikat_without_documents RPC,
-    // which answers with an envelope rather than a row set. This fixture has no
-    // opinion about underlag, so it answers "none missing"; the predicate itself
-    // is covered by vat-close-check-missing-underlag.test.ts.
-    rpc: (fn: string) =>
-      fn === 'verifikat_without_documents'
-        ? Promise.resolve({ data: { ok: true, total_count: 0, verifikat: [] }, error: null })
-        : makeChain([]),
+    // The declaration total and missing-underlag RPCs are independent
+    // authorities. Seed both from the fixture rather than making the production
+    // calculation fall back to the obsolete local row scan.
+    rpc: (fn: string) => {
+      if (fn === 'get_vat_declaration_totals') {
+        return Promise.resolve({
+          data: {
+            totals,
+            settlement_shaped_entries: [],
+            source_type_counts: {},
+          },
+          error: null,
+        })
+      }
+      if (fn === 'verifikat_without_documents') {
+        return Promise.resolve({
+          data: { ok: true, total_count: 0, verifikat: [] },
+          error: null,
+        })
+      }
+      return makeChain([])
+    },
   } as never
 }
 

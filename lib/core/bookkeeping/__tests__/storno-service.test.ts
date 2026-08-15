@@ -5,6 +5,7 @@ import {
   BookkeepingDatabaseError,
   CorrectionChainTooDeepError,
   MeaninglessCorrectionError,
+  SupplierPaymentAccountingChangedError,
 } from '@/lib/bookkeeping/errors'
 
 // ============================================================
@@ -47,8 +48,24 @@ vi.mock('@/lib/bookkeeping/account-backfill', () => ({
   backfillStandardBASAccounts: (...args: unknown[]) => mockBackfill(...args),
 }))
 
+vi.mock('@/lib/bookkeeping/payment-sync', () => ({
+  resolveSupplierPaymentLineage: vi.fn().mockImplementation(
+    (_supabase: unknown, companyId: string, entryId: string) =>
+      Promise.resolve({
+        company_id: companyId,
+        requested_journal_entry_id: entryId,
+        root_journal_entry_id: entryId,
+        live_journal_entry_id: entryId,
+        allocation_owner_journal_entry_id: null,
+        is_supplier_payment: false,
+        nodes: [],
+      }),
+  ),
+}))
+
 import { correctEntry } from '../storno-service'
 import { validateBalance, getNextVoucherNumber } from '@/lib/bookkeeping/engine'
+import { resolveSupplierPaymentLineage } from '@/lib/bookkeeping/payment-sync'
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -147,6 +164,55 @@ describe('correctEntry', () => {
         { account_number: '1930', debit_amount: 0, credit_amount: 1000 },
       ])
     ).rejects.toThrow('not balanced')
+  })
+
+  it('rejects supplier payment accounting changes before voucher allocation', async () => {
+    vi.mocked(resolveSupplierPaymentLineage).mockResolvedValueOnce({
+      company_id: 'company-1',
+      requested_journal_entry_id: 'orig-1',
+      root_journal_entry_id: 'orig-1',
+      live_journal_entry_id: 'orig-1',
+      allocation_owner_journal_entry_id: 'orig-1',
+      is_supplier_payment: true,
+      nodes: [
+        {
+          journal_entry_id: 'orig-1',
+          parent_journal_entry_id: null,
+          relation: 'root',
+          depth: 0,
+          source_type: 'supplier_invoice_paid',
+          has_supplier_payment_allocation: true,
+        },
+      ],
+    })
+    results = [
+      { data: originalEntry, error: null },
+      {
+        data: [{
+          id: 'orig-1',
+          company_id: 'company-1',
+          lines: originalEntry.lines,
+        }],
+        error: null,
+      },
+    ]
+    const supabase = makeClient()
+
+    await expect(
+      correctEntry(
+        supabase as never,
+        'company-1',
+        'user-1',
+        'orig-1',
+        [
+          { account_number: '5410', debit_amount: 999, credit_amount: 0 },
+          { account_number: '1930', debit_amount: 0, credit_amount: 999 },
+        ],
+      ),
+    ).rejects.toBeInstanceOf(SupplierPaymentAccountingChangedError)
+
+    expect(getNextVoucherNumber).not.toHaveBeenCalled()
+    expect(inserts).toEqual([])
   })
 
   it('cancels both entries on concurrent reversal (CAS guard)', async () => {

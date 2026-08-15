@@ -26,8 +26,10 @@ describe('total_amount computed column', () => {
       await client.query(
         `INSERT INTO public.journal_entries
            (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-            entry_date, description, source_type, status)
-         VALUES ($1,$2,$3,$4,$5,'A','2026-06-01',$6,'manual',$7)`,
+            entry_date, description, source_type, status, committed_at, commit_method)
+         VALUES ($1,$2,$3,$4,$5,'A','2026-06-01',$6,'manual',$7,
+                 CASE WHEN $7 = 'posted' THEN now() END,
+                 CASE WHEN $7 = 'posted' THEN 'legacy' END)`,
         [
           id,
           p.userId,

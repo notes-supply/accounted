@@ -37,6 +37,7 @@ function makeClient() {
 }
 
 import { generateSIEExport } from '../sie-export'
+import { parseSIEFile } from '@/lib/import/sie-parser'
 
 let supabase: ReturnType<typeof makeClient>
 
@@ -496,14 +497,15 @@ describe('generateSIEExport', () => {
     expect(output).toContain('#RES 0 3001 -1000.00')
   })
 
-  it('escapes quotes in descriptions', async () => {
+  it('round-trips a literal backslash immediately before a quote', async () => {
+    const description = `Invoice C:\\Temp ${'\\' + '"'}consulting" and "quotes"`
     results = [
       { data: { id: 'period-1', period_start: '2024-01-01', period_end: '2024-12-31' }, error: null },
       { data: null, error: null }, // prevPeriod
       { data: [], error: null }, // accounts
       {
         data: [
-          { id: 'e1', entry_date: '2024-01-15', voucher_number: 1, voucher_series: 'A', description: 'Invoice for "consulting"', status: 'posted' },
+          { id: 'e1', entry_date: '2024-01-15', voucher_number: 1, voucher_series: 'A', description, status: 'posted' },
         ],
         error: null,
       },
@@ -520,8 +522,9 @@ describe('generateSIEExport', () => {
     ]
 
     const output = await generateSIEExport(supabase, 'company-1', baseOptions)
+    const parsed = parseSIEFile(output)
 
-    expect(output).toContain('#VER "A" 1 20240115 "Invoice for \\"consulting\\""')
+    expect(parsed.vouchers[0]?.description).toBe(description)
   })
 
   it('uses \\r\\n line endings', async () => {

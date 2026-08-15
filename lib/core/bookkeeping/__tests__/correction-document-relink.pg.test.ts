@@ -3,9 +3,9 @@ import { describe, expect, it } from 'vitest'
 import { getPool, withUserContext } from '@/tests/pg/setup'
 import {
   insertAuthUser,
-  insertBalancedLines,
   insertCompanyMember,
-  insertDraftJournalEntry,
+  insertPostedJournalEntry,
+  insertReversedJournalEntryGraph,
   seedCompany,
 } from '@/tests/pg/fixtures'
 
@@ -53,34 +53,11 @@ async function insertEntryAtStatus(params: {
   fiscalPeriodId: string
   voucherNumber: number
   status?: 'posted' | 'reversed'
-  correctionOfId?: string
 }): Promise<string> {
-  const entryId = await insertDraftJournalEntry({
-    userId: params.userId,
-    companyId: params.companyId,
-    fiscalPeriodId: params.fiscalPeriodId,
-    voucherNumber: params.voucherNumber,
-  })
-  await insertBalancedLines(entryId)
-  if (params.correctionOfId) {
-    // Drafts are mutable — set the correction link before posting; the
-    // immutability trigger blocks changing it afterwards.
-    await getPool().query(
-      `UPDATE public.journal_entries SET correction_of_id = $2 WHERE id = $1`,
-      [entryId, params.correctionOfId],
-    )
-  }
-  await getPool().query(
-    `UPDATE public.journal_entries SET status = 'posted' WHERE id = $1`,
-    [entryId],
-  )
   if (params.status === 'reversed') {
-    await getPool().query(
-      `UPDATE public.journal_entries SET status = 'reversed' WHERE id = $1`,
-      [entryId],
-    )
+    return (await insertReversedJournalEntryGraph(params)).originalId
   }
-  return entryId
+  return insertPostedJournalEntry(params)
 }
 
 /** A reversed original + its posted correction, mirroring correctEntry()'s end state. */
@@ -89,17 +66,12 @@ async function seedCorrectionPair(seed: {
   companyId: string
   fiscalPeriodId: string
 }): Promise<{ originalId: string; correctionId: string }> {
-  const originalId = await insertEntryAtStatus({
+  const graph = await insertReversedJournalEntryGraph({
     ...seed,
     voucherNumber: 1,
-    status: 'reversed',
+    correction: { voucherNumber: 3 },
   })
-  const correctionId = await insertEntryAtStatus({
-    ...seed,
-    voucherNumber: 2,
-    correctionOfId: originalId,
-  })
-  return { originalId, correctionId }
+  return { originalId: graph.originalId, correctionId: graph.correctionId! }
 }
 
 describe('correction-document-relink.pg — relink_documents_to_correction RPC', () => {
@@ -205,7 +177,7 @@ describe('correction-document-relink.pg — relink_documents_to_correction RPC',
       status: 'reversed',
     })
     // Posted, but with no correction_of_id link back to the original.
-    const unrelatedId = await insertEntryAtStatus({ ...seed, voucherNumber: 2 })
+    const unrelatedId = await insertEntryAtStatus({ ...seed, voucherNumber: 3 })
     await insertDocument({
       userId: seed.userId,
       companyId: seed.companyId,
@@ -225,11 +197,7 @@ describe('correction-document-relink.pg — relink_documents_to_correction RPC',
   it('rejects when the source entry is not reversed', async () => {
     const seed = await seedCompany()
     const originalId = await insertEntryAtStatus({ ...seed, voucherNumber: 1 }) // still posted
-    const correctionId = await insertEntryAtStatus({
-      ...seed,
-      voucherNumber: 2,
-      correctionOfId: originalId,
-    })
+    const correctionId = await insertEntryAtStatus({ ...seed, voucherNumber: 2 })
 
     await withUserContext(seed.userId, async (client) => {
       await expect(

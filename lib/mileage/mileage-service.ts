@@ -33,6 +33,69 @@ export type MileageCounterAccount = (typeof MILEAGE_COUNTER_ACCOUNTS)[number]
 
 const round2 = roundOre
 
+const CLAIM_MILEAGE_FOR_SALARY_RPC = 'claim_mileage_trips_for_salary'
+const DELETE_DRAFT_SALARY_OBJECT_RPC = 'delete_draft_salary_object_with_mileage_release'
+
+type RpcError = { code?: string; message?: string }
+
+type MileageJournalIdentity = {
+  journalEntryId?: string
+  voucherNumber?: number | null
+  voucherSeries?: string | null
+}
+
+export class MileageRpcError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string,
+    public readonly retryable: boolean,
+    public readonly details?: Record<string, unknown>,
+  ) {
+    super(message)
+    this.name = 'MileageRpcError'
+  }
+}
+
+function rpcRow(data: unknown): Record<string, unknown> | null {
+  const row = Array.isArray(data) ? (data.length === 1 ? data[0] : null) : data
+  return row && typeof row === 'object' ? (row as Record<string, unknown>) : null
+}
+
+function isSerializationConflict(error: RpcError | null): boolean {
+  return error?.code === '40001' || error?.code === '40P01'
+}
+
+function postCommitIdentity(error: unknown): MileageJournalIdentity | null {
+  if (!error || typeof error !== 'object') return null
+  const record = error as Record<string, unknown>
+  const code = record.code
+  if (
+    code !== 'POST_COMMIT_IDENTITY_AMBIGUOUS' &&
+    code !== 'JOURNAL_POST_COMMIT_IDENTITY_AMBIGUOUS' &&
+    code !== 'JOURNAL_POST_COMMIT_READBACK_FAILED'
+  ) {
+    return null
+  }
+
+  const details =
+    record.details && typeof record.details === 'object'
+      ? (record.details as Record<string, unknown>)
+      : record
+  const journalEntryId = details.journalEntryId ?? details.journal_entry_id
+  const voucherNumber = details.voucherNumber ?? details.voucher_number
+  const voucherSeries = details.voucherSeries ?? details.voucher_series
+
+  return {
+    ...(typeof journalEntryId === 'string' ? { journalEntryId } : {}),
+    ...(typeof voucherNumber === 'number' || voucherNumber === null
+      ? { voucherNumber }
+      : {}),
+    ...(typeof voucherSeries === 'string' || voucherSeries === null
+      ? { voucherSeries }
+      : {}),
+  }
+}
+
 export function ratePerMil(config: PayrollConfig, vehicleType: MileageVehicleType): number {
   switch (vehicleType) {
     case 'own_car':
@@ -184,8 +247,12 @@ export type BookMileageResult =
         | 'PERIOD_NOT_OPEN'
         | 'CLAIM_LOST'
         | 'TRIPS_CHANGED'
+        | 'RELEASE_INCOMPLETE'
+        | 'POST_COMMIT_IDENTITY_AMBIGUOUS'
         | 'STAMP_FAILED'
       journalEntryId?: string
+      voucherNumber?: number | null
+      voucherSeries?: string | null
     }
 
 /**
@@ -310,20 +377,24 @@ export async function bookMileagePeriod(
     throw new Error(`Failed to claim mileage trips: ${claimError.message}`)
   }
   const claimedIds = (claimed ?? []).map((row) => row.id as string)
-  const revertClaim = async () => {
-    if (claimedIds.length === 0) return
-    await supabase
+  const releaseClaim = async (): Promise<boolean> => {
+    if (claimedIds.length === 0) return true
+    const { data: released, error: releaseError } = await supabase
       .from('mileage_trips')
       .update({ status: 'draft' })
       .eq('company_id', companyId)
       .eq('status', 'booked')
       .is('journal_entry_id', null)
       .in('id', claimedIds)
+      .select('id')
+    return !releaseError && (released?.length ?? 0) === claimedIds.length
   }
   if (claimedIds.length !== tripIds.length) {
-    // A concurrent booking claimed part of the set first: distinct from
-    // "nothing to book" so the caller can say "reload and retry".
-    await revertClaim()
+    // A concurrent booking claimed part of the set first. Verify that our
+    // partial claim was released before telling the caller a retry is safe.
+    if (!(await releaseClaim())) {
+      return { ok: false, code: 'RELEASE_INCOMPLETE' }
+    }
     return { ok: false, code: 'CLAIM_LOST' }
   }
 
@@ -350,7 +421,15 @@ export async function bookMileagePeriod(
       ],
     })
   } catch (err) {
-    await revertClaim()
+    const identity = postCommitIdentity(err)
+    if (identity) {
+      // The journal boundary may already have committed. Releasing the claim
+      // here could make the same trips bookable again, so fail closed.
+      return { ok: false, code: 'POST_COMMIT_IDENTITY_AMBIGUOUS', ...identity }
+    }
+    if (!(await releaseClaim())) {
+      return { ok: false, code: 'RELEASE_INCOMPLETE' }
+    }
     throw err
   }
 
@@ -363,9 +442,15 @@ export async function bookMileagePeriod(
     .select('id')
 
   if (linkError || !linked || linked.length !== claimedIds.length) {
-    // The verifikat exists and the trips are booked, but some rows lost the
-    // entry link. Surface loudly so the körjournal can be repaired.
-    return { ok: false, code: 'STAMP_FAILED', journalEntryId: entry.id }
+    // The verifikat exists. This is terminal until an operator reconciles the
+    // trip stamps, and its durable identity must survive the failed readback.
+    return {
+      ok: false,
+      code: 'STAMP_FAILED',
+      journalEntryId: entry.id,
+      voucherNumber: entry.voucher_number ?? null,
+      voucherSeries: entry.voucher_series ?? null,
+    }
   }
 
   return {
@@ -391,11 +476,32 @@ export type PushToSalaryRunResult =
         | 'CLAIM_LOST'
     }
 
+interface SalaryMileageClaim {
+  trip_ids: string[]
+  line_item: {
+    item_type: 'mileage_taxfree'
+    description: string
+    quantity: number
+    unit_price: number
+    amount: number
+    is_taxable: false
+    is_avgift_basis: false
+    is_vacation_basis: false
+    account_number: string
+    sort_order: number
+  }
+}
+
+interface ClaimMileageRpcResult {
+  outcome: 'claimed' | 'conflict' | 'run_not_found' | 'run_not_draft' | 'employee_not_in_run'
+  claimed_trip_count?: number
+  created_line_item_count?: number
+}
+
 /**
- * Push the period's draft trips into a draft/review salary run as
- * mileage_taxfree line items (kostnadsersättning: not taxable, no avgifter,
- * not semesterlönegrundande). The salary run's own booking flow then carries
- * the amounts into the verifikat and AGI.
+ * Push the period's draft trips into a draft salary run as tax-free mileage.
+ * Claiming trips, inserting each salary line, and linking exact provenance are
+ * one M6 transaction. There is deliberately no application compensation path.
  */
 export async function pushMileageToSalaryRun(
   supabase: SupabaseClient,
@@ -415,7 +521,7 @@ export async function pushMileageToSalaryRun(
     .eq('company_id', companyId)
     .single()
   if (!run) return { ok: false, code: 'RUN_NOT_FOUND' }
-  if (run.status !== 'draft' && run.status !== 'review') {
+  if (run.status !== 'draft') {
     return { ok: false, code: 'RUN_NOT_EDITABLE' }
   }
 
@@ -435,65 +541,168 @@ export async function pushMileageToSalaryRun(
   })
   const includeUnassigned = params.includeUnassigned ?? true
   const trips = all.filter(
-    (t) =>
-      t.employee_id === params.employeeId || (includeUnassigned && t.employee_id === null)
+    (trip) =>
+      trip.employee_id === params.employeeId ||
+      (includeUnassigned && trip.employee_id === null)
   )
   if (trips.length === 0) return { ok: false, code: 'NO_TRIPS' }
 
   const config = await loadPayrollConfig(supabase, Number(params.to.slice(0, 4)))
   const summaries = summarizeTrips(trips, config)
-  const totalAmount = round2(summaries.reduce((sum, s) => sum + s.amount, 0))
-
-  // Claim the trips BEFORE inserting the salary lines: a retry after a
-  // partial failure would otherwise insert the mileage_taxfree items twice
-  // for the same trips (double pay). A lost claim reverts and reports.
-  const tripIds = trips.map((t) => t.id)
-  const { data: claimed, error: claimError } = await supabase
-    .from('mileage_trips')
-    .update({ status: 'booked', salary_run_id: params.runId })
-    .eq('company_id', companyId)
-    .eq('status', 'draft')
-    .in('id', tripIds)
-    .select('id')
-  if (claimError) {
-    throw new Error(`Failed to claim mileage trips: ${claimError.message}`)
-  }
-  const claimedIds = (claimed ?? []).map((row) => row.id as string)
-  const revertClaim = async () => {
-    if (claimedIds.length === 0) return
-    await supabase
-      .from('mileage_trips')
-      .update({ status: 'draft', salary_run_id: null })
-      .eq('company_id', companyId)
-      .eq('status', 'booked')
-      .is('journal_entry_id', null)
-      .in('id', claimedIds)
-  }
-  if (claimedIds.length !== tripIds.length) {
-    await revertClaim()
-    return { ok: false, code: 'CLAIM_LOST' }
-  }
-
-  const { error: itemError } = await supabase.from('salary_line_items').insert(
-    summaries.map((s, index) => ({
-      salary_run_employee_id: sre.id,
-      company_id: companyId,
+  const totalAmount = round2(summaries.reduce((sum, summary) => sum + summary.amount, 0))
+  const claims: SalaryMileageClaim[] = summaries.map((summary, index) => ({
+    trip_ids: trips
+      .filter((trip) => trip.vehicle_type === summary.vehicle_type)
+      .map((trip) => trip.id)
+      .sort(),
+    line_item: {
       item_type: 'mileage_taxfree',
-      description: `Milersättning ${VEHICLE_TYPE_LABELS[s.vehicle_type]} ${params.from} till ${params.to} (${s.trip_count} resor)`,
-      quantity: s.total_mil,
-      unit_price: s.rate_per_mil,
-      amount: s.amount,
+      description: `Milersättning ${VEHICLE_TYPE_LABELS[summary.vehicle_type]} ${params.from} till ${params.to} (${summary.trip_count} resor)`,
+      quantity: summary.total_mil,
+      unit_price: summary.rate_per_mil,
+      amount: summary.amount,
       is_taxable: false,
       is_avgift_basis: false,
       is_vacation_basis: false,
       account_number: MILEAGE_TAXFREE_ACCOUNT,
       sort_order: 100 + index,
-    }))
-  )
-  if (itemError) {
-    await revertClaim()
-    throw new Error(`Failed to add mileage line items: ${itemError.message}`)
+    },
+  }))
+
+  const { data, error } = await supabase.rpc(CLAIM_MILEAGE_FOR_SALARY_RPC, {
+    p_company_id: companyId,
+    p_salary_run_id: params.runId,
+    p_salary_run_employee_id: sre.id,
+    p_claims: claims,
+  })
+  if (error) {
+    if (isSerializationConflict(error)) return { ok: false, code: 'CLAIM_LOST' }
+    throw new MileageRpcError(
+      'MILEAGE_CLAIM_FAILED',
+      error.message || 'Mileage salary claim RPC failed',
+      false,
+    )
   }
 
-  return { ok: true, tripCount: trips.length, totalAmount, summaries }
+  const result = rpcRow(data) as ClaimMileageRpcResult | null
+  switch (result?.outcome) {
+    case 'conflict':
+      return { ok: false, code: 'CLAIM_LOST' }
+    case 'run_not_found':
+      return { ok: false, code: 'RUN_NOT_FOUND' }
+    case 'run_not_draft':
+      return { ok: false, code: 'RUN_NOT_EDITABLE' }
+    case 'employee_not_in_run':
+      return { ok: false, code: 'EMPLOYEE_NOT_IN_RUN' }
+    case 'claimed':
+      if (
+        result.claimed_trip_count !== trips.length ||
+        result.created_line_item_count !== claims.length
+      ) {
+        throw new MileageRpcError(
+          'MILEAGE_CLAIM_RESULT_INCOMPLETE',
+          'Mileage claim RPC returned an incomplete committed result',
+          false,
+          {
+            expected_trip_count: trips.length,
+            claimed_trip_count: result.claimed_trip_count,
+            expected_line_item_count: claims.length,
+            created_line_item_count: result.created_line_item_count,
+          },
+        )
+      }
+      return { ok: true, tripCount: trips.length, totalAmount, summaries }
+    default:
+      throw new MileageRpcError(
+        'MILEAGE_CLAIM_RESULT_INVALID',
+        'Mileage claim RPC returned an invalid result',
+        false,
+      )
+  }
+}
+
+export type DraftSalaryObjectTarget =
+  | { kind: 'line_item'; id: string }
+  | { kind: 'run_employee'; id: string }
+  | { kind: 'run'; id: string }
+
+export type DeleteDraftSalaryObjectResult =
+  | { ok: true; releasedTripCount: number }
+  | {
+      ok: false
+      code:
+        | 'NOT_FOUND'
+        | 'NOT_DRAFT'
+        | 'MILEAGE_CLAIM_CONFLICT'
+        | 'MILEAGE_CLAIM_RELEASE_INCOMPLETE'
+        | 'INTERNAL_ERROR'
+      details?: Record<string, unknown>
+    }
+
+interface DeleteDraftSalaryObjectRpcResult {
+  outcome: 'deleted' | 'not_found' | 'not_draft' | 'conflict' | 'release_incomplete'
+  released_trip_count?: number
+  expected_trip_count?: number
+  current_status?: string
+}
+
+/**
+ * Atomically release exact, unposted mileage claims and delete one draft
+ * salary object. M6 owns authorization, row locks, provenance checks, and the
+ * mutation. Callers must never replace this with multiple table writes.
+ */
+export async function deleteDraftSalaryObjectWithMileageRelease(
+  supabase: SupabaseClient,
+  companyId: string,
+  salaryRunId: string,
+  target: DraftSalaryObjectTarget,
+): Promise<DeleteDraftSalaryObjectResult> {
+  const { data, error } = await supabase.rpc(DELETE_DRAFT_SALARY_OBJECT_RPC, {
+    p_company_id: companyId,
+    p_salary_run_id: salaryRunId,
+    p_target_kind: target.kind,
+    p_target_id: target.id,
+  })
+
+  if (error) {
+    if (isSerializationConflict(error)) {
+      return { ok: false, code: 'MILEAGE_CLAIM_CONFLICT' }
+    }
+    return {
+      ok: false,
+      code: 'INTERNAL_ERROR',
+      details: { message: error.message || 'Mileage claim release RPC failed' },
+    }
+  }
+
+  const result = rpcRow(data) as DeleteDraftSalaryObjectRpcResult | null
+  switch (result?.outcome) {
+    case 'deleted':
+      return { ok: true, releasedTripCount: result.released_trip_count ?? 0 }
+    case 'not_found':
+      return { ok: false, code: 'NOT_FOUND' }
+    case 'not_draft':
+      return {
+        ok: false,
+        code: 'NOT_DRAFT',
+        details: { current_status: result.current_status },
+      }
+    case 'conflict':
+      return { ok: false, code: 'MILEAGE_CLAIM_CONFLICT' }
+    case 'release_incomplete':
+      return {
+        ok: false,
+        code: 'MILEAGE_CLAIM_RELEASE_INCOMPLETE',
+        details: {
+          expected_trip_count: result.expected_trip_count,
+          released_trip_count: result.released_trip_count,
+        },
+      }
+    default:
+      return {
+        ok: false,
+        code: 'INTERNAL_ERROR',
+        details: { message: 'Mileage claim release RPC returned an invalid result' },
+      }
+  }
 }

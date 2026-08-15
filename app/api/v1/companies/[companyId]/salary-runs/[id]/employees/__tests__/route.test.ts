@@ -66,7 +66,10 @@ function makeFlexibleSupabase(byTable: Record<string, TableResp | TableResp[]>) 
     }
     return new Proxy({}, handler)
   }
-  return { from: vi.fn((table: string) => buildChain(table)) }
+  return {
+    from: vi.fn((table: string) => buildChain(table)),
+    rpc: vi.fn((fn: string) => buildChain(`rpc:${fn}`)),
+  }
 }
 
 const COMPANY_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
@@ -506,17 +509,17 @@ describe('DELETE /api/v1/companies/:companyId/salary-runs/:id/employees/:employe
     })
 
   it('removes an attached employee (204)', async () => {
-    mockServiceClient.mockReturnValue(
-      makeFlexibleSupabase({
-        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
-        salary_runs: { data: { id: RUN_ID, status: 'draft' }, error: null },
-        salary_run_employees: [
-          { data: { id: SRE_ID }, error: null },
-          { data: null, error: null },
-        ],
-        idempotency_keys: { data: null, error: null },
-      }),
-    )
+    const supabaseMock = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      salary_runs: { data: { id: RUN_ID, status: 'draft' }, error: null },
+      salary_run_employees: { data: { id: SRE_ID }, error: null },
+      'rpc:delete_draft_salary_object_with_mileage_release': {
+        data: { outcome: 'deleted', released_trip_count: 2 },
+        error: null,
+      },
+      idempotency_keys: { data: null, error: null },
+    })
+    mockServiceClient.mockReturnValue(supabaseMock)
 
     const res = await removeEmployee(
       deleteRequest(
@@ -525,6 +528,15 @@ describe('DELETE /api/v1/companies/:companyId/salary-runs/:id/employees/:employe
       detailParams(COMPANY_ID, RUN_ID, EMPLOYEE_ID),
     )
     expect(res.status).toBe(204)
+    expect(supabaseMock.rpc).toHaveBeenCalledWith(
+      'delete_draft_salary_object_with_mileage_release',
+      {
+        p_company_id: COMPANY_ID,
+        p_salary_run_id: RUN_ID,
+        p_target_kind: 'run_employee',
+        p_target_id: SRE_ID,
+      },
+    )
   })
 
   it('returns 404 SALARY_RUN_EMPLOYEE_NOT_FOUND when not attached', async () => {

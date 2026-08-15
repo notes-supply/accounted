@@ -1745,12 +1745,19 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
   // The gap-downgrade evidence (per-momssats 44xx/45xx balances) travels on
   // the declaration payload. Absent on responses from an older deploy: then
   // the gaps keep their blocking ERROR tier rather than guessing.
+  const rcInputAccountTotals = data
+    ? rcInputTotalsFromDeclaration(data)
+    : undefined
   const checks = data
     ? withRcBasisGapFindings(
-        runVatDeclarationChecks(data.rutor, rcInputTotalsFromDeclaration(data)),
+        runVatDeclarationChecks(data.rutor, rcInputAccountTotals),
         rcBasisScan,
         data.rcBasisByRate
-          ? { rutor: data.rutor, rcBasisByRate: data.rcBasisByRate }
+          ? {
+              rutor: data.rutor,
+              rcBasisByRate: data.rcBasisByRate,
+              rcInputAccountTotals,
+            }
           : undefined,
       )
     : []
@@ -1928,8 +1935,10 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
               <FyPicker
                 value={fiscalPeriodId || null}
                 onChange={(id, fp) => {
+                  const selectedEnd = fp?.period_end ?? null
                   setFiscalPeriodId(id || '')
-                  setFiscalPeriodEnd(fp?.period_end ?? null)
+                  setFiscalPeriodEnd(selectedEnd)
+                  if (selectedEnd) setYear(Number(selectedEnd.slice(0, 4)))
                 }}
                 includeAllOption={false}
                 hideFuturePeriods
@@ -2243,6 +2252,7 @@ export function VatDeclarationView({ pageTitle }: { pageTitle?: string } = {}) {
                       }
                     : undefined
                 }
+                approvedRutor={data.rutor}
                 hasData={data !== null}
                 localBlocked={checksBlocked}
               />

@@ -472,15 +472,40 @@ export function calculateSalary(
     })
   }
 
-  // ─── Step 7: Net salary ───
+  // ─── Step 7: Net salary and tax-free reimbursements ───
   const netDeductionItems = input.lineItems.filter(li => li.isNetDeduction)
   const totalNetDeductions = r(Math.abs(netDeductionItems.reduce((sum, li) => sum + li.amount, 0)))
+  const mileageTaxfree = r(
+    input.lineItems
+      .filter(li => li.itemType === 'mileage_taxfree' && li.amount > 0)
+      .reduce((sum, li) => sum + li.amount, 0)
+  )
+  if (mileageTaxfree > 0) {
+    steps.push({
+      label: 'Skattefri milersättning',
+      formula: 'summa skattefri milersättning',
+      input: {
+        count: input.lineItems.filter(
+          li => li.itemType === 'mileage_taxfree' && li.amount > 0
+        ).length,
+      },
+      output: mileageTaxfree,
+    })
+  }
 
-  let netSalary = r(grossSalary - taxWithheld - totalNetDeductions)
+  let netSalary = r(grossSalary - taxWithheld - totalNetDeductions + mileageTaxfree)
   steps.push({
     label: 'Nettolön',
-    formula: 'bruttolön − skatt − nettoavdrag',
-    input: { gross: grossSalary, tax: taxWithheld, net_deductions: totalNetDeductions },
+    formula:
+      mileageTaxfree > 0
+        ? 'bruttolön − skatt − nettoavdrag + skattefri milersättning'
+        : 'bruttolön − skatt − nettoavdrag',
+    input: {
+      gross: grossSalary,
+      tax: taxWithheld,
+      net_deductions: totalNetDeductions,
+      mileage_taxfree: mileageTaxfree,
+    },
     output: netSalary,
   })
 
@@ -622,16 +647,27 @@ export function calculateSalary(
   })
 
   // totalEmployerCost deliberately EXCLUDES netRounding: payslip summary,
-  // run KPI cards and the lönejournal all recompute this figure as
-  // gross + avgifter + semester + avgifter-på-semester from stored columns,
-  // so including the rounding only here would print two different totals on
-  // the same payslip. The öre cost is still real and lives in the ledger as
-  // the 3740 debit.
-  const totalEmployerCost = r(grossSalary + avgifterAmount + vacationAccrual + vacationAccrualAvgifter)
+  // run KPI cards and the lönejournal use the same persisted components.
+  // Tax-free mileage is an additional cash expense, but it never enters gross,
+  // tax, avgifter, or vacation bases.
+  const totalEmployerCost = r(
+    grossSalary +
+      avgifterAmount +
+      vacationAccrual +
+      vacationAccrualAvgifter +
+      mileageTaxfree
+  )
   steps.push({
     label: 'Total arbetsgivarkostnad',
-    formula: 'bruttolön + avgifter + semesteravsättning + avgifter på semester',
-    input: { gross: grossSalary, avgifter: avgifterAmount, vacation_accrual: vacationAccrual, vacation_avgifter: vacationAccrualAvgifter },
+    formula:
+      'bruttolön + avgifter + semesteravsättning + avgifter på semester + skattefri milersättning',
+    input: {
+      gross: grossSalary,
+      avgifter: avgifterAmount,
+      vacation_accrual: vacationAccrual,
+      vacation_avgifter: vacationAccrualAvgifter,
+      mileage_taxfree: mileageTaxfree,
+    },
     output: totalEmployerCost,
   })
 

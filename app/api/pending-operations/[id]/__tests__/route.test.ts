@@ -6,7 +6,13 @@ import {
   createQueuedMockSupabase,
 } from '@/tests/helpers'
 
-const { supabase: mockSupabase, enqueue, reset } = createQueuedMockSupabase()
+const {
+  supabase: mockSupabase,
+  enqueue,
+  reset,
+  findCall,
+  findCalls,
+} = createQueuedMockSupabase()
 
 // The route runs through the real withRouteContext wrapper: mock its auth,
 // company-resolution and write-permission dependencies (getActiveCompanyId,
@@ -317,6 +323,26 @@ describe('PATCH /api/pending-operations/[id]', () => {
       expect.objectContaining({ id: 'tx-1', cash_account_id: 'cash-1' }),
       expect.objectContaining({ debit_account: '5410', credit_account: '1931' }),
     )
+    const [updatePayload] = findCall('pending_operations', 'update') as [
+      {
+        params: Record<string, unknown>
+        preview_data: Record<string, unknown>
+      },
+    ]
+    const expectedSnapshot = {
+      companyId: 'company-1',
+      transactionId: 'tx-1',
+      expectedJournalEntryId: null,
+      cashAccountId: 'cash-1',
+      settlementAccount: '1931',
+      amountSek: 500,
+      category: 'expense_software',
+      isBusiness: true,
+      lines: [],
+    }
+    expect(updatePayload.params.settlement_snapshot).toEqual(expectedSnapshot)
+    expect(updatePayload.preview_data.settlement_snapshot).toEqual(expectedSnapshot)
+    expect(findCalls('pending_operations', 'eq')).toContainEqual(['status', 'pending'])
   })
 
   it('preserves a staged vat_amount override when the new treatment still carries VAT', async () => {

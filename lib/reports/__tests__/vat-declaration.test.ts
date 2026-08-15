@@ -20,6 +20,7 @@ let chartAccounts: Array<{
   default_vat_rate: number | null
   default_vat_treatment?: string | null
 }>
+let controlledInputCandidates: Array<{ id: string }>
 
 function makeBuilder() {
   const b: Record<string, unknown> = {}
@@ -55,11 +56,26 @@ function makeChartBuilder() {
   return b
 }
 
+function makeStaticBuilder(data: unknown) {
+  const b: Record<string, unknown> = {}
+  for (const m of ['select', 'eq', 'in', 'gte', 'lte', 'limit']) {
+    b[m] = vi.fn().mockReturnValue(b)
+  }
+  b.maybeSingle = vi.fn().mockResolvedValue({ data, error: null })
+  b.then = (resolve: (value: unknown) => void) => resolve({ data, error: null })
+  return b
+}
+
 function makeClient() {
   return {
-    from: vi.fn().mockImplementation((table: string) =>
-      table === 'chart_of_accounts' ? makeChartBuilder() : makeBuilder()
-    ),
+    from: vi.fn().mockImplementation((table: string) => {
+      if (table === 'chart_of_accounts') return makeChartBuilder()
+      if (table === 'company_settings') {
+        return makeStaticBuilder({ vat_liability_start_date: null })
+      }
+      if (table === 'journal_entries') return makeStaticBuilder(controlledInputCandidates)
+      return makeBuilder()
+    }),
     rpc: vi.fn().mockImplementation(async () => results[resultIdx++] ?? { data: null, error: null }),
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } as any
@@ -101,9 +117,11 @@ function seedLedger(
 
 import {
   calculatePeriodDates,
+  parseVatPeriodInput,
   formatPeriodLabel,
   getVatDeclarationSummary,
   calculateVatDeclaration,
+  createSharedLineageVatConsumer,
   rcInputTotalsFromDeclaration,
   rutorFromTotals,
 } from '../vat-declaration'
@@ -117,6 +135,7 @@ beforeEach(() => {
   resultIdx = 0
   results = []
   chartAccounts = []
+  controlledInputCandidates = []
   supabase = makeClient()
 })
 
@@ -208,6 +227,29 @@ describe('calculatePeriodDates', () => {
   })
 })
 
+
+describe('parseVatPeriodInput', () => {
+  it('accepts only canonical whole decimal inputs', () => {
+    expect(parseVatPeriodInput({
+      periodType: 'quarterly',
+      year: '2026',
+      period: '3',
+    })).toEqual({ periodType: 'quarterly', year: 2026, period: 3 })
+
+    for (const [year, period] of [
+      ['2026x', '3'],
+      ['2026', '3.0'],
+      ['02026', '3'],
+      ['2026', '03'],
+    ]) {
+      expect(() => parseVatPeriodInput({
+        periodType: 'quarterly',
+        year,
+        period,
+      })).toThrow(/Invalid VAT/)
+    }
+  })
+})
 describe('formatPeriodLabel', () => {
   it('formats monthly period', () => {
     expect(formatPeriodLabel('monthly', 2024, 1)).toBe('Januari 2024')
@@ -230,7 +272,13 @@ describe('getVatDeclarationSummary', () => {
 
   it('calculates totals and detects payment', () => {
     const declaration: VatDeclaration = {
-      period: { type: 'monthly', year: 2024, period: 1, start: '2024-01-01', end: '2024-01-31' },
+      period: {
+        type: 'monthly', year: 2024, period: 1,
+        start: '2024-01-01', end: '2024-01-31',
+        originalStart: '2024-01-01', originalEnd: '2024-01-31',
+        fiscalPeriodId: null, fiscalPeriodStart: null, fiscalPeriodEnd: null,
+        vatLiabilityStartDate: null,
+      },
       rutor: {
         ruta05: 10000, ruta06: 0, ruta07: 0,
         ruta10: 2500, ruta11: 0, ruta12: 0,
@@ -259,7 +307,13 @@ describe('getVatDeclarationSummary', () => {
 
   it('identifies refund when ruta49 is negative', () => {
     const declaration: VatDeclaration = {
-      period: { type: 'monthly', year: 2024, period: 1, start: '2024-01-01', end: '2024-01-31' },
+      period: {
+        type: 'monthly', year: 2024, period: 1,
+        start: '2024-01-01', end: '2024-01-31',
+        originalStart: '2024-01-01', originalEnd: '2024-01-31',
+        fiscalPeriodId: null, fiscalPeriodStart: null, fiscalPeriodEnd: null,
+        vatLiabilityStartDate: null,
+      },
       rutor: {
         ruta05: 2000, ruta06: 0, ruta07: 0,
         ruta10: 500, ruta11: 0, ruta12: 0,
@@ -286,7 +340,13 @@ describe('getVatDeclarationSummary', () => {
 
   it('includes ruta30-32 in totalOutputVat', () => {
     const declaration: VatDeclaration = {
-      period: { type: 'monthly', year: 2024, period: 1, start: '2024-01-01', end: '2024-01-31' },
+      period: {
+        type: 'monthly', year: 2024, period: 1,
+        start: '2024-01-01', end: '2024-01-31',
+        originalStart: '2024-01-01', originalEnd: '2024-01-31',
+        fiscalPeriodId: null, fiscalPeriodStart: null, fiscalPeriodEnd: null,
+        vatLiabilityStartDate: null,
+      },
       rutor: {
         ruta05: 10000, ruta06: 0, ruta07: 0,
         ruta10: 2500, ruta11: 0, ruta12: 0,
@@ -969,21 +1029,189 @@ describe('calculateVatDeclaration: parent/summary accounts', () => {
     expect(result.rutor.ruta49).toBe(-200) // refund
   })
 
-  it('maps year-end input VAT on 2648 to ruta48', async () => {
-    seedLedger([{ account_number: '2648', debit_amount: 250, credit_amount: 0 }])
+  it('uses only accepted shared-lineage 2648 entries in ruta48', async () => {
+    controlledInputCandidates = [{ id: '11111111-1111-4111-8111-111111111111' }]
 
-    const result = await calculateVatDeclaration(supabase, 'company-1', 'monthly', 2024, 1)
+    const result = await calculateVatDeclaration(
+      supabase,
+      'company-1',
+      'monthly',
+      2024,
+      1,
+      {
+        controlledInputVatConsumer: {
+          resolveControlledInputVat: async () => ({
+            entries: [{
+              entryId: '11111111-1111-4111-8111-111111111111',
+              entryDate: '2024-01-31',
+              debit: 250,
+              credit: 0,
+            }],
+          }),
+        },
+      },
+    )
 
     expect(result.rutor.ruta48).toBe(250)
+  })
+
+  it('nets the accepted scheduled 2648 credit against later payment input VAT', async () => {
+    controlledInputCandidates = [{ id: '11111111-1111-4111-8111-111111111111' }]
+    seedLedger([{ account_number: '2641', debit_amount: 250, credit_amount: 0 }])
+
+    const result = await calculateVatDeclaration(
+      supabase,
+      'company-1',
+      'monthly',
+      2024,
+      1,
+      {
+        controlledInputVatConsumer: {
+          resolveControlledInputVat: async () => ({
+            entries: [{
+              entryId: '11111111-1111-4111-8111-111111111111',
+              entryDate: '2024-01-02',
+              debit: 0,
+              credit: 250,
+            }],
+          }),
+        },
+      },
+    )
+
+    expect(result.rutor.ruta48).toBe(0)
+  })
+
+  it('fails closed when controlled 2648 exists but lineage is unavailable', async () => {
+    controlledInputCandidates = [{ id: '11111111-1111-4111-8111-111111111111' }]
+    seedLedger([])
+
+    await expect(calculateVatDeclaration(
+      supabase, 'company-1', 'monthly', 2024, 1,
+    )).rejects.toThrow(/lineage evidence is unavailable/)
+  })
+
+  it('derives the scheduled reversal credit from the shared lineage RPC', async () => {
+    const cutoffId = '11111111-1111-4111-8111-111111111111'
+    const reversalId = '22222222-2222-4222-8222-222222222222'
+    const cutoff = {
+      id: cutoffId,
+      company_id: 'company-1',
+      status: 'posted',
+      entry_date: '2023-12-31',
+      description: 'Leverantörsskulder vid bokslut (kontantmetoden)',
+      source_type: 'year_end',
+      source_id: null,
+      correction_of_id: null,
+      reverses_id: null,
+      reversed_by_id: null,
+      lines: [
+        { account_number: '4999', debit_amount: 1000, credit_amount: 0 },
+        { account_number: '2648', debit_amount: 250, credit_amount: 0 },
+        { account_number: '2440', debit_amount: 0, credit_amount: 1250 },
+      ],
+    }
+    const reversal = {
+      ...cutoff,
+      id: reversalId,
+      entry_date: '2024-01-01',
+      description: 'Vändning leverantörsskulder bokslut (kontantmetoden)',
+      lines: [
+        { account_number: '4999', debit_amount: 0, credit_amount: 1000 },
+        { account_number: '2648', debit_amount: 0, credit_amount: 250 },
+        { account_number: '2440', debit_amount: 1250, credit_amount: 0 },
+      ],
+    }
+    const queryResults = [[reversal], [cutoff, reversal]]
+    let queryIndex = 0
+    const lineageSupabase = {
+      from: vi.fn(() => {
+        const data = queryResults[queryIndex++] ?? []
+        const chain: Record<string, unknown> = {}
+        for (const method of ['select', 'eq', 'in', 'gte', 'lte', 'order', 'range']) {
+          chain[method] = vi.fn().mockReturnValue(chain)
+        }
+        chain.then = (resolve: (value: unknown) => void) =>
+          resolve({ data, error: null })
+        return chain
+      }),
+      rpc: vi.fn().mockResolvedValue({
+        data: {
+          valid: true,
+          company_id: 'company-1',
+          requested_root_count: 2,
+          rows: [
+            {
+              root_id: cutoffId,
+              parent_id: null,
+              edge_kind: 'root',
+              id: cutoffId,
+              company_id: 'company-1',
+              entry_date: cutoff.entry_date,
+              status: cutoff.status,
+              source_type: cutoff.source_type,
+              correction_of_id: null,
+              reverses_id: null,
+              depth: 0,
+              path: [cutoffId],
+              cycle: false,
+            },
+            {
+              root_id: reversalId,
+              parent_id: null,
+              edge_kind: 'root',
+              id: reversalId,
+              company_id: 'company-1',
+              entry_date: reversal.entry_date,
+              status: reversal.status,
+              source_type: reversal.source_type,
+              correction_of_id: null,
+              reverses_id: null,
+              depth: 0,
+              path: [reversalId],
+              cycle: false,
+            },
+          ],
+        },
+        error: null,
+      }),
+    }
+    const consumer = createSharedLineageVatConsumer(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      lineageSupabase as any,
+    )
+
+    await expect(consumer.resolveControlledInputVat({
+      companyId: 'company-1',
+      start: '2024-01-01',
+      end: '2024-01-31',
+    })).resolves.toEqual({
+      entries: [{
+        entryId: reversalId,
+        entryDate: '2024-01-01',
+        debit: 0,
+        credit: 250,
+      }],
+    })
+    expect(lineageSupabase.rpc).toHaveBeenCalledWith('get_journal_lineage', {
+      p_company_id: 'company-1',
+      p_root_ids: [cutoffId, reversalId],
+    })
   })
 
   it('reproduces the user-reported bug: 2610 balance now reaches ruta10', async () => {
     // Customer screenshot scenario (simplified): 3001 + 2610 booked with the
     // correct VAT amount on the parent account. Before the fix, ruta10 read 0
     // and ruta49 incorrectly showed a refund.
-    // Yearly without fiscalPeriodId now looks up the räkenskapsår ending in
-    // the year first; no fiscal period rows → calendar fallback.
-    results = [{ data: null, error: null }]
+    // The annual filing is anchored to an actual company fiscal period.
+    results = [{
+      data: {
+        id: '11111111-1111-4111-8111-111111111111',
+        period_start: '2025-01-01',
+        period_end: '2025-12-31',
+      },
+      error: null,
+    }]
     seedLedger([
       { account_number: '3001', debit_amount: 0, credit_amount: 21600 },
       { account_number: '2610', debit_amount: 0, credit_amount: 9768 },
@@ -1361,9 +1589,14 @@ describe('calculateVatDeclaration: annual VAT spans the räkenskapsår', () => {
     // (helårsmoms) must cover the whole period, not the calendar year that
     // period_start falls in. The first queued result feeds the fiscal_periods
     // lookup; seedLedger then queues the RPC payload.
-    results = [
-      { data: { period_start: '2025-07-03', period_end: '2026-12-31' }, error: null },
-    ]
+    results = [{
+      data: {
+        id: '11111111-1111-4111-8111-111111111111',
+        period_start: '2025-07-03',
+        period_end: '2026-12-31',
+      },
+      error: null,
+    }]
     seedLedger([
       { account_number: '3001', debit_amount: 0, credit_amount: 21600 },
       { account_number: '2610', debit_amount: 0, credit_amount: 9768 },
@@ -1371,7 +1604,9 @@ describe('calculateVatDeclaration: annual VAT spans the räkenskapsår', () => {
     ])
 
     const result = await calculateVatDeclaration(
-      supabase, 'company-1', 'yearly', 2026, 1, 'accrual', { fiscalPeriodId: 'fp-1' },
+      supabase, 'company-1', 'yearly', 2026, 1, {
+        fiscalPeriodId: '11111111-1111-4111-8111-111111111111',
+      },
     )
 
     expect(result.period.start).toBe('2025-07-03')
@@ -1381,18 +1616,19 @@ describe('calculateVatDeclaration: annual VAT spans the räkenskapsår', () => {
     expect(result.rutor.ruta48).toBe(7048.45)
   })
 
-  it('falls back to the calendar year when the fiscal period cannot be resolved', async () => {
+  it('fails closed when an explicit annual fiscal period cannot be resolved', async () => {
     results = [
-      { data: null, error: null }, // fiscal_periods lookup → not found
+      { data: null, error: null },
     ]
-    seedLedger([])
 
-    const result = await calculateVatDeclaration(
-      supabase, 'company-1', 'yearly', 2026, 1, 'accrual', { fiscalPeriodId: 'missing' },
-    )
-
-    expect(result.period.start).toBe('2026-01-01')
-    expect(result.period.end).toBe('2026-12-31')
+    await expect(calculateVatDeclaration(
+      supabase,
+      'company-1',
+      'yearly',
+      2026,
+      1,
+      { fiscalPeriodId: '22222222-2222-4222-8222-222222222222' },
+    )).rejects.toThrow(/Annual fiscal period is unavailable/)
   })
 
   it('resolves the räkenskapsår ending in the year for yearly WITHOUT a fiscalPeriodId', async () => {
@@ -1401,37 +1637,40 @@ describe('calculateVatDeclaration: annual VAT spans the räkenskapsår', () => {
     // still target the actual räkenskapsår, not calendar 2026
     // (SFL 26 kap 10-11 §§).
     results = [
-      { data: { period_start: '2025-07-01', period_end: '2026-06-30' }, error: null },
+      {
+        data: {
+          id: '11111111-1111-4111-8111-111111111111',
+          period_start: '2025-07-01',
+          period_end: '2026-06-30',
+        },
+        error: null,
+      },
     ]
     seedLedger([])
 
     const result = await calculateVatDeclaration(
-      supabase, 'company-1', 'yearly', 2026, 1, 'accrual',
+      supabase, 'company-1', 'yearly', 2026, 1,
     )
 
     expect(result.period.start).toBe('2025-07-01')
     expect(result.period.end).toBe('2026-06-30')
   })
 
-  it('falls back to the calendar year for yearly without a fiscalPeriodId when no fiscal period exists', async () => {
+  it('fails closed when no actual annual fiscal period exists', async () => {
     results = [
-      { data: null, error: null }, // no fiscal period ending in 2026
+      { data: null, error: null },
     ]
-    seedLedger([])
 
-    const result = await calculateVatDeclaration(
-      supabase, 'company-1', 'yearly', 2026, 1, 'accrual',
-    )
-
-    expect(result.period.start).toBe('2026-01-01')
-    expect(result.period.end).toBe('2026-12-31')
+    await expect(calculateVatDeclaration(
+      supabase, 'company-1', 'yearly', 2026, 1,
+    )).rejects.toThrow(/Annual fiscal period is unavailable/)
   })
 
   it('ignores fiscalPeriodId for monthly periods (calendar month, no lookup)', async () => {
     seedLedger([])
 
     const result = await calculateVatDeclaration(
-      supabase, 'company-1', 'monthly', 2026, 3, 'accrual', { fiscalPeriodId: 'fp-1' },
+      supabase, 'company-1', 'monthly', 2026, 3,
     )
 
     expect(result.period.start).toBe('2026-03-01')

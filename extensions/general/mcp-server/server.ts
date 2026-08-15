@@ -24,13 +24,13 @@ import { isSlpPensionAccount } from '@/lib/bookkeeping/slp-lines'
 import { getErrorEntry } from '@/lib/errors/structured-errors'
 import { applySettlementAccount } from '@/lib/bookkeeping/mapping-engine'
 import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
-import { buildTransactionEntryLines, createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
-import { upsertCounterpartyTemplate, findCounterpartyTemplatesBatch, formatCounterpartyName } from '@/lib/bookkeeping/counterparty-templates'
+import { buildTransactionEntryLines } from '@/lib/bookkeeping/transaction-entries'
+import { findCounterpartyTemplatesBatch, formatCounterpartyName } from '@/lib/bookkeeping/counterparty-templates'
 import { formatVoucherLabel, hasLiveJournalEntryLink } from '@/lib/transactions/link-journal-entry'
 import { canApproveSupplierInvoice } from '@/lib/supplier-invoices/lifecycle'
 import { eventBus } from '@/lib/events/bus'
 import { getVatRules, getPermittedVatRates } from '@/lib/invoices/vat-rules'
-import { fetchExchangeRate, convertToSEK } from '@/lib/currency/riksbanken'
+import { fetchExchangeRate } from '@/lib/currency/riksbanken'
 import { getBranding } from '@/lib/branding/service'
 import { generateIncomeStatement } from '@/lib/reports/income-statement'
 import {
@@ -42,13 +42,9 @@ import {
 } from '@/lib/reports/kpi'
 import { generateTrialBalance } from '@/lib/reports/trial-balance'
 import {
-  ACCOUNT_RUTA,
-  VAT_SETTLEMENT_NET_ACCOUNTS,
-  rutorFromTotals,
   rcInputTotalsFromDeclaration,
   calculateVatDeclaration,
 } from '@/lib/reports/vat-declaration'
-import { fetchDynamicRuta05Accounts } from '@/lib/reports/vat-revenue-accounts'
 // The momsdeklaration completeness checks live in core (lib/reports) and are
 // shared with the web UI's "Kontroll av underlaget" gate. The MCP surface
 // imports them instead of mirroring them: a hand-rolled copy here is exactly
@@ -62,7 +58,7 @@ import {
 import {
   withRcBasisGapFindings,
   isFilingBlocked,
-  rcBasisTotalsByRate,
+  type RcBasisTotalsByRate,
   type RcBasisGapScan,
 } from '@/lib/reports/vat-filing-gate'
 import { findRcBasisGaps } from '@/lib/reports/rc-basis-gaps'
@@ -117,7 +113,6 @@ import {
   checkIdempotencyKey,
   storeIdempotencyResponse,
   hashRequest,
-  IdempotencyKeyReuseError,
 } from '@/lib/api/idempotency'
 import { toToolError, type NextActionHint } from './tool-result'
 import {
@@ -143,7 +138,6 @@ import {
 import { generateSupplierLedger } from '@/lib/reports/supplier-ledger'
 import { getReconciliationStatus } from '@/lib/reconciliation/bank-reconciliation'
 import { resolveCashAccountScope } from '@/lib/reconciliation/cash-account-scope'
-import { createInvoicePaymentJournalEntry, createInvoiceCashEntry, createInvoiceJournalEntry } from '@/lib/bookkeeping/invoice-entries'
 import { findMatchingInvoices } from '@/lib/invoices/invoice-matching'
 import { sanitizeDeliveryRecipientStatuses } from '@/lib/invoices/delivery-recipient-statuses'
 import { listRotRutCandidates, createRotRutPayoutRequest } from '@/lib/invoices/rot-rut-service'
@@ -157,8 +151,8 @@ import {
   findMatchingVouchersForSupplierInvoice,
   validateVoucherForSupplierInvoiceLink,
 } from '@/lib/invoices/supplier-voucher-matching'
-import { findFiscalPeriod, getSwedishLocalDate, reverseEntry, validateBalance } from '@/lib/bookkeeping/engine'
-import { closePeriod, countUnbookedInPeriod, findNextPeriod, lockPeriod, resolvePeriodStatusForDate, type PeriodStatusForDate } from '@/lib/core/bookkeeping/period-service'
+import { findFiscalPeriod, getSwedishLocalDate, validateBalance } from '@/lib/bookkeeping/engine'
+import { countUnbookedInPeriod, findNextPeriod, resolvePeriodStatusForDate, type PeriodStatusForDate } from '@/lib/core/bookkeeping/period-service'
 import { validateYearEndReadiness, previewYearEndClosing } from '@/lib/core/bookkeeping/year-end-service'
 import {
   assessKontantmetodCutoff,
@@ -170,36 +164,33 @@ import {
 } from '@/lib/core/bookkeeping/kontantmetod-cutoff'
 import { generateSIEExport } from '@/lib/reports/sie-export'
 import { generateFullArchive, estimateArchiveSize } from '@/lib/reports/full-archive-export'
-import { bookkeepingErrorResponse, CorrectionChainTooDeepError } from '@/lib/bookkeeping/errors'
+import { CorrectionChainTooDeepError } from '@/lib/bookkeeping/errors'
 import { correctionChainDepth, CORRECTION_CHAIN_GUARD_DEPTH } from '@/lib/core/bookkeeping/correction-chain'
 import { getSuggestedCategories, buildMerchantHistory, merchantHistoryFor } from '@/lib/transactions/category-suggestions'
-import { detectBookingDuplicate } from '@/lib/transactions/booking-duplicate-detection'
+import {
+  detectBookingDuplicate,
+  resolveTransactionAmountSek,
+} from '@/lib/transactions/booking-duplicate-detection'
 import { buildDuplicateBookingClaim } from '@/lib/transactions/categorize-core'
 import { findDuplicatePaymentCandidatesForInvoice } from '@/lib/invoices/duplicate-payment-candidates'
-import { renderToBuffer } from '@react-pdf/renderer'
-import { InvoicePDF } from '@/lib/invoices/pdf-template'
 import { getEmailService } from '@/lib/email/service'
 import { hasCapability, capabilityBlockedError } from '@/lib/entitlements/has-capability'
 import { MCP_TOOL_CAPABILITY_MAP } from '@/lib/entitlements/keys'
-import {
-  generateInvoiceEmailHtml,
-  generateInvoiceEmailText,
-  generateInvoiceEmailSubject,
-} from '@/lib/email/invoice-templates'
 import {
   completePendingDocumentUpload,
   createPendingDocumentUpload,
   uploadDocument,
   MAX_DOCUMENT_SIZE,
 } from '@/lib/core/documents/document-service'
-import { extractInvoiceFields, ExtractionSchema as InvoiceExtractionSchema, AgentExtractionSchema } from '@/extensions/general/invoice-inbox/lib/extract-invoice-fields'
+import { extractInvoiceFields, AgentExtractionSchema } from '@/extensions/general/invoice-inbox/lib/extract-invoice-fields'
 // Skatteverket filing tools (PR5). Cross-extension lib import, same sanctioned
 // pattern as invoice-inbox above: the CI guard only checks lib/, app/api/,
 // components/. The two submit tools stage ops whose commit dispatches back into
 // the skatteverket extension via the registry (lib/pending-operations/commit.ts).
 import { skvRequest, SkatteverketAuthError } from '@/extensions/general/skatteverket/lib/api-client'
 import { agiGetKvittenser } from '@/extensions/general/skatteverket/lib/agi-client'
-import { buildMomsuppgift, resolveRedovisare } from '@/extensions/general/skatteverket/lib/declaration-prep'
+import { resolveRedovisare } from '@/extensions/general/skatteverket/lib/declaration-prep'
+import { rutorToMomsuppgift } from '@/extensions/general/skatteverket/lib/mappers'
 import { writeSkatteverketAudit } from '@/extensions/general/skatteverket/lib/audit'
 import { skvAuthCodeToStructured } from '@/extensions/general/skatteverket/lib/error-map'
 import { formatRedovisningsperiod } from '@/lib/skatteverket/format'
@@ -209,7 +200,7 @@ import { appendProcessingHistory } from '@/lib/processing-history/append'
 import { getUserCompanies } from '@/lib/company/context'
 // ensureInitialized() is called by the extension router (ext/[...path]/route.ts)
 // which dispatches to this handler: no duplicate call needed here.
-import type { Transaction, TransactionCategory, EntityType, VatTreatment, Invoice, Currency, CompanySettings, Customer, InvoiceItem, PendingOperation, VatPeriodType, VatDeclarationRutor, YearEndBlockerCode } from '@/types'
+import type { Transaction, TransactionCategory, EntityType, VatTreatment, Currency, Customer, PendingOperation, VatPeriodType, VatDeclarationRutor, YearEndBlockerCode } from '@/types'
 
 // ── Actor context ────────────────────────────────────────────
 
@@ -231,6 +222,39 @@ interface ActorContext {
    * behavior.
    */
   client?: string | null
+}
+
+interface McpSettlementSnapshotLine {
+  account_number: string
+  debit_amount: number
+  credit_amount: number
+  line_description: string | null
+  dimensions: Record<string, string>
+}
+
+interface McpSettlementSnapshot {
+  companyId: string
+  transactionId: string
+  expectedJournalEntryId: string | null
+  cashAccountId: string | null
+  settlementAccount: string
+  amountSek: number
+  category: TransactionCategory
+  isBusiness: boolean
+  lines: McpSettlementSnapshotLine[]
+}
+
+interface McpInboxSettlementSnapshot extends McpSettlementSnapshot {
+  inboxItemId: string
+}
+
+function canonicalSettlementDimensions(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter((entry): entry is [string, string] => typeof entry[1] === 'string')
+      .sort(([left], [right]) => left.localeCompare(right)),
+  )
 }
 
 // ── JSON-RPC types ───────────────────────────────────────────
@@ -829,28 +853,26 @@ async function categorizeTransactionCore(
   // Explicit business-side account replacing the category default (v1 REST
   // account_override semantics): must exist active in chart_of_accounts.
   accountOverride: string | undefined,
-  userId: string,
+  dimensions: Record<string, string> | undefined,
   companyId: string,
   supabase: SupabaseClient,
-  confirm: boolean = false
 ): Promise<{
-  preview?: boolean
-  success?: boolean
-  journal_entry_created?: boolean
-  journal_entry_id?: string | null
-  journal_entry_error?: string | null
+  preview: true
   category: string
   debit_account: string
   credit_account: string
   amount: number
+  settlement_account: string
   currency: string
-  vat_lines?: Array<{ account_number: string; debit_amount: number; credit_amount: number; description: string }>
-  // The exact journal lines the commit executor will post (net cost line,
-  // VAT line, gross bank line) — always in SEK, matching the booked entry.
-  lines?: Array<{ account_number: string; debit_amount: number; credit_amount: number; description: string }>
-  message?: string
-  transaction?: Transaction
-  underlag?: {
+  vat_lines: Array<{
+    account_number: string
+    debit_amount: number
+    credit_amount: number
+    description: string
+  }>
+  lines: McpSettlementSnapshotLine[]
+  message: string
+  underlag: {
     document_id: string
     total: number | null
     vat_amount: number | null
@@ -925,24 +947,15 @@ async function categorizeTransactionCore(
   }
 
   if (transaction.journal_entry_id) {
-    return {
-      success: true,
-      journal_entry_created: false,
-      journal_entry_id: transaction.journal_entry_id,
-      journal_entry_error: 'Transaction already has a journal entry: use gnubok_list_uncategorized_transactions to find unbooked ones.',
-      category,
-      debit_account: '',
-      credit_account: '',
-      amount: Math.abs(transaction.amount),
-      currency: transaction.currency,
-      transaction: transaction as Transaction,
-    }
+    throw new Error(
+      'Transaction already has a journal entry: use gnubok_list_uncategorized_transactions to find unbooked ones.',
+    )
   }
 
   // Get entity type
   const { data: settings } = await supabase
     .from('company_settings')
-    .select('entity_type, fiscal_year_start_month')
+    .select('entity_type')
     .eq('company_id', companyId)
     .single()
 
@@ -980,6 +993,7 @@ async function categorizeTransactionCore(
       vatTreatment != null || vatAmount != null,
     )
   }
+  if (dimensions) mappingResult = { ...mappingResult, dimensions }
 
   if (!mappingResult.debit_account || !mappingResult.credit_account) {
     throw new Error(
@@ -988,133 +1002,30 @@ async function categorizeTransactionCore(
     )
   }
 
-  // Preview mode: return what would happen without executing
-  if (!confirm) {
-    // Materialize the exact lines the commit executor will post — including
-    // the gross→net split on the cost line. Historically the preview only
-    // carried { debit/credit account, gross amount, vat_lines }, which reads
-    // as an unbalanced "gross on cost account + VAT debit" entry and misled
-    // both users and agents into rejecting correct proposals.
-    const entryLines = buildTransactionEntryLines(transaction as Transaction, mappingResult)
-    return {
-      preview: true,
-      category,
-      debit_account: mappingResult.debit_account,
-      credit_account: mappingResult.credit_account,
-      amount: Math.abs(transaction.amount),
-      currency: transaction.currency,
-      lines: entryLines.map(l => ({
-        account_number: l.account_number,
-        debit_amount: l.debit_amount,
-        credit_amount: l.credit_amount,
-        description: l.line_description ?? '',
-      })),
-      vat_lines: mappingResult.vat_lines.map(v => ({
-        account_number: v.account_number,
-        debit_amount: v.debit_amount,
-        credit_amount: v.credit_amount,
-        description: v.description,
-      })),
-      message: 'Preview only: no changes made. Call again with confirm: true to create the journal entry.',
-      underlag: underlagSummary,
-    }
-  }
-
-  // Ensure fiscal period exists
-  const fiscalYearStartMonth = settings?.fiscal_year_start_month ?? 1
-  const txDate = new Date(transaction.date)
-  const txMonth = txDate.getMonth() + 1
-  const txYear = txDate.getFullYear()
-
-  let periodStartYear: number
-  if (fiscalYearStartMonth === 1) {
-    periodStartYear = txYear
-  } else if (txMonth >= fiscalYearStartMonth) {
-    periodStartYear = txYear
-  } else {
-    periodStartYear = txYear - 1
-  }
-
-  const startMonth = String(fiscalYearStartMonth).padStart(2, '0')
-  const periodStart = `${periodStartYear}-${startMonth}-01`
-
-  const endYear = fiscalYearStartMonth === 1 ? periodStartYear : periodStartYear + 1
-  const endMonth = fiscalYearStartMonth === 1 ? 12 : fiscalYearStartMonth - 1
-  const lastDay = new Date(endYear, endMonth, 0).getDate()
-  const periodEnd = `${endYear}-${String(endMonth).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`
-
-  const periodName = fiscalYearStartMonth === 1
-    ? `Räkenskapsår ${periodStartYear}`
-    : `Räkenskapsår ${periodStartYear}/${endYear}`
-
-  await supabase
-    .from('fiscal_periods')
-    .upsert(
-      { user_id: userId, name: periodName, period_start: periodStart, period_end: periodEnd },
-      { onConflict: 'user_id,period_start,period_end' }
-    )
-
-  // Create journal entry
-  let journalEntryId: string | null = null
-  let journalEntryError: string | null = null
-
-  try {
-    const journalEntry = await createTransactionJournalEntry(
-      supabase,
-      companyId,
-      userId,
-      transaction as Transaction,
-      mappingResult
-    )
-    if (journalEntry) {
-      journalEntryId = journalEntry.id
-    }
-  } catch (err) {
-    journalEntryError = err instanceof Error ? err.message : 'Unknown error'
-  }
-
-  // Update transaction
-  await supabase
-    .from('transactions')
-    .update({
-      is_business: isBusiness,
-      category,
-      journal_entry_id: journalEntryId,
-    })
-    .eq('id', txId)
-
-  // Emit event so extensions (mapping rules, etc.) can react
-  await eventBus.emit({
-    type: 'transaction.categorized',
-    payload: {
-      transaction: transaction as Transaction,
-      account: mappingResult.debit_account,
-      taxCode: mappingResult.vat_lines[0]?.account_number || '',
-      userId,
-      companyId,
-    },
-  })
-
-  // Upsert counterparty template for future auto-matching
-  try {
-    await upsertCounterpartyTemplate(
-      supabase, companyId, transaction as Transaction, mappingResult, 'user_approved'
-    )
-  } catch {
-    // Non-critical
-  }
-
+  const entryLines = buildTransactionEntryLines(transaction as Transaction, mappingResult)
   return {
-    success: true,
-    journal_entry_created: !!journalEntryId,
-    journal_entry_id: journalEntryId,
-    journal_entry_error: journalEntryError,
+    preview: true,
     category,
     debit_account: mappingResult.debit_account,
     credit_account: mappingResult.credit_account,
+    settlement_account: settlementAccount,
     amount: Math.abs(transaction.amount),
     currency: transaction.currency,
-    transaction: transaction as Transaction,
+    lines: entryLines.map((line) => ({
+      account_number: line.account_number,
+      debit_amount: roundOre(line.debit_amount),
+      credit_amount: roundOre(line.credit_amount),
+      line_description: line.line_description ?? null,
+      dimensions: canonicalSettlementDimensions(line.dimensions),
+    })),
+    vat_lines: mappingResult.vat_lines.map((line) => ({
+      account_number: line.account_number,
+      debit_amount: line.debit_amount,
+      credit_amount: line.credit_amount,
+      description: line.description,
+    })),
+    message: 'Preview only: approve the staged operation to categorize the transaction.',
+    underlag: underlagSummary,
   }
 }
 
@@ -1225,42 +1136,57 @@ const VAT_REPORT_OUTPUT_SCHEMA = {
         type: { type: 'string', enum: ['monthly', 'quarterly', 'yearly'] },
         year: { type: 'number' },
         period: { type: 'number' },
-        start: { type: 'string', description: 'Period start date (YYYY-MM-DD)' },
-        end: { type: 'string', description: 'Period end date (YYYY-MM-DD)' },
+        start: { type: 'string' },
+        end: { type: 'string' },
+        original_period_start: { type: 'string' },
+        original_period_end: { type: 'string' },
+        fiscal_period_id: { type: ['string', 'null'] },
+        fiscal_period_start: { type: ['string', 'null'] },
+        fiscal_period_end: { type: ['string', 'null'] },
+        vat_liability_start_date: { type: ['string', 'null'] },
       },
-      required: ['type', 'year', 'period', 'start', 'end'],
+      required: [
+        'type',
+        'year',
+        'period',
+        'start',
+        'end',
+        'original_period_start',
+        'original_period_end',
+        'fiscal_period_id',
+        'fiscal_period_start',
+        'fiscal_period_end',
+        'vat_liability_start_date',
+      ],
     },
-    period_label: { type: 'string', description: 'Human-readable period label (e.g. "Q1 2026")' },
+    period_label: { type: 'string' },
     rutor: {
       type: 'object',
-      description: 'SKV 4700 momsdeklaration boxes: absolute values, signs implied by box semantics',
+      description: 'SKV 4700 boxes',
       properties: {
-        ruta05: { type: 'number', description: 'Total domestic taxable sales (all rates)' },
-        ruta10: { type: 'number', description: 'Output VAT 25 % (account 2611)' },
-        ruta11: { type: 'number', description: 'Output VAT 12 % (account 2621)' },
-        ruta12: { type: 'number', description: 'Output VAT 6 % (account 2631)' },
-        ruta30: { type: 'number', description: 'Reverse-charge output VAT 25 % (account 2614)' },
-        ruta31: { type: 'number', description: 'Reverse-charge output VAT 12 % (account 2624)' },
-        ruta32: { type: 'number', description: 'Reverse-charge output VAT 6 % (account 2634)' },
-        ruta35: { type: 'number', description: 'EU intra-community goods supplies, momsfri (account 3108)' },
-        ruta39: { type: 'number', description: 'EU services sold (account 3308)' },
-        ruta40: { type: 'number', description: 'Export outside EU (account 3305)' },
-        ruta48: { type: 'number', description: 'Total input VAT (2641 + 2645 + 2647)' },
-        ruta49: {
-          type: 'number',
-          description: 'VAT to pay (positive) or refund (negative) = (10+11+12+30+31+32+60+61+62) − 48',
-        },
-        ruta60: { type: 'number', description: 'Import VAT 25 % (account 2615): non-EU import declared via momsdeklaration' },
-        ruta61: { type: 'number', description: 'Import VAT 12 % (account 2625)' },
-        ruta62: { type: 'number', description: 'Import VAT 6 % (account 2635)' },
+        ruta05: { type: 'number', description: 'Taxable sales' },
+        ruta10: { type: 'number', description: 'Output VAT 25%' },
+        ruta11: { type: 'number', description: 'Output VAT 12%' },
+        ruta12: { type: 'number', description: 'Output VAT 6%' },
+        ruta30: { type: 'number', description: 'Reverse-charge VAT 25%' },
+        ruta31: { type: 'number', description: 'Reverse-charge VAT 12%' },
+        ruta32: { type: 'number', description: 'Reverse-charge VAT 6%' },
+        ruta35: { type: 'number', description: 'EU goods sold' },
+        ruta39: { type: 'number', description: 'EU services sold' },
+        ruta40: { type: 'number', description: 'Exports' },
+        ruta48: { type: 'number', description: 'Deductible input VAT' },
+        ruta49: { type: 'number', description: 'Pay (+) or refund (-)' },
+        ruta60: { type: 'number', description: 'Import VAT 25%' },
+        ruta61: { type: 'number', description: 'Import VAT 12%' },
+        ruta62: { type: 'number', description: 'Import VAT 6%' },
       },
       required: ['ruta05', 'ruta10', 'ruta11', 'ruta12', 'ruta30', 'ruta31', 'ruta32', 'ruta35', 'ruta39', 'ruta40', 'ruta48', 'ruta49', 'ruta60', 'ruta61', 'ruta62'],
     },
-    summary: { type: 'string', description: 'One-line Swedish summary string (att betala / att få tillbaka / noll)' },
+    summary: { type: 'string' },
     warnings: {
       type: 'array',
       items: { type: 'string' },
-      description: 'Pre-filing warnings (e.g. one-sided reverse charge). Empty when none.',
+      description: 'Pre-filing warnings',
     },
   },
   required: ['period', 'period_label', 'rutor', 'summary', 'warnings'],
@@ -1272,40 +1198,49 @@ const VAT_REPORT_OUTPUT_SCHEMA = {
 const SKV_VAT_VALIDATE_OUTPUT_SCHEMA = {
   type: 'object',
   properties: {
-    redovisare: { type: 'string', description: '12-digit redovisare' },
-    redovisningsperiod: { type: 'string', description: 'YYYYMM' },
-    momsuppgift: { type: 'object', description: 'The momsuppgift payload sent to Skatteverket' },
-    kontrollresultat: { type: 'object', description: 'Skatteverket kontrollresultat (status + per-ruta fel/varningar)' },
+    redovisare: { type: 'string' },
+    redovisningsperiod: { type: 'string' },
+    momsuppgift: { type: 'object' },
+    kontrollresultat: { type: 'object' },
+    period_identity: { type: 'object' },
+    approved_rutor: { type: 'object' },
     arithmetic_ok: {
       type: 'boolean',
-      description: 'Skatteverket found no ERROR: the payload adds up. Says NOTHING about whether the underlag is complete.',
+      description: 'No Skatteverket arithmetic ERROR',
     },
     completeness_ok: {
       type: 'boolean',
-      description: 'Local pre-flight found no ERROR. False = materially incomplete (e.g. FK004) even when arithmetic_ok is true.',
+      description: 'No local completeness ERROR',
     },
     completeness_checks: {
       type: 'array',
       items: { type: 'object' },
-      description: 'Local findings: { code, status (ERROR|WARNING), message (Swedish), rutor }.',
     },
-    summary: { type: 'string', description: 'One-line Swedish verdict for both results.' },
+    summary: { type: 'string' },
   },
   required: [
     'redovisare', 'redovisningsperiod', 'momsuppgift', 'kontrollresultat',
-    'arithmetic_ok', 'completeness_ok', 'completeness_checks', 'summary',
+    'period_identity', 'approved_rutor', 'arithmetic_ok', 'completeness_ok',
+    'completeness_checks', 'summary',
   ],
 } as const
 
 const SKV_VAT_STATUS_OUTPUT_SCHEMA = {
   type: 'object',
   properties: {
-    redovisare: { type: 'string', description: '12-digit redovisare' },
-    redovisningsperiod: { type: 'string', description: 'YYYYMM' },
-    submitted: { type: ['object', 'null'], description: 'Inlämnad deklaration, or null if none on file' },
-    decided: { type: ['object', 'null'], description: 'Beslutad deklaration, or null if not yet decided' },
+    redovisare: { type: 'string' },
+    redovisningsperiod: { type: 'string' },
+    period_identity: { type: 'object' },
+    submitted: { type: ['object', 'null'] },
+    decided: { type: ['object', 'null'] },
   },
-  required: ['redovisare', 'redovisningsperiod', 'submitted', 'decided'],
+  required: [
+    'redovisare',
+    'redovisningsperiod',
+    'period_identity',
+    'submitted',
+    'decided',
+  ],
 } as const
 
 const SKV_AGI_STATUS_OUTPUT_SCHEMA = {
@@ -1331,75 +1266,49 @@ const SKV_AGI_STATUS_OUTPUT_SCHEMA = {
   required: ['salary_run_id', 'period', 'filing_state', 'kvittensnummer', 'local_state', 'kvittenser'],
 } as const
 
-// ── VAT report computation (shared by gnubok_get_vat_report + gnubok_vat_review_widget) ──
-//
-// Maps posted journal entry lines to SKV 4700 rutor. ruta49 covers domestic
-// output VAT (10/11/12) AND reverse-charge output VAT (30/31/32) per
-// ML 2023:200: both must be displayed and netted against ruta48 (input VAT).
-//
-// Account → ruta map:
-//   3001-3008, 3041-3048, 3051-3058, 3071-3078 → ruta05  (all domestic taxable sales, common BAS revenue accounts)
-//   2611           → ruta10  (output VAT 25%)
-//   2621           → ruta11  (output VAT 12%)
-//   2631           → ruta12  (output VAT 6%)
-//   2614           → ruta30  (reverse-charge output VAT 25%)
-//   2624           → ruta31  (reverse-charge output VAT 12%)
-//   2634           → ruta32  (reverse-charge output VAT 6%)
-//   3308           → ruta39  (EU services sold)
-//   3305           → ruta40  (export outside EU)
-//   2641/2645/2647 → ruta48  (all input VAT)
-//
-// Posted+reversed status filter: a "reversed" original entry is still part of
-// its period's books: Skatteverket files VAT period-by-period under
-// faktureringsmetoden (sale's VAT in invoice-date period; kreditfaktura's
-// reduction in storno-date period). The original entry stays in its period;
-// the storno (status 'posted', dated when the credit was issued) lands in
-// its own period. The two periods file independently; across a year they
-// arithmetically cancel. *Excluding* 'reversed' would under-report Period N
-// (the original sale's VAT silently disappears) and over-credit Period N+M
-// (a reversal with no original), incorrect per ML 2023:200.
+// -- VAT report computation (shared by report, review, validation, and filing) --
 
-/** Common BAS taxable-revenue accounts that contribute to ruta 05.
- *
- *  Conservative expansion beyond 3001/3002/3003. Excludes 3004 (momsfri,
- *  exempt) and 3108/3305/3308 (handled by ruta35/40/39). 3106 covers the
- *  rare case of taxable EU goods (momspliktig EU-leverans, e.g. when the
- *  buyer's VAT number is invalid).
- *
- *  This hand-maintained widening predates #1261 and is kept so no company
- *  loses a figure it already saw. It is no longer the only path: a company's
- *  own class 3 konto marked with a moms-sats is resolved at runtime by
- *  fetchDynamicRuta05Accounts and unioned in below, which is what actually
- *  covers non-standard charts (Accounted's BAS chart ships no varugrupp
- *  accounts at all). */
-const RUTA_05_ACCOUNTS = [
-  // The 30xx gruppkonto. ACCOUNT_RUTA maps it to ruta05, so leaving it out here
-  // made a balance on 3000 appear in the filed projection but not in
-  // report.rutor.ruta05.
-  '3000',
-  // Domestic sales by VAT rate (canonical BAS)
-  '3001', '3002', '3003', '3005', '3006', '3007', '3008',
-  // Taxable EU goods (momspliktig, buyer's VAT number invalid or buyer is private)
-  '3106',
-  // Domestic services (alternative numbering some companies use)
-  '3041', '3042', '3043', '3044', '3045', '3046', '3047', '3048',
-  // Domestic goods (alternative numbering)
-  '3051', '3052', '3053', '3054', '3055', '3056', '3057', '3058',
-  // Other domestic taxable
-  '3071', '3072', '3073', '3074', '3075', '3076', '3077', '3078',
-] as const
+interface McpVatResolvedPeriod {
+  type: VatPeriodType
+  year: number
+  period: number
+  start: string
+  end: string
+  originalStart: string
+  originalEnd: string
+  fiscalPeriodId: string | null
+  fiscalPeriodStart: string | null
+  fiscalPeriodEnd: string | null
+  vatLiabilityStartDate: string | null
+}
+
+interface McpVatDeclaration {
+  period: McpVatResolvedPeriod
+  rutor: VatDeclarationRutor
+  rcInputAccountTotals?: Record<string, { debit: number; credit: number }>
+  rcBasisByRate?: RcBasisTotalsByRate
+}
 
 export interface VatReportResult {
-  period: { type: string; year: number; period: number; start: string; end: string }
+  period: {
+    type: string
+    year: number
+    period: number
+    start: string
+    end: string
+    original_period_start: string
+    original_period_end: string
+    fiscal_period_id: string | null
+    fiscal_period_start: string | null
+    fiscal_period_end: string | null
+    vat_liability_start_date: string | null
+  }
   period_label: string
   rutor: {
     ruta05: number; ruta10: number; ruta11: number; ruta12: number
     ruta30: number; ruta31: number; ruta32: number
     ruta35: number; ruta39: number; ruta40: number
     ruta48: number; ruta49: number
-    // Import VAT (post-2015 momsdeklaration path, accounts 2615/2625/2635).
-    // Buyer/importer self-assesses output VAT here and deducts the matching
-    // input via ruta 48: same mechanic as ruta 30/31/32.
     ruta60: number; ruta61: number; ruta62: number
   }
   summary: string
@@ -1408,36 +1317,70 @@ export interface VatReportResult {
 
 export interface VatReportWithRutor {
   report: VatReportResult
-  /**
-   * The FULL SKV 4700 projection of the same ledger aggregate, via core's
-   * `rutorFromTotals`. `report.rutor` is the trimmed agent-facing view: it has
-   * no rutor 20-24 (beskattningsunderlag vid omvänd skattskyldighet) and no
-   * ruta 50 (underlag vid import), which are exactly the boxes the
-   * completeness checks in lib/reports/vat-declaration-checks.ts compare
-   * against rutor 30-32 / 60-62.
-   *
-   * The two also differ on ruta 05 by design: `report.rutor.ruta05` sums the
-   * widened RUTA_05_ACCOUNTS list for display, while this one is the canonical
-   * ACCOUNT_RUTA projection, i.e. what would actually be filed. Checks run on
-   * the filed shape, never on the display shape. The company's own ruta 05
-   * accounts feed BOTH: they are part of the filing, not a display widening.
-   */
   declarationRutor: VatDeclarationRutor
-  /**
-   * The per-account debit/credit totals both projections above are built from,
-   * exactly the shape `runVatDeclarationChecks` takes as its optional second
-   * argument. Threaded through so the completeness checks compare rutor 30-32
-   * against the reverse-charge INPUT accounts (2645/2647) rather than the ruta
-   * 48 aggregate, which ordinary debiterad ingående moms on 2641 masks. Internal
-   * to the server: no tool puts this map on the wire.
-   */
-  accountTotals: VatCheckAccountTotals
+  accountTotals?: VatCheckAccountTotals
+  rcBasisByRate?: RcBasisTotalsByRate
 }
 
-/**
- * Agent-facing VAT report. Thin wrapper over {@link computeVatReportWithRutor}
- * so callers that only need the report keep the old signature.
- */
+function requireAnnualFiscalPeriodId(
+  args: Record<string, unknown>,
+  periodType: VatPeriodType,
+): string | undefined {
+  const fiscalPeriodId =
+    typeof args.fiscal_period_id === 'string' && args.fiscal_period_id.length > 0
+      ? args.fiscal_period_id
+      : undefined
+  if (periodType === 'yearly' && !fiscalPeriodId) {
+    throw new Error('fiscal_period_id is required for yearly VAT periods')
+  }
+  return fiscalPeriodId
+}
+
+function assertMcpVatPeriodIdentity(
+  period: McpVatResolvedPeriod,
+  requested: {
+    periodType: VatPeriodType
+    year: number
+    period: number
+    fiscalPeriodId?: string
+  },
+): void {
+  if (
+    period.type !== requested.periodType ||
+    period.year !== requested.year ||
+    period.period !== requested.period ||
+    period.start > period.end ||
+    period.originalStart > period.originalEnd ||
+    period.end !== period.originalEnd ||
+    (period.vatLiabilityStartDate
+      ? period.start !==
+        (period.vatLiabilityStartDate > period.originalStart
+          ? period.vatLiabilityStartDate
+          : period.originalStart)
+      : period.start !== period.originalStart)
+  ) {
+    throw new Error('VAT report period identity does not match the request')
+  }
+  if (requested.periodType === 'yearly') {
+    if (
+      !requested.fiscalPeriodId ||
+      period.fiscalPeriodId !== requested.fiscalPeriodId ||
+      period.fiscalPeriodStart !== period.originalStart ||
+      period.fiscalPeriodEnd !== period.originalEnd ||
+      Number(period.originalEnd.slice(0, 4)) !== requested.year
+    ) {
+      throw new Error('Annual VAT fiscal period identity mismatch')
+    }
+  } else if (
+    period.fiscalPeriodId !== null ||
+    period.fiscalPeriodStart !== null ||
+    period.fiscalPeriodEnd !== null
+  ) {
+    throw new Error('Non-annual VAT report contains a fiscal period identity')
+  }
+}
+
+/** Agent-facing VAT report. */
 export async function computeVatReport(
   args: Record<string, unknown>,
   companyId: string,
@@ -1447,203 +1390,127 @@ export async function computeVatReport(
   return report
 }
 
+/**
+ * Builds one canonical core declaration and projects it for MCP. The returned
+ * rutor and completeness inputs are the same object later persisted for filing.
+ */
 export async function computeVatReportWithRutor(
   args: Record<string, unknown>,
   companyId: string,
   supabase: SupabaseClient
 ): Promise<VatReportWithRutor> {
-  const periodType = args.period_type as string
+  const periodType = args.period_type as VatPeriodType
   const year = Number(args.year)
   const period = Number(args.period)
-
+  const fiscalPeriodId = requireAnnualFiscalPeriodId(args, periodType)
   if (!['monthly', 'quarterly', 'yearly'].includes(periodType)) {
     throw new Error('period_type must be: monthly, quarterly, yearly')
   }
-  if (!year || year < 2000 || year > 2100) throw new Error('year must be between 2000 and 2100')
-  if (periodType === 'monthly' && (period < 1 || period > 12)) throw new Error('period must be 1-12 for monthly')
-  if (periodType === 'quarterly' && (period < 1 || period > 4)) throw new Error('period must be 1-4 for quarterly')
-
-  let startDate: string
-  let endDate: string
-
-  if (periodType === 'monthly') {
-    startDate = `${year}-${String(period).padStart(2, '0')}-01`
-    const lastDay = new Date(year, period, 0).getDate()
-    endDate = `${year}-${String(period).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`
-  } else if (periodType === 'quarterly') {
-    const startMonth = (period - 1) * 3 + 1
-    const endMonth = period * 3
-    startDate = `${year}-${String(startMonth).padStart(2, '0')}-01`
-    const lastDay = new Date(year, endMonth, 0).getDate()
-    endDate = `${year}-${String(endMonth).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`
-  } else {
-    startDate = `${year}-01-01`
-    endDate = `${year}-12-31`
+  if (!Number.isInteger(year) || year < 2000 || year > 2100) {
+    throw new Error('year must be between 2000 and 2100')
+  }
+  if (periodType === 'monthly' && (!Number.isInteger(period) || period < 1 || period > 12)) {
+    throw new Error('period must be 1-12 for monthly')
+  }
+  if (periodType === 'quarterly' && (!Number.isInteger(period) || period < 1 || period > 4)) {
+    throw new Error('period must be 1-4 for quarterly')
+  }
+  if (periodType === 'yearly' && period !== 1) {
+    throw new Error('period must be 1 for yearly')
   }
 
-  // Two-step fetch (lib/bookkeeping/entry-lines.ts) rather than a
-  // `journal_entries!inner` embed: PostgREST compiles that embed into a
-  // correlated LATERAL join that walks every tenant's journal_entry_lines.
-  // Both steps paginate, so a yearly (or busy quarterly) VAT period with
-  // >1000 entry lines is no longer silently truncated at PostgREST's
-  // 1000-row default.
-  // The helper reattaches the parent entry as an OBJECT under
-  // `journal_entries`, so the old "embed may be an object or an array" shape
-  // guard is gone with the embed.
-  const lines = await fetchEntryLines<{
-    journal_entry_id: string
-    account_number: string
-    debit_amount: number
-    credit_amount: number
-    journal_entries?: { source_type: string | null }
-  }>({
+  const calculateCanonicalVatDeclaration = calculateVatDeclaration as unknown as (
+    db: SupabaseClient,
+    tenantId: string,
+    requestedPeriodType: VatPeriodType,
+    requestedYear: number,
+    requestedPeriod: number,
+    options?: { fiscalPeriodId?: string },
+  ) => Promise<McpVatDeclaration>
+  const declaration = await calculateCanonicalVatDeclaration(
     supabase,
-    entryColumns: 'entry_date, status, user_id, source_type',
-    lineColumns: 'journal_entry_id, account_number, debit_amount, credit_amount',
-    filterEntries: (q: EntryLinesQuery) =>
-      q
-        .eq('company_id', companyId)
-        .in('status', ['posted', 'reversed'])
-        // Momsredovisning entries (the settlement verifikat clearing 26xx to
-        // 2650/1650) would zero the rutor once booked; exclude them so this
-        // report matches lib/reports/vat-declaration.ts (fetchVatAccountTotals).
-        .neq('source_type', 'vat_settlement')
-        .gte('entry_date', startDate)
-        .lte('entry_date', endDate),
+    companyId,
+    periodType,
+    year,
+    period,
+    fiscalPeriodId ? { fiscalPeriodId } : undefined,
+  )
+  assertMcpVatPeriodIdentity(declaration.period, {
+    periodType,
+    year,
+    period,
+    fiscalPeriodId,
   })
 
-  // Settlements booked WITHOUT the vat_settlement tag (manual momsomföring,
-  // SIE-imported settlements, stornos of a settlement) are excluded by shape,
-  // mirroring fetchVatAccountTotals (#984): an entry touching both a
-  // declaration account (ACCOUNT_RUTA) and a settlement net account
-  // (2650/1650) is a momsredovisning, not VAT-bearing activity. Opening
-  // balances are exempt: carried-in 26xx balances are unsettled VAT that
-  // belongs in the next declaration.
-  const declarationEntryIds = new Set<string>()
-  const netEntryIds = new Set<string>()
-  for (const line of lines) {
-    if (ACCOUNT_RUTA[line.account_number]) declarationEntryIds.add(line.journal_entry_id)
-    else if (VAT_SETTLEMENT_NET_ACCOUNTS.includes(line.account_number)) {
-      netEntryIds.add(line.journal_entry_id)
-    }
+  const rutor = declaration.rutor
+  const reportRutor = {
+    ruta05: Math.abs(rutor.ruta05),
+    ruta10: Math.abs(rutor.ruta10),
+    ruta11: Math.abs(rutor.ruta11),
+    ruta12: Math.abs(rutor.ruta12),
+    ruta30: Math.abs(rutor.ruta30),
+    ruta31: Math.abs(rutor.ruta31),
+    ruta32: Math.abs(rutor.ruta32),
+    ruta35: Math.abs(rutor.ruta35),
+    ruta39: Math.abs(rutor.ruta39),
+    ruta40: Math.abs(rutor.ruta40),
+    ruta48: Math.abs(rutor.ruta48),
+    ruta49: rutor.ruta49,
+    ruta60: Math.abs(rutor.ruta60),
+    ruta61: Math.abs(rutor.ruta61),
+    ruta62: Math.abs(rutor.ruta62),
   }
-  const settlementShapedIds = new Set<string>()
-  for (const line of lines) {
-    const id = line.journal_entry_id
-    if (!declarationEntryIds.has(id) || !netEntryIds.has(id)) continue
-    const entry = line.journal_entries
-    if (!entry || entry.source_type === 'opening_balance') continue
-    settlementShapedIds.add(id)
-  }
-
-  const accountTotals = new Map<string, { debit: number; credit: number }>()
-  for (const line of lines) {
-    if (settlementShapedIds.has(line.journal_entry_id)) continue
-    const acc = line.account_number
-    const existing = accountTotals.get(acc) ?? { debit: 0, credit: 0 }
-    existing.debit += Number(line.debit_amount) || 0
-    existing.credit += Number(line.credit_amount) || 0
-    accountTotals.set(acc, existing)
-  }
-
-  function creditBalance(acc: string): number {
-    const t = accountTotals.get(acc)
-    return t ? Math.round((t.credit - t.debit) * 100) / 100 : 0
-  }
-
-  function debitBalance(acc: string): number {
-    const t = accountTotals.get(acc)
-    return t ? Math.round((t.debit - t.credit) * 100) / 100 : 0
-  }
-
-  // The company's own momspliktiga intäktskonton join the hand-maintained list.
-  // Deduped: an account can appear in both (e.g. 3041 with a moms-sats set),
-  // and counting it twice would inflate ruta 05.
-  const dynamicRuta05 = await fetchDynamicRuta05Accounts(supabase, companyId)
-  const ruta05Accounts = [...new Set([...RUTA_05_ACCOUNTS, ...dynamicRuta05.accounts])]
-  const ruta05 = ruta05Accounts.reduce((sum, acc) => sum + creditBalance(acc), 0)
-  const ruta10 = creditBalance('2611')
-  const ruta11 = creditBalance('2621')
-  const ruta12 = creditBalance('2631')
-  const ruta30 = creditBalance('2614')
-  const ruta31 = creditBalance('2624')
-  const ruta32 = creditBalance('2634')
-  const ruta35 = creditBalance('3108')   // EU intra-community goods supplies (momsfri leverans till EU)
-  const ruta39 = creditBalance('3308')
-  const ruta40 = creditBalance('3305')
-  // Import VAT (since 2015 declared via momsdeklaration, not Tullverket): the
-  // importer books output VAT to 2615/2625/2635 (ruta 60/61/62) and the
-  // matching deductible input to 2645 (rolls into ruta 48 below).
-  const ruta60 = creditBalance('2615')
-  const ruta61 = creditBalance('2625')
-  const ruta62 = creditBalance('2635')
-  const calculatedInput2645 = debitBalance('2645')
-  const calculatedInput2647 = debitBalance('2647')
-  const ruta48 = debitBalance('2641') + calculatedInput2645 + calculatedInput2647
-  const ruta49 = Math.round(
-    (ruta10 + ruta11 + ruta12 + ruta30 + ruta31 + ruta32 + ruta60 + ruta61 + ruta62 - ruta48) * 100
-  ) / 100
-
-  const monthNames = ['Januari', 'Februari', 'Mars', 'April', 'Maj', 'Juni',
-    'Juli', 'Augusti', 'September', 'Oktober', 'November', 'December']
-
-  let periodLabel: string
-  if (periodType === 'monthly') periodLabel = `${monthNames[period - 1]} ${year}`
-  else if (periodType === 'quarterly') periodLabel = `Q${period} ${year}`
-  else periodLabel = `${year}`
-
-  // Pre-filing warnings: surface common compliance footguns.
-  //
-  // The matching input for reverse-charge output (2614/2624/2634) lands on
-  // 2645 (EU acquisitions) or 2647 (domestic reverse charge per ML 16:13,
-  // byggtjänster, electronics > 100k SEK, etc.). Either is a valid mirror;
-  // the warning must fire only when *both* are zero.
+  const periodLabel =
+    periodType === 'monthly'
+      ? `${[
+          'Januari', 'Februari', 'Mars', 'April', 'Maj', 'Juni',
+          'Juli', 'Augusti', 'September', 'Oktober', 'November', 'December',
+        ][period - 1]} ${year}`
+      : periodType === 'quarterly'
+        ? `Q${period} ${year}`
+        : `${year}`
   const warnings: string[] = []
-  const totalReverseChargeOutput = ruta30 + ruta31 + ruta32
-  const totalReverseChargeInput = calculatedInput2645 + calculatedInput2647
+  const rcInput = declaration.rcInputAccountTotals
+  const totalReverseChargeOutput = rutor.ruta30 + rutor.ruta31 + rutor.ruta32
+  const totalReverseChargeInput =
+    (rcInput?.['2645']?.debit ?? 0) - (rcInput?.['2645']?.credit ?? 0) +
+    (rcInput?.['2647']?.debit ?? 0) - (rcInput?.['2647']?.credit ?? 0)
   if (totalReverseChargeOutput > 0 && totalReverseChargeInput === 0) {
     warnings.push(
       'Omvänd betalningsskyldighet: utgående moms har bokförts (rutor 30/31/32) men ingen ' +
       'beräknad ingående moms (varken 2645 EU eller 2647 inhemsk). Kontrollera att den ' +
-      'motsvarande ingående bokningen finns: båda sidor krävs enligt ML 2023:200.'
+      'motsvarande ingående bokningen finns: båda sidor krävs enligt ML 2023:200.',
     )
   }
 
-  const report: VatReportResult = {
-    period: { type: periodType, year, period, start: startDate, end: endDate },
-    period_label: periodLabel,
-    rutor: {
-      ruta05: Math.abs(ruta05),
-      ruta10: Math.abs(ruta10),
-      ruta11: Math.abs(ruta11),
-      ruta12: Math.abs(ruta12),
-      ruta30: Math.abs(ruta30),
-      ruta31: Math.abs(ruta31),
-      ruta32: Math.abs(ruta32),
-      ruta35: Math.abs(ruta35),
-      ruta39: Math.abs(ruta39),
-      ruta40: Math.abs(ruta40),
-      ruta48: Math.abs(ruta48),
-      ruta49,
-      ruta60: Math.abs(ruta60),
-      ruta61: Math.abs(ruta61),
-      ruta62: Math.abs(ruta62),
-    },
-    summary: ruta49 > 0
-      ? `Moms att betala: ${Math.abs(ruta49).toFixed(2)} kr`
-      : ruta49 < 0
-        ? `Moms att få tillbaka: ${Math.abs(ruta49).toFixed(2)} kr`
-        : 'Noll i moms',
-    warnings,
-  }
-
-  // Same `accountTotals` the report is built from, projected through core's
-  // ACCOUNT_RUTA map so the completeness checks see the full declaration
-  // (incl. rutor 20-24 and 50) instead of the trimmed report view.
   return {
-    report,
-    declarationRutor: rutorFromTotals(accountTotals, dynamicRuta05.accounts),
-    accountTotals,
+    report: {
+      period: {
+        type: declaration.period.type,
+        year: declaration.period.year,
+        period: declaration.period.period,
+        start: declaration.period.start,
+        end: declaration.period.end,
+        original_period_start: declaration.period.originalStart,
+        original_period_end: declaration.period.originalEnd,
+        fiscal_period_id: declaration.period.fiscalPeriodId,
+        fiscal_period_start: declaration.period.fiscalPeriodStart,
+        fiscal_period_end: declaration.period.fiscalPeriodEnd,
+        vat_liability_start_date: declaration.period.vatLiabilityStartDate,
+      },
+      period_label: periodLabel,
+      rutor: reportRutor,
+      summary:
+        rutor.ruta49 > 0
+          ? `Moms att betala: ${Math.abs(rutor.ruta49)} kr`
+          : rutor.ruta49 < 0
+            ? `Moms att få tillbaka: ${Math.abs(rutor.ruta49)} kr`
+            : 'Noll i moms',
+      warnings,
+    },
+    declarationRutor: rutor,
+    accountTotals: rcInputTotalsFromDeclaration(declaration),
+    rcBasisByRate: declaration.rcBasisByRate,
   }
 }
 
@@ -1676,20 +1543,24 @@ async function runVatCompletenessChecks(
   year: number,
   period: number,
   accountTotals?: VatCheckAccountTotals,
+  rcBasisByRate?: RcBasisTotalsByRate,
+  fiscalPeriodId?: string,
 ): Promise<VatDeclarationCheck[]> {
   let scan: RcBasisGapScan
   try {
-    const gaps = await findRcBasisGaps(supabase, companyId, periodType, year, period)
+    const gaps = await findRcBasisGaps(
+      supabase,
+      companyId,
+      periodType,
+      year,
+      period,
+      { fiscalPeriodId },
+    )
     scan = { status: 'scanned', gapCount: gaps.length }
   } catch {
     scan = { status: 'unavailable' }
   }
-  // Downgrade evidence (per-momssats 44xx/45xx balances) only exists when the
-  // caller supplied the account totals; without them the per-voucher gaps
-  // keep their blocking ERROR tier rather than guessing.
-  const evidence = accountTotals
-    ? { rutor, rcBasisByRate: rcBasisTotalsByRate(accountTotals) }
-    : undefined
+  const evidence = rcBasisByRate ? { rutor, rcBasisByRate } : undefined
   return withRcBasisGapFindings(runVatDeclarationChecks(rutor, accountTotals), scan, evidence)
 }
 
@@ -2073,8 +1944,12 @@ export async function computeVatCloseCheck(
   //    step 4b: they need rutor 20-24 and 50, which the report view omits, plus
   //    the per-account totals so the RC input comparison reads 2645/2647
   //    instead of the ruta 48 aggregate.
-  const { report: vatReport, declarationRutor, accountTotals } =
-    await computeVatReportWithRutor(args, companyId, supabase)
+  const {
+    report: vatReport,
+    declarationRutor,
+    accountTotals,
+    rcBasisByRate,
+  } = await computeVatReportWithRutor(args, companyId, supabase)
   const { start, end, type: periodType, year, period } = vatReport.period
 
   // 2) Company settings: moms_period drives deadline labelling
@@ -2184,6 +2059,8 @@ export async function computeVatCloseCheck(
     Number(year),
     Number(period),
     accountTotals,
+    rcBasisByRate,
+    vatReport.period.fiscal_period_id ?? undefined,
   )
 
   // Zero deductible input VAT against self-assessed utgående moms is
@@ -4237,6 +4114,13 @@ export const tools: McpTool[] = [
         throw new Error('account_override must be exactly 4 digits, e.g. "4020".')
       }
 
+      const { bags: dimBags, resolutions: dimensionResolutions } = await resolveDimensionBags(
+        supabase,
+        companyId,
+        [inputDimensions],
+      )
+      const resolvedDimensions = dimBags[0]
+      const hasDimensions = Boolean(resolvedDimensions && Object.keys(resolvedDimensions).length > 0)
       // Compute the preview (accounts, amounts, VAT lines)
       const result = await categorizeTransactionCore(
         args.transaction_id as string,
@@ -4244,35 +4128,29 @@ export const tools: McpTool[] = [
         args.vat_treatment as VatTreatment | undefined,
         vatAmount,
         accountOverride,
-        userId,
+        resolvedDimensions,
         companyId,
         supabase,
-        false // preview mode: execution happens at approval time via gnubok_approve_pending_operation
       )
 
-      // If already has a journal entry, pass through as-is
-      if (result.success && result.journal_entry_created === false) {
-        const { transaction: _tx, ...publicResult } = result
-        return publicResult
-      }
 
       // Fetch transaction description (and date for period_status) for the title
-      const { data: tx } = await supabase
+      const { data: tx, error: txError } = await supabase
         .from('transactions')
-        // amount_sek / exchange_rate are projected for the duplicate guard: it
-        // compares this bank line against SEK ledger legs, and without them a
-        // non-SEK row has no SEK value to compare with.
-        .select('description, merchant_name, amount, currency, amount_sek, exchange_rate, date, cash_account_id')
+        .select(
+          'description, merchant_name, amount, currency, amount_sek, exchange_rate, date, cash_account_id, journal_entry_id',
+        )
         .eq('id', args.transaction_id as string)
         .eq('company_id', companyId)
         .single()
+      if (txError || !tx) throw new Error('Transaction not found after preview resolution.')
 
       // Booking-time duplicate guard: surface a likely double-booking to the
       // agent NOW (before staging) so it can link to the existing verifikat
       // instead of queuing a second one for approval. The commit executor
       // re-checks as the hard gate; this is the early, actionable signal.
       // Mirrors the web /categorize route's guard.
-      if (args.allow_duplicate !== true && tx) {
+      if (args.allow_duplicate !== true) {
         const txFx = tx as { cash_account_id?: string | null; amount_sek?: number | null; exchange_rate?: number | null }
         const dup = await detectBookingDuplicate(supabase, companyId, {
           id: args.transaction_id as string,
@@ -4302,21 +4180,28 @@ export const tools: McpTool[] = [
         }
       }
 
-      const txDesc = tx
-        ? `${tx.merchant_name || tx.description || 'Transaktion'} ${tx.amount} ${tx.currency}`
-        : String(args.transaction_id)
-
-      // Resolve-don't-select: codes AND natural-language names resolve against
-      // the registry in one pass (zero queries when untagged; free-text
-      // passthrough while dimensions_enabled is off). The resolved bag lands on
-      // the expense/business lines only: the executor never tags bank/VAT lines.
-      const { bags: dimBags, resolutions: dimensionResolutions } = await resolveDimensionBags(
-        supabase,
+      const amountSek = resolveTransactionAmountSek(tx)
+      if (amountSek === null) {
+        throw new Error(
+          'Transaktionen saknar ett verifierat SEK-belopp. Uppdatera växelkursen innan kategoriseringen stageas.',
+        )
+      }
+      if (!result.settlement_account || !result.lines) {
+        throw new Error('Kategoriseringspreviewn saknar fullständig avräkningsproveniens.')
+      }
+      const settlementSnapshot: McpSettlementSnapshot = {
         companyId,
-        [inputDimensions],
-      )
-      const resolvedDimensions = dimBags[0]
-      const hasDimensions = Boolean(resolvedDimensions && Object.keys(resolvedDimensions).length > 0)
+        transactionId: args.transaction_id as string,
+        expectedJournalEntryId: tx.journal_entry_id ?? null,
+        cashAccountId: tx.cash_account_id ?? null,
+        settlementAccount: result.settlement_account,
+        amountSek,
+        category: args.category as TransactionCategory,
+        isBusiness: args.category !== 'private',
+        lines: result.lines,
+      }
+      const txDesc =
+        `${tx.merchant_name || tx.description || 'Transaktion'} ${tx.amount} ${tx.currency}`
 
       // Stage for user approval
       return stagePendingOperation(supabase, companyId, userId, 'categorize_transaction',
@@ -4332,6 +4217,7 @@ export const tools: McpTool[] = [
             : null,
           ...(hasDimensions ? { dimensions: resolvedDimensions } : {}),
           allow_duplicate: args.allow_duplicate === true,
+          settlement_snapshot: settlementSnapshot,
         },
         {
           debit_account: result.debit_account,
@@ -4347,6 +4233,7 @@ export const tools: McpTool[] = [
           vat_lines: result.vat_lines || [],
           category: result.category,
           underlag: result.underlag ?? null,
+          settlement_snapshot: settlementSnapshot,
           ...(hasDimensions ? { dimensions: resolvedDimensions } : {}),
           // Echoed for every non-exact dimension resolution (resolve-don't-
           // select) so the agent can verify what a name attached to.
@@ -5280,9 +5167,13 @@ export const tools: McpTool[] = [
         },
         year: { type: 'number', description: 'Year (e.g. 2025)' },
         period: { type: 'number', description: '1-12 for monthly, 1-4 for quarterly, 1 for yearly' },
+        fiscal_period_id: {
+          type: 'string',
+          description: 'Required for yearly VAT.',
+        },
         render_ui: {
           type: 'boolean',
-          description: 'When true, also render the interactive momsdeklaration review widget (claude.ai / Claude Desktop). The structured rutor are returned either way. Default false.',
+          description: 'Render the VAT review widget. Default false.',
         },
       },
       required: ['period_type', 'year', 'period'],
@@ -5313,6 +5204,10 @@ export const tools: McpTool[] = [
         period_type: { type: 'string', enum: ['monthly', 'quarterly', 'yearly'], description: 'Period type' },
         year: { type: 'number', description: 'Year (e.g. 2025)' },
         period: { type: 'number', description: '1-12 for monthly, 1-4 for quarterly, 1 for yearly' },
+        fiscal_period_id: {
+          type: 'string',
+          description: 'Required for yearly VAT.',
+        },
       },
       required: ['period_type', 'year', 'period'],
     },
@@ -5340,6 +5235,10 @@ export const tools: McpTool[] = [
         period_type: { type: 'string', enum: ['monthly', 'quarterly', 'yearly'], description: 'Period type' },
         year: { type: 'number', description: 'Year (e.g. 2026)' },
         period: { type: 'number', description: '1-12 for monthly, 1-4 for quarterly, 1 for yearly' },
+        fiscal_period_id: {
+          type: 'string',
+          description: 'Required for yearly VAT.',
+        },
       },
       required: ['period_type', 'year', 'period'],
     },
@@ -8749,24 +8648,60 @@ export const tools: McpTool[] = [
         )
       }
 
-      // Resolve matched-tx dates/amounts for the period envelope + an aggregate
-      // total. preview_data carries only aggregate counts + sum: no per-item
-      // PII (GDPR Art.25), same rationale as gnubok_bulk_book_transactions.
-      const txIds = bookable.map((it) => it.matched_transaction_id as string)
-      const { data: txs } = await supabase
+      // Build one immutable settlement snapshot per staged item. Params retain
+      // these item-level identities; preview_data remains aggregate-only.
+      const txIds = bookable.map((item) => item.matched_transaction_id as string)
+      const { data: txs, error: txError } = await supabase
         .from('transactions')
-        .select('id, date, amount, currency, amount_sek, exchange_rate')
+        .select(
+          'id, date, description, amount, currency, amount_sek, exchange_rate, cash_account_id, journal_entry_id',
+        )
         .in('id', txIds)
         .eq('company_id', companyId)
-      const txDates = (txs ?? []).map((t) => t.date as string).filter(Boolean).sort()
+      if (txError) throw new Error(`Kunde inte läsa matchade transaktioner: ${txError.message}`)
+      const txById = new Map((txs ?? []).map((transaction) => [transaction.id as string, transaction]))
+      const settlementSnapshots: McpInboxSettlementSnapshot[] = []
+      for (const item of bookable) {
+        const transactionId = item.matched_transaction_id as string
+        const transaction = txById.get(transactionId)
+        if (!transaction) {
+          throw new Error(`Matchad transaktion ${transactionId} saknas. Ladda om underlagen.`)
+        }
+        const preview = await categorizeTransactionCore(
+          transactionId,
+          args.category as TransactionCategory,
+          args.vat_treatment as VatTreatment | undefined,
+          vatAmount,
+          undefined,
+          resolvedDimensions,
+          companyId,
+          supabase,
+        )
+        const amountSek = resolveTransactionAmountSek(transaction)
+        if (amountSek === null || !preview.settlement_account || !preview.lines) {
+          throw new Error(
+            `Underlag ${item.id} saknar fullständig SEK- eller avräkningsproveniens.`,
+          )
+        }
+        settlementSnapshots.push({
+          companyId,
+          inboxItemId: item.id as string,
+          transactionId,
+          expectedJournalEntryId: transaction.journal_entry_id ?? null,
+          cashAccountId: transaction.cash_account_id ?? null,
+          settlementAccount: preview.settlement_account,
+          amountSek,
+          category: args.category as TransactionCategory,
+          isBusiness: args.category !== 'private',
+          lines: preview.lines,
+        })
+      }
+      const txDates = (txs ?? []).map((transaction) => transaction.date as string).filter(Boolean).sort()
       const earliestDate = txDates[0]
-      const totalSek = (txs ?? []).reduce((s, t) => {
-        const cur = String(t.currency ?? 'SEK').toUpperCase()
-        const sek = cur === 'SEK'
-          ? Math.abs(Number(t.amount))
-          : Math.abs(Number(t.amount_sek ?? Number(t.amount) * Number(t.exchange_rate ?? 1)))
-        return s + (Number.isFinite(sek) ? sek : 0)
-      }, 0)
+      const totalSek = settlementSnapshots.reduce(
+        (sum, snapshot) => sum + snapshot.amountSek,
+        0,
+      )
 
       return stagePendingOperation(supabase, companyId, userId, 'bulk_book_inbox_items',
         `Bulkbokför ${bookable.length} underlag`,
@@ -8782,6 +8717,7 @@ export const tools: McpTool[] = [
           dimensions: resolvedDimensions && Object.keys(resolvedDimensions).length > 0
             ? resolvedDimensions
             : null,
+          settlement_snapshots: settlementSnapshots,
         },
         {
           item_count: itemIds.length,
@@ -11192,6 +11128,10 @@ export const tools: McpTool[] = [
         period_type: { type: 'string', enum: ['monthly', 'quarterly', 'yearly'], description: 'Period type' },
         year: { type: 'number', description: 'Year (e.g. 2026)' },
         period: { type: 'number', description: '1-12 for monthly, 1-4 for quarterly, 1 for yearly' },
+        fiscal_period_id: {
+          type: 'string',
+          description: 'Required for yearly VAT.',
+        },
       },
       required: ['period_type', 'year', 'period'],
     },
@@ -11202,6 +11142,7 @@ export const tools: McpTool[] = [
       const periodType = args.period_type as VatPeriodType
       const year = args.year as number
       const period = args.period as number
+      const fiscalPeriodId = requireAnnualFiscalPeriodId(args, periodType)
       const ctx = createExtensionContext(supabase, userId, companyId, 'skatteverket')
 
       // LOCAL pre-flight first, and deliberately outside the SKV try/catch so a
@@ -11212,21 +11153,27 @@ export const tools: McpTool[] = [
       // that treated a green kontrollresultat as "safe to file" could submit a
       // momsdeklaration missing its beskattningsunderlag (FK004). Same checks,
       // same gate helper, same verdict as the web filing UI.
-      const declaration = await calculateVatDeclaration(
-        supabase, companyId, periodType, year, period,
-      )
-      // The 2645/2647 pair the declaration carries goes with it, so the RC input
-      // comparison here is the sharp one too: ruta 48 alone would let ordinary
-      // debiterad ingående moms hide a completely missing beräknad ingående moms.
+      const computed = await computeVatReportWithRutor(args, companyId, supabase)
+      const declarationRutor = computed.declarationRutor
       const completenessChecks = await runVatCompletenessChecks(
-        supabase, companyId, declaration.rutor, periodType, year, period,
-        rcInputTotalsFromDeclaration(declaration),
+        supabase,
+        companyId,
+        declarationRutor,
+        periodType,
+        year,
+        period,
+        computed.accountTotals,
+        computed.rcBasisByRate,
+        fiscalPeriodId,
       )
       const completenessOk = !isFilingBlocked(completenessChecks)
+      const redovisare = await resolveRedovisare(supabase, companyId)
+      const redovisningsperiod =
+        `${computed.report.period.original_period_end.slice(0, 4)}` +
+        `${computed.report.period.original_period_end.slice(5, 7)}`
+      const momsuppgift = rutorToMomsuppgift(declarationRutor)
 
       try {
-        const { redovisare, redovisningsperiod, momsuppgift } =
-          await buildMomsuppgift(supabase, companyId, { periodType, year, period })
         const res = await skvRequest(
           supabase, userId, companyId, 'POST', `/kontrollera/${redovisare}/${redovisningsperiod}`, momsuppgift,
         )
@@ -11248,6 +11195,21 @@ export const tools: McpTool[] = [
           redovisningsperiod,
           momsuppgift,
           kontrollresultat,
+          period_identity: {
+            period_type: computed.report.period.type,
+            year: computed.report.period.year,
+            period: computed.report.period.period,
+            fiscal_period_id: computed.report.period.fiscal_period_id,
+            fiscal_period_start: computed.report.period.fiscal_period_start,
+            fiscal_period_end: computed.report.period.fiscal_period_end,
+            original_period_start: computed.report.period.original_period_start,
+            original_period_end: computed.report.period.original_period_end,
+            resolved_period_start: computed.report.period.start,
+            resolved_period_end: computed.report.period.end,
+            vat_liability_start_date:
+              computed.report.period.vat_liability_start_date,
+          },
+          approved_rutor: declarationRutor,
           arithmetic_ok: arithmeticOk,
           completeness_ok: completenessOk,
           completeness_checks: toCompletenessFindings(completenessChecks),
@@ -11279,6 +11241,10 @@ export const tools: McpTool[] = [
         period_type: { type: 'string', enum: ['monthly', 'quarterly', 'yearly'], description: 'Period type' },
         year: { type: 'number', description: 'Year (e.g. 2026)' },
         period: { type: 'number', description: '1-12 for monthly, 1-4 for quarterly, 1 for yearly' },
+        fiscal_period_id: {
+          type: 'string',
+          description: 'Required for yearly VAT.',
+        },
       },
       required: ['period_type', 'year', 'period'],
     },
@@ -11289,48 +11255,115 @@ export const tools: McpTool[] = [
       const periodType = args.period_type as VatPeriodType
       const year = args.year as number
       const period = args.period as number
+      const fiscalPeriodId = requireAnnualFiscalPeriodId(args, periodType)
+      const computed = await computeVatReportWithRutor(args, companyId, supabase)
+      const declarationRutor = computed.declarationRutor
+      const approvedMomsuppgift = rutorToMomsuppgift(declarationRutor)
+      const redovisare = await resolveRedovisare(supabase, companyId)
+      const redovisningsperiod =
+        `${computed.report.period.original_period_end.slice(0, 4)}` +
+        `${computed.report.period.original_period_end.slice(5, 7)}`
+      const periodIdentity = {
+        type: computed.report.period.type,
+        year: computed.report.period.year,
+        period: computed.report.period.period,
+        start: computed.report.period.start,
+        end: computed.report.period.end,
+        original_period_start: computed.report.period.original_period_start,
+        original_period_end: computed.report.period.original_period_end,
+        fiscal_period_id: computed.report.period.fiscal_period_id,
+        fiscal_period_start: computed.report.period.fiscal_period_start,
+        fiscal_period_end: computed.report.period.fiscal_period_end,
+        vat_liability_start_date:
+          computed.report.period.vat_liability_start_date,
+      }
+      const completenessChecks = await runVatCompletenessChecks(
+        supabase,
+        companyId,
+        declarationRutor,
+        periodType,
+        year,
+        period,
+        computed.accountTotals,
+        computed.rcBasisByRate,
+        fiscalPeriodId,
+      )
+      if (isFilingBlocked(completenessChecks)) {
+        throw new Error(
+          'Momsdeklarationens underlag är ofullständigt. Åtgärda blockerande kontrollfel före staging.',
+        )
+      }
       const ctx = createExtensionContext(supabase, userId, companyId, 'skatteverket')
-      // Mandatory stage-time validation: the preview carries the real
-      // kontrollresultat and we never stage a declaration SKV would reject.
-      // /kontrollera is read-only on SKV's side. Shares buildMomsuppgift with
-      // the commit executor so preview numbers == filed numbers.
-      const prepared = await (async () => {
+      // Validate the exact approved momsuppgift. No second ledger projection is
+      // built while staging; commit performs the snapshot CAS before SKV writes.
+      const kontrollresultat = await (async () => {
         try {
-          const prep = await buildMomsuppgift(supabase, companyId, { periodType, year, period })
           const res = await skvRequest(
-            supabase, userId, companyId, 'POST', `/kontrollera/${prep.redovisare}/${prep.redovisningsperiod}`, prep.momsuppgift,
+            supabase,
+            userId,
+            companyId,
+            'POST',
+            `/kontrollera/${redovisare}/${redovisningsperiod}`,
+            approvedMomsuppgift,
           )
           await writeSkatteverketAudit(ctx, {
-            endpoint: 'kontrollera', agRegistreradId: prep.redovisare, redovisningsperiod: prep.redovisningsperiod,
-            outcome: res.ok ? 'ok' : 'skv_error', responseStatus: res.status,
+            endpoint: 'kontrollera',
+            agRegistreradId: redovisare,
+            redovisningsperiod,
+            outcome: res.ok ? 'ok' : 'skv_error',
+            responseStatus: res.status,
           })
           if (!res.ok) {
             const text = await res.text().catch(() => '')
             throw new Error(`Skatteverket svarade med ${res.status}: ${text}`)
           }
-          return { ...prep, kontrollresultat: await res.json() }
+          return await res.json()
         } catch (err) {
           throw mapSkatteverketError(err)
         }
       })()
       return stagePendingOperation(
         supabase, companyId, userId, 'submit_vat_declaration',
-        `Lämna momsdeklaration: ${prepared.redovisningsperiod}`,
-        { period_type: periodType, year, period },
+        `Lämna momsdeklaration: ${redovisningsperiod}`,
         {
-          redovisningsperiod: prepared.redovisningsperiod,
-          redovisare: prepared.redovisare,
-          rutor: prepared.momsuppgift,
-          kontrollresultat: prepared.kontrollresultat,
+          period_type: periodType,
+          year,
+          period,
+          redovisare,
+          redovisningsperiod,
+          fiscal_period_id: periodIdentity.fiscal_period_id,
+          fiscal_period_start: periodIdentity.fiscal_period_start,
+          fiscal_period_end: periodIdentity.fiscal_period_end,
+          original_period_start: periodIdentity.original_period_start,
+          original_period_end: periodIdentity.original_period_end,
+          resolved_period_start: periodIdentity.start,
+          resolved_period_end: periodIdentity.end,
+          vat_liability_start_date: periodIdentity.vat_liability_start_date,
+          approved_rutor: declarationRutor,
+          approved_momsuppgift: approvedMomsuppgift,
+        },
+        {
+          redovisningsperiod,
+          redovisare,
+          period_identity: periodIdentity,
+          approved_rutor: declarationRutor,
+          approved_momsuppgift: approvedMomsuppgift,
+          completeness_checks: toCompletenessFindings(completenessChecks),
+          kontrollresultat,
           commit_action: 'Skickar för BankID-signering; lämnas inte in förrän du signerat.',
         },
         actor,
         {
           description: 'After approval, sign in Skatteverket via the returned BankID link, then poll gnubok_vat_declaration_status.',
           tool: 'gnubok_vat_declaration_status',
-          args: { period_type: periodType, year, period },
+          args: {
+            period_type: periodType,
+            year,
+            period,
+            ...(fiscalPeriodId ? { fiscal_period_id: fiscalPeriodId } : {}),
+          },
         },
-        { dateForPeriodCheck: skvPeriodToEndDate(prepared.redovisningsperiod) },
+        { dateForPeriodCheck: skvPeriodToEndDate(redovisningsperiod) },
       )
     },
   },
@@ -11346,6 +11379,10 @@ export const tools: McpTool[] = [
         period_type: { type: 'string', enum: ['monthly', 'quarterly', 'yearly'], description: 'Period type' },
         year: { type: 'number', description: 'Year (e.g. 2026)' },
         period: { type: 'number', description: '1-12 for monthly, 1-4 for quarterly, 1 for yearly' },
+        fiscal_period_id: {
+          type: 'string',
+          description: 'Required for yearly VAT.',
+        },
         state: { type: 'string', enum: ['submitted', 'decided', 'both'], description: "Which view to fetch. Default 'both'." },
       },
       required: ['period_type', 'year', 'period'],
@@ -11355,13 +11392,71 @@ export const tools: McpTool[] = [
     async execute(args, companyId, userId, supabase) {
       assertSkatteverketEnabled()
       const periodType = args.period_type as VatPeriodType
-      const year = args.year as number
-      const period = args.period as number
       const state = (args.state as string) ?? 'both'
       const ctx = createExtensionContext(supabase, userId, companyId, 'skatteverket')
       try {
+        const { report: vatReport } = await computeVatReportWithRutor(
+          args,
+          companyId,
+          supabase,
+        )
         const redovisare = await resolveRedovisare(supabase, companyId)
-        const redovisningsperiod = formatRedovisningsperiod(periodType, year, period)
+        const redovisningsperiod =
+          `${vatReport.period.original_period_end.slice(0, 4)}` +
+          `${vatReport.period.original_period_end.slice(5, 7)}`
+        const periodIdentity = {
+          period_type: vatReport.period.type,
+          year: vatReport.period.year,
+          period: vatReport.period.period,
+          fiscal_period_id: vatReport.period.fiscal_period_id,
+          fiscal_period_start: vatReport.period.fiscal_period_start,
+          fiscal_period_end: vatReport.period.fiscal_period_end,
+          original_period_start: vatReport.period.original_period_start,
+          original_period_end: vatReport.period.original_period_end,
+          resolved_period_start: vatReport.period.start,
+          resolved_period_end: vatReport.period.end,
+          vat_liability_start_date: vatReport.period.vat_liability_start_date,
+        }
+        const { data: storedState, error: storedStateError } = await supabase
+          .from('extension_data')
+          .select('value')
+          .eq('company_id', companyId)
+          .eq('extension_id', 'skatteverket')
+          .eq('key', `submission_${redovisningsperiod}`)
+          .maybeSingle()
+        if (storedStateError) {
+          throw new Error('Kunde inte läsa momsdeklarationens sparade periodidentitet.')
+        }
+        if (storedState && periodType === 'yearly') {
+          let value: Record<string, unknown>
+          try {
+            value =
+              typeof storedState.value === 'string'
+                ? JSON.parse(storedState.value) as Record<string, unknown>
+                : storedState.value as Record<string, unknown>
+          } catch {
+            throw new Error('Momsdeklarationens sparade periodidentitet är ogiltig.')
+          }
+          if (
+            value.redovisare !== redovisare ||
+            value.redovisningsperiod !== redovisningsperiod ||
+            value.periodType !== vatReport.period.type ||
+            value.year !== vatReport.period.year ||
+            value.period !== vatReport.period.period ||
+            value.fiscalPeriodId !== vatReport.period.fiscal_period_id ||
+            value.fiscalPeriodStart !== vatReport.period.fiscal_period_start ||
+            value.fiscalPeriodEnd !== vatReport.period.fiscal_period_end ||
+            value.originalPeriodStart !== vatReport.period.original_period_start ||
+            value.originalPeriodEnd !== vatReport.period.original_period_end ||
+            value.resolvedPeriodStart !== vatReport.period.start ||
+            value.resolvedPeriodEnd !== vatReport.period.end ||
+            value.vatLiabilityStartDate !== vatReport.period.vat_liability_start_date
+          ) {
+            throw new Error(
+              'Momsdeklarationens sparade periodidentitet matchar inte den begärda räkenskapsperioden.',
+            )
+          }
+        }
         let submitted: unknown = null
         let decided: unknown = null
         if (state === 'submitted' || state === 'both') {
@@ -11392,7 +11487,13 @@ export const tools: McpTool[] = [
             decided = await res.json()
           }
         }
-        return { redovisare, redovisningsperiod, submitted, decided }
+        return {
+          redovisare,
+          redovisningsperiod,
+          period_identity: periodIdentity,
+          submitted,
+          decided,
+        }
       } catch (err) {
         throw mapSkatteverketError(err)
       }
@@ -15593,11 +15694,16 @@ export const tools: McpTool[] = [
       type: 'object',
       additionalProperties: false,
       properties: {
-        status: { type: 'string', enum: ['committed', 'rejected', 'failed'] },
+        status: {
+          type: 'string',
+          enum: ['committed', 'rejected', 'failed', 'failed_partial'],
+        },
         operation_id: { type: 'string' },
         data: { type: 'object' },
         error: { type: 'string' },
         auto_rejected: { type: 'boolean' },
+        code: { type: 'string' },
+        retryable: { type: 'boolean' },
       },
       required: ['status', 'operation_id'],
     },
@@ -15657,8 +15763,18 @@ export const tools: McpTool[] = [
       // this operation makes via the runWithActor() scope inside
       // commitPendingOperation, stamping journal_entries.committed_actor_*
       // and the audit_log COMMIT row (migration 20260619120000).
+      if (!actor?.id) {
+        throw new Error('Verified MCP actor metadata is required for approval.')
+      }
+      const approvalActor = {
+        type: actor.type,
+        id: actor.id,
+        ...(actor.label ? { label: actor.label } : {}),
+      }
       const commitMethod =
-        actor?.type === 'api_key' ? ('api_key' as const) : ('user_accept' as const)
+        approvalActor.type === 'api_key' || approvalActor.type === 'mcp_oauth'
+          ? ('api_key' as const)
+          : ('user_accept' as const)
 
       const result = await commitPendingOperation(
         supabase,
@@ -15667,13 +15783,14 @@ export const tools: McpTool[] = [
         operation,
         {
           commitMethod,
-          actor: {
-            type: actor?.type === 'api_key' ? 'api_key' : 'user',
-            ...(actor?.label ? { label: actor.label } : {}),
-          },
+          actor: approvalActor,
           ...(userEmail ? { userEmail } : {}),
         }
       )
+      const processingHistoryActorType =
+        approvalActor.type === 'mcp_oauth'
+          ? 'api_key'
+          : approvalActor.type
 
       // Audit the MCP-initiated approval. Failure must not break the user
       // flow: the side-effects have already happened.
@@ -15694,9 +15811,9 @@ export const tools: McpTool[] = [
             confirmed: args.confirmed === true,
           },
           actor: {
-            type: actor?.type === 'api_key' ? 'api_key' : 'user',
-            id: actor?.id ?? userId,
-            ...(actor?.label ? { label: actor.label } : {}),
+            type: processingHistoryActorType,
+            id: approvalActor.id,
+            ...(approvalActor.label ? { label: approvalActor.label } : {}),
           },
           occurredAt: new Date(),
         })
@@ -15705,11 +15822,13 @@ export const tools: McpTool[] = [
       }
 
       return {
-        status: result.status,
+        status: result.code === 'partial_commit' ? 'failed_partial' : result.status,
         operation_id: operationId,
         ...(result.data ? { data: result.data } : {}),
         ...(result.error ? { error: result.error } : {}),
         ...(result.auto_rejected ? { auto_rejected: true } : {}),
+        ...(result.code ? { code: result.code } : {}),
+        ...(result.retryable !== undefined ? { retryable: result.retryable } : {}),
       }
     },
   },

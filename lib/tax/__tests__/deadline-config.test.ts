@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { TAX_DEADLINE_CONFIGS } from '../deadline-config'
+import { TAX_DEADLINE_CONFIGS, resolveCanonicalVatDeadline } from '../deadline-config'
 import type { CompanySettingsForDeadlines } from '../deadline-config'
 
 function getConfig(type: string) {
@@ -18,6 +18,7 @@ function makeSettings(overrides: Partial<CompanySettingsForDeadlines> = {}): Com
     employer_seasonal: false,
     fiscal_year_start_month: 1,
     vat_taxable_base_over_40m: false,
+    vat_liability_start_date: null,
     vat_has_eu_trade: false,
     vat_filing_method: 'electronic',
     periodisk_sammanstallning_enabled: false,
@@ -539,5 +540,109 @@ describe('arsredovisning: 7 months after FY end (ÅRL 8:3)', () => {
     expect(dates.length).toBe(1)
     expect(dates[0].month).toBe(1) // Feb
     expect(dates[0].day).toBe(28) // 2025 is not a leap year
+  })
+})
+
+describe('canonical VAT filing and deadline identity', () => {
+  it('keeps original bounds separate from a liability-clamped monthly period', () => {
+    const result = resolveCanonicalVatDeadline({
+      periodType: 'monthly',
+      year: 2026,
+      period: 1,
+      settings: makeSettings({ vat_liability_start_date: '2026-01-15' }),
+    })
+
+    expect(result).toMatchObject({
+      originalStart: '2026-01-01',
+      originalEnd: '2026-01-31',
+      resolvedStart: '2026-01-15',
+      resolvedEnd: '2026-01-31',
+      vatLiabilityStartDate: '2026-01-15',
+      taxDeadlineTypes: ['moms_monthly'],
+      taxPeriod: '2026-01',
+      linkedReportPeriod: {
+        year: 2026,
+        month: 1,
+        start: '2026-01-15',
+        end: '2026-01-31',
+        original_start: '2026-01-01',
+        original_end: '2026-01-31',
+        vat_liability_start_date: '2026-01-15',
+      },
+    })
+  })
+
+  it('uses one actual extended fiscal period for annual VAT identity', () => {
+    const result = resolveCanonicalVatDeadline({
+      periodType: 'yearly',
+      year: 2026,
+      period: 1,
+      settings: makeSettings(),
+      fiscalPeriod: {
+        id: '11111111-1111-4111-8111-111111111111',
+        period_start: '2025-07-03',
+        period_end: '2026-12-31',
+      },
+    })
+
+    expect(result).toMatchObject({
+      originalStart: '2025-07-03',
+      originalEnd: '2026-12-31',
+      resolvedStart: '2025-07-03',
+      fiscalPeriodId: '11111111-1111-4111-8111-111111111111',
+      taxDeadlineTypes: ['moms_yearly'],
+      taxPeriod: '2025-07-03/2026-12-31',
+      linkedReportPeriod: {
+        fiscal_period_id: '11111111-1111-4111-8111-111111111111',
+        fiscal_period_start: '2025-07-03',
+        fiscal_period_end: '2026-12-31',
+        vat_liability_start_date: null,
+      },
+    })
+  })
+
+  it('fails closed on missing liability source or annual end-year drift', () => {
+    const settings = makeSettings() as CompanySettingsForDeadlines & {
+      vat_liability_start_date?: string | null
+    }
+    delete settings.vat_liability_start_date
+    expect(() => resolveCanonicalVatDeadline({
+      periodType: 'monthly',
+      year: 2026,
+      period: 1,
+      settings,
+    })).toThrow(/liability start/)
+
+    expect(() => resolveCanonicalVatDeadline({
+      periodType: 'yearly',
+      year: 2026,
+      period: 1,
+      settings: makeSettings(),
+      fiscalPeriod: {
+        id: '11111111-1111-4111-8111-111111111111',
+        period_start: '2025-01-01',
+        period_end: '2025-12-31',
+      },
+    })).toThrow(/fiscal period identity/)
+  })
+
+  it('rejects unknown period types and non-calendar identity dates', () => {
+    expect(() => resolveCanonicalVatDeadline({
+      periodType: 'weekly' as never,
+      year: 2026,
+      period: 1,
+      settings: makeSettings(),
+    })).toThrow(/Invalid canonical VAT period/)
+    expect(() => resolveCanonicalVatDeadline({
+      periodType: 'yearly',
+      year: 2026,
+      period: 1,
+      settings: makeSettings(),
+      fiscalPeriod: {
+        id: '11111111-1111-4111-8111-111111111111',
+        period_start: '2025-02-30',
+        period_end: '2026-12-31',
+      },
+    })).toThrow(/fiscal period identity/)
   })
 })

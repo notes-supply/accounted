@@ -6,7 +6,7 @@ import {
   insertCompanyMember,
   insertFiscalPeriod,
 } from '@/tests/pg/fixtures'
-import { getPool } from '@/tests/pg/setup'
+import { getPool, runAsServiceRole } from '@/tests/pg/setup'
 
 /**
  * Covers 20260529120000_transaction_voucher_links per PR #602 review note:
@@ -226,9 +226,10 @@ describe('block_contradictory_invoice_denorm trigger', () => {
     await getPool().query(
       `INSERT INTO public.journal_entries
          (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-          entry_date, description, source_type, status)
-       VALUES ($1, $2, $3, $4, 1, 'A', '2026-06-05', 'Test', 'manual', 'draft')`,
-      [jeId, userId, companyId, fiscalPeriodId],
+          entry_date, description, source_type, source_id, status, commit_method)
+       VALUES ($1, $2, $3, $4, 1, 'A', '2026-06-05', 'Test',
+               'supplier_invoice_paid', $5, 'draft', 'legacy')`,
+      [jeId, userId, companyId, fiscalPeriodId, siA],
     )
     await getPool().query(
       `INSERT INTO public.journal_entry_lines (journal_entry_id, account_number, debit_amount, credit_amount)
@@ -237,12 +238,14 @@ describe('block_contradictory_invoice_denorm trigger', () => {
     )
     await getPool().query(`UPDATE public.journal_entries SET status = 'posted' WHERE id = $1`, [jeId])
 
-    await getPool().query(
-      `INSERT INTO public.supplier_invoice_payments
-         (user_id, company_id, supplier_invoice_id, payment_date, amount, currency,
-          journal_entry_id, transaction_id)
-       VALUES ($1, $2, $3, '2026-06-05', 1000, 'SEK', $4, $5)`,
-      [userId, companyId, siA, jeId, txId],
+    await runAsServiceRole((client) =>
+      client.query(
+        `INSERT INTO public.supplier_invoice_payments
+           (user_id, company_id, supplier_invoice_id, payment_date, amount, currency,
+            journal_entry_id, transaction_id)
+         VALUES ($1, $2, $3, '2026-06-05', 1000, 'SEK', $4, $5)`,
+        [userId, companyId, siA, jeId, txId],
+      ),
     )
 
     await expect(

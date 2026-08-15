@@ -30,6 +30,35 @@ vi.mock('@/lib/entitlements/has-capability', async (importOriginal) => {
   return { ...actual, hasCapability: vi.fn().mockResolvedValue(true) }
 })
 
+const APPROVED_RUTOR = {
+  ruta05: 0, ruta06: 0, ruta07: 0, ruta08: 0,
+  ruta10: 0, ruta11: 0, ruta12: 0,
+  ruta20: 0, ruta21: 0, ruta22: 0, ruta23: 0, ruta24: 0,
+  ruta30: 0, ruta31: 0, ruta32: 0,
+  ruta35: 0, ruta36: 0, ruta37: 0, ruta38: 0,
+  ruta39: 0, ruta40: 0, ruta41: 0, ruta42: 0,
+  ruta48: 0, ruta49: 0,
+  ruta50: 0, ruta60: 0, ruta61: 0, ruta62: 0,
+}
+
+const validVatParams = () => ({
+  period_type: 'monthly' as const,
+  year: 2025,
+  period: 3,
+  redovisare: '165560000000',
+  redovisningsperiod: '202503',
+  fiscal_period_id: null,
+  fiscal_period_start: null,
+  fiscal_period_end: null,
+  original_period_start: '2025-03-01',
+  original_period_end: '2025-03-31',
+  resolved_period_start: '2025-03-01',
+  resolved_period_end: '2025-03-31',
+  vat_liability_start_date: null,
+  approved_rutor: APPROVED_RUTOR,
+  approved_momsuppgift: { summaMoms: 0 },
+})
+
 function makePendingOp(overrides: Partial<PendingOperation>): PendingOperation {
   return {
     id: 'op-1',
@@ -81,14 +110,21 @@ describe('commitPendingOperation: submit_vat_declaration / submit_agi', () => {
     enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
     enqueue({ data: null, error: null })           // dispatcher commit update
 
-    const op = makePendingOp({ params: { period_type: 'monthly', year: 2025, period: 3 } })
+    const op = makePendingOp({ params: validVatParams() })
     const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
 
     expect(result.status).toBe('committed')
     expect(result.data).toMatchObject({ signing_url: 'https://skv.test/sign/abc', status: 'awaiting_signature' })
-    expect(vat).toHaveBeenCalledWith(expect.anything(), 'user-1', 'company-1', {
-      period_type: 'monthly', year: 2025, period: 3,
-    })
+    expect(vat).toHaveBeenCalledWith(
+      expect.anything(),
+      'user-1',
+      'company-1',
+      expect.objectContaining({
+        ...validVatParams(),
+        approved_rutor: APPROVED_RUTOR,
+        approved_momsuppgift: { summaMoms: 0 },
+      }),
+    )
   })
 
   it('happy AGI path → committed with signing_url', async () => {
@@ -112,7 +148,7 @@ describe('commitPendingOperation: submit_vat_declaration / submit_agi', () => {
     enqueue({ data: { id: 'op-1' }, error: null }) // CAS claim
     enqueue({ data: null, error: null })           // release-to-pending update
 
-    const op = makePendingOp({ params: { period_type: 'monthly', year: 2025, period: 3 } })
+    const op = makePendingOp({ params: validVatParams() })
     const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
 
     expect(result.status).toBe('failed')
@@ -129,7 +165,7 @@ describe('commitPendingOperation: submit_vat_declaration / submit_agi', () => {
     enqueue({ data: { id: 'op-1' }, error: null })
     enqueue({ data: null, error: null }) // release-to-pending update
 
-    const op = makePendingOp({ params: { period_type: 'monthly', year: 2025, period: 3 } })
+    const op = makePendingOp({ params: validVatParams() })
     const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
 
     expect(result.status).toBe('failed')
@@ -146,7 +182,7 @@ describe('commitPendingOperation: submit_vat_declaration / submit_agi', () => {
     enqueue({ data: { id: 'op-1' }, error: null })
     enqueue({ data: null, error: null }) // reject update
 
-    const op = makePendingOp({ params: { period_type: 'monthly', year: 2025, period: 3 } })
+    const op = makePendingOp({ params: validVatParams() })
     const result = await commitPendingOperation(supabase as never, 'user-1', 'company-1', op)
 
     expect(result.status).toBe('failed')

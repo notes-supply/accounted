@@ -101,15 +101,19 @@ const PERIOD = {
 }
 
 const RECON_CLEAN = {
+  currency: 'SEK',
   bank_transaction_total: 100,
   gl_1930_balance: 100,
   gl_1930_period_movement: 100,
   gl_1930_opening_balance: 0,
+  gl_1930_correction_adjustment: 0,
   difference: 0,
   is_reconciled: true,
   matched_count: 5,
   unmatched_transaction_count: 0,
   unmatched_gl_line_count: 0,
+  unconvertible_gl_line_count: 0,
+  not_reconcilable_reason: null,
 }
 
 const AR_CLEAN = {
@@ -336,7 +340,18 @@ describe('buildBokslutReadinessReport', () => {
     expect(ap?.href).toBe('/reports/supplier-ledger')
     // Warnings never flip readiness.
     expect(report.ready).toBe(true)
-    expect(vi.mocked(generateARReconciliation)).toHaveBeenCalledWith(supabase, 'co-1', 'fp-1')
+    expect(vi.mocked(generateARReconciliation)).toHaveBeenCalledWith(
+      supabase,
+      'co-1',
+      'fp-1',
+      PERIOD.period_end,
+    )
+    expect(vi.mocked(generateAPReconciliation)).toHaveBeenCalledWith(
+      supabase,
+      'co-1',
+      'fp-1',
+      PERIOD.period_end,
+    )
   })
 
   it('skips the AR/AP tie-outs entirely for kontantmetoden companies', async () => {

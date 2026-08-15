@@ -71,6 +71,7 @@ function makeFlexibleSupabase(byTable: Record<string, TableResp | TableResp[]>) 
       tableCalls.push(table)
       return buildChain(table)
     }),
+    rpc: vi.fn((fn: string) => buildChain(`rpc:${fn}`)),
   }
 }
 
@@ -392,17 +393,20 @@ describe('PATCH /salary-runs/:id/lines/:lineId', () => {
 
 describe('DELETE /salary-runs/:id/lines/:lineId', () => {
   it('deletes a line and returns 204', async () => {
-    mockServiceClient.mockReturnValue(
-      makeFlexibleSupabase({
-        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
-        salary_runs: { data: { id: RUN_ID, status: 'draft' }, error: null },
-        salary_line_items: [
-          { data: { ...SAMPLE_LINE, salary_run_employee: { salary_run_id: RUN_ID } }, error: null },
-          { data: null, error: null },
-        ],
-        idempotency_keys: { data: null, error: null },
-      }),
-    )
+    const supabaseMock = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      salary_runs: { data: { id: RUN_ID, status: 'draft' }, error: null },
+      salary_line_items: {
+        data: { ...SAMPLE_LINE, salary_run_employee: { salary_run_id: RUN_ID } },
+        error: null,
+      },
+      'rpc:delete_draft_salary_object_with_mileage_release': {
+        data: { outcome: 'deleted', released_trip_count: 1 },
+        error: null,
+      },
+      idempotency_keys: { data: null, error: null },
+    })
+    mockServiceClient.mockReturnValue(supabaseMock)
 
     const res = await deleteLine(
       makeRequest(
@@ -413,6 +417,15 @@ describe('DELETE /salary-runs/:id/lines/:lineId', () => {
     )
 
     expect(res.status).toBe(204)
+    expect(supabaseMock.rpc).toHaveBeenCalledWith(
+      'delete_draft_salary_object_with_mileage_release',
+      {
+        p_company_id: COMPANY_ID,
+        p_salary_run_id: RUN_ID,
+        p_target_kind: 'line_item',
+        p_target_id: LINE_ID,
+      },
+    )
   })
 
   it('returns 400 SALARY_RUN_LINE_NOT_DRAFT once the run has advanced', async () => {

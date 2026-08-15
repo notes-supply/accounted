@@ -119,6 +119,42 @@ describe('buildPayslipData', () => {
 
     expect(data.lineItems.map(li => li.description)).toEqual(['Grundlön', 'Förmån'])
   })
+
+  it('uses persisted mileage, net payout, and matching employer cost', () => {
+    const data = buildPayslipData({
+      run,
+      sre: sre({
+        net_salary: 27250,
+        line_items: [
+          {
+            item_type: 'monthly_salary',
+            description: 'Grundlön',
+            amount: 35000,
+            sort_order: 0,
+          },
+          {
+            item_type: 'mileage_taxfree',
+            description: 'Milersättning egen bil',
+            amount: 250,
+            quantity: 10,
+            unit_price: 25,
+            sort_order: 100,
+          },
+        ],
+      }),
+      employee,
+      company: { name: 'Bolaget AB', org_number: '5560000000' },
+    })
+
+    expect(data.netSalary).toBe(27250)
+    expect(data.totalEmployerCost).toBe(35000 + 10997 + 4200 + 1319.74 + 250)
+    expect(data.lineItems).toContainEqual({
+      description: 'Milersättning egen bil',
+      amount: 250,
+      quantity: 10,
+      unitPrice: 25,
+    })
+  })
 })
 
 describe('payslipFileName', () => {

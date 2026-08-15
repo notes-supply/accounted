@@ -23,8 +23,41 @@ vi.mock('../lib/audit', () => ({ writeSkatteverketAudit: vi.fn() }))
 
 import { submitVatDeclarationChain } from '../lib/vat-submit'
 import type { ExtensionContext } from '@/lib/extensions/types'
+import type { VatDeclarationRutor } from '@/types'
 
-const PARAMS = { periodType: 'monthly' as const, year: 2026, period: 6 }
+const RUTA_KEYS = [
+  'ruta05', 'ruta06', 'ruta07', 'ruta08', 'ruta10', 'ruta11', 'ruta12',
+  'ruta20', 'ruta21', 'ruta22', 'ruta23', 'ruta24', 'ruta30', 'ruta31',
+  'ruta32', 'ruta35', 'ruta36', 'ruta37', 'ruta38', 'ruta39', 'ruta40',
+  'ruta41', 'ruta42', 'ruta48', 'ruta49', 'ruta50', 'ruta60', 'ruta61',
+  'ruta62',
+] as const
+const RUTOR = Object.fromEntries(
+  RUTA_KEYS.map((key) => [key, 0]),
+) as unknown as VatDeclarationRutor
+const IDENTITY = {
+  redovisare: '165560000000',
+  redovisningsperiod: '202606',
+  periodType: 'monthly' as const,
+  year: 2026,
+  period: 6,
+  resolvedPeriodStart: '2026-06-01',
+  resolvedPeriodEnd: '2026-06-30',
+  originalPeriodStart: '2026-06-01',
+  originalPeriodEnd: '2026-06-30',
+  fiscalPeriodId: null,
+  fiscalPeriodStart: null,
+  fiscalPeriodEnd: null,
+  vatLiabilityStartDate: null,
+  approvedRutor: RUTOR,
+  approvedMomsuppgift: { summaMoms: 0 },
+}
+const PARAMS = {
+  periodType: 'monthly' as const,
+  year: 2026,
+  period: 6,
+  approvedRutor: RUTOR,
+}
 
 function makeCtx() {
   return {
@@ -41,7 +74,9 @@ beforeEach(() => {
   mockBuildMomsuppgift.mockResolvedValue({
     redovisare: '165560000000',
     redovisningsperiod: '202606',
-    momsuppgift: { summaMoms: 150 },
+    momsuppgift: { summaMoms: 0 },
+    rutor: RUTOR,
+    identity: IDENTITY,
   })
 })
 
@@ -163,4 +198,32 @@ describe('submitVatDeclarationChain', () => {
       ok: false, stage: 'lock', httpStatus: 502, draftSaved: true,
     })
   })
+  it('stops before utkast when the identity drifts after validation', async () => {
+    mockSkvRequest.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ kontrollResultat: { status: 'OK', resultat: [] } }),
+    })
+    mockBuildMomsuppgift
+      .mockResolvedValueOnce({
+        redovisare: IDENTITY.redovisare,
+        redovisningsperiod: IDENTITY.redovisningsperiod,
+        momsuppgift: { summaMoms: 0 },
+        rutor: RUTOR,
+        identity: IDENTITY,
+      })
+      .mockResolvedValueOnce({
+        redovisare: IDENTITY.redovisare,
+        redovisningsperiod: IDENTITY.redovisningsperiod,
+        momsuppgift: { summaMoms: 0 },
+        rutor: RUTOR,
+        identity: { ...IDENTITY, vatLiabilityStartDate: '2026-06-02' },
+      })
+
+    await expect(
+      submitVatDeclarationChain(makeCtx(), PARAMS, { validate: true }),
+    ).rejects.toThrow(/identity or approved rutor changed/)
+    expect(mockSkvRequest).toHaveBeenCalledTimes(1)
+  })
+
 })

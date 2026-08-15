@@ -3,6 +3,8 @@ import { NextResponse } from 'next/server'
 import { createMockRequest, createQueuedMockSupabase, parseJsonResponse } from '@/tests/helpers'
 
 const { supabase, reset } = createQueuedMockSupabase()
+const { supabase: serviceSupabase } = createQueuedMockSupabase()
+const createServiceClientMock = vi.fn(() => serviceSupabase)
 const requireAuthMock = vi.fn()
 const requireWriteMock = vi.fn()
 
@@ -15,6 +17,9 @@ vi.mock('@/lib/company/context', () => ({
 }))
 vi.mock('@/lib/auth/require-write', () => ({
   requireWritePermission: (...args: unknown[]) => requireWriteMock(...args),
+}))
+vi.mock('@/lib/supabase/server', () => ({
+  createServiceClient: () => createServiceClientMock(),
 }))
 vi.mock('@/lib/bokslut/assets/asset-service', () => ({
   disposeAsset: vi.fn(),
@@ -85,7 +90,7 @@ describe('POST /api/assets/[id]/dispose', () => {
     expect(body.error.code).toBe('ASSET_NOT_FOUND')
   })
 
-  it('returns the atomically posted disposal', async () => {
+  it('plans as the authenticated caller and commits through the service client', async () => {
     mockDisposeAsset.mockResolvedValue({
       asset: { id: 'asset-1', disposed_at: '2026-06-30' },
       disposal_entry: { id: 'entry-1', status: 'posted', voucher_number: 42 },
@@ -101,8 +106,12 @@ describe('POST /api/assets/[id]/dispose', () => {
 
     expect(status).toBe(200)
     expect(body.data.gain_or_loss).toBe(10_000)
+    expect(createServiceClientMock).toHaveBeenCalledOnce()
     expect(mockDisposeAsset).toHaveBeenCalledWith(
-      supabase,
+      {
+        plannerClient: supabase,
+        commitClient: serviceSupabase,
+      },
       'company-1',
       'user-1',
       'asset-1',

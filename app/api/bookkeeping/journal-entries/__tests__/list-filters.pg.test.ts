@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import { getPool } from '@/tests/pg/setup'
-import { seedCompany } from '@/tests/pg/fixtures'
+import {
+  insertReversedJournalEntryGraph,
+  seedCompany,
+} from '@/tests/pg/fixtures'
 
 // Covers the p_exclude_draft / p_collapse_corrections / p_series params on
 // list_fiscal_period_entries_with_related (migrations 20260621130500 +
@@ -29,8 +32,6 @@ describe('list_fiscal_period_entries_with_related: draft + correction filters', 
     description: string
     voucherSeries?: string
     entryDate?: string
-    reversesId?: string
-    correctionOfId?: string
     withLines?: boolean
   }): Promise<string> {
     const id = randomUUID()
@@ -40,8 +41,10 @@ describe('list_fiscal_period_entries_with_related: draft + correction filters', 
       await client.query(
         `INSERT INTO public.journal_entries
            (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-            entry_date, description, source_type, status, reverses_id, correction_of_id)
-         VALUES ($1,$2,$3,$4,$5,$11,$12,$6,$7,$8,$9,$10)`,
+            entry_date, description, source_type, status, committed_at, commit_method)
+         VALUES ($1,$2,$3,$4,$5,$9,$10,$6,$7,$8,
+                 CASE WHEN $8 = 'posted' THEN now() END,
+                 CASE WHEN $8 = 'posted' THEN 'legacy' END)`,
         [
           id,
           p.userId,
@@ -51,8 +54,6 @@ describe('list_fiscal_period_entries_with_related: draft + correction filters', 
           p.description,
           p.sourceType,
           p.status,
-          p.reversesId ?? null,
-          p.correctionOfId ?? null,
           p.voucherSeries ?? 'A',
           p.entryDate ?? '2026-06-01',
         ],
@@ -114,10 +115,19 @@ describe('list_fiscal_period_entries_with_related: draft + correction filters', 
 
     const posted = await insertEntry({ userId, companyId, fiscalPeriodId, status: 'posted', sourceType: 'manual', voucherNumber: 10, withLines: true, description: 'Plain posted' })
     const draft = await insertEntry({ userId, companyId, fiscalPeriodId, status: 'draft', sourceType: 'manual', voucherNumber: 0, description: 'Draft' })
-    // Correction group: original is reversed; storno reverses it; correction replaces it.
-    const original = await insertEntry({ userId, companyId, fiscalPeriodId, status: 'reversed', sourceType: 'manual', voucherNumber: 11, withLines: true, description: 'Original' })
-    const storno = await insertEntry({ userId, companyId, fiscalPeriodId, status: 'posted', sourceType: 'storno', voucherNumber: 12, reversesId: original, withLines: true, description: 'Storno' })
-    const correction = await insertEntry({ userId, companyId, fiscalPeriodId, status: 'posted', sourceType: 'correction', voucherNumber: 13, correctionOfId: original, withLines: true, description: 'Correction' })
+    // Correction group: original, storno, correction, and reverse pointer
+    // become visible only as one coherent durable graph.
+    const graph = await insertReversedJournalEntryGraph({
+      userId,
+      companyId,
+      fiscalPeriodId,
+      voucherNumber: 11,
+      description: 'Original',
+      correction: { description: 'Correction', voucherNumber: 13 },
+    })
+    const original = graph.originalId
+    const storno = graph.stornoId
+    const correction = graph.correctionId!
 
     // Default (no filters): every row shows.
     const all = await callRpc(companyId, fiscalPeriodId, {})

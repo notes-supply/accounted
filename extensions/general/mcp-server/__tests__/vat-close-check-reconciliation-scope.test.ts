@@ -59,7 +59,7 @@ function mockSupabase(
     chain.range = () => settled
     chain.single = async () => ({ data: null, error: null })
     chain.maybeSingle = async () => {
-      if (!isCashAccounts) return { data: null, error: null }
+      if (!isCashAccounts) return { data: rows[0] ?? null, error: null }
       const row = cashAccounts[lookup] ?? null
       lookup += 1
       return { data: row, error: maybeSingleError }
@@ -81,6 +81,9 @@ function mockSupabase(
   const from = vi.fn((table: string) => {
     if (table === 'cash_accounts') {
       return makeChain([], true, cashAccountFilters, cashAccountError)
+    }
+    if (table === 'company_settings') {
+      return makeChain([{ vat_liability_start_date: null }])
     }
     return makeChain([])
   })

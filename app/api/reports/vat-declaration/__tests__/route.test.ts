@@ -61,6 +61,17 @@ function chartBuilder(accounts: Array<{ account_number: string; default_vat_rate
   return b
 }
 
+function staticBuilder(data: unknown) {
+  const result = { data, error: null }
+  const b: Record<string, unknown> = {}
+  for (const method of ['select', 'eq', 'in', 'gte', 'lte', 'limit']) {
+    b[method] = vi.fn().mockReturnValue(b)
+  }
+  b.maybeSingle = vi.fn().mockResolvedValue(result)
+  b.then = (resolve: (value: unknown) => void) => resolve(result)
+  return b
+}
+
 describe('GET /api/reports/vat-declaration', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -70,7 +81,13 @@ describe('GET /api/reports/vat-declaration', () => {
       error: null,
     })
     mockSupabase.rpc.mockResolvedValue({ data: rpcPayload(), error: null })
-    mockSupabase.from.mockImplementation(() => chartBuilder())
+    mockSupabase.from.mockImplementation((table: string) => {
+      if (table === 'company_settings') {
+        return staticBuilder({ vat_liability_start_date: null })
+      }
+      if (table === 'journal_entries') return staticBuilder([])
+      return chartBuilder()
+    })
   })
 
   it('returns 401 when not authenticated', async () => {
@@ -145,11 +162,13 @@ describe('GET /api/reports/vat-declaration', () => {
     expect(body.data.transactionCount).toBe(3)
     expect(body.data.periodLabel).toBe('Kvartal 3 2026')
 
-    // Regression guard: the dead company_settings round trip is gone and
-    // resolvePeriodDates makes no DB call for calendar quarters. The only
-    // table read left is chart_of_accounts, for the company's own ruta 05
-    // accounts (#1261).
-    expect(mockSupabase.from.mock.calls.map(([t]) => t)).toEqual(['chart_of_accounts'])
+    // Liability identity, dynamic chart mapping, and the narrow controlled
+    // ruta 48 consumer are loaded before the aggregate RPC.
+    expect(mockSupabase.from.mock.calls.map(([table]) => table)).toEqual([
+      'company_settings',
+      'chart_of_accounts',
+      'journal_entries',
+    ])
     expect(mockSupabase.rpc).toHaveBeenCalledTimes(1)
     expect(mockSupabase.rpc).toHaveBeenCalledWith(
       'get_vat_declaration_totals',

@@ -2319,6 +2319,8 @@
     "period_quarterly": "Quarterly",
     "period_yearly": "Yearly",
     "moms_period_help": "Per decision from Skatteverket.",
+    "vat_liability_start_label": "VAT liability start date",
+    "vat_liability_start_help": "Use the date stated in the company's VAT registration decision. Activity before this date is excluded from VAT filings.",
     "vat_taxable_base_over_40m_label": "VAT taxable base above SEK 40 million per year",
     "vat_taxable_base_over_40m_help": "Requires monthly VAT reporting and moves the filing day for both the VAT and employer declarations to the 26th. Deducted tax and employer contributions must still be paid by the 12th. Also select this if Skatteverket has decided that the company files on these dates despite a lower taxable base.",
     "vat_has_eu_trade_label": "Trade with other EU countries",

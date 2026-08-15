@@ -43,12 +43,12 @@ describe('ACCOUNT_TO_BOX', () => {
     expect(ACCOUNT_TO_BOX['2634']).toBe('32')
   })
 
-  it('maps all input VAT accounts including parent and domestic RC', () => {
+  it('maps declaration input accounts plus the controlled 2648 cross-validation hint', () => {
     expect(ACCOUNT_TO_BOX['2640']).toBe('48')
     expect(ACCOUNT_TO_BOX['2641']).toBe('48')
     expect(ACCOUNT_TO_BOX['2645']).toBe('48')
     expect(ACCOUNT_TO_BOX['2647']).toBe('48')
-    expect(ACCOUNT_TO_BOX['2648']).toBe('48')
+    expect(ACCOUNT_TO_BOX['2648']).toBe('48') // Controlled lineage only; not a direct declaration input.
     expect(ACCOUNT_TO_BOX['2649']).toBe('48')
   })
 
@@ -145,14 +145,19 @@ describe('ACCOUNT_TO_BOX ↔ ACCOUNT_RUTA alignment', () => {
   })
 
   it('every account in ACCOUNT_TO_BOX exists in ACCOUNT_RUTA (or is an extra cross-validation hint)', () => {
-    // Allowed extras: accounts in ACCOUNT_TO_BOX that don't feed the declaration
-    // but are useful for the Export VAT Monitor / EU Sales List. Currently these
-    // are the frakter accounts that follow goods treatment.
-    const allowedExtras = new Set<string>(['3521', '3522', '3109'])
+    // Allowed extras: cross-validation hints that do not directly feed the
+    // declaration. 2648 is admitted only through the controlled lineage
+    // projection in vat-declaration.ts, never through ACCOUNT_RUTA.
+    const allowedExtras: Record<string, true> = {
+      '3521': true,
+      '3522': true,
+      '3109': true,
+      '2648': true,
+    }
 
     const drift: string[] = []
     for (const account of Object.keys(ACCOUNT_TO_BOX)) {
-      if (allowedExtras.has(account)) continue
+      if (allowedExtras[account]) continue
       if (!ACCOUNT_RUTA[account]) {
         drift.push(`extra in ACCOUNT_TO_BOX: ${account} (not in ACCOUNT_RUTA: consider adding to declaration mapping or to allowedExtras)`)
       }

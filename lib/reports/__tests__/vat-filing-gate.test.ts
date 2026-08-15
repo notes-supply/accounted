@@ -294,13 +294,37 @@ describe('rcBasisGapAdvisoryFinding', () => {
 })
 
 describe('withRcBasisGapFindings, failed scan', () => {
-  it('adds a non-blocking finding so the banner cannot claim all-clear', () => {
-    // An empty check list renders as "Inga fel hittades i underlaget för
-    // perioden". A scan that never answered has not earned that sentence.
+  it('blocks filing when required evidence cannot be loaded', () => {
     const result = withRcBasisGapFindings([], { status: 'unavailable' })
     expect(result).toHaveLength(1)
-    expect(result[0].status).toBe('WARNING')
-    expect(isFilingBlocked(result)).toBe(false)
+    expect(result[0].status).toBe('ERROR')
+    expect(isFilingBlocked(result)).toBe(true)
+  })
+
+  it('does not require reverse-charge scan evidence when the period has no activity', () => {
+    const evidence: RcGapDowngradeEvidence = {
+      ...makeEvidence({}, {}),
+      rcInputAccountTotals: new Map([
+        ['2645', { debit: 0, credit: 0 }],
+        ['2647', { debit: 0, credit: 0 }],
+      ]),
+    }
+    expect(withRcBasisGapFindings(
+      [],
+      { status: 'unavailable' },
+      evidence,
+    )).toEqual([])
+  })
+
+  it('blocks an unavailable scan when gross reverse-charge input activity exists', () => {
+    const evidence: RcGapDowngradeEvidence = {
+      ...makeEvidence({}, {}),
+      rcInputAccountTotals: new Map([
+        ['2645', { debit: 250, credit: 250 }],
+      ]),
+    }
+    const result = withRcBasisGapFindings([], { status: 'unavailable' }, evidence)
+    expect(result[0].status).toBe('ERROR')
   })
 
   it('does not stack on top of a finding that already blocks', () => {
@@ -346,10 +370,10 @@ describe('rcBasisGapFinding', () => {
 })
 
 describe('rcBasisScanUnavailableFinding', () => {
-  it('is a warning that admits it does not know, and points at the worklist', () => {
+  it('fails closed and tells the user to retry the unavailable check', () => {
     const finding = rcBasisScanUnavailableFinding()
-    expect(finding.status).toBe('WARNING')
+    expect(finding.status).toBe('ERROR')
     expect(finding.message).toContain('kunde inte köras')
-    expect(finding.message).toContain('listan nedan')
+    expect(finding.message).toContain('Ladda om sidan')
   })
 })

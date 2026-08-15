@@ -28,9 +28,14 @@ vi.mock('@/lib/auth/require-write', () => ({
   requireWritePermission: vi.fn().mockResolvedValue({ ok: true }),
 }))
 
+vi.mock('@/lib/mileage/mileage-service', () => ({
+  deleteDraftSalaryObjectWithMileageRelease: vi.fn(),
+}))
+
 import { DELETE, GET } from '../route'
 import { requireAuth } from '@/lib/auth/require-auth'
 import { encryptPersonnummer } from '@/lib/salary/personnummer'
+import { deleteDraftSalaryObjectWithMileageRelease } from '@/lib/mileage/mileage-service'
 
 // ── Test data ────────────────────────────────────────────────
 
@@ -98,7 +103,7 @@ describe('DELETE /api/salary/runs/[id]', () => {
     expect(body.error).toContain('utkast')
   })
 
-  it('deletes a draft run and returns success', async () => {
+  it('atomically releases exact claims and deletes a draft run', async () => {
     const { supabase, enqueueMany } = createQueuedMockSupabase()
     vi.mocked(requireAuth).mockResolvedValue({
       user: mockUser as never,
@@ -107,16 +112,60 @@ describe('DELETE /api/salary/runs/[id]', () => {
     })
 
     enqueueMany([
-      { data: { id: 'run-1', status: 'draft' } }, // salary_runs lookup
-      { data: null },                              // salary_runs delete (cascade handles children)
+      { data: { id: 'run-1', status: 'draft' } },
     ])
+    vi.mocked(deleteDraftSalaryObjectWithMileageRelease).mockResolvedValue({
+      ok: true,
+      releasedTripCount: 3,
+    })
 
     const request = createMockRequest('/api/salary/runs/run-1', { method: 'DELETE' })
     const response = await DELETE(request, createMockRouteParams({ id: 'run-1' }))
-    const { status, body } = await parseJsonResponse<{ data: { id: string; deleted: boolean } }>(response)
+    const { status, body } = await parseJsonResponse<{
+      data: { id: string; deleted: boolean }
+    }>(response)
 
     expect(status).toBe(200)
     expect(body.data).toEqual({ id: 'run-1', deleted: true })
+    expect(deleteDraftSalaryObjectWithMileageRelease).toHaveBeenCalledWith(
+      supabase,
+      'company-1',
+      'run-1',
+      { kind: 'run', id: 'run-1' },
+    )
+    expect(supabase.from).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not report success when exact release cannot be completed', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    vi.mocked(requireAuth).mockResolvedValue({
+      user: mockUser as never,
+      supabase: supabase as never,
+      error: null,
+    })
+    enqueue({ data: { id: 'run-1', status: 'draft' } })
+    vi.mocked(deleteDraftSalaryObjectWithMileageRelease).mockResolvedValue({
+      ok: false,
+      code: 'MILEAGE_CLAIM_RELEASE_INCOMPLETE',
+      details: { expected_trip_count: 3, released_trip_count: 2 },
+    })
+
+    const response = await DELETE(
+      createMockRequest('/api/salary/runs/run-1', { method: 'DELETE' }),
+      createMockRouteParams({ id: 'run-1' }),
+    )
+    const { status, body } = await parseJsonResponse<{
+      error: { code: string; details: Record<string, unknown> }
+    }>(response)
+    expect(status).toBe(500)
+    expect(body.error).toMatchObject({
+      code: 'MILEAGE_CLAIM_RELEASE_INCOMPLETE',
+      details: {
+        expected_trip_count: 3,
+        released_trip_count: 2,
+        retryable: false,
+      },
+    })
   })
 })
 

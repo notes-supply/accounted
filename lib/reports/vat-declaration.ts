@@ -7,6 +7,103 @@ import type {
 import type { VatCheckAccountTotals } from './vat-declaration-checks'
 import { rcBasisTotalsByRate } from './vat-filing-gate'
 import { fetchDynamicVatAccounts, type DynamicVatAccounts } from './vat-revenue-accounts'
+import { ISO_DATE_RE } from '@/lib/invariants'
+import { roundOre } from '@/lib/money'
+import { fetchAllRows } from '@/lib/supabase/fetch-all'
+
+const VAT_PERIOD_TYPES = ['monthly', 'quarterly', 'yearly'] as const
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+export interface VatPeriodInput {
+  periodType: VatPeriodType
+  year: number
+  period: number
+  fiscalPeriodId?: string
+}
+
+export interface VatResolvedPeriod {
+  type: VatPeriodType
+  year: number
+  period: number
+  start: string
+  end: string
+  originalStart: string
+  originalEnd: string
+  fiscalPeriodId: string | null
+  fiscalPeriodStart: string | null
+  fiscalPeriodEnd: string | null
+  vatLiabilityStartDate: string | null
+}
+
+export type VatDeclarationWithIdentity = Omit<VatDeclaration, 'period'> & {
+  period: VatResolvedPeriod
+}
+
+export interface VatControlledInputEntry {
+  entryId: string
+  entryDate: string
+  debit: number
+  credit: number
+}
+
+export interface VatControlledInputLineageConsumer {
+  resolveControlledInputVat(input: {
+    companyId: string
+    start: string
+    end: string
+  }): Promise<{ entries: VatControlledInputEntry[] }>
+}
+
+export interface VatControlledInputProjection {
+  debit: number
+  credit: number
+  acceptedEntryIds: string[]
+}
+
+function parseStrictInteger(value: unknown, field: string): number {
+  if (
+    (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value))
+    && (typeof value !== 'string' || !/^\d+$/.test(value))
+  ) {
+    throw new Error(`Invalid VAT ${field}`)
+  }
+  const parsed = typeof value === 'number' ? value : Number(value)
+  if (!Number.isSafeInteger(parsed)) throw new Error(`Invalid VAT ${field}`)
+  if (typeof value === 'string' && String(parsed) !== value) {
+    throw new Error(`Invalid VAT ${field}`)
+  }
+  return parsed
+}
+
+export function parseVatPeriodInput(input: {
+  periodType: unknown
+  year: unknown
+  period: unknown
+  fiscalPeriodId?: unknown
+}): VatPeriodInput {
+  if (!VAT_PERIOD_TYPES.includes(input.periodType as VatPeriodType)) {
+    throw new Error('Invalid VAT period type')
+  }
+  const periodType = input.periodType as VatPeriodType
+  const year = parseStrictInteger(input.year, 'year')
+  const period = parseStrictInteger(input.period, 'period')
+  if (year < 2000 || year > 2100) throw new Error('Invalid VAT year')
+  const maximum = periodType === 'monthly' ? 12 : periodType === 'quarterly' ? 4 : 1
+  if (period < 1 || period > maximum) throw new Error('Invalid VAT period')
+
+  const fiscalPeriodId = input.fiscalPeriodId
+  if (fiscalPeriodId !== undefined && fiscalPeriodId !== null && fiscalPeriodId !== '') {
+    if (typeof fiscalPeriodId !== 'string' || !UUID_PATTERN.test(fiscalPeriodId)) {
+      throw new Error('Invalid VAT fiscal period id')
+    }
+    if (periodType !== 'yearly') {
+      throw new Error('Fiscal period id is only valid for yearly VAT')
+    }
+    return { periodType, year, period, fiscalPeriodId }
+  }
+  return { periodType, year, period }
+}
 
 /**
  * Calculate VAT declaration (Momsdeklaration) for a given period.
@@ -84,7 +181,6 @@ export const ACCOUNT_RUTA: Record<string, { box: keyof VatDeclarationRutor; side
   '2645': { box: 'ruta48', side: 'debit' },   // Förvärv utlandet (EU/non-EU RC)
   '2646': { box: 'ruta48', side: 'debit' },   // Uthyrning
   '2647': { box: 'ruta48', side: 'debit' },   // Omvänd skattskyldighet i Sverige
-  '2648': { box: 'ruta48', side: 'debit' },   // Vilande ingående moms vid bokslut
   '2649': { box: 'ruta48', side: 'debit' },   // Blandad verksamhet
   // Import VAT (since 2015, via momsdeklaration) → ruta 60/61/62
   '2615': { box: 'ruta60', side: 'credit' },  // Import 25%
@@ -137,6 +233,15 @@ export const ACCOUNT_RUTA: Record<string, { box: keyof VatDeclarationRutor; side
   '4547': { box: 'ruta50', side: 'debit' },   // Beskattningsunderlag import 6%
 }
 
+const CONTROLLED_INPUT_VAT_KEY = '__controlled_2648__'
+const RUTA_PROJECTION: Record<string, {
+  box: keyof VatDeclarationRutor
+  side: 'credit' | 'debit'
+}> = {
+  ...ACCOUNT_RUTA,
+  [CONTROLLED_INPUT_VAT_KEY]: { box: 'ruta48', side: 'debit' },
+}
+
 const VAT_ACCOUNTS = Object.keys(ACCOUNT_RUTA)
 
 /**
@@ -178,42 +283,24 @@ export function calculatePeriodDates(
   year: number,
   period: number
 ): { start: string; end: string } {
-  let startMonth: number
-  let endMonth: number
-
-  switch (periodType) {
-    case 'monthly':
-      // period is 1-12
-      startMonth = period
-      endMonth = period
-      break
-    case 'quarterly':
-      // period is 1-4
-      startMonth = (period - 1) * 3 + 1
-      endMonth = period * 3
-      break
-    case 'yearly':
-      // period is 1
-      startMonth = 1
-      endMonth = 12
-      break
-    default:
-      startMonth = 1
-      endMonth = 12
-  }
-
-  const startDate = new Date(year, startMonth - 1, 1)
-  const endDate = new Date(year, endMonth, 0) // Last day of end month
+  const validated = parseVatPeriodInput({ periodType, year, period })
+  const startMonth = validated.periodType === 'monthly'
+    ? validated.period
+    : validated.periodType === 'quarterly'
+      ? (validated.period - 1) * 3 + 1
+      : 1
+  const endMonth = validated.periodType === 'monthly'
+    ? validated.period
+    : validated.periodType === 'quarterly'
+      ? validated.period * 3
+      : 12
 
   return {
-    start: formatDate(startDate),
-    end: formatDate(endDate),
+    start: formatDate(new Date(validated.year, startMonth - 1, 1)),
+    end: formatDate(new Date(validated.year, endMonth, 0)),
   }
 }
 
-/**
- * Format date as YYYY-MM-DD
- */
 function formatDate(date: Date): string {
   const y = date.getFullYear()
   const m = String(date.getMonth() + 1).padStart(2, '0')
@@ -221,29 +308,42 @@ function formatDate(date: Date): string {
   return `${y}-${m}-${d}`
 }
 
-/**
- * Round to 2 decimal places
- */
 function round(value: number): number {
-  return Math.round(value * 100) / 100
+  return roundOre(value)
 }
 
-/**
- * Resolve the start/end dates for a VAT period.
- *
- * Monthly and quarterly VAT periods are always calendar months/quarters
- * (kalendermånad / kalenderkvartal per SFL 26 kap), so they use the plain
- * calendar calculation.
- *
- * Annual VAT (helårsmoms), however, is reported per *räkenskapsår* (the
- * beskattningsår), not per calendar year (SFL 26 kap 10-11 §§). A räkenskapsår
- * can be extended or shortened (up to 18 months for a first/changed year per
- * BFL 3 kap 3 §), so a calendar Jan-Dec span would silently drop part of an
- * extended year (e.g. a first year 2025-07-03 → 2026-12-31). When the caller
- * supplies the fiscal period we therefore use its actual bounds. If the period
- * can't be resolved we fall back to the calendar span so behaviour degrades
- * gracefully instead of erroring.
- */
+function assertIsoDate(value: unknown, field: string): asserts value is string {
+  if (typeof value !== 'string' || !ISO_DATE_RE.test(value)) {
+    throw new Error(`Invalid ${field}`)
+  }
+  const [year, month, day] = value.split('-').map(Number)
+  const parsed = new Date(Date.UTC(year, month - 1, day))
+  if (
+    parsed.getUTCFullYear() !== year
+    || parsed.getUTCMonth() !== month - 1
+    || parsed.getUTCDate() !== day
+  ) {
+    throw new Error(`Invalid ${field}`)
+  }
+}
+
+async function resolveVatLiabilityStart(
+  supabase: SupabaseClient,
+  companyId: string,
+): Promise<string | null> {
+  const { data, error } = await supabase
+    .from('company_settings')
+    .select('vat_liability_start_date')
+    .eq('company_id', companyId)
+    .maybeSingle()
+  if (error) throw new Error(`Failed to resolve VAT liability start: ${error.message}`)
+  if (!data) throw new Error('Company VAT liability settings are unavailable')
+  const value = data.vat_liability_start_date as unknown
+  if (value === null) return null
+  assertIsoDate(value, 'VAT liability start date')
+  return value
+}
+
 export async function resolvePeriodDates(
   supabase: SupabaseClient,
   companyId: string,
@@ -251,40 +351,84 @@ export async function resolvePeriodDates(
   year: number,
   period: number,
   fiscalPeriodId?: string
-): Promise<{ start: string; end: string }> {
-  if (periodType === 'yearly') {
-    if (fiscalPeriodId) {
-      const { data: fp } = await supabase
+): Promise<VatResolvedPeriod> {
+  const validated = parseVatPeriodInput({ periodType, year, period, fiscalPeriodId })
+  let original = calculatePeriodDates(
+    validated.periodType,
+    validated.year,
+    validated.period,
+  )
+  let resolvedFiscalPeriodId: string | null = null
+
+  if (validated.periodType === 'yearly') {
+    let rows: Array<{ id: string; period_start: string; period_end: string }> = []
+    if (validated.fiscalPeriodId) {
+      const { data, error } = await supabase
         .from('fiscal_periods')
-        .select('period_start, period_end')
-        .eq('id', fiscalPeriodId)
+        .select('id, period_start, period_end')
+        .eq('id', validated.fiscalPeriodId)
         .eq('company_id', companyId)
         .maybeSingle()
-      if (fp?.period_start && fp?.period_end) {
-        return { start: fp.period_start, end: fp.period_end }
-      }
+      if (error) throw new Error(`Failed to resolve annual fiscal period: ${error.message}`)
+      if (data) rows = [data]
     } else {
-      // No explicit fiscal period: resolve the räkenskapsår ending in `year`
-      // instead of assuming a calendar FY. Helårsmoms is filed per
-      // räkenskapsår (SFL 26 kap 10-11 §§), so for a broken fiscal year the
-      // calendar-year assumption would put both the redovisningsperiod and
-      // the figures on the wrong period. For calendar-FY companies this
-      // resolves to Jan-Dec of `year`, identical to the arithmetic fallback.
-      const { data: fp } = await supabase
+      const { data, error } = await supabase
         .from('fiscal_periods')
-        .select('period_start, period_end')
+        .select('id, period_start, period_end')
         .eq('company_id', companyId)
-        .gte('period_end', `${year}-01-01`)
-        .lte('period_end', `${year}-12-31`)
+        .gte('period_end', `${validated.year}-01-01`)
+        .lte('period_end', `${validated.year}-12-31`)
         .order('period_end', { ascending: false })
-        .limit(1)
-        .maybeSingle()
-      if (fp?.period_start && fp?.period_end) {
-        return { start: fp.period_start, end: fp.period_end }
-      }
+        .limit(2)
+      if (error) throw new Error(`Failed to resolve annual fiscal period: ${error.message}`)
+      rows = Array.isArray(data) ? data : data ? [data] : []
     }
+    if (rows.length === 0) throw new Error('Annual fiscal period is unavailable')
+    if (rows.length > 1) {
+      throw new Error('Annual fiscal period is ambiguous; fiscal_period_id is required')
+    }
+    const fiscalPeriod = rows[0]
+    if (typeof fiscalPeriod.id !== 'string' || !UUID_PATTERN.test(fiscalPeriod.id)) {
+      throw new Error('Annual fiscal period identity is invalid')
+    }
+    assertIsoDate(fiscalPeriod.period_start, 'fiscal period start')
+    assertIsoDate(fiscalPeriod.period_end, 'fiscal period end')
+    if (fiscalPeriod.period_start > fiscalPeriod.period_end) {
+      throw new Error('Annual fiscal period bounds are reversed')
+    }
+    if (Number(fiscalPeriod.period_end.slice(0, 4)) !== validated.year) {
+      throw new Error('Annual fiscal period does not end in the requested year')
+    }
+    if (validated.fiscalPeriodId && fiscalPeriod.id !== validated.fiscalPeriodId) {
+      throw new Error('Annual fiscal period identity mismatch')
+    }
+    original = { start: fiscalPeriod.period_start, end: fiscalPeriod.period_end }
+    resolvedFiscalPeriodId = fiscalPeriod.id
   }
-  return calculatePeriodDates(periodType, year, period)
+
+  const vatLiabilityStartDate = await resolveVatLiabilityStart(supabase, companyId)
+  if (vatLiabilityStartDate && original.end < vatLiabilityStartDate) {
+    throw new Error(
+      `Requested VAT period ends before VAT liability starts on ${vatLiabilityStartDate}`,
+    )
+  }
+  const start = vatLiabilityStartDate && vatLiabilityStartDate > original.start
+    ? vatLiabilityStartDate
+    : original.start
+
+  return {
+    type: validated.periodType,
+    year: validated.year,
+    period: validated.period,
+    start,
+    end: original.end,
+    originalStart: original.start,
+    originalEnd: original.end,
+    fiscalPeriodId: resolvedFiscalPeriodId,
+    fiscalPeriodStart: resolvedFiscalPeriodId ? original.start : null,
+    fiscalPeriodEnd: resolvedFiscalPeriodId ? original.end : null,
+    vatLiabilityStartDate,
+  }
 }
 
 /**
@@ -328,6 +472,590 @@ interface VatTotalsRpcPayload {
   totals: Array<{ account_number: string; debit: number; credit: number }>
   settlement_shaped_entries: VatSettlementShapedEntry[]
   source_type_counts: Record<string, number>
+}
+const CONTROLLED_INPUT_MAX_ENTRIES = 512
+
+const CONTROLLED_CUTOFF_DESCRIPTION =
+  'Leverantörsskulder vid bokslut (kontantmetoden)'
+const CONTROLLED_REVERSAL_DESCRIPTION =
+  'Vändning leverantörsskulder bokslut (kontantmetoden)'
+const CONTROLLED_LINEAGE_DEPTH = 32
+const CONTROLLED_LINEAGE_BATCH = 100
+const CONTROLLED_ENTRY_SELECT = `
+  id, company_id, status, entry_date, description,
+  source_type, source_id, correction_of_id, reverses_id, reversed_by_id,
+  lines:journal_entry_lines(account_number, debit_amount, credit_amount)
+`
+
+interface ControlledInputLine {
+  account_number: string
+  debit_amount: number
+  credit_amount: number
+}
+
+interface ControlledInputEntryRow {
+  id: string
+  company_id: string
+  status: string
+  entry_date: string
+  description: string
+  source_type: string | null
+  source_id: string | null
+  correction_of_id: string | null
+  reverses_id: string | null
+  reversed_by_id: string | null
+  lines: ControlledInputLine[] | null
+}
+
+interface SharedLineageRow {
+  root_id: string
+  parent_id: string | null
+  edge_kind: 'root' | 'correction' | 'storno'
+  id: string
+  company_id: string
+  entry_date: string
+  status: string
+  source_type: string | null
+  correction_of_id: string | null
+  reverses_id: string | null
+  depth: number
+  path: string[]
+  cycle: boolean
+}
+
+function shiftIsoDate(value: string, days: number): string {
+  const date = new Date(`${value}T00:00:00Z`)
+  date.setUTCDate(date.getUTCDate() + days)
+  return date.toISOString().slice(0, 10)
+}
+
+function controlledLineKey(line: ControlledInputLine, reverse: boolean): string | null {
+  const debit = reverse ? line.credit_amount : line.debit_amount
+  const credit = reverse ? line.debit_amount : line.credit_amount
+  if (
+    typeof line.account_number !== 'string'
+    || typeof debit !== 'number'
+    || !Number.isFinite(debit)
+    || debit < 0
+    || typeof credit !== 'number'
+    || !Number.isFinite(credit)
+    || credit < 0
+    || (debit === 0) === (credit === 0)
+  ) {
+    return null
+  }
+  return JSON.stringify([line.account_number, Math.round(debit * 100), Math.round(credit * 100)])
+}
+
+function hasExactReverse(
+  original: ControlledInputLine[] | null,
+  reversal: ControlledInputLine[] | null,
+): boolean {
+  if (!original?.length || !reversal?.length || original.length !== reversal.length) return false
+  const remaining = new Map<string, number>()
+  for (const line of original) {
+    const key = controlledLineKey(line, true)
+    if (!key) return false
+    remaining.set(key, (remaining.get(key) ?? 0) + 1)
+  }
+  for (const line of reversal) {
+    const key = controlledLineKey(line, false)
+    const count = key ? remaining.get(key) : undefined
+    if (!key || !count) return false
+    if (count === 1) remaining.delete(key)
+    else remaining.set(key, count - 1)
+  }
+  return remaining.size === 0
+}
+
+function hasControlledInputShape(entry: ControlledInputEntryRow, companyId: string): boolean {
+  return (
+    entry.company_id === companyId
+    && entry.source_type === 'year_end'
+    && entry.source_id === null
+    && entry.correction_of_id === null
+    && entry.reverses_id === null
+    && (
+      entry.description === CONTROLLED_CUTOFF_DESCRIPTION
+      || entry.description === CONTROLLED_REVERSAL_DESCRIPTION
+    )
+    && Boolean(entry.lines?.length)
+    && entry.lines!.every((line) => controlledLineKey(line, false) !== null)
+    && entry.lines!.some((line) => line.account_number === '2648')
+    && !entry.lines!.some((line) => VAT_SETTLEMENT_NET_ACCOUNTS.includes(line.account_number))
+  )
+}
+
+function mergeControlledInputEntries(
+  target: Map<string, ControlledInputEntryRow>,
+  rows: ControlledInputEntryRow[],
+): void {
+  for (const row of rows) {
+    const existing = target.get(row.id)
+    if (existing && JSON.stringify(existing) !== JSON.stringify(row)) {
+      throw new Error(`Conflicting controlled input VAT entry ${row.id}`)
+    }
+    target.set(row.id, row)
+  }
+  if (target.size > CONTROLLED_INPUT_MAX_ENTRIES) {
+    throw new Error('Controlled input VAT lineage exceeds the entry bound')
+  }
+}
+
+async function fetchControlledInputEntriesByIds(
+  supabase: SupabaseClient,
+  companyId: string,
+  ids: string[],
+): Promise<ControlledInputEntryRow[]> {
+  const result: ControlledInputEntryRow[] = []
+  const uniqueIds = Array.from(new Set(ids)).sort()
+  for (let offset = 0; offset < uniqueIds.length; offset += CONTROLLED_LINEAGE_BATCH) {
+    const batch = uniqueIds.slice(offset, offset + CONTROLLED_LINEAGE_BATCH)
+    const rows = await fetchAllRows<ControlledInputEntryRow>(({ from, to }) =>
+      supabase
+        .from('journal_entries')
+        .select(CONTROLLED_ENTRY_SELECT)
+        .eq('company_id', companyId)
+        .in('status', ['posted', 'reversed'])
+        .in('id', batch)
+        .order('id', { ascending: true })
+        .range(from, to),
+    )
+    result.push(...rows)
+    if (result.length > CONTROLLED_INPUT_MAX_ENTRIES) {
+      throw new Error('Controlled input VAT lookup exceeds the entry bound')
+    }
+  }
+  return result
+}
+
+function parseSharedLineageRow(value: unknown, companyId: string): SharedLineageRow {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Controlled input VAT lineage response is malformed')
+  }
+  const row = value as Record<string, unknown>
+  if (
+    typeof row.root_id !== 'string'
+    || !UUID_PATTERN.test(row.root_id)
+    || (row.parent_id !== null && (typeof row.parent_id !== 'string' || !UUID_PATTERN.test(row.parent_id)))
+    || !['root', 'correction', 'storno'].includes(String(row.edge_kind))
+    || typeof row.id !== 'string'
+    || !UUID_PATTERN.test(row.id)
+    || row.company_id !== companyId
+    || typeof row.entry_date !== 'string'
+    || !ISO_DATE_RE.test(row.entry_date)
+    || typeof row.status !== 'string'
+    || (row.source_type !== null && typeof row.source_type !== 'string')
+    || (row.correction_of_id !== null && typeof row.correction_of_id !== 'string')
+    || (row.reverses_id !== null && typeof row.reverses_id !== 'string')
+    || !Number.isInteger(row.depth)
+    || !Array.isArray(row.path)
+    || !row.path.every((id) => typeof id === 'string' && UUID_PATTERN.test(id))
+    || typeof row.cycle !== 'boolean'
+  ) {
+    throw new Error('Controlled input VAT lineage response is malformed')
+  }
+  return row as unknown as SharedLineageRow
+}
+
+function verifiedControlledPairIds(
+  roots: ControlledInputEntryRow[],
+  companyId: string,
+): Set<string> {
+  for (const root of roots) {
+    if (
+      !hasControlledInputShape(root, companyId)
+      || !['posted', 'reversed'].includes(root.status)
+    ) {
+      throw new Error(`Controlled input VAT root ${root.id} is malformed`)
+    }
+  }
+  const cutoffs = roots.filter((entry) => entry.description === CONTROLLED_CUTOFF_DESCRIPTION)
+  const reversals = roots.filter((entry) => entry.description === CONTROLLED_REVERSAL_DESCRIPTION)
+  const matchesByCutoff = new Map<string, ControlledInputEntryRow[]>()
+  const matchesByReversal = new Map<string, ControlledInputEntryRow[]>()
+  for (const cutoff of cutoffs) {
+    for (const reversal of reversals) {
+      if (
+        reversal.entry_date === shiftIsoDate(cutoff.entry_date, 1)
+        && hasExactReverse(cutoff.lines, reversal.lines)
+      ) {
+        matchesByCutoff.set(cutoff.id, [...(matchesByCutoff.get(cutoff.id) ?? []), reversal])
+        matchesByReversal.set(
+          reversal.id,
+          [...(matchesByReversal.get(reversal.id) ?? []), cutoff],
+        )
+      }
+    }
+  }
+  const verified = new Set<string>()
+  for (const cutoff of cutoffs) {
+    const matches = matchesByCutoff.get(cutoff.id) ?? []
+    if (matches.length !== 1 || (matchesByReversal.get(matches[0].id) ?? []).length !== 1) {
+      throw new Error(`Controlled input VAT scheduled reversal is ambiguous for ${cutoff.id}`)
+    }
+    verified.add(cutoff.id)
+    verified.add(matches[0].id)
+  }
+  if (reversals.some((reversal) => !verified.has(reversal.id))) {
+    throw new Error('Controlled input VAT scheduled reversal is orphaned')
+  }
+  return verified
+}
+
+function collectAcceptedControlledEntries(
+  id: string,
+  companyId: string,
+  entries: Map<string, ControlledInputEntryRow>,
+  corrections: Map<string, ControlledInputEntryRow[]>,
+  stornos: Map<string, ControlledInputEntryRow[]>,
+  accepted: Set<string>,
+  visiting: Set<string> = new Set(),
+): void {
+  const entry = entries.get(id)
+  if (!entry || visiting.has(id)) throw new Error('Controlled input VAT lineage is malformed')
+  const correctionChildren = corrections.get(id) ?? []
+  const stornoChildren = stornos.get(id) ?? []
+  if (entry.status === 'posted') {
+    if (entry.reversed_by_id !== null || correctionChildren.length || stornoChildren.length) {
+      throw new Error(`Controlled input VAT lineage is contradictory for ${id}`)
+    }
+    accepted.add(id)
+    return
+  }
+  if (
+    entry.status !== 'reversed'
+    || !entry.reversed_by_id
+    || correctionChildren.length > 1
+    || stornoChildren.length !== 1
+  ) {
+    throw new Error(`Controlled input VAT lineage is incomplete for ${id}`)
+  }
+  const storno = stornoChildren[0]
+  if (
+    storno.id !== entry.reversed_by_id
+    || storno.company_id !== companyId
+    || storno.status !== 'posted'
+    || storno.source_type !== 'storno'
+    || storno.source_id !== null
+    || storno.correction_of_id !== null
+    || storno.reverses_id !== entry.id
+    || storno.reversed_by_id !== null
+    || storno.description !== `Makulering: ${entry.description}`
+    || !hasExactReverse(entry.lines, storno.lines)
+  ) {
+    throw new Error(`Controlled input VAT storno ${storno.id} is malformed`)
+  }
+  accepted.add(entry.id)
+  accepted.add(storno.id)
+  const correction = correctionChildren[0]
+  if (!correction) return
+  if (
+    correction.company_id !== companyId
+    || correction.source_type !== 'correction'
+    || correction.source_id !== null
+    || correction.correction_of_id !== entry.id
+    || correction.reverses_id !== null
+    || storno.entry_date !== entry.entry_date
+    || !correction.lines?.length
+    || !correction.lines.every((line) => controlledLineKey(line, false) !== null)
+  ) {
+    throw new Error(`Controlled input VAT correction ${correction.id} is malformed`)
+  }
+  collectAcceptedControlledEntries(
+    correction.id,
+    companyId,
+    entries,
+    corrections,
+    stornos,
+    accepted,
+    new Set([...visiting, id]),
+  )
+}
+
+/**
+ * Adapt the shared, company-scoped journal lineage RPC to the narrow ruta 48
+ * contract. Only verified cash-method cutoff and next-day reversal pairs,
+ * including their complete correction/storno closure, are admitted.
+ */
+export function createSharedLineageVatConsumer(
+  supabase: SupabaseClient,
+): VatControlledInputLineageConsumer {
+  return {
+    async resolveControlledInputVat({ companyId, start, end }) {
+      try {
+        const anchors = await fetchAllRows<ControlledInputEntryRow>(({ from, to }) =>
+          supabase
+            .from('journal_entries')
+            .select(`${CONTROLLED_ENTRY_SELECT}, vat_lines:journal_entry_lines!inner(id)`)
+            .eq('company_id', companyId)
+            .in('status', ['posted', 'reversed'])
+            .in('source_type', ['year_end', 'correction', 'storno'])
+            .gte('entry_date', shiftIsoDate(start, -1))
+            .lte('entry_date', shiftIsoDate(end, 1))
+            .eq('vat_lines.account_number', '2648')
+            .order('id', { ascending: true })
+            .range(from, to),
+        )
+        if (anchors.length > CONTROLLED_INPUT_MAX_ENTRIES) {
+          throw new Error('Controlled input VAT lookup exceeds the entry bound')
+        }
+        if (anchors.length === 0) return { entries: [] }
+
+        const entries = new Map<string, ControlledInputEntryRow>()
+        mergeControlledInputEntries(entries, anchors)
+        let parentIds = Array.from(new Set(anchors.flatMap((entry) =>
+          [entry.correction_of_id, entry.reverses_id].filter((id): id is string => id !== null),
+        )))
+        const visitedParents = new Set<string>()
+        for (let depth = 0; parentIds.length > 0 && depth <= CONTROLLED_LINEAGE_DEPTH; depth++) {
+          const unresolved = parentIds.filter((id) => !visitedParents.has(id))
+          if (unresolved.length === 0) break
+          if (depth === CONTROLLED_LINEAGE_DEPTH) {
+            throw new Error('Controlled input VAT ancestry exceeds the depth bound')
+          }
+          unresolved.forEach((id) => visitedParents.add(id))
+          mergeControlledInputEntries(
+            entries,
+            await fetchControlledInputEntriesByIds(supabase, companyId, unresolved),
+          )
+          if (unresolved.some((id) => !entries.has(id))) {
+            throw new Error('Controlled input VAT ancestor is unavailable')
+          }
+          parentIds = Array.from(new Set(unresolved.flatMap((id) => {
+            const entry = entries.get(id)!
+            return [entry.correction_of_id, entry.reverses_id]
+              .filter((parentId): parentId is string => parentId !== null)
+          })))
+        }
+
+        const discoveredRoots = [...entries.values()].filter((entry) =>
+          entry.source_type === 'year_end'
+          && (
+            entry.description === CONTROLLED_CUTOFF_DESCRIPTION
+            || entry.description === CONTROLLED_REVERSAL_DESCRIPTION
+          ),
+        )
+        if (discoveredRoots.length === 0) return { entries: [] }
+        const companionDates = Array.from(new Set(discoveredRoots.flatMap((entry) => [
+          shiftIsoDate(entry.entry_date, -1),
+          entry.entry_date,
+          shiftIsoDate(entry.entry_date, 1),
+        ])))
+        for (
+          let offset = 0;
+          offset < companionDates.length;
+          offset += CONTROLLED_LINEAGE_BATCH
+        ) {
+          const dates = companionDates.slice(offset, offset + CONTROLLED_LINEAGE_BATCH)
+          const companions = await fetchAllRows<ControlledInputEntryRow>(({ from, to }) =>
+            supabase
+              .from('journal_entries')
+              .select(`${CONTROLLED_ENTRY_SELECT}, vat_lines:journal_entry_lines!inner(id)`)
+              .eq('company_id', companyId)
+              .in('status', ['posted', 'reversed'])
+              .eq('source_type', 'year_end')
+              .in('description', [CONTROLLED_CUTOFF_DESCRIPTION, CONTROLLED_REVERSAL_DESCRIPTION])
+              .in('entry_date', dates)
+              .eq('vat_lines.account_number', '2648')
+              .order('id', { ascending: true })
+              .range(from, to),
+          )
+          mergeControlledInputEntries(entries, companions)
+        }
+        const roots = [...entries.values()].filter((entry) =>
+          entry.source_type === 'year_end'
+          && (
+            entry.description === CONTROLLED_CUTOFF_DESCRIPTION
+            || entry.description === CONTROLLED_REVERSAL_DESCRIPTION
+          ),
+        )
+        const verifiedRoots = verifiedControlledPairIds(roots, companyId)
+        const rootIds = [...verifiedRoots].sort()
+        const lineageRows: SharedLineageRow[] = []
+        for (let offset = 0; offset < rootIds.length; offset += CONTROLLED_LINEAGE_BATCH) {
+          const batch = rootIds.slice(offset, offset + CONTROLLED_LINEAGE_BATCH)
+          const { data, error } = await supabase.rpc('get_journal_lineage', {
+            p_company_id: companyId,
+            p_root_ids: batch,
+          })
+          if (error) throw new Error(`Shared journal lineage failed: ${error.message}`)
+          if (!data || typeof data !== 'object' || Array.isArray(data)) {
+            throw new Error('Controlled input VAT lineage response is malformed')
+          }
+          const payload = data as Record<string, unknown>
+          if (
+            payload.valid !== true
+            || payload.company_id !== companyId
+            || payload.requested_root_count !== batch.length
+            || !Array.isArray(payload.rows)
+          ) {
+            throw new Error('Controlled input VAT lineage response is malformed')
+          }
+          const batchRoots = new Set(batch)
+          for (const value of payload.rows) {
+            const row = parseSharedLineageRow(value, companyId)
+            if (
+              !batchRoots.has(row.root_id)
+              || row.path[0] !== row.root_id
+              || row.path.at(-1) !== row.id
+              || row.path.length !== row.depth + 1
+              || row.cycle
+            ) {
+              throw new Error('Controlled input VAT lineage response is malformed')
+            }
+            lineageRows.push(row)
+          }
+        }
+        if (lineageRows.length > CONTROLLED_INPUT_MAX_ENTRIES) {
+          throw new Error('Controlled input VAT lineage exceeds the entry bound')
+        }
+        const lineageIds = Array.from(new Set(lineageRows.map((row) => row.id)))
+        mergeControlledInputEntries(
+          entries,
+          await fetchControlledInputEntriesByIds(
+            supabase,
+            companyId,
+            lineageIds.filter((id) => !entries.has(id)),
+          ),
+        )
+        if (lineageIds.some((id) => !entries.has(id))) {
+          throw new Error('Controlled input VAT lineage entry is unavailable')
+        }
+
+        const corrections = new Map<string, ControlledInputEntryRow[]>()
+        const stornos = new Map<string, ControlledInputEntryRow[]>()
+        const resolvedRoots = new Set<string>()
+        for (const row of lineageRows) {
+          const entry = entries.get(row.id)!
+          if (
+            entry.entry_date !== row.entry_date
+            || entry.status !== row.status
+            || entry.source_type !== row.source_type
+            || entry.correction_of_id !== row.correction_of_id
+            || entry.reverses_id !== row.reverses_id
+          ) {
+            throw new Error('Controlled input VAT evidence changed')
+          }
+          if (row.edge_kind === 'root') {
+            if (row.parent_id !== null || row.depth !== 0 || row.id !== row.root_id) {
+              throw new Error('Controlled input VAT lineage root is malformed')
+            }
+            resolvedRoots.add(row.root_id)
+            continue
+          }
+          if (!row.parent_id) throw new Error('Controlled input VAT lineage is orphaned')
+          const target = row.edge_kind === 'correction' ? corrections : stornos
+          target.set(row.parent_id, [...(target.get(row.parent_id) ?? []), entry])
+        }
+        if (rootIds.some((id) => !resolvedRoots.has(id))) {
+          throw new Error('Controlled input VAT lineage root is unavailable')
+        }
+        if (
+          [...corrections.values(), ...stornos.values()].some((children) => children.length > 1)
+        ) {
+          throw new Error('Controlled input VAT lineage is ambiguous')
+        }
+
+        const accepted = new Set<string>()
+        for (const rootId of verifiedRoots) {
+          collectAcceptedControlledEntries(
+            rootId,
+            companyId,
+            entries,
+            corrections,
+            stornos,
+            accepted,
+          )
+        }
+        const acceptedEntries: VatControlledInputEntry[] = []
+        for (const id of accepted) {
+          const entry = entries.get(id)
+          if (!entry || entry.entry_date < start || entry.entry_date > end) continue
+          let debit = 0
+          let credit = 0
+          for (const line of entry.lines ?? []) {
+            if (line.account_number !== '2648') continue
+            debit = roundOre(debit + line.debit_amount)
+            credit = roundOre(credit + line.credit_amount)
+          }
+          if (debit !== 0 || credit !== 0) {
+            acceptedEntries.push({ entryId: id, entryDate: entry.entry_date, debit, credit })
+          }
+        }
+        return { entries: acceptedEntries }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        throw new Error(`Controlled input VAT lineage evidence is unavailable: ${message}`)
+      }
+    },
+  }
+}
+
+
+export async function resolveControlledInputVatProjection(
+  supabase: SupabaseClient,
+  companyId: string,
+  start: string,
+  end: string,
+  consumer?: VatControlledInputLineageConsumer,
+): Promise<VatControlledInputProjection> {
+  const { data: candidates, error: candidateError } = await supabase
+    .from('journal_entries')
+    .select('id, vat_lines:journal_entry_lines!inner(id)')
+    .eq('company_id', companyId)
+    .in('status', ['posted', 'reversed'])
+    .in('source_type', ['year_end', 'correction', 'storno'])
+    .gte('entry_date', start)
+    .lte('entry_date', end)
+    .eq('vat_lines.account_number', '2648')
+    .limit(1)
+  if (candidateError) {
+    throw new Error(`Controlled input VAT discovery failed: ${candidateError.message}`)
+  }
+  if (!candidates || candidates.length === 0) {
+    return { debit: 0, credit: 0, acceptedEntryIds: [] }
+  }
+  if (!consumer) {
+    throw new Error('Controlled input VAT lineage evidence is unavailable')
+  }
+
+  const result = await consumer.resolveControlledInputVat({ companyId, start, end })
+  if (!result || !Array.isArray(result.entries)) {
+    throw new Error('Controlled input VAT lineage response is malformed')
+  }
+  if (result.entries.length > CONTROLLED_INPUT_MAX_ENTRIES) {
+    throw new Error('Controlled input VAT lineage response exceeds the entry bound')
+  }
+
+  let debit = 0
+  let credit = 0
+  const acceptedEntryIds = new Set<string>()
+  for (const entry of result.entries) {
+    if (
+      !entry
+      || typeof entry.entryId !== 'string'
+      || !UUID_PATTERN.test(entry.entryId)
+      || typeof entry.entryDate !== 'string'
+      || !ISO_DATE_RE.test(entry.entryDate)
+      || entry.entryDate < start
+      || entry.entryDate > end
+      || typeof entry.debit !== 'number'
+      || !Number.isFinite(entry.debit)
+      || entry.debit < 0
+      || typeof entry.credit !== 'number'
+      || !Number.isFinite(entry.credit)
+      || entry.credit < 0
+      || acceptedEntryIds.has(entry.entryId)
+    ) {
+      throw new Error('Controlled input VAT lineage response is malformed')
+    }
+    acceptedEntryIds.add(entry.entryId)
+    debit = round(debit + entry.debit)
+    credit = round(credit + entry.credit)
+  }
+
+  return { debit, credit, acceptedEntryIds: [...acceptedEntryIds].sort() }
 }
 
 /**
@@ -435,7 +1163,7 @@ export function rutorFromTotals(
     ruta50: 0, ruta60: 0, ruta61: 0, ruta62: 0,
   }
 
-  for (const [account, mapping] of Object.entries(ACCOUNT_RUTA)) {
+  for (const [account, mapping] of Object.entries(RUTA_PROJECTION)) {
     const t = totals.get(account)
     if (!t) continue
     const balance = mapping.side === 'credit'
@@ -521,27 +1249,42 @@ export async function calculateVatDeclaration(
   periodType: VatPeriodType,
   year: number,
   period: number,
-  options: { fiscalPeriodId?: string } = {}
-): Promise<VatDeclaration> {
-  // For yearly VAT this resolves to the räkenskapsår bounds (when a fiscal
-  // period is supplied), not the calendar year: see resolvePeriodDates.
-  const { start, end } = await resolvePeriodDates(
-    supabase, companyId, periodType, year, period, options.fiscalPeriodId
+  options: {
+    fiscalPeriodId?: string
+    controlledInputVatConsumer?: VatControlledInputLineageConsumer | null
+  } = {}
+): Promise<VatDeclarationWithIdentity> {
+  const validated = parseVatPeriodInput({
+    periodType,
+    year,
+    period,
+    fiscalPeriodId: options.fiscalPeriodId,
+  })
+  const resolvedPeriod = await resolvePeriodDates(
+    supabase,
+    companyId,
+    validated.periodType,
+    validated.year,
+    validated.period,
+    validated.fiscalPeriodId,
   )
+  const { start, end } = resolvedPeriod
 
-  // Which of the company's OWN class 3 accounts count as momspliktig
-  // försäljning. Resolved from their "Standard moms" rather than a fixed BAS
-  // list, because Accounted seeds no varugrupp accounts: every 3011/3013-style
-  // konto is user-added and would otherwise never be fetched at all (#1261).
   const dynamicVatAccounts = await fetchDynamicVatAccounts(supabase, companyId)
+  const [{ totals, sourceTypeCounts }, controlledInputVat] = await Promise.all([
+    fetchVatAccountTotals(supabase, companyId, start, end, dynamicVatAccounts.accounts),
+    resolveControlledInputVatProjection(
+      supabase,
+      companyId,
+      start,
+      end,
+      options.controlledInputVatConsumer === null
+        ? undefined
+        : options.controlledInputVatConsumer ?? createSharedLineageVatConsumer(supabase),
+    ),
+  ])
+  totals.set(CONTROLLED_INPUT_VAT_KEY, controlledInputVat)
 
-  // Fetch and aggregate posted VAT-account activity for the period. The same
-  // RPC round trip carries the per-source_type entry counts for the metadata.
-  const { totals, sourceTypeCounts } = await fetchVatAccountTotals(
-    supabase, companyId, start, end, dynamicVatAccounts.accounts
-  )
-
-  // Map account balances to momsdeklaration boxes
   const rutor = rutorFromTotals(totals, dynamicVatAccounts)
 
   // Compute per-rate base amounts from individual revenue accounts. The
@@ -597,7 +1340,7 @@ export async function calculateVatDeclaration(
   }
 
   return {
-    period: { type: periodType, year, period, start, end },
+    period: resolvedPeriod,
     rutor,
     // The 2645/2647 pair travels with the declaration so an HTTP caller can run
     // the sharp RC_INPUT_VAT_MISMATCH comparison instead of the ruta 48

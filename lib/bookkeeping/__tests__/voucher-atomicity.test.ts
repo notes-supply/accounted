@@ -1,9 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import type { JournalEntryStatus } from '@/types'
 
-// Mock event bus
+const emit = vi.hoisted(() => vi.fn().mockResolvedValue([]))
 vi.mock('@/lib/events', () => ({
-  eventBus: { emit: vi.fn().mockResolvedValue([]) },
+  eventBus: { emit },
 }))
 
 vi.mock('@/lib/logger', () => ({
@@ -17,7 +17,10 @@ vi.mock('@/lib/logger', () => ({
 
 import { commitEntry, getNextVoucherNumber, createJournalEntry } from '../engine'
 import { runWithActor } from '../actor-context-node'
-import { BookkeepingDatabaseError } from '../errors'
+import {
+  AmbiguousJournalCommitError,
+  BookkeepingDatabaseError,
+} from '../errors'
 
 describe('voucher number atomicity', () => {
   beforeEach(() => {
@@ -59,9 +62,20 @@ describe('voucher number atomicity', () => {
    * If the RPC fails (e.g., balance trigger rejection), the sequence increment
    * rolls back: no burned number, no gap.
    */
-  it('commitEntry RPC failure does not burn a sequence number', async () => {
+  it('commitEntry RPC failure readback confirms no sequence number burned', async () => {
+    const draftEntry = {
+      id: 'entry-1',
+      company_id: 'co-1',
+      status: 'draft' as JournalEntryStatus,
+      voucher_number: 0,
+      lines: [],
+    }
+    const chain: Record<string, unknown> = {}
+    chain.select = vi.fn().mockReturnValue(chain)
+    chain.eq = vi.fn().mockReturnValue(chain)
+    chain.single = vi.fn().mockResolvedValue({ data: draftEntry, error: null })
     const supabase = {
-      from: vi.fn(),
+      from: vi.fn().mockReturnValue(chain),
       rpc: vi.fn().mockResolvedValue({
         data: null,
         error: { message: 'Journal entry is not balanced: debit=1000 credit=500' },
@@ -72,8 +86,6 @@ describe('voucher number atomicity', () => {
       commitEntry(supabase as never, 'co-1', 'user-1', 'entry-1')
     ).rejects.toThrow(BookkeepingDatabaseError)
 
-    // The atomic RPC was called: it failed, rolling back both the
-    // sequence increment and the status update. No burned number.
     expect(supabase.rpc).toHaveBeenCalledWith('commit_journal_entry', {
       p_company_id: 'co-1',
       p_entry_id: 'entry-1',
@@ -82,12 +94,59 @@ describe('voucher number atomicity', () => {
       p_actor_type: null,
       p_actor_label: null,
     })
+    expect(supabase.from).toHaveBeenCalledWith('journal_entries')
+    expect(chain.eq).toHaveBeenCalledWith('id', 'entry-1')
+    expect(chain.eq).toHaveBeenCalledWith('company_id', 'co-1')
+  })
 
-    // No line/entry fetch happened: the RPC handles everything atomically.
-    // (PR10: commitEntry now also probes account_dimension_rules first; the
-    // bare mock makes that probe fail open, which is exactly the posture.)
-    expect(supabase.from).not.toHaveBeenCalledWith('journal_entries')
-    expect(supabase.from).not.toHaveBeenCalledWith('journal_entry_lines')
+  it('returns a typed ambiguous outcome when the RPC error readback is posted', async () => {
+    const postedEntry = {
+      id: 'entry-1',
+      company_id: 'co-1',
+      status: 'posted' as JournalEntryStatus,
+      voucher_number: 17,
+      lines: [],
+    }
+    const chain: Record<string, unknown> = {}
+    chain.select = vi.fn().mockReturnValue(chain)
+    chain.eq = vi.fn().mockReturnValue(chain)
+    chain.single = vi.fn().mockResolvedValue({ data: postedEntry, error: null })
+    const supabase = {
+      from: vi.fn().mockReturnValue(chain),
+      rpc: vi.fn().mockResolvedValue({
+        data: null,
+        error: { message: 'connection lost after commit' },
+      }),
+    }
+
+    await expect(
+      commitEntry(supabase as never, 'co-1', 'user-1', 'entry-1')
+    ).resolves.toEqual(postedEntry)
+  })
+
+  it('reports the exact recovery identity when durable state cannot be read', async () => {
+    const chain: Record<string, unknown> = {}
+    chain.select = vi.fn().mockReturnValue(chain)
+    chain.eq = vi.fn().mockReturnValue(chain)
+    chain.single = vi.fn().mockResolvedValue({
+      data: null,
+      error: { message: 'readback unavailable' },
+    })
+    const supabase = {
+      from: vi.fn().mockReturnValue(chain),
+      rpc: vi.fn().mockResolvedValue({
+        data: [{ voucher_number: 17 }],
+        error: { message: 'connection lost after commit' },
+      }),
+    }
+
+    await expect(
+      commitEntry(supabase as never, 'co-1', 'user-1', 'entry-1')
+    ).rejects.toMatchObject({
+      code: 'AMBIGUOUS_JOURNAL_COMMIT',
+      journalEntryId: 'entry-1',
+      voucherNumber: 17,
+    } satisfies Partial<AmbiguousJournalCommitError>)
   })
 
   it('commitEntry succeeds via atomic RPC and returns posted entry', async () => {
@@ -101,14 +160,12 @@ describe('voucher number atomicity', () => {
       lines: [],
     }
 
+    const chain: Record<string, unknown> = {}
+    chain.select = vi.fn().mockReturnValue(chain)
+    chain.eq = vi.fn().mockReturnValue(chain)
+    chain.single = vi.fn().mockResolvedValue({ data: postedEntry, error: null })
     const supabase = {
-      from: vi.fn().mockImplementation(() => ({
-        select: vi.fn().mockReturnValue({
-          eq: vi.fn().mockReturnValue({
-            single: vi.fn().mockResolvedValue({ data: postedEntry, error: null }),
-          }),
-        }),
-      })),
+      from: vi.fn().mockReturnValue(chain),
       // Atomic RPC returns the assigned voucher number
       rpc: vi.fn().mockResolvedValue({ data: [{ voucher_number: 3 }], error: null }),
     }
@@ -129,11 +186,41 @@ describe('voucher number atomicity', () => {
     expect(supabase.from).toHaveBeenCalledWith('journal_entries')
   })
 
+  it('can defer committed publication to the atomic categorization boundary', async () => {
+    const postedEntry = {
+      id: 'entry-1',
+      company_id: 'co-1',
+      voucher_number: 3,
+      status: 'posted' as JournalEntryStatus,
+      lines: [],
+    }
+    const chain: Record<string, unknown> = {}
+    chain.select = vi.fn().mockReturnValue(chain)
+    chain.eq = vi.fn().mockReturnValue(chain)
+    chain.single = vi.fn().mockResolvedValue({ data: postedEntry, error: null })
+    const supabase = {
+      from: vi.fn().mockReturnValue(chain),
+      rpc: vi.fn().mockResolvedValue({ data: [{ voucher_number: 3 }], error: null }),
+    }
+
+    await commitEntry(
+      supabase as never,
+      'co-1',
+      'user-1',
+      'entry-1',
+      undefined,
+      undefined,
+      { emitCommittedEvent: false },
+    )
+
+    expect(emit).not.toHaveBeenCalled()
+  })
+
   /**
    * Actor attribution (migration 20260619120000): commitEntry forwards the
    * surrounding runWithActor() scope to the RPC so the immutable layer can
    * record WHO relayed the commit. Outside a scope the params stay null
-   * (asserted by the two tests above).
+   * (asserted by the tests above).
    */
   it('commitEntry forwards the runWithActor scope to the RPC', async () => {
     const postedEntry = {
@@ -143,14 +230,12 @@ describe('voucher number atomicity', () => {
       status: 'posted' as JournalEntryStatus,
       lines: [],
     }
+    const chain: Record<string, unknown> = {}
+    chain.select = vi.fn().mockReturnValue(chain)
+    chain.eq = vi.fn().mockReturnValue(chain)
+    chain.single = vi.fn().mockResolvedValue({ data: postedEntry, error: null })
     const supabase = {
-      from: vi.fn().mockImplementation(() => ({
-        select: vi.fn().mockReturnValue({
-          eq: vi.fn().mockReturnValue({
-            single: vi.fn().mockResolvedValue({ data: postedEntry, error: null }),
-          }),
-        }),
-      })),
+      from: vi.fn().mockReturnValue(chain),
       rpc: vi.fn().mockResolvedValue({ data: [{ voucher_number: 1 }], error: null }),
     }
 
@@ -205,7 +290,9 @@ describe('createJournalEntry orphan draft cleanup', () => {
     const draftId = 'entry-1'
     const cancelUpdate = vi.fn().mockReturnValue({
       eq: vi.fn().mockReturnValue({
-        eq: vi.fn().mockResolvedValue({ error: null }),
+        eq: vi.fn().mockReturnValue({
+          eq: vi.fn().mockResolvedValue({ error: null }),
+        }),
       }),
     })
 
@@ -254,8 +341,14 @@ describe('createJournalEntry orphan draft cleanup', () => {
             }),
             select: vi.fn().mockReturnValue({
               eq: vi.fn().mockReturnValue({
+                eq: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({
+                    data: { id: draftId, status: 'draft', voucher_number: 0, lines: [] },
+                    error: null,
+                  }),
+                }),
                 single: vi.fn().mockResolvedValue({
-                  data: { id: draftId, status: 'draft', lines: [] },
+                  data: { id: draftId, status: 'draft', voucher_number: 0, lines: [] },
                   error: null,
                 }),
               }),
@@ -295,7 +388,9 @@ describe('createJournalEntry orphan draft cleanup', () => {
     const firstEq = cancelUpdate.mock.results[0].value.eq
     expect(firstEq).toHaveBeenCalledWith('id', draftId)
     const secondEq = firstEq.mock.results[0].value.eq
-    expect(secondEq).toHaveBeenCalledWith('status', 'draft')
+    expect(secondEq).toHaveBeenCalledWith('company_id', 'co-1')
+    const thirdEq = secondEq.mock.results[0].value.eq
+    expect(thirdEq).toHaveBeenCalledWith('status', 'draft')
   })
 
   it('surfaces original commit error even if cleanup update fails', async () => {
@@ -346,8 +441,14 @@ describe('createJournalEntry orphan draft cleanup', () => {
             }),
             select: vi.fn().mockReturnValue({
               eq: vi.fn().mockReturnValue({
+                eq: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({
+                    data: { id: draftId, status: 'draft', voucher_number: 0, lines: [] },
+                    error: null,
+                  }),
+                }),
                 single: vi.fn().mockResolvedValue({
-                  data: { id: draftId, status: 'draft', lines: [] },
+                  data: { id: draftId, status: 'draft', voucher_number: 0, lines: [] },
                   error: null,
                 }),
               }),

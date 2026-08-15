@@ -1,6 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { validateBalance, getSwedishLocalDate, createDraftEntry, reverseEntry } from '../engine'
 import { BookkeepingDatabaseError, AccountsNotInChartError, CannotReverseStornoError } from '../errors'
+import {
+  applySupplierPaymentReversal,
+  resolveSupplierPaymentLineage,
+} from '@/lib/bookkeeping/payment-sync'
 import type { CreateJournalEntryLineInput, JournalEntryStatus } from '@/types'
 
 // Mock Supabase client for createDraftEntry/reverseEntry tests
@@ -31,6 +35,21 @@ vi.mock('@/lib/events', () => ({
 const mockBackfill = vi.fn().mockResolvedValue([])
 vi.mock('@/lib/bookkeeping/account-backfill', () => ({
   backfillStandardBASAccounts: (...args: unknown[]) => mockBackfill(...args),
+}))
+
+vi.mock('@/lib/bookkeeping/payment-sync', () => ({
+  applySupplierPaymentReversal: vi.fn(),
+  isPaymentSourceType: vi.fn().mockReturnValue(false),
+  resolveSupplierPaymentLineage: vi.fn().mockResolvedValue({
+    company_id: 'company-1',
+    requested_journal_entry_id: 'entry-1',
+    root_journal_entry_id: 'entry-1',
+    live_journal_entry_id: 'entry-1',
+    allocation_owner_journal_entry_id: null,
+    is_supplier_payment: false,
+    nodes: [],
+  }),
+  syncInvoiceStatusFromPaymentEntry: vi.fn().mockResolvedValue(undefined),
 }))
 
 describe('validateBalance', () => {
@@ -481,6 +500,102 @@ describe('createDraftEntry: on-demand BAS account backfill', () => {
     ).rejects.toThrow(AccountsNotInChartError)
 
     expect(mockBackfill).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('reverseEntry: durable supplier delegation', () => {
+  it('propagates an explicit API actor to the M3 boundary', async () => {
+    const original = {
+      id: 'entry-1',
+      company_id: 'company-1',
+      status: 'posted',
+      source_type: 'supplier_invoice_paid',
+      entry_date: '2026-08-15',
+      lines: [],
+    }
+    const reversedOriginal = {
+      ...original,
+      status: 'reversed',
+      reversed_by_id: 'storno-1',
+    }
+    const storno = {
+      id: 'storno-1',
+      company_id: 'company-1',
+      status: 'posted',
+      source_type: 'storno',
+      reverses_id: 'entry-1',
+      lines: [],
+    }
+    vi.mocked(resolveSupplierPaymentLineage).mockResolvedValueOnce({
+      company_id: 'company-1',
+      requested_journal_entry_id: 'entry-1',
+      root_journal_entry_id: 'entry-1',
+      live_journal_entry_id: 'entry-1',
+      allocation_owner_journal_entry_id: 'entry-1',
+      is_supplier_payment: true,
+      nodes: [],
+    })
+    vi.mocked(applySupplierPaymentReversal).mockResolvedValueOnce({
+      status: 'applied',
+      company_id: 'company-1',
+      root_journal_entry_id: 'entry-1',
+      original_journal_entry_id: 'entry-1',
+      reversal_journal_entry_id: 'storno-1',
+      actor_type: 'api_key',
+      actor_id: 'key-1',
+      actor_label: 'Automation key',
+      publications: [
+        {
+          publication_id: 'publication-1',
+          event_key: 'journal:storno-1:committed',
+          event_type: 'journal_entry.committed',
+        },
+        {
+          publication_id: 'publication-2',
+          event_key: 'journal:entry-1:reversed',
+          event_type: 'journal_entry.reversed',
+        },
+      ],
+    })
+    const single = vi.fn()
+      .mockResolvedValueOnce({ data: original, error: null })
+      .mockResolvedValueOnce({ data: reversedOriginal, error: null })
+      .mockResolvedValueOnce({ data: storno, error: null })
+    const chain: Record<string, unknown> = {}
+    chain.select = vi.fn().mockReturnValue(chain)
+    chain.eq = vi.fn().mockReturnValue(chain)
+    chain.single = single
+    const supabase = {
+      from: vi.fn().mockReturnValue(chain),
+    }
+
+    await reverseEntry(
+      supabase as never,
+      'company-1',
+      'fallback-user',
+      'entry-1',
+      undefined,
+      {
+        actor: {
+          actor_type: 'api_key',
+          actor_id: 'key-1',
+          actor_label: 'Automation key',
+        },
+      },
+    )
+
+    expect(applySupplierPaymentReversal).toHaveBeenCalledWith(
+      supabase,
+      expect.objectContaining({
+        companyId: 'company-1',
+        requestedJournalEntryId: 'entry-1',
+        actor: {
+          actor_type: 'api_key',
+          actor_id: 'key-1',
+          actor_label: 'Automation key',
+        },
+      }),
+    )
   })
 })
 

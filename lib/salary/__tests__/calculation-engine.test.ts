@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import {
   calculateSalary,
   calculateKarensavdrag,
@@ -397,6 +397,71 @@ describe('calculateSalary', () => {
     const expectedCost = Math.round((40000 + expectedAvgifter + expectedVacation + expectedVacationAvgifter) * 100) / 100
 
     expect(result.totalEmployerCost).toBe(expectedCost)
+  })
+
+  it('adds tax-free mileage once to net payout and employer cash cost only', () => {
+    const baseline = calculateSalary(makeBasicInput(), config2026, emptyTaxRates)
+    const result = calculateSalary(
+      makeBasicInput({
+        lineItems: [
+          {
+            itemType: 'mileage_taxfree',
+            amount: 250,
+            isTaxable: false,
+            isAvgiftBasis: false,
+            isVacationBasis: false,
+            isGrossDeduction: false,
+            isNetDeduction: false,
+          },
+        ],
+      }),
+      config2026,
+      emptyTaxRates,
+    )
+
+    expect(result.netSalary).toBe(baseline.netSalary + 250)
+    expect(result.totalEmployerCost).toBe(baseline.totalEmployerCost + 250)
+    expect(result.grossSalary).toBe(baseline.grossSalary)
+    expect(result.taxableIncome).toBe(baseline.taxableIncome)
+    expect(result.taxWithheld).toBe(baseline.taxWithheld)
+    expect(result.avgifterBasis).toBe(baseline.avgifterBasis)
+    expect(result.avgifterAmount).toBe(baseline.avgifterAmount)
+    expect(result.vacationAccrual).toBe(baseline.vacationAccrual)
+    expect(result.vacationAccrualAvgifter).toBe(baseline.vacationAccrualAvgifter)
+  })
+
+  it('treats a mileage-only payroll as a real payout without tax bases', () => {
+    const result = calculateSalary(
+      makeBasicInput({
+        monthlySalary: 0,
+        vacationRule: 'none',
+        lineItems: [
+          {
+            itemType: 'mileage_taxfree',
+            amount: 250,
+            isTaxable: false,
+            isAvgiftBasis: false,
+            isVacationBasis: false,
+            isGrossDeduction: false,
+            isNetDeduction: false,
+          },
+        ],
+      }),
+      config2026,
+      emptyTaxRates,
+    )
+
+    expect(result).toMatchObject({
+      grossSalary: 0,
+      taxableIncome: 0,
+      taxWithheld: 0,
+      avgifterBasis: 0,
+      avgifterAmount: 0,
+      vacationAccrual: 0,
+      vacationAccrualAvgifter: 0,
+      netSalary: 250,
+      totalEmployerCost: 250,
+    })
   })
 })
 

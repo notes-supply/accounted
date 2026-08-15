@@ -4,6 +4,8 @@ import { withRouteContext } from '@/lib/api/with-route-context'
 import { formatRedovisare } from '@/lib/skatteverket/format'
 import { maskEmployeeForResponse } from '@/lib/salary/personnummer'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+import { errorResponseFromCode } from '@/lib/errors/get-structured-error'
+import { deleteDraftSalaryObjectWithMileageRelease } from '@/lib/mileage/mileage-service'
 
 ensureInitialized()
 
@@ -216,7 +218,7 @@ export const PATCH = withRouteContext<{ params: Promise<{ id: string }> }>(
 
 export const DELETE = withRouteContext<{ params: Promise<{ id: string }> }>(
   'salary.runs.delete',
-  async (_request, { supabase, companyId }, { params }) => {
+  async (_request, { supabase, companyId, log, requestId }, { params }) => {
     const { id } = await params
 
     // Only draft runs can be deleted. Once a run reaches review/approved/paid/
@@ -243,18 +245,47 @@ export const DELETE = withRouteContext<{ params: Promise<{ id: string }> }>(
       )
     }
 
-    // salary_run_employees and their salary_line_items are removed via
-    // ON DELETE CASCADE. An agi_declarations row (never present on a draft)
-    // would block the delete via its RESTRICT FK, the safety net for the
-    // impossible case.
-    const { error } = await supabase
-      .from('salary_runs')
-      .delete()
-      .eq('id', id)
-      .eq('company_id', companyId)
-
-    if (error) {
-      return NextResponse.json({ error: getUserErrorMessage(error) }, { status: 500 })
+    const deletion = await deleteDraftSalaryObjectWithMileageRelease(
+      supabase,
+      companyId,
+      id,
+      { kind: 'run', id },
+    )
+    if (!deletion.ok) {
+      if (deletion.code === 'NOT_FOUND') {
+        return errorResponseFromCode('SALARY_RUN_NOT_FOUND', log, { requestId })
+      }
+      if (deletion.code === 'NOT_DRAFT') {
+        return errorResponseFromCode('SALARY_RUN_DELETE_NOT_DRAFT', log, {
+          requestId,
+          status: 409,
+          details: deletion.details,
+        })
+      }
+      if (deletion.code === 'MILEAGE_CLAIM_CONFLICT') {
+        return errorResponseFromCode(deletion.code, log, {
+          requestId,
+          status: 409,
+          messageSv: 'Lönekörningen ändrades samtidigt. Ladda om och försök igen.',
+          messageEn: 'The salary run changed concurrently. Reload and try again.',
+          details: { retryable: true },
+        })
+      }
+      if (deletion.code === 'MILEAGE_CLAIM_RELEASE_INCOMPLETE') {
+        return errorResponseFromCode(deletion.code, log, {
+          requestId,
+          status: 500,
+          messageSv:
+            'Lönekörningen kunde inte raderas eftersom milersättningsanspråken inte kunde verifieras fullständigt.',
+          messageEn:
+            'The salary run was not deleted because its mileage claim release could not be fully verified.',
+          details: { ...deletion.details, retryable: false },
+        })
+      }
+      return errorResponseFromCode('INTERNAL_ERROR', log, {
+        requestId,
+        details: deletion.details,
+      })
     }
 
     return NextResponse.json({ data: { id, deleted: true } })

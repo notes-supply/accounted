@@ -42,9 +42,28 @@ const SI_ITEM_COLUMNS =
 
 const SI_PAYMENT_COLUMNS =
   'id, payment_date, amount, currency, exchange_rate, exchange_rate_difference, journal_entry_id, transaction_id, notes, created_at'
+const SI_PAYMENT_HISTORY_COLUMNS =
+  'id, payment_date, amount, currency, exchange_rate, exchange_rate_difference, journal_entry_id, transaction_id, notes, created_at:allocation_created_at, reversed_at, reversed_by_journal_entry_id'
 
 const SUPPLIER_DETAIL_COLUMNS_EXPAND =
   'id, name, supplier_type, email, org_number, vat_number, default_payment_terms, default_currency, bankgiro, plusgiro, iban, bic, default_expense_account, archived_at'
+
+const SupplierInvoicePaymentDetail = z.object({
+  id: z.string().uuid(),
+  payment_date: z.string(),
+  amount: z.number(),
+  currency: z.string(),
+  exchange_rate: z.number().nullable(),
+  exchange_rate_difference: z.number().nullable(),
+  journal_entry_id: z.string().uuid().nullable(),
+  transaction_id: z.string().uuid().nullable(),
+  notes: z.string().nullable(),
+  created_at: z.string(),
+  retained: z.boolean(),
+  reversed_at: z.string().nullable(),
+  reversed_by_journal_entry_id: z.string().uuid().nullable(),
+})
+type SupplierPaymentDetail = z.infer<typeof SupplierInvoicePaymentDetail>
 
 const SupplierInvoiceDetail = z.object({
   id: z.string().uuid(),
@@ -72,6 +91,7 @@ const SupplierInvoiceDetail = z.object({
   notes: z.string().nullable(),
   created_at: z.string(),
   updated_at: z.string(),
+  payments: z.array(SupplierInvoicePaymentDetail).optional(),
 })
 
 const ALLOWED_EXPAND = ['supplier', 'items', 'payments'] as const
@@ -163,6 +183,46 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string; id: string }
     if (!data) {
       ctx.log.warn('supplier-invoices.get: not found', { invoiceId, companyId: ctx.companyId })
       return v1ErrorResponseFromCode('SI_NOT_FOUND', ctx.log, { requestId: ctx.requestId })
+    }
+
+    if (expand.has('payments')) {
+      const { data: retainedRows, error: retainedError } = await ctx.supabase
+        .from('supplier_invoice_payment_history')
+        .select(SI_PAYMENT_HISTORY_COLUMNS)
+        .eq('company_id', ctx.companyId!)
+        .eq('supplier_invoice_id', invoiceId)
+        .order('payment_date', { ascending: true })
+        .order('id', { ascending: true })
+      if (retainedError) {
+        return v1ErrorResponse(retainedError, ctx.log, { requestId: ctx.requestId })
+      }
+
+      // PostgREST's generated relation type does not include M3 in this worker.
+      // The selected columns are the narrow integration contract above.
+      const detail = data as unknown as Record<string, unknown>
+      const activeRows = (
+        Array.isArray(detail.payments)
+          ? detail.payments
+          : []
+      ) as unknown as Array<Omit<SupplierPaymentDetail, 'retained' | 'reversed_at' | 'reversed_by_journal_entry_id'>>
+      const retained = (retainedRows ?? []) as unknown as Array<
+        Omit<SupplierPaymentDetail, 'retained'>
+      >
+      const payments: SupplierPaymentDetail[] = [
+        ...activeRows.map((payment) => ({
+          ...payment,
+          retained: false,
+          reversed_at: null,
+          reversed_by_journal_entry_id: null,
+        })),
+        ...retained.map((payment) => ({ ...payment, retained: true })),
+      ].sort(
+        (left, right) =>
+          left.payment_date.localeCompare(right.payment_date) ||
+          left.id.localeCompare(right.id),
+      )
+
+      return ok({ ...detail, payments }, { requestId: ctx.requestId })
     }
 
     return ok(data, { requestId: ctx.requestId })

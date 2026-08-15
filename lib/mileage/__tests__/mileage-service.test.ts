@@ -146,20 +146,9 @@ describe('pushMileageToSalaryRun', () => {
   function salarySupabase(opts: {
     run?: { id: string; status: string } | null
     sre?: { id: string } | null
-    claimIds?: string[]
-    itemError?: { message: string } | null
+    rpcData?: unknown
+    rpcError?: { code?: string; message: string } | null
   }) {
-    const insert = vi.fn(() => Promise.resolve({ error: opts.itemError ?? null }))
-    const tripChain: Record<string, unknown> = {}
-    for (const method of ['update', 'eq', 'in', 'is']) {
-      tripChain[method] = vi.fn(() => tripChain)
-    }
-    tripChain.select = vi.fn(() =>
-      Promise.resolve({ data: (opts.claimIds ?? []).map((id) => ({ id })), error: null })
-    )
-    tripChain.then = (resolve: (v: unknown) => unknown) =>
-      Promise.resolve({ data: null, error: null }).then(resolve)
-
     const singleChain = (row: unknown) => {
       const chain: Record<string, unknown> = {}
       for (const method of ['select', 'eq']) {
@@ -173,23 +162,24 @@ describe('pushMileageToSalaryRun', () => {
       from: vi.fn((table: string) => {
         if (table === 'salary_runs') return singleChain(opts.run ?? null)
         if (table === 'salary_run_employees') return singleChain(opts.sre ?? null)
-        if (table === 'salary_line_items') return { insert }
-        return tripChain
+        throw new Error(`Unexpected table write: ${table}`)
       }),
-      insert,
-      tripChain,
+      rpc: vi.fn().mockResolvedValue({
+        data: opts.rpcData ?? null,
+        error: opts.rpcError ?? null,
+      }),
     }
   }
 
-  it('maps missing run / wrong status / missing employee to their codes', async () => {
+  it('maps missing, non-draft, and missing-employee runs to their codes', async () => {
     const missingRun = salarySupabase({ run: null })
     expect(
       await pushMileageToSalaryRun(missingRun as never, 'company-1', params)
     ).toEqual({ ok: false, code: 'RUN_NOT_FOUND' })
 
-    const bookedRun = salarySupabase({ run: { id: 'run-1', status: 'booked' } })
+    const reviewRun = salarySupabase({ run: { id: 'run-1', status: 'review' } })
     expect(
-      await pushMileageToSalaryRun(bookedRun as never, 'company-1', params)
+      await pushMileageToSalaryRun(reviewRun as never, 'company-1', params)
     ).toEqual({ ok: false, code: 'RUN_NOT_EDITABLE' })
 
     const noSre = salarySupabase({ run: { id: 'run-1', status: 'draft' }, sre: null })
@@ -198,69 +188,91 @@ describe('pushMileageToSalaryRun', () => {
     ).toEqual({ ok: false, code: 'EMPLOYEE_NOT_IN_RUN' })
   })
 
-  it('claims trips BEFORE inserting line items and inserts kostnadsersättning flags', async () => {
+  it('delegates exact trip partitions and salary-line provenance to one atomic RPC', async () => {
     vi.mocked(fetchAllRows).mockResolvedValue([
-      trip({ id: 't1', employee_id: 'emp-1', distance_km: 100 }),
+      trip({ id: 't2', employee_id: 'emp-1', distance_km: 50 }),
+      trip({
+        id: 't1',
+        employee_id: 'emp-1',
+        distance_km: 40,
+        vehicle_type: 'company_car_electric',
+      }),
     ])
     vi.mocked(loadPayrollConfig).mockResolvedValue(CONFIG)
     const supabase = salarySupabase({
       run: { id: 'run-1', status: 'draft' },
       sre: { id: 'sre-1' },
-      claimIds: ['t1'],
+      rpcData: {
+        outcome: 'claimed',
+        claimed_trip_count: 2,
+        created_line_item_count: 2,
+      },
     })
 
     const result = await pushMileageToSalaryRun(supabase as never, 'company-1', params)
-    expect(result).toMatchObject({ ok: true, tripCount: 1, totalAmount: 250 })
-    const item = (supabase.insert.mock.calls[0] as unknown[][])[0][0]
-    expect(item).toMatchObject({
-      item_type: 'mileage_taxfree',
-      amount: 250,
-      is_taxable: false,
-      is_avgift_basis: false,
-      is_vacation_basis: false,
-      account_number: '7331',
-    })
-    // The claim ran before the insert (retry cannot double-pay).
-    const claimOrder = (supabase.tripChain.update as ReturnType<typeof vi.fn>).mock
-      .invocationCallOrder[0]
-    const insertOrder = supabase.insert.mock.invocationCallOrder[0]
-    expect(claimOrder).toBeLessThan(insertOrder)
-  })
-
-  it('returns CLAIM_LOST and reverts when another booking claimed first', async () => {
-    vi.mocked(fetchAllRows).mockResolvedValue([
-      trip({ id: 't1', employee_id: 'emp-1' }),
-      trip({ id: 't2', employee_id: 'emp-1' }),
-    ])
-    vi.mocked(loadPayrollConfig).mockResolvedValue(CONFIG)
-    const supabase = salarySupabase({
-      run: { id: 'run-1', status: 'draft' },
-      sre: { id: 'sre-1' },
-      claimIds: ['t1'],
-    })
-    const result = await pushMileageToSalaryRun(supabase as never, 'company-1', params)
-    expect(result).toEqual({ ok: false, code: 'CLAIM_LOST' })
-    expect(supabase.insert).not.toHaveBeenCalled()
-    // The partial claim was reverted, not left dangling.
-    expect(supabase.tripChain.update).toHaveBeenCalledWith({
-      status: 'draft',
-      salary_run_id: null,
+    expect(result).toMatchObject({ ok: true, tripCount: 2, totalAmount: 163 })
+    expect(supabase.rpc).toHaveBeenCalledOnce()
+    expect(supabase.rpc).toHaveBeenCalledWith('claim_mileage_trips_for_salary', {
+      p_company_id: 'company-1',
+      p_salary_run_id: 'run-1',
+      p_salary_run_employee_id: 'sre-1',
+      p_claims: [
+        {
+          trip_ids: ['t1'],
+          line_item: expect.objectContaining({
+            item_type: 'mileage_taxfree',
+            amount: 38,
+            is_taxable: false,
+            is_avgift_basis: false,
+            is_vacation_basis: false,
+            account_number: '7331',
+          }),
+        },
+        {
+          trip_ids: ['t2'],
+          line_item: expect.objectContaining({
+            item_type: 'mileage_taxfree',
+            amount: 125,
+            account_number: '7331',
+          }),
+        },
+      ],
     })
   })
 
-  it('reverts the claim when the line item insert fails', async () => {
+  it('reports an atomic claim conflict without any compensating table write', async () => {
     vi.mocked(fetchAllRows).mockResolvedValue([trip({ id: 't1', employee_id: 'emp-1' })])
     vi.mocked(loadPayrollConfig).mockResolvedValue(CONFIG)
     const supabase = salarySupabase({
       run: { id: 'run-1', status: 'draft' },
       sre: { id: 'sre-1' },
-      claimIds: ['t1'],
-      itemError: { message: 'insert failed' },
+      rpcData: { outcome: 'conflict' },
     })
+
+    const result = await pushMileageToSalaryRun(supabase as never, 'company-1', params)
+    expect(result).toEqual({ ok: false, code: 'CLAIM_LOST' })
+    expect(supabase.rpc).toHaveBeenCalledOnce()
+  })
+
+  it('fails closed on an incomplete committed claim result', async () => {
+    vi.mocked(fetchAllRows).mockResolvedValue([trip({ id: 't1', employee_id: 'emp-1' })])
+    vi.mocked(loadPayrollConfig).mockResolvedValue(CONFIG)
+    const supabase = salarySupabase({
+      run: { id: 'run-1', status: 'draft' },
+      sre: { id: 'sre-1' },
+      rpcData: {
+        outcome: 'claimed',
+        claimed_trip_count: 1,
+        created_line_item_count: 0,
+      },
+    })
+
     await expect(
       pushMileageToSalaryRun(supabase as never, 'company-1', params)
-    ).rejects.toThrow('insert failed')
-    expect(supabase.tripChain.update).toHaveBeenCalledWith({ status: 'draft', salary_run_id: null })
+    ).rejects.toMatchObject({
+      code: 'MILEAGE_CLAIM_RESULT_INCOMPLETE',
+      retryable: false,
+    })
   })
 })
 
@@ -272,9 +284,9 @@ describe('bookMileagePeriod', () => {
     counterAccount: '2820' as const,
   }
 
-  // Queued mock: each .select() call consumes the next result (claim first,
-  // then the journal_entry_id link). The orphan sweep and revert paths await
-  // the chain without .select(), so the chain itself is thenable.
+  // Queued mock: every .select() consumes one result for claim, verified
+  // release, or journal_entry_id stamping. The orphan sweep awaits the chain
+  // without .select(), so the chain itself remains thenable.
   function stampSupabase(selectResults: string[][]) {
     const queue = [...selectResults]
     const chain: Record<string, unknown> = {}
@@ -311,7 +323,7 @@ describe('bookMileagePeriod', () => {
     vi.mocked(loadPayrollConfig).mockResolvedValue(CONFIG)
 
     // Another booking claimed t2 first: our claim only gets t1.
-    const supabase = stampSupabase([['t1']])
+    const supabase = stampSupabase([['t1'], ['t1']])
     const result = await bookMileagePeriod(supabase as never, 'company-1', 'user-1', params)
     expect(result).toEqual({ ok: false, code: 'CLAIM_LOST' })
     expect(createJournalEntry).not.toHaveBeenCalled()
@@ -420,13 +432,23 @@ describe('bookMileagePeriod', () => {
       period_id: 'period-1',
     } as never)
     vi.mocked(loadPayrollConfig).mockResolvedValue(CONFIG)
-    vi.mocked(createJournalEntry).mockResolvedValue({ id: 'je-1' } as never)
+    vi.mocked(createJournalEntry).mockResolvedValue({
+      id: 'je-1',
+      voucher_number: 42,
+      voucher_series: 'A',
+    } as never)
 
     // Claim succeeds for both trips; the journal_entry_id backfill only lands
     // on one row.
     const supabase = stampSupabase([['t1', 't2'], ['t1']])
     const result = await bookMileagePeriod(supabase as never, 'company-1', 'user-1', params)
-    expect(result).toEqual({ ok: false, code: 'STAMP_FAILED', journalEntryId: 'je-1' })
+    expect(result).toEqual({
+      ok: false,
+      code: 'STAMP_FAILED',
+      journalEntryId: 'je-1',
+      voucherNumber: 42,
+      voucherSeries: 'A',
+    })
   })
 
   it('reverts the claim when verifikat creation fails', async () => {
@@ -438,12 +460,65 @@ describe('bookMileagePeriod', () => {
     vi.mocked(loadPayrollConfig).mockResolvedValue(CONFIG)
     vi.mocked(createJournalEntry).mockRejectedValue(new Error('period locked'))
 
-    const supabase = stampSupabase([['t1']])
+    const supabase = stampSupabase([['t1'], ['t1']])
     await expect(
       bookMileagePeriod(supabase as never, 'company-1', 'user-1', params)
     ).rejects.toThrow('period locked')
-    // Claim + revert both went through the update chain.
+    // Claim + verified release both went through the update chain.
     expect(supabase.chain.update).toHaveBeenCalledWith({ status: 'booked' })
     expect(supabase.chain.update).toHaveBeenCalledWith({ status: 'draft' })
+  })
+
+  it('returns non-retryable RELEASE_INCOMPLETE when rollback cannot be verified', async () => {
+    vi.mocked(fetchAllRows).mockResolvedValue([trip({ id: 't1' })])
+    vi.mocked(resolvePeriodStatusForDate).mockResolvedValue({
+      status: 'open',
+      period_id: 'period-1',
+    } as never)
+    vi.mocked(loadPayrollConfig).mockResolvedValue(CONFIG)
+    vi.mocked(createJournalEntry).mockRejectedValue(new Error('period locked'))
+
+    const result = await bookMileagePeriod(
+      stampSupabase([['t1'], []]) as never,
+      'company-1',
+      'user-1',
+      params,
+    )
+    expect(result).toEqual({ ok: false, code: 'RELEASE_INCOMPLETE' })
+  })
+
+  it('does not release claims after an ambiguous post-commit outcome', async () => {
+    vi.mocked(fetchAllRows).mockResolvedValue([trip({ id: 't1' })])
+    vi.mocked(resolvePeriodStatusForDate).mockResolvedValue({
+      status: 'open',
+      period_id: 'period-1',
+    } as never)
+    vi.mocked(loadPayrollConfig).mockResolvedValue(CONFIG)
+    vi.mocked(createJournalEntry).mockRejectedValue(
+      Object.assign(new Error('posted entry readback failed'), {
+        code: 'POST_COMMIT_IDENTITY_AMBIGUOUS',
+        details: {
+          journalEntryId: 'je-1',
+          voucherNumber: 42,
+          voucherSeries: 'A',
+        },
+      }),
+    )
+
+    const supabase = stampSupabase([['t1']])
+    const result = await bookMileagePeriod(
+      supabase as never,
+      'company-1',
+      'user-1',
+      params,
+    )
+    expect(result).toEqual({
+      ok: false,
+      code: 'POST_COMMIT_IDENTITY_AMBIGUOUS',
+      journalEntryId: 'je-1',
+      voucherNumber: 42,
+      voucherSeries: 'A',
+    })
+    expect(supabase.chain.select).toHaveBeenCalledOnce()
   })
 })

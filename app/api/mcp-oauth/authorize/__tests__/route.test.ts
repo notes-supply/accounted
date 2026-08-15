@@ -29,6 +29,14 @@ vi.mock('@/lib/branding/service', () => ({
 }))
 
 import { GET, POST } from '../route'
+beforeEach(() => {
+  vi.stubEnv('REQUIRE_MFA', 'false')
+  vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'false')
+})
+
+afterEach(() => {
+  vi.unstubAllEnvs()
+})
 
 function buildAuthorizeUrl(params: Record<string, string>): string {
   const url = new URL('http://localhost/api/mcp-oauth/authorize')
@@ -36,16 +44,29 @@ function buildAuthorizeUrl(params: Record<string, string>): string {
   return url.toString()
 }
 
+const publicOriginAuthorizeParams = {
+  response_type: 'code',
+  redirect_uri: 'https://claude.ai/api/mcp/auth_callback',
+  code_challenge: 'abc',
+  code_challenge_method: 'S256',
+  scope: 'mcp',
+  state: 'xyz',
+}
+
 function buildSupabase(
   user: { id: string } | null,
   companyName = 'Test AB',
-  aal: { currentLevel: string; nextLevel: string } = { currentLevel: 'aal2', nextLevel: 'aal2' },
+  aal: unknown = { currentLevel: 'aal2', nextLevel: 'aal2' },
+  aalError: unknown = null,
 ) {
   return {
     auth: {
       getUser: vi.fn().mockResolvedValue({ data: { user }, error: null }),
       mfa: {
-        getAuthenticatorAssuranceLevel: vi.fn().mockResolvedValue({ data: aal, error: null }),
+        getAuthenticatorAssuranceLevel: vi.fn().mockResolvedValue({
+          data: aal,
+          error: aalError,
+        }),
       },
     },
     from: vi.fn().mockReturnValue({
@@ -255,15 +276,13 @@ describe('MFA step-up on /api/mcp-oauth/authorize', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-key'
+    vi.stubEnv('REQUIRE_MFA', 'true')
     vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'true')
     vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'false')
+    vi.stubEnv('NEXT_PUBLIC_APP_URL', 'http://localhost')
     mocks.isAllowedRedirectUri.mockResolvedValue(true)
     mocks.requireCompanyId.mockResolvedValue('company-1')
     mocks.getBranding.mockReturnValue({ appName: 'gnubok' })
-  })
-
-  afterEach(() => {
-    vi.unstubAllEnvs()
   })
 
   it('GET redirects an AAL1 session to /mfa/verify with returnTo', async () => {
@@ -301,6 +320,21 @@ describe('MFA step-up on /api/mcp-oauth/authorize', () => {
     expect(response.headers.get('location')).not.toContain('code=')
   })
 
+  it.each([
+    [null, null],
+    [{}, null],
+    [{ currentLevel: 'aal3', nextLevel: 'aal2' }, null],
+    [{ currentLevel: 'aal2', nextLevel: 'aal1' }, null],
+    [null, { message: 'assurance lookup failed' }],
+  ])('GET redirects an untrusted assurance response to /mfa/verify: %j', async (aal, error) => {
+    mocks.createClient.mockResolvedValue(buildSupabase({ id: 'user-1' }, 'Test AB', aal, error))
+
+    const response = await GET(new Request(buildAuthorizeUrl(authorizeParams)))
+
+    expect(response.status).toBe(307)
+    expect(new URL(response.headers.get('location')!).pathname).toBe('/mfa/verify')
+  })
+
   it('GET renders consent for an AAL2 session', async () => {
     mocks.createClient.mockResolvedValue(
       buildSupabase({ id: 'user-1' }, 'Test AB', { currentLevel: 'aal2', nextLevel: 'aal2' }),
@@ -310,7 +344,7 @@ describe('MFA step-up on /api/mcp-oauth/authorize', () => {
     expect(response.status).toBe(200)
   })
 
-  it('GET skips step-up for BankID-linked users (inherently 2FA)', async () => {
+  it('GET requires current-session AAL2 even when BankID is linked', async () => {
     const supabase = buildSupabase(
       { id: 'user-1' },
       'Test AB',
@@ -323,7 +357,124 @@ describe('MFA step-up on /api/mcp-oauth/authorize', () => {
     mocks.createClient.mockResolvedValue(supabase)
 
     const response = await GET(new Request(buildAuthorizeUrl(authorizeParams)))
-    expect(response.status).toBe(200)
+    expect(response.status).toBe(307)
+    expect(new URL(response.headers.get('location')!).pathname).toBe('/mfa/verify')
+  })
+})
+
+describe('public-origin redirects on /api/mcp-oauth/authorize', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-key'
+    vi.stubEnv('NEXT_PUBLIC_APP_URL', 'https://public.example')
+    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'true')
+    mocks.createClient.mockResolvedValue(buildSupabase(null))
+    mocks.isAllowedRedirectUri.mockResolvedValue(true)
+    mocks.requireCompanyId.mockResolvedValue('company-1')
+    mocks.getBranding.mockReturnValue({ appName: 'gnubok' })
+  })
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  it('uses the configured public origin for an internal unauthenticated request', async () => {
+    const internalUrl = buildAuthorizeUrl(publicOriginAuthorizeParams).replace(
+      'http://localhost',
+      'http://0.0.0.0:3000',
+    )
+
+    const response = await GET(new Request(internalUrl))
+
+    expect(response.status).toBe(307)
+    const location = new URL(response.headers.get('location')!)
+    expect(location.origin).toBe('https://public.example')
+    expect(location.pathname).toBe('/login')
+    expect(location.searchParams.get('next')).toBe(
+      `/api/mcp-oauth/authorize?${new URL(internalUrl).searchParams.toString()}`,
+    )
+  })
+
+  it('uses the configured public origin for MFA step-up from private ingress', async () => {
+    vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'true')
+    vi.stubEnv('REQUIRE_MFA', 'true')
+    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'false')
+    mocks.createClient.mockResolvedValue(
+      buildSupabase({ id: 'user-1' }, 'Test AB', { currentLevel: 'aal1', nextLevel: 'aal2' }),
+    )
+    const internalUrl = buildAuthorizeUrl(publicOriginAuthorizeParams).replace(
+      'http://localhost',
+      'http://10.0.0.12:3000',
+    )
+
+    const response = await GET(new Request(internalUrl))
+
+    expect(response.status).toBe(307)
+    expect(new URL(response.headers.get('location')!).origin).toBe('https://public.example')
+    expect(new URL(response.headers.get('location')!).pathname).toBe('/mfa/verify')
+  })
+
+  it('preserves only the exact legacy host', async () => {
+    const internalUrl = buildAuthorizeUrl(publicOriginAuthorizeParams).replace(
+      'http://localhost',
+      'http://0.0.0.0:3000',
+    )
+
+    const response = await GET(
+      new Request(internalUrl, { headers: { host: 'app.gnubok.se' } }),
+    )
+
+    expect(new URL(response.headers.get('location')!).origin).toBe('https://app.gnubok.se')
+  })
+
+  it('rejects a legacy-host lookalike and uses the configured origin', async () => {
+    const internalUrl = buildAuthorizeUrl(publicOriginAuthorizeParams).replace(
+      'http://localhost',
+      'http://0.0.0.0:3000',
+    )
+
+    const response = await GET(
+      new Request(internalUrl, { headers: { host: 'app.gnubok.se.evil.example' } }),
+    )
+
+    expect(new URL(response.headers.get('location')!).origin).toBe('https://public.example')
+  })
+
+  it('fails closed when the public origin is missing behind private ingress', async () => {
+    vi.stubEnv('NEXT_PUBLIC_APP_URL', '')
+    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'false')
+    const internalUrl = buildAuthorizeUrl(publicOriginAuthorizeParams).replace(
+      'http://localhost',
+      'http://0.0.0.0:3000',
+    )
+
+    const response = await GET(new Request(internalUrl))
+
+    expect(response.status).toBe(500)
+    expect(response.headers.get('location')).toBeNull()
+  })
+
+  it('fails closed when the configured public origin is malformed', async () => {
+    vi.stubEnv('NEXT_PUBLIC_APP_URL', 'not a URL')
+
+    const response = await GET(new Request(buildAuthorizeUrl(publicOriginAuthorizeParams)))
+
+    expect(response.status).toBe(500)
+    expect(response.headers.get('location')).toBeNull()
+  })
+
+  it('retains the public HTTPS request-origin fallback for hosted deployments', async () => {
+    vi.stubEnv('NEXT_PUBLIC_APP_URL', '')
+    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'false')
+    const hostedUrl = buildAuthorizeUrl(publicOriginAuthorizeParams).replace(
+      'http://localhost',
+      'https://tenant.example',
+    )
+
+    const response = await GET(new Request(hostedUrl))
+
+    expect(response.status).toBe(307)
+    expect(new URL(response.headers.get('location')!).origin).toBe('https://tenant.example')
   })
 })
 

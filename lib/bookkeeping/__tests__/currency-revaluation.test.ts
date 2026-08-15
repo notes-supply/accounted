@@ -1145,9 +1145,11 @@ describe('currency-revaluation', () => {
         invoicePayments: [
           {
             company_id: 'company-1',
+            id: 'pay-settled-later',
             invoice_id: 'inv-settled-later',
             amount: 1000,
             payment_date: '2025-02-01',
+            journal_entry_id: null,
           },
         ],
       })
@@ -1179,15 +1181,19 @@ describe('currency-revaluation', () => {
           // 600 paid before balansdagen, 400 after: only 400 was open.
           {
             company_id: 'company-1',
+            id: 'pay-partial-before',
             invoice_id: 'inv-partial-asof',
             amount: 600,
             payment_date: '2024-12-10',
+            journal_entry_id: null,
           },
           {
+            id: 'pay-partial-after',
             company_id: 'company-1',
             invoice_id: 'inv-partial-asof',
             amount: 400,
             payment_date: '2025-01-20',
+            journal_entry_id: null,
           },
         ],
       })
@@ -1301,8 +1307,22 @@ describe('currency-revaluation', () => {
       const supabase = createMockSupabase({
         invoices: [straddling],
         invoicePayments: [
-          { company_id: 'company-1', invoice_id: 'inv-straddle', amount: 300, payment_date: '2024-11-05' },
-          { company_id: 'company-1', invoice_id: 'inv-straddle', amount: 600, payment_date: '2025-02-11' },
+          {
+            id: 'pay-straddle-before',
+            company_id: 'company-1',
+            invoice_id: 'inv-straddle',
+            amount: 300,
+            payment_date: '2024-11-05',
+            journal_entry_id: null,
+          },
+          {
+            id: 'pay-straddle-after',
+            company_id: 'company-1',
+            invoice_id: 'inv-straddle',
+            amount: 600,
+            payment_date: '2025-02-11',
+            journal_entry_id: null,
+          },
         ],
       })
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1329,8 +1349,22 @@ describe('currency-revaluation', () => {
       const supabase = createMockSupabase({
         supplierInvoices: [straddlingPayable],
         supplierInvoicePayments: [
-          { company_id: 'company-1', supplier_invoice_id: 'si-straddle', amount: 500, payment_date: '2024-12-01' },
-          { company_id: 'company-1', supplier_invoice_id: 'si-straddle', amount: 1300, payment_date: '2025-03-04' },
+          {
+            id: 'pay-si-straddle-before',
+            company_id: 'company-1',
+            supplier_invoice_id: 'si-straddle',
+            amount: 500,
+            payment_date: '2024-12-01',
+            journal_entry_id: null,
+          },
+          {
+            id: 'pay-si-straddle-after',
+            company_id: 'company-1',
+            supplier_invoice_id: 'si-straddle',
+            amount: 1300,
+            payment_date: '2025-03-04',
+            journal_entry_id: null,
+          },
         ],
       })
       // eslint-disable-next-line @typescript-eslint/no-explicit-any

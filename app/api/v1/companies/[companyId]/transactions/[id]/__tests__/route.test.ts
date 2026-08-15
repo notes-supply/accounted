@@ -28,8 +28,8 @@ vi.mock('@supabase/supabase-js', async () => {
 })
 
 // Engine stubs: happy-path returns reusable across cases.
-const { createTxJE, reverseEntryMock, createInvPmtJE, createInvCashJE, createSupplierInvPmtJE, createSupplierInvCashJE, findMissingAccountsMock, createJEMock, findFiscalPeriodMock } = vi.hoisted(() => ({
-  createTxJE: vi.fn().mockResolvedValue({ id: 'je-fresh' }),
+const { coordinateSettlementMock, reverseEntryMock, createInvPmtJE, createInvCashJE, createSupplierInvPmtJE, createSupplierInvCashJE, findMissingAccountsMock, createJEMock, findFiscalPeriodMock } = vi.hoisted(() => ({
+  coordinateSettlementMock: vi.fn(),
   reverseEntryMock: vi.fn().mockResolvedValue(undefined),
   createInvPmtJE: vi.fn().mockResolvedValue({ id: 'je-invpmt' }),
   createInvCashJE: vi.fn().mockResolvedValue({ id: 'je-invcash' }),
@@ -50,9 +50,14 @@ const { createTxJE, reverseEntryMock, createInvPmtJE, createInvCashJE, createSup
   findFiscalPeriodMock: vi.fn().mockResolvedValue('fp-2026-05'),
 }))
 
-vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
-  createTransactionJournalEntry: createTxJE,
-}))
+vi.mock('@/lib/transactions/settlement-attachment', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>()
+  return {
+    ...actual,
+    coordinateTransactionSettlement: coordinateSettlementMock,
+  }
+})
+
 vi.mock('@/lib/bookkeeping/engine', () => ({
   reverseEntry: reverseEntryMock,
   createJournalEntry: createJEMock,
@@ -178,6 +183,25 @@ function txParams(id: string) {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  coordinateSettlementMock.mockResolvedValue({
+    kind: 'attached',
+    created: true,
+    readback: {
+      transaction: {
+        journalEntryId: 'je-fresh',
+        cashAccountId: null,
+        category: 'expense_office',
+        isBusiness: true,
+      },
+      journalEntry: { id: 'je-fresh' },
+    },
+    publication: {
+      publication_id: 'publication-1',
+      event_key: 'journal:je-fresh:committed',
+      event_type: 'journal_entry.committed',
+    },
+    journalEntry: { id: 'je-fresh' },
+  })
   mockValidate.mockResolvedValue({
     userId: 'user-1',
     companyId: COMPANY_ID,
@@ -225,7 +249,7 @@ describe('POST :id/categorize', () => {
     const body = await res.json()
     expect(body.data.journal_entry_created).toBe(true)
     expect(body.data.category).toBe('expense_office')
-    expect(createTxJE).toHaveBeenCalledTimes(1)
+    expect(coordinateSettlementMock).toHaveBeenCalledTimes(1)
   })
 
   it('dry-run returns mapping preview without creating a JE', async () => {
@@ -257,7 +281,7 @@ describe('POST :id/categorize', () => {
     )
     expect(res.status).toBe(200)
     expect(res.headers.get('X-Dry-Run')).toBe('true')
-    expect(createTxJE).not.toHaveBeenCalled()
+    expect(coordinateSettlementMock).not.toHaveBeenCalled()
   })
 
   it('rejects unknown transaction id with TX_CATEGORIZE_TX_NOT_FOUND', async () => {
@@ -317,7 +341,7 @@ describe('POST :id/categorize', () => {
     expect(body.error.details.account_numbers).toEqual(['5410'])
     // Engine and transaction-update must NOT run: the row stays in the
     // categorization queue so the user can re-activate and retry.
-    expect(createTxJE).not.toHaveBeenCalled()
+    expect(coordinateSettlementMock).not.toHaveBeenCalled()
   })
 
   it('returns 400 ACCOUNTS_NOT_IN_CHART when the engine throws mid-flight (defense in depth)', async () => {
@@ -348,7 +372,7 @@ describe('POST :id/categorize', () => {
     // no verifikation.
     findMissingAccountsMock.mockResolvedValueOnce([])
     const { AccountsNotInChartError } = await import('@/lib/bookkeeping/errors')
-    createTxJE.mockRejectedValueOnce(new AccountsNotInChartError(['5410']))
+    coordinateSettlementMock.mockRejectedValueOnce(new AccountsNotInChartError(['5410']))
 
     const res = await categorizePOST(
       makeRequest(
@@ -401,12 +425,11 @@ describe('POST :id/categorize', () => {
       txParams(TX_ID),
     )
     expect(res.status).toBe(200)
-    expect(createTxJE).toHaveBeenCalledTimes(1)
-    const mappingResult = createTxJE.mock.calls[0][4] as {
-      debit_account: string
-      credit_account: string
+    expect(coordinateSettlementMock).toHaveBeenCalledTimes(1)
+    const settlementInput = coordinateSettlementMock.mock.calls[0][0] as {
+      mappingResult: { debit_account: string; credit_account: string }
     }
-    expect(mappingResult.credit_account).toBe('1940')
+    expect(settlementInput.mappingResult.credit_account).toBe('1940')
   })
 
   it('falls back to 1930 when the transaction has no linked cash account', async () => {
@@ -441,8 +464,10 @@ describe('POST :id/categorize', () => {
       txParams(TX_ID),
     )
     expect(res.status).toBe(200)
-    const mappingResult = createTxJE.mock.calls[0][4] as { credit_account: string }
-    expect(mappingResult.credit_account).toBe('1930')
+    const settlementInput = coordinateSettlementMock.mock.calls[0][0] as {
+      mappingResult: { credit_account: string }
+    }
+    expect(settlementInput.mappingResult.credit_account).toBe('1930')
   })
 
   it('aborts with 500 BOOKKEEPING_DATABASE_ERROR when the cash_accounts lookup errors, mutating nothing', async () => {
@@ -477,7 +502,7 @@ describe('POST :id/categorize', () => {
     expect(res.status).toBe(500)
     const body = await res.json()
     expect(body.error.code).toBe('BOOKKEEPING_DATABASE_ERROR')
-    expect(createTxJE).not.toHaveBeenCalled()
+    expect(coordinateSettlementMock).not.toHaveBeenCalled()
   })
 })
 

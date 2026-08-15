@@ -6,6 +6,7 @@ import {
   insertAuthUser,
   insertCompanyMember,
   insertDraftJournalEntry,
+  insertReversedJournalEntryGraph,
 } from '@/tests/pg/fixtures'
 
 // Migration 20260723210000_verifikat_inline_rattelse.sql: the founder-approved
@@ -184,8 +185,15 @@ describe('inline rättelse: metadata (correct_entry_metadata)', () => {
 
   it('rejects all metadata edits on storno entries', async () => {
     const { companyId, userId, fiscalPeriodId } = await seedCompany()
-    const { entryId } = await insertPostedEntry({
-      companyId, userId, fiscalPeriodId, sourceType: 'storno', voucherNumber: 8,
+    const { stornoId: entryId } = await insertReversedJournalEntryGraph({
+      companyId,
+      userId,
+      fiscalPeriodId,
+      voucherNumber: 8,
+      lines: [
+        { accountNumber: '5010', debitAmount: 1000, creditAmount: 0 },
+        { accountNumber: '1930', debitAmount: 0, creditAmount: 1000 },
+      ],
     })
 
     await expect(callMetadata(companyId, entryId, 'Omdöpt storno', null, userId)).rejects.toThrow(

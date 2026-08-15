@@ -12,11 +12,15 @@ import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
 import { safeGenerate } from '@/lib/api/v1/report-period'
-import { calculateVatDeclaration } from '@/lib/reports/vat-declaration'
-import type { VatPeriodType } from '@/types'
+import {
+  calculateVatDeclaration,
+  parseVatPeriodInput,
+  type VatPeriodInput,
+} from '@/lib/reports/vat-declaration'
 
 const VatPeriodTypeEnum = z.enum(['monthly', 'quarterly', 'yearly'])
 const AccountingMethodEnum = z.enum(['accrual', 'cash'])
+const StrictIntegerString = z.string().regex(/^\d+$/, 'Must be an exact decimal integer.')
 
 registerEndpoint({
   operation: 'reports.vat-declaration',
@@ -79,37 +83,18 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
   'reports.vat-declaration',
   async (request, ctx) => {
     const url = new URL(request.url)
-    const FiltersSchema = z
-      .object({
-        period_type: VatPeriodTypeEnum,
-        year: z.coerce.number().int().min(2000).max(2100),
-        period: z.coerce.number().int().min(1).max(12),
-        accounting_method: AccountingMethodEnum.optional(),
-      })
-      // Cross-field bounds: monthly accepts 1-12, quarterly 1-4, yearly only 1.
-      // Without this guard a caller could pass period_type=quarterly + period=7
-      // and silently get a nonsensical declaration that they might submit to
-      // Skatteverket.
-      .superRefine((data, ctx) => {
-        if (data.period_type === 'quarterly' && (data.period < 1 || data.period > 4)) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            path: ['period'],
-            message: 'For quarterly period_type, period must be 1-4.',
-          })
-        }
-        if (data.period_type === 'yearly' && data.period !== 1) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            path: ['period'],
-            message: 'For yearly period_type, period must be 1.',
-          })
-        }
-      })
+    const FiltersSchema = z.object({
+      period_type: VatPeriodTypeEnum,
+      year: StrictIntegerString,
+      period: StrictIntegerString,
+      fiscal_period_id: z.string().uuid().optional(),
+      accounting_method: AccountingMethodEnum.optional(),
+    })
     const filters = FiltersSchema.safeParse({
       period_type: url.searchParams.get('period_type'),
       year: url.searchParams.get('year'),
       period: url.searchParams.get('period'),
+      fiscal_period_id: url.searchParams.get('fiscal_period_id') ?? undefined,
       accounting_method: url.searchParams.get('accounting_method') ?? undefined,
     })
     if (!filters.success) {
@@ -123,18 +108,32 @@ export const GET = withApiV1<{ params: Promise<{ companyId: string }> }>(
         },
       })
     }
-    // accounting_method is still accepted (public API back-compat) but has no
-    // effect: see the invariant note on calculateVatDeclaration.
-    const { period_type, year, period } = filters.data
+    let parsed: VatPeriodInput
+    try {
+      parsed = parseVatPeriodInput({
+        periodType: filters.data.period_type,
+        year: Number(filters.data.year),
+        period: Number(filters.data.period),
+        fiscalPeriodId: filters.data.fiscal_period_id,
+      })
+    } catch {
+      return v1ErrorResponseFromCode('VALIDATION_ERROR', ctx.log, {
+        requestId: ctx.requestId,
+        details: {
+          issues: [{ field: 'period', message: 'Invalid VAT period' }],
+        },
+      })
+    }
 
     const gen = await safeGenerate(
       () =>
         calculateVatDeclaration(
           ctx.supabase,
           ctx.companyId!,
-          period_type as VatPeriodType,
-          year,
-          period,
+          parsed.periodType,
+          parsed.year,
+          parsed.period,
+          { fiscalPeriodId: parsed.fiscalPeriodId },
         ),
       { log: ctx.log, requestId: ctx.requestId, reportName: 'vat-declaration' },
     )

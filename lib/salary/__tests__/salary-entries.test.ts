@@ -226,6 +226,66 @@ describe('salary entries: net deductions', () => {
   })
 })
 
+describe('salary entries: tax-free mileage', () => {
+  const mileageItem = (amount: number) => ({
+    item_type: 'mileage_taxfree',
+    amount,
+    account_number: '7331',
+    is_net_deduction: false,
+    is_gross_deduction: false,
+  })
+
+  it('keeps 7331 additional to full gross and credits the persisted net', async () => {
+    const run = makeRun([
+      makeEmployee({
+        gross_salary: 100,
+        tax_withheld: 30,
+        net_salary: 95,
+        line_items: [mileageItem(25)],
+      }),
+    ])
+
+    await createSalaryRunEntries(makeSupabase(), 'company-1', 'user-1', run)
+    const salary = entryByDescription('Lön 2026-06')
+
+    expect(linesOn(salary, '7210')[0].debit_amount).toBe(100)
+    expect(linesOn(salary, '7331')[0].debit_amount).toBe(25)
+    expect(linesOn(salary, '2710')[0].credit_amount).toBe(30)
+    expect(linesOn(salary, '1930')[0].credit_amount).toBe(95)
+    assertBalanced(salary)
+  })
+
+  it('posts one material voucher for a mileage-only run and no zero avgifter voucher', async () => {
+    const run = makeRun([
+      makeEmployee({
+        gross_salary: 0,
+        tax_withheld: 0,
+        net_salary: 250,
+        avgifter_amount: 0,
+        avgifter_basis: 0,
+        vacation_accrual: 0,
+        vacation_accrual_avgifter: 0,
+        line_items: [mileageItem(250)],
+      }),
+    ])
+
+    const result = await createSalaryRunEntries(
+      makeSupabase(),
+      'company-1',
+      'user-1',
+      run,
+    )
+    const salary = entryByDescription('Lön 2026-06')
+
+    expect(result.avgifterEntry).toBeNull()
+    expect(mockedCreateEntry).toHaveBeenCalledOnce()
+    expect(linesOn(salary, '7210')).toEqual([])
+    expect(linesOn(salary, '7331')[0].debit_amount).toBe(250)
+    expect(linesOn(salary, '1930')[0].credit_amount).toBe(250)
+    assertBalanced(salary)
+  })
+})
+
 describe('salary entries: öresavrundning', () => {
   const roundingItem = (amount: number) => ({
     item_type: 'oresavrundning',
@@ -545,16 +605,28 @@ describe('salary entries: dimensions propagation (PR8)', () => {
     assertBalanced(avgifter)
   })
 
-  it('keeps the legacy zero-avgifter shape (single untagged debit)', async () => {
+  it('omits the legally invalid zero-amount avgifter voucher', async () => {
     const run = makeRun([
-      makeEmployee({ employee_id: 'a', avgifter_amount: 0, gross_salary: 1000, tax_withheld: 0, net_salary: 1000 }),
+      makeEmployee({
+        employee_id: 'a',
+        avgifter_amount: 0,
+        gross_salary: 1000,
+        tax_withheld: 0,
+        net_salary: 1000,
+      }),
     ])
-    await createSalaryRunEntries(makeSupabase(), 'company-1', 'user-1', run)
-    const avgifter = entryByDescription('Arbetsgivaravgifter')
-    const expense = linesOn(avgifter, '7510')
-    expect(expense).toHaveLength(1)
-    expect(expense[0].debit_amount).toBe(0)
-    expect(expense[0].dimensions).toBeUndefined()
+    const result = await createSalaryRunEntries(
+      makeSupabase(),
+      'company-1',
+      'user-1',
+      run,
+    )
+    expect(result.avgifterEntry).toBeNull()
+    expect(
+      mockedCreateEntry.mock.calls.some((call) =>
+        call[3].description.includes('Arbetsgivaravgifter')
+      )
+    ).toBe(false)
   })
 
   it('splits vacation accrual + its avgifter per bag; liabilities stay aggregated', async () => {

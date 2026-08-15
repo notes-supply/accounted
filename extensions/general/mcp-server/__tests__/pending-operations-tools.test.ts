@@ -99,7 +99,7 @@ describe('gnubok_approve_pending_operation', () => {
       'company-1',
       'user-1',
       supabase as never,
-      { type: 'api_key' }
+      { type: 'api_key', id: 'key-1', label: 'Verified approver' }
     )) as { status: string; operation_id: string; data?: { invoice_id: string } }
 
     expect(commitSpy).toHaveBeenCalledTimes(1)
@@ -114,15 +114,109 @@ describe('gnubok_approve_pending_operation', () => {
     // (committed_actor_* + audit_log, migration 20260619120000).
     expect(commitSpy.mock.calls[0][4]).toMatchObject({
       commitMethod: 'api_key',
-      actor: { type: 'api_key' },
+      actor: {
+        type: 'api_key',
+        id: 'key-1',
+        label: 'Verified approver',
+      },
     })
     expect(result.status).toBe('committed')
     expect(result.operation_id).toBe('op-1')
     expect(result.data?.invoice_id).toBe('inv-1')
   })
 
+  it('uses the verified approval actor and preserves partial-posting recovery fields', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({
+      data: {
+        id: 'op-1',
+        operation_type: 'categorize_transaction',
+        company_id: 'company-1',
+        status: 'pending',
+        risk_level: 'medium',
+        params: {},
+        actor_type: 'mcp_oauth',
+        actor_label: 'Accounted connector',
+        actor_id: 'connector-1',
+      },
+      error: null,
+    })
+    commitSpy.mockResolvedValue({
+      status: 'failed',
+      error: 'Compensation failed',
+      code: 'partial_commit',
+      retryable: false,
+      http_status: 500,
+      data: {
+        posted_ids: {
+          original_journal_entry_id: '22222222-2222-4222-8222-222222222222',
+          root_journal_entry_id: '33333333-3333-4333-8333-333333333333',
+          reversal_journal_entry_id: '44444444-4444-4444-8444-444444444444',
+          returned_journal_entry_id: '55555555-5555-4555-8555-555555555555',
+        },
+        publication_ids: ['pub-original', 'pub-reversal'],
+      },
+    })
+
+    const result = await approveTool.execute(
+      { operation_id: 'op-1' },
+      'company-1',
+      'user-1',
+      supabase as never,
+      { type: 'api_key', id: 'key-approval', label: 'Verified approver' },
+    )
+
+    expect(commitSpy.mock.calls[0][4]).toMatchObject({
+      commitMethod: 'api_key',
+      actor: {
+        type: 'api_key',
+        id: 'key-approval',
+        label: 'Verified approver',
+      },
+    })
+    expect(result).toMatchObject({
+      status: 'failed_partial',
+      code: 'partial_commit',
+      retryable: false,
+      data: {
+        posted_ids: {
+          original_journal_entry_id: '22222222-2222-4222-8222-222222222222',
+          root_journal_entry_id: '33333333-3333-4333-8333-333333333333',
+          reversal_journal_entry_id: '44444444-4444-4444-8444-444444444444',
+          returned_journal_entry_id: '55555555-5555-4555-8555-555555555555',
+        },
+        publication_ids: ['pub-original', 'pub-reversal'],
+      },
+    })
+  })
+
   // No 'mcp_oauth' row: handleMcpRequest hardcodes actor.type='api_key' for
   // ALL MCP traffic (the OAuth connector's access_token is a minted API key),
+
+  it('rejects approval without verified request actor metadata', async () => {
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({
+      data: {
+        id: 'op-1',
+        operation_type: 'create_invoice',
+        company_id: 'company-1',
+        status: 'pending',
+        risk_level: 'medium',
+        params: {},
+        actor_type: 'api_key',
+        actor_id: 'staged-owner-key',
+      },
+      error: null,
+    })
+
+    await expect(approveTool.execute(
+      { operation_id: 'op-1' },
+      'company-1',
+      'user-1',
+      supabase as never,
+    )).rejects.toThrow(/verified MCP actor metadata/i)
+    expect(commitSpy).not.toHaveBeenCalled()
+  })
   // so 'api_key' is the only agent-credential value a live request produces.
   it.each([
     { actorType: 'api_key', expected: 'api_key' },
@@ -140,12 +234,12 @@ describe('gnubok_approve_pending_operation', () => {
         'company-1',
         'user-1',
         supabase as never,
-        { type: actorType }
+        { type: actorType, id: `${actorType}-1` }
       )
 
       expect(commitSpy.mock.calls[0][4]).toMatchObject({
         commitMethod: expected,
-        actor: { type: actorType },
+        actor: { type: actorType, id: `${actorType}-1` },
       })
     }
   )
@@ -168,7 +262,7 @@ describe('gnubok_approve_pending_operation', () => {
         'company-1',
         'user-1',
         supabase as never,
-        { type: 'api_key' }
+        { type: 'api_key', id: 'key-1' }
       )
     ).rejects.toThrow(/confirmed=true/i)
     expect(commitSpy).not.toHaveBeenCalled()
@@ -192,7 +286,7 @@ describe('gnubok_approve_pending_operation', () => {
       'company-1',
       'user-1',
       supabase as never,
-      { type: 'api_key' }
+      { type: 'api_key', id: 'key-1' }
     )) as { status: string; operation_id: string }
 
     expect(commitSpy).toHaveBeenCalledTimes(1)
@@ -218,7 +312,8 @@ describe('gnubok_approve_pending_operation', () => {
       { operation_id: 'op-1' },
       'company-1',
       'user-1',
-      supabase as never
+      supabase as never,
+      { type: 'api_key', id: 'key-1' },
     )) as { status: string; error?: string }
 
     expect(result.status).toBe('failed')

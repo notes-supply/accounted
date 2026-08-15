@@ -27,9 +27,9 @@ import { buildMappingResultFromCategory } from '@/lib/bookkeeping/category-mappi
 import { applyAccountOverride } from '@/lib/bookkeeping/account-override'
 import { applySettlementAccount } from '@/lib/bookkeeping/mapping-engine'
 import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
-import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
+import { coordinateTransactionSettlement } from '@/lib/transactions/settlement-attachment'
+import type { SettlementSnapshot } from '@/lib/transactions/settlement-attachment'
 import { upsertCounterpartyTemplate } from '@/lib/bookkeeping/counterparty-templates'
-import { isBookkeepingError } from '@/lib/bookkeeping/errors'
 import { renderChannelContextNotes } from '@/lib/documents/channel-context-notes'
 import {
   detectBookingDuplicate,
@@ -40,7 +40,14 @@ import { hasLiveJournalEntryLink } from '@/lib/transactions/link-journal-entry'
 import { propagateUnderlagForBookedTransaction } from '@/lib/transactions/inbox-underlag'
 import { appendProcessingHistory } from '@/lib/processing-history/append'
 import { createLogger } from '@/lib/logger'
-import type { InboxChannelContext, Transaction, TransactionCategory, EntityType, VatTreatment } from '@/types'
+import type {
+  InboxChannelContext,
+  MappingResult,
+  Transaction,
+  TransactionCategory,
+  EntityType,
+  VatTreatment,
+} from '@/types'
 
 const log = createLogger('transactions/categorize-core')
 
@@ -48,7 +55,10 @@ const log = createLogger('transactions/categorize-core')
 export interface CategorizeCoreResult {
   data?: Record<string, unknown>
   error?: string
+  errorCode?: string
   status?: number
+  partialPostedIds?: Record<string, string>
+  partialPublicationIds?: string[]
 }
 
 export interface CategorizeMatchedTransactionOpts {
@@ -81,6 +91,8 @@ export interface CategorizeMatchedTransactionOpts {
    * 'private'. See lib/bookkeeping/account-override.ts.
    */
   accountOverride?: string
+  /** Exact preview state approved by a staged caller. Omission stages current state. */
+  approvedSettlementSnapshot?: SettlementSnapshot
 }
 
 // ── Helper: duplicate-guard claim text ───────────────────────────────
@@ -195,6 +207,138 @@ export async function ensureFiscalPeriod(
   return true
 }
 
+export interface CategorizeResolvedTransactionOpts {
+  transaction: Transaction
+  mappingResult: MappingResult
+  category: TransactionCategory
+  isBusiness: boolean
+  settlementAccount: string
+  notes?: string
+  approvedSettlementSnapshot?: SettlementSnapshot
+  learnCounterparty?: boolean
+  existingCategorization?: boolean
+}
+
+/**
+ * Finalize one fully resolved categorization through the sole settlement
+ * coordinator. All underlag, learning, and success events are ordered after
+ * authoritative attachment verification.
+ */
+export async function categorizeResolvedTransaction(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  opts: CategorizeResolvedTransactionOpts,
+): Promise<CategorizeCoreResult> {
+  const settlement = await coordinateTransactionSettlement({
+    supabase,
+    companyId,
+    userId,
+    transaction: opts.transaction,
+    mappingResult: opts.mappingResult,
+    category: opts.category,
+    isBusiness: opts.isBusiness,
+    existingCategorization: opts.existingCategorization,
+    settlementAccount: opts.settlementAccount,
+    notes: opts.notes,
+    approvedSnapshot: opts.approvedSettlementSnapshot,
+  })
+
+  if (settlement.kind === 'conflict') {
+    return {
+      error: settlement.message,
+      errorCode: settlement.code,
+      status: 409,
+    }
+  }
+  if (settlement.kind === 'partial') {
+    return {
+      data: {
+        posted_ids: settlement.postedIds,
+        publication_ids: settlement.publicationIds,
+      },
+      error: settlement.message,
+      errorCode: settlement.code,
+      status: 500,
+      partialPostedIds: settlement.postedIds,
+      partialPublicationIds: settlement.publicationIds,
+    }
+  }
+
+  const journalEntryId = settlement.readback.journalEntry.id
+  if (settlement.created) {
+    await propagateUnderlagForBookedTransaction(
+      supabase,
+      companyId,
+      opts.transaction.id,
+      journalEntryId,
+    )
+
+    if (opts.learnCounterparty !== false) {
+      try {
+        await upsertCounterpartyTemplate(
+          supabase,
+          companyId,
+          opts.transaction,
+          opts.mappingResult,
+          'user_approved',
+        )
+      } catch {
+        // Learning is non-critical after the accounting outcome is verified.
+      }
+    }
+
+    try {
+      const committedEvent = {
+        type: 'journal_entry.committed' as const,
+        payload: {
+          entry: settlement.journalEntry,
+          userId,
+          companyId,
+          durablePublication: {
+            persisted: true as const,
+            publication_id: settlement.publication.publication_id,
+            event_key: settlement.publication.event_key,
+          },
+        },
+      }
+      await eventBus.emit(committedEvent)
+    } catch (error) {
+      log.warn('journal_entry.committed emit failed after verified attachment', error)
+    }
+
+    try {
+      await eventBus.emit({
+        type: 'transaction.categorized',
+        payload: {
+          transaction: {
+            ...opts.transaction,
+            journal_entry_id: settlement.readback.transaction.journalEntryId,
+            cash_account_id: settlement.readback.transaction.cashAccountId,
+            category: settlement.readback.transaction.category,
+            is_business: settlement.readback.transaction.isBusiness,
+          },
+          account: opts.mappingResult.debit_account,
+          taxCode: opts.mappingResult.vat_lines[0]?.account_number || '',
+          userId,
+          companyId,
+        },
+      })
+    } catch (error) {
+      log.warn('transaction.categorized emit failed after verified attachment', error)
+    }
+  }
+
+  return {
+    data: {
+      journal_entry_id: journalEntryId,
+      category: settlement.readback.transaction.category,
+      already_had_journal_entry: !settlement.created,
+      settlement: settlement.readback,
+    },
+  }
+}
+
 /**
  * Book a single bank transaction by category. Creates the verifikation, marks
  * the transaction booked, propagates any matched invoice-inbox underlag onto
@@ -220,7 +364,16 @@ export async function categorizeMatchedTransaction(
    */
   exclude?: BookingDuplicateExclusions,
 ): Promise<CategorizeCoreResult> {
-  const { category, vatTreatment, vatAmount, notes, allowDuplicate, dimensions, accountOverride } = opts
+  const {
+    category,
+    vatTreatment,
+    vatAmount,
+    notes,
+    allowDuplicate,
+    dimensions,
+    accountOverride,
+    approvedSettlementSnapshot,
+  } = opts
 
   const { data: transaction, error: fetchError } = await supabase
     .from('transactions').select('*').eq('id', txId).eq('company_id', companyId).single()
@@ -228,37 +381,24 @@ export async function categorizeMatchedTransaction(
   if (fetchError || !transaction) {
     return { error: 'Transaction not found: it may have been deleted.', status: 404 }
   }
-  // A stale pointer at a 'reversed' entry (storno/correction left it behind)
-  // must not block re-categorization: the row reads as "utan koppling" in the
-  // UI, so a fresh booking has to be allowed (issue #988). Only a live posted
-  // link means it was genuinely categorized in the meantime. The UPDATE below
-  // is unconditional (no null-lock), so it overwrites the stale pointer; the
-  // duplicate guard still catches an existing live correction and steers the
-  // user to link instead.
-  if (
+  // A live posted pointer is eligible only for an exact immutable no-op.
+  // Stale reversal pointers remain an expected prior state for M4 to replace
+  // atomically; they are not rewritten client-side.
+  const existingCategorization = Boolean(
     transaction.journal_entry_id &&
-    (await hasLiveJournalEntryLink(supabase, companyId, transaction.journal_entry_id))
-  ) {
-    return { error: 'Transaction already has a journal entry: it was categorized in the meantime.', status: 409 }
-  }
+    await hasLiveJournalEntryLink(supabase, companyId, transaction.journal_entry_id),
+  )
+  let dismissedDuplicate: BookedDuplicateCandidate | null = null
 
-  // Booking-time duplicate guard: parity with the web /categorize route.
-  // Refuse to mint a second verifikat for an affärshändelse already in the
-  // ledger: an already-booked sibling transaction, OR an unlinked voucher that
-  // already books this amount on the bank account (invoice "markera som
-  // betald", the salary run's net-wage payout, a manual verifikat). Fail
-  // closed; the caller re-runs with allowDuplicate=true after the user
-  // confirms the bank line is a genuinely separate event. Fail-open on a
-  // detection error so a transient query failure never blocks a real booking.
-  if (allowDuplicate !== true) {
-    let dup = null
+  // Duplicate detection applies only when a new voucher may be posted. An
+  // existing categorization is verified against its immutable snapshot later.
+  if (!existingCategorization && allowDuplicate !== true) {
+    let duplicate: BookedDuplicateCandidate | null = null
     try {
-      dup = await detectBookingDuplicate(supabase, companyId, {
+      duplicate = await detectBookingDuplicate(supabase, companyId, {
         id: txId,
         date: transaction.date,
         amount: transaction.amount,
-        // `amount` is denominated in `currency`; the ledger legs the guard
-        // compares it against are always SEK. Selected above via select('*').
         currency: transaction.currency ?? null,
         amount_sek: transaction.amount_sek ?? null,
         exchange_rate: transaction.exchange_rate ?? null,
@@ -267,29 +407,25 @@ export async function categorizeMatchedTransaction(
     } catch (err) {
       log.warn('booking-time duplicate detection failed (continuing)', err)
     }
-    if (dup) {
-      const voucher = dup.voucher_label ? `verifikat ${dup.voucher_label}` : 'en befintlig verifikation'
-      // Shared three-branch claim (see buildDuplicateBookingClaim above): SEK
-      // figure when verified, foreign amount when the sibling has no SEK
-      // value, explicit "could not compare" otherwise.
-      const claim = buildDuplicateBookingClaim(dup, transaction.currency)
+    if (duplicate) {
+      const voucher = duplicate.voucher_label
+        ? `verifikat ${duplicate.voucher_label}`
+        : 'en befintlig verifikation'
+      const claim = buildDuplicateBookingClaim(duplicate, transaction.currency)
       return {
         error:
-          `Möjlig dubblettbokföring: ${voucher} (${dup.entry_date}) ${claim}. ` +
+          `Möjlig dubblettbokföring: ${voucher} (${duplicate.entry_date}) ${claim}. ` +
           `Den här affärshändelsen ser redan ut att vara bokförd: länka transaktionen till den befintliga ` +
           `verifikationen i stället för att bokföra den igen. Om banktransaktionen verkligen är en separat ` +
           `affärshändelse, kör om med allow_duplicate=true.`,
         status: 409,
       }
     }
-  } else {
-    // allowDuplicate=true bypassed the guard. Booking over a possible
-    // double-booking is a bookkeeping act that must leave a durable
-    // behandlingshistorik record (BFNAR 2013:2 kap 8). Re-detect to capture
-    // the dismissed candidate; best-effort, a logging failure must never block
-    // a legitimate booking.
+  } else if (!existingCategorization) {
+    // Capture the user's override now, but persist its behandlingshistorik only
+    // after the settlement attachment is authoritatively verified.
     try {
-      const dismissed = await detectBookingDuplicate(supabase, companyId, {
+      dismissedDuplicate = await detectBookingDuplicate(supabase, companyId, {
         id: txId,
         date: transaction.date,
         amount: transaction.amount,
@@ -298,38 +434,8 @@ export async function categorizeMatchedTransaction(
         exchange_rate: transaction.exchange_rate ?? null,
         cash_account_id: transaction.cash_account_id ?? null,
       }, exclude)
-      if (dismissed) {
-        await appendProcessingHistory({
-          companyId,
-          correlationId: txId,
-          aggregateType: 'BankTransaction',
-          aggregateId: txId,
-          eventType: 'BankTransactionDuplicateDismissed',
-          payload: {
-            transaction_id: txId,
-            dismissed_transaction_id: dismissed.transaction_id,
-            dismissed_journal_entry_id: dismissed.journal_entry_id,
-            // Null when the candidate's SEK value could not be established (a
-            // rateless foreign sibling); the foreign figures below then carry
-            // the durable record instead of a fabricated kr amount.
-            amount_ore: dismissed.amount != null ? Math.round(dismissed.amount * 100) : null,
-            dismissed_currency: dismissed.currency,
-            dismissed_amount_in_currency: dismissed.amount_in_currency,
-            entry_date: dismissed.entry_date,
-            // Dismissing a candidate whose amounts were never comparable is a
-            // materially different decision from dismissing a confirmed
-            // same-amount twin; behandlingshistorik has to record which one
-            // the user actually made (BFNAR 2013:2 kap 8).
-            amount_verified: dismissed.amount_verified,
-            unverified_reason: dismissed.unverified_reason,
-            via: 'allow_duplicate',
-          },
-          actor: { type: 'user', id: userId },
-          occurredAt: new Date(),
-        })
-      }
     } catch (logErr) {
-      log.warn('failed to record duplicate-dismissal behandlingshistorik', logErr)
+      log.warn('failed to capture duplicate-dismissal candidate', logErr)
     }
   }
 
@@ -380,54 +486,48 @@ export async function categorizeMatchedTransaction(
 
   await ensureFiscalPeriod(supabase, userId, companyId, transaction.date, fiscalYearStartMonth)
 
-  let journalEntryId: string | null = null
-  try {
-    const journalEntry = await createTransactionJournalEntry(
-      supabase, companyId, userId, transaction as Transaction, mappingResult, notes,
-    )
-    if (journalEntry) journalEntryId = journalEntry.id
-  } catch (err) {
-    if (isBookkeepingError(err)) throw err
-    log.error('Failed to create journal entry:', err)
-    return { error: err instanceof Error ? err.message : 'Failed to create journal entry', status: 500 }
-  }
-
-  const { error: updateError } = await supabase
-    .from('transactions')
-    .update({ is_business: isBusiness, category, journal_entry_id: journalEntryId })
-    .eq('id', txId)
-
-  if (updateError) {
-    log.error('Failed to update transaction:', updateError)
-    return { error: 'Failed to update transaction', status: 500 }
-  }
-
-  // Propagate the underlag from matched invoice-inbox items onto the new
-  // verifikation and stamp them consumed (BFL 7 kap): shared with the other
-  // booking paths, see lib/transactions/inbox-underlag.ts. Best-effort: the
-  // verifikation is already posted, so a failure is logged, never fatal.
-  if (journalEntryId) {
-    await propagateUnderlagForBookedTransaction(supabase, companyId, txId, journalEntryId)
-  }
-
-  try {
-    await upsertCounterpartyTemplate(
-      supabase, companyId, transaction as Transaction, mappingResult, 'user_approved'
-    )
-  } catch { /* non-critical */ }
-
-  await eventBus.emit({
-    type: 'transaction.categorized',
-    payload: {
-      transaction: transaction as Transaction,
-      account: mappingResult.debit_account,
-      taxCode: mappingResult.vat_lines[0]?.account_number || '',
-      userId,
-      companyId,
-    },
+  const result = await categorizeResolvedTransaction(supabase, userId, companyId, {
+    transaction: transaction as Transaction,
+    mappingResult,
+    category,
+    isBusiness,
+    settlementAccount,
+    notes,
+    approvedSettlementSnapshot,
+    existingCategorization,
   })
 
-  return { data: { journal_entry_id: journalEntryId, category } }
+  if (!result.error && dismissedDuplicate) {
+    try {
+      await appendProcessingHistory({
+        companyId,
+        correlationId: txId,
+        aggregateType: 'BankTransaction',
+        aggregateId: txId,
+        eventType: 'BankTransactionDuplicateDismissed',
+        payload: {
+          transaction_id: txId,
+          dismissed_transaction_id: dismissedDuplicate.transaction_id,
+          dismissed_journal_entry_id: dismissedDuplicate.journal_entry_id,
+          amount_ore: dismissedDuplicate.amount != null
+            ? Math.round(dismissedDuplicate.amount * 100)
+            : null,
+          dismissed_currency: dismissedDuplicate.currency,
+          dismissed_amount_in_currency: dismissedDuplicate.amount_in_currency,
+          entry_date: dismissedDuplicate.entry_date,
+          amount_verified: dismissedDuplicate.amount_verified,
+          unverified_reason: dismissedDuplicate.unverified_reason,
+          via: 'allow_duplicate',
+        },
+        actor: { type: 'user', id: userId },
+        occurredAt: new Date(),
+      })
+    } catch (logErr) {
+      log.warn('failed to record duplicate-dismissal behandlingshistorik', logErr)
+    }
+  }
+
+  return result
 }
 
 // ── Bulk: book N selected Underlag against their matched transactions ──────
@@ -448,7 +548,13 @@ export interface BulkBookInboxInput {
 
 export interface BulkBookInboxResult {
   booked: Array<{ item_id: string; transaction_id: string; journal_entry_id: string | null }>
-  skipped: Array<{ item_id: string; reason: string; detail?: string }>
+  skipped: Array<{
+    item_id: string
+    reason: string
+    detail?: string
+    posted_ids?: Record<string, string>
+    publication_ids?: string[]
+  }>
 }
 
 /**
@@ -561,7 +667,13 @@ export async function bulkBookMatchedInboxItems(
         : result.status === 409 ? 'already_booked_or_duplicate'
         : result.status === 400 ? 'no_account_mapping'
         : 'error'
-      skipped.push({ item_id: itemId, reason, detail: result.error })
+      skipped.push({
+        item_id: itemId,
+        reason,
+        detail: result.error,
+        posted_ids: result.partialPostedIds,
+        publication_ids: result.partialPublicationIds,
+      })
       continue
     }
 

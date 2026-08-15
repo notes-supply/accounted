@@ -492,7 +492,10 @@ describe('cut-off snapshot and posting inspection', () => {
 })
 
 describe('collectKontantmetodCutoff', () => {
-  function makePagedSupabase(rows: Record<string, Array<Record<string, unknown>>>) {
+  function makePagedSupabase(
+    rows: Record<string, Array<Record<string, unknown>>>,
+    lineageRows: Array<Record<string, unknown>> = [],
+  ) {
     return {
       from: (table: string) => {
         let range = { from: 0, to: 999 }
@@ -507,6 +510,33 @@ describe('collectKontantmetodCutoff', () => {
           error: null,
         })
         return query
+      },
+      rpc: async (_name: string, args: { p_root_ids: string[] }) => {
+        const lineage = lineageRows.filter((row) =>
+          args.p_root_ids.includes(row.root_id as string),
+        )
+        const stornoDepths = lineage
+          .filter((row) => row.edge_kind === 'storno')
+          .map((row) => row.depth as number)
+        return {
+          data: {
+            valid: true,
+            company_id: 'co-1',
+            requested_root_count: args.p_root_ids.length,
+            row_count: lineage.length,
+            max_depth: Math.max(...lineage.map((row) => row.depth as number)),
+            max_correction_depth: Math.max(
+              ...lineage
+                .filter((row) => row.edge_kind !== 'storno')
+                .map((row) => row.depth as number),
+            ),
+            terminal_storno_depth: stornoDepths.length > 0
+              ? Math.max(...stornoDepths)
+              : null,
+            rows: lineage,
+          },
+          error: null,
+        }
       },
     }
   }
@@ -559,14 +589,14 @@ describe('collectKontantmetodCutoff', () => {
         total: 1000, total_sek: 11500, vat_amount: 200, vat_amount_sek: 2300,
         vat_treatment: 'standard_25', document_type: 'invoice', currency: 'EUR', exchange_rate: 11.5,
       }],
-      invoice_payments: [{ id: 'ip-1', invoice_id: 'inv-eur', amount: 200, payment_date: '2026-12-15' }],
+      invoice_payments: [{ id: 'ip-1', invoice_id: 'inv-eur', amount: 200, payment_date: '2026-12-15', journal_entry_id: null }],
       supplier_invoices: [{
         id: 'si-eur', supplier_invoice_number: 'L-EUR', invoice_date: '2026-12-01', status: 'partially_paid',
         total: 1000, total_sek: 11500, vat_amount: 200, vat_amount_sek: 2300,
         reverse_charge: false, is_credit_note: false, currency: 'EUR', exchange_rate: 11.5,
         items: [{ account_number: '5410', line_total: 800 }],
       }],
-      supplier_invoice_payments: [{ id: 'sp-1', supplier_invoice_id: 'si-eur', amount: 200, payment_date: '2026-12-15' }],
+      supplier_invoice_payments: [{ id: 'sp-1', supplier_invoice_id: 'si-eur', amount: 200, payment_date: '2026-12-15', journal_entry_id: null }],
     })
     const result = await collectKontantmetodCutoff(
       supabase as never, 'co-1', '2026-01-01', '2026-12-31',
@@ -589,7 +619,8 @@ describe('collectKontantmetodCutoff', () => {
         }],
       }],
       supplier_invoice_payments: [{
-        id: 'sp-rc', supplier_invoice_id: 'si-rc', amount: 200, payment_date: '2026-12-15',
+        id: 'sp-rc', supplier_invoice_id: 'si-rc', amount: 200,
+        payment_date: '2026-12-15', journal_entry_id: null,
       }],
     }) as never, 'co-1', '2026-01-01', '2026-12-31')
     expect(result.payables[0]).toMatchObject({
@@ -642,7 +673,7 @@ describe('collectKontantmetodCutoff', () => {
         },
         {
           id: 'inv-credit', invoice_number: 'K-1', invoice_date: '2026-12-01', status: 'sent',
-          total: -1250, total_sek: -1250, vat_amount: -250, vat_amount_sek: -250,
+          total: 1250, total_sek: 1250, vat_amount: 250, vat_amount_sek: 250,
           vat_treatment: 'standard_25', document_type: 'invoice', currency: 'SEK',
           credited_invoice_id: 'inv-original',
         },
@@ -669,6 +700,104 @@ describe('collectKontantmetodCutoff', () => {
     expect(lines.receivableLines).toEqual([])
     expect(lines.payableLines).toEqual([])
   })
+  it('preserves customer item VAT rates and frozen revenue accounts with exact balance', async () => {
+    const result = await collectKontantmetodCutoff(makePagedSupabase({
+      invoices: [{
+        id: 'inv-mixed',
+        invoice_number: 'F-MIX',
+        invoice_date: '2026-12-01',
+        status: 'sent',
+        total: 206,
+        total_sek: 206,
+        vat_amount: 26,
+        vat_amount_sek: 26,
+        vat_treatment: null,
+        document_type: 'invoice',
+        currency: 'SEK',
+        items: [
+          {
+            id: 'item-25', sort_order: 0, line_total: 80, vat_amount: 20,
+            vat_rate: 25, revenue_account: '3041',
+          },
+          {
+            id: 'item-6', sort_order: 1, line_total: 100, vat_amount: 6,
+            vat_rate: 6, revenue_account: '3043',
+          },
+        ],
+      }],
+    }) as never, 'co-1', '2026-01-01', '2026-12-31')
+
+    expect(result.unknownVatTreatment).toEqual([])
+    const lines = buildCutoffLines(result.receivables, []).receivableLines
+    expect(lines.find((line) => line.account_number === '3041')?.credit_amount).toBe(80)
+    expect(lines.find((line) => line.account_number === '3043')?.credit_amount).toBe(100)
+    expect(lines.find((line) => line.account_number === '2618')?.credit_amount).toBe(20)
+    expect(lines.find((line) => line.account_number === '2638')?.credit_amount).toBe(6)
+    expect(lines.every((line) => line.debit_amount >= 0 && line.credit_amount >= 0)).toBe(true)
+    expect(
+      lines.reduce((sum, line) => sum + line.debit_amount - line.credit_amount, 0),
+    ).toBe(0)
+  })
+
+  it('excludes only credit sources economically effective by period end', async () => {
+    const lineageRows = [
+      ['customer-credit-source', '2026-12-20T10:00:00Z'],
+      ['supplier-credit-source', '2027-01-10T10:00:00Z'],
+    ].map(([id, committedAt]) => ({
+      root_id: id,
+      parent_id: null,
+      edge_kind: 'root',
+      id,
+      company_id: 'co-1',
+      entry_date: '2026-12-20',
+      status: 'posted',
+      source_type: 'supplier_invoice_received',
+      correction_of_id: null,
+      reverses_id: null,
+      reversed_by_id: null,
+      committed_at: committedAt,
+      depth: 0,
+      path: [id],
+      cycle: false,
+    }))
+    const result = await collectKontantmetodCutoff(makePagedSupabase({
+      invoices: [{
+        id: 'customer-credit',
+        invoice_number: 'K-1',
+        invoice_date: '2026-12-01',
+        status: 'credited',
+        total: -125,
+        total_sek: -125,
+        vat_amount: -25,
+        vat_amount_sek: -25,
+        vat_treatment: 'standard_25',
+        document_type: 'invoice',
+        currency: 'SEK',
+        credited_invoice_id: 'customer-original',
+        journal_entry_id: 'customer-credit-source',
+      }],
+      supplier_invoices: [{
+        id: 'supplier-credit',
+        supplier_invoice_number: 'LK-1',
+        invoice_date: '2026-12-01',
+        status: 'reversed',
+        total: 125,
+        total_sek: 125,
+        vat_amount: 25,
+        vat_amount_sek: 25,
+        reverse_charge: false,
+        is_credit_note: true,
+        credited_invoice_id: 'supplier-original',
+        currency: 'SEK',
+        registration_journal_entry_id: 'supplier-credit-source',
+        items: [{ account_number: '5410', line_total: 100 }],
+      }],
+    }, lineageRows) as never, 'co-1', '2026-01-01', '2026-12-31')
+
+    expect(result.receivables).toEqual([])
+    expect(result.payables.map((row) => row.outstanding)).toEqual([-125])
+  })
+
 })
 
 describe('postKontantmetodCutoff', () => {

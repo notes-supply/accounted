@@ -7,6 +7,7 @@ import type {
 } from '@/types'
 import { validateBalance, getNextVoucherNumber } from '@/lib/bookkeeping/engine'
 import { normalizeLineDimensions } from '@/lib/bookkeeping/dimension-resolver'
+import { resolveSupplierPaymentLineage } from '@/lib/bookkeeping/payment-sync'
 import { backfillStandardBASAccounts } from '@/lib/bookkeeping/account-backfill'
 import { resolvePeriodStatusForDate } from '@/lib/core/bookkeeping/period-service'
 import {
@@ -27,6 +28,7 @@ import {
   NoOpenPeriodForDateError,
   TargetPeriodClosedError,
   TargetPeriodLockedError,
+  SupplierPaymentAccountingChangedError,
 } from '@/lib/bookkeeping/errors'
 
 /**
@@ -69,6 +71,97 @@ function isIdenticalToOriginal(
     .map((l) => key(l.account_number, Number(l.debit_amount) || 0, Number(l.credit_amount) || 0))
     .sort()
   return proposedKeys.every((k, i) => k === originalKeys[i])
+}
+
+type AccountingLineShape = CreateJournalEntryLineInput | JournalEntryLine
+
+function accountingLineKey(line: AccountingLineShape): string {
+  const dimensions = normalizeLineDimensions(line)
+  const normalizedDimensions = Object.entries(dimensions).sort(([left], [right]) =>
+    left.localeCompare(right),
+  )
+  return JSON.stringify([
+    line.account_number,
+    round2(line.debit_amount || 0),
+    round2(line.credit_amount || 0),
+    line.currency || 'SEK',
+    line.amount_in_currency == null ? null : round2(Number(line.amount_in_currency)),
+    line.exchange_rate == null ? null : Number(line.exchange_rate),
+    line.tax_code || null,
+    normalizedDimensions,
+  ])
+}
+
+function hasSameAccountingLineMultiset(
+  left: AccountingLineShape[],
+  right: AccountingLineShape[],
+): boolean {
+  if (left.length !== right.length) return false
+  const leftKeys = left.map(accountingLineKey).sort()
+  const rightKeys = right.map(accountingLineKey).sort()
+  return leftKeys.every((key, index) => key === rightKeys[index])
+}
+
+async function assertSupplierPaymentAccountingUnchanged(
+  supabase: SupabaseClient,
+  companyId: string,
+  requestedJournalEntryId: string,
+  correctedLines: CreateJournalEntryLineInput[],
+): Promise<void> {
+  const lineage = await resolveSupplierPaymentLineage(
+    supabase,
+    companyId,
+    requestedJournalEntryId,
+  )
+  if (!lineage.is_supplier_payment) return
+
+  const accountingEntryIds = lineage.nodes
+    .filter((node) => node.relation !== 'storno')
+    .map((node) => node.journal_entry_id)
+  const uniqueEntryIds = [...new Set(accountingEntryIds)]
+  const { data, error } = await supabase
+    .from('journal_entries')
+    .select('id, company_id, lines:journal_entry_lines(*)')
+    .eq('company_id', companyId)
+    .in('id', uniqueEntryIds)
+  if (error || !data || data.length !== uniqueEntryIds.length) {
+    throw new BookkeepingDatabaseError(
+      'resolve_supplier_payment_lineage',
+      error?.message ?? 'supplier correction lineage entries were incomplete',
+    )
+  }
+
+  const entries = data as Array<{
+    id: string
+    company_id: string
+    lines: JournalEntryLine[] | null
+  }>
+  const root = entries.find(
+    (entry) => entry.id === lineage.root_journal_entry_id,
+  )
+  const rootLines = root?.lines
+  if (!root || root.company_id !== companyId || !Array.isArray(rootLines)) {
+    throw new BookkeepingDatabaseError(
+      'resolve_supplier_payment_lineage',
+      'supplier payment root lines were not returned',
+    )
+  }
+
+  const committedLinesMatch = entries.every(
+    (entry) =>
+      entry.company_id === companyId &&
+      Array.isArray(entry.lines) &&
+      hasSameAccountingLineMultiset(rootLines, entry.lines),
+  )
+  if (
+    !committedLinesMatch ||
+    !hasSameAccountingLineMultiset(rootLines, correctedLines)
+  ) {
+    throw new SupplierPaymentAccountingChangedError(
+      lineage.root_journal_entry_id,
+      requestedJournalEntryId,
+    )
+  }
 }
 
 /**
@@ -197,6 +290,12 @@ export async function correctEntry(
   }
 
   const originalLines = (original.lines as JournalEntryLine[]) || []
+  await assertSupplierPaymentAccountingUnchanged(
+    supabase,
+    companyId,
+    originalEntryId,
+    correctedLines,
+  )
 
   // Resolve where the corrected entry lands. Defaults to the original's own
   // date/period (a plain line-correction). A caller may override either to

@@ -12,7 +12,35 @@ import type {
   ReconciliationMethod,
   InvoiceInboxItem,
   SupplierInvoice,
+  DurablePublicationMarker,
 } from '@/types'
+
+export type DurablePublicationPayload = {
+  durablePublication?: DurablePublicationMarker
+}
+
+export function hasDurablePublicationMarker(
+  payload: unknown,
+): payload is DurablePublicationPayload & {
+  durablePublication: DurablePublicationMarker
+} {
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) return false
+  if (!('durablePublication' in payload)) return false
+  const marker = payload.durablePublication
+  return (
+    marker !== null &&
+    typeof marker === 'object' &&
+    !Array.isArray(marker) &&
+    'persisted' in marker &&
+    marker.persisted === true &&
+    'publication_id' in marker &&
+    typeof marker.publication_id === 'string' &&
+    marker.publication_id.length > 0 &&
+    'event_key' in marker &&
+    typeof marker.event_key === 'string' &&
+    marker.event_key.length > 0
+  )
+}
 
 // ============================================================
 // Core Event Types: discriminated union of all system events
@@ -21,9 +49,9 @@ import type {
 export type CoreEvent =
   // Bookkeeping
   | { type: 'journal_entry.drafted'; payload: { entry: JournalEntry; userId: string; companyId: string } }
-  | { type: 'journal_entry.committed'; payload: { entry: JournalEntry; userId: string; companyId: string } }
+  | { type: 'journal_entry.committed'; payload: { entry: JournalEntry; userId: string; companyId: string } & DurablePublicationPayload }
   | { type: 'journal_entry.corrected'; payload: { original: JournalEntry; storno: JournalEntry; corrected: JournalEntry; userId: string; companyId: string } }
-  | { type: 'journal_entry.reversed'; payload: { originalEntry: JournalEntry; reversalEntry: JournalEntry; userId: string; companyId: string } }
+  | { type: 'journal_entry.reversed'; payload: { originalEntry: JournalEntry; reversalEntry: JournalEntry; userId: string; companyId: string } & DurablePublicationPayload }
   | { type: 'journal_entry.deleted'; payload: { entryId: string; voucherSeries: string; voucherNumber: number; userId: string; companyId: string } }
   // Documents
   | { type: 'document.uploaded'; payload: { document: DocumentAttachment; userId: string; companyId: string } }

@@ -12,8 +12,8 @@
  */
 import { describe, it, expect } from 'vitest'
 import { randomUUID } from 'node:crypto'
-import { getPool } from './setup'
-import { seedCompany } from './fixtures'
+import { getPool, runAsServiceRole } from './setup'
+import { insertPostedJournalEntry, seedCompany } from './fixtures'
 
 let arrivalSeq = 0
 
@@ -78,9 +78,33 @@ const INSERT_INVOICE_PAYMENT = `
 
 const INSERT_SUPPLIER_PAYMENT = `
   INSERT INTO public.supplier_invoice_payments
-    (user_id, company_id, supplier_invoice_id, payment_date, amount, currency)
-  VALUES ($1, $2, $3, '2026-05-05', 100, 'SEK')
+    (user_id, company_id, supplier_invoice_id, payment_date, amount, currency,
+     journal_entry_id)
+  VALUES ($1, $2, $3, '2026-05-05', 100, 'SEK', $4)
   RETURNING id`
+
+async function insertSupplierPayment(params: {
+  userId: string
+  companyId: string
+  fiscalPeriodId: string
+  supplierInvoiceId: string
+}) {
+  const journalEntryId = await insertPostedJournalEntry({
+    userId: params.userId,
+    companyId: params.companyId,
+    fiscalPeriodId: params.fiscalPeriodId,
+    sourceType: 'supplier_invoice_paid',
+    sourceId: params.supplierInvoiceId,
+  })
+  return runAsServiceRole((client) =>
+    client.query(INSERT_SUPPLIER_PAYMENT, [
+      params.userId,
+      params.companyId,
+      params.supplierInvoiceId,
+      journalEntryId,
+    ]),
+  )
+}
 
 describe('invoice_payments: company-consistency trigger', () => {
   it('accepts a payment whose company_id matches its invoice', async () => {
@@ -144,23 +168,29 @@ describe('invoice_payments: company-consistency trigger', () => {
   })
 })
 
-describe('supplier_invoice_payments: company-consistency trigger', () => {
+describe('supplier_invoice_payments: tenant provenance and immutability', () => {
   it('accepts a payment whose company_id matches its supplier invoice', async () => {
     const a = await seedCompany()
     const supplierInvoiceId = await seedSupplierInvoice({ userId: a.userId, companyId: a.companyId })
 
-    const res = await getPool().query(INSERT_SUPPLIER_PAYMENT, [a.userId, a.companyId, supplierInvoiceId])
+    const res = await insertSupplierPayment({
+      ...a,
+      supplierInvoiceId,
+    })
     expect(res.rows).toHaveLength(1)
     expect(res.rows[0].id).toBeTruthy()
   })
 
-  it('rejects a payment whose company_id is a different tenant than its supplier invoice', async () => {
+  it('rejects a payment whose journal and invoice provenance cross tenants', async () => {
     const a = await seedCompany()
     const b = await seedCompany()
     const supplierInvoiceId = await seedSupplierInvoice({ userId: a.userId, companyId: a.companyId })
 
     await expect(
-      getPool().query(INSERT_SUPPLIER_PAYMENT, [b.userId, b.companyId, supplierInvoiceId]),
+      insertSupplierPayment({
+        ...b,
+        supplierInvoiceId,
+      }),
     ).rejects.toThrow(/does not match supplier_invoices\.company_id/i)
 
     const rows = await getPool().query(
@@ -170,11 +200,14 @@ describe('supplier_invoice_payments: company-consistency trigger', () => {
     expect(rows.rows).toHaveLength(0)
   })
 
-  it('rejects an UPDATE that points company_id at a foreign tenant', async () => {
+  it('rejects rerouting an immutable allocation to a foreign company', async () => {
     const a = await seedCompany()
     const b = await seedCompany()
     const supplierInvoiceId = await seedSupplierInvoice({ userId: a.userId, companyId: a.companyId })
-    const ins = await getPool().query(INSERT_SUPPLIER_PAYMENT, [a.userId, a.companyId, supplierInvoiceId])
+    const ins = await insertSupplierPayment({
+      ...a,
+      supplierInvoiceId,
+    })
     const paymentId = ins.rows[0].id as string
 
     await expect(
@@ -185,12 +218,15 @@ describe('supplier_invoice_payments: company-consistency trigger', () => {
     ).rejects.toThrow(/does not match supplier_invoices\.company_id/i)
   })
 
-  it('rejects rerouting supplier_invoice_id to a foreign tenant invoice (UPDATE OF supplier_invoice_id path)', async () => {
+  it('rejects rerouting an immutable allocation to a foreign supplier invoice', async () => {
     const a = await seedCompany()
     const b = await seedCompany()
     const siA = await seedSupplierInvoice({ userId: a.userId, companyId: a.companyId })
     const siB = await seedSupplierInvoice({ userId: b.userId, companyId: b.companyId })
-    const ins = await getPool().query(INSERT_SUPPLIER_PAYMENT, [a.userId, a.companyId, siA])
+    const ins = await insertSupplierPayment({
+      ...a,
+      supplierInvoiceId: siA,
+    })
     const paymentId = ins.rows[0].id as string
 
     await expect(

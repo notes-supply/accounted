@@ -858,6 +858,7 @@ describe('validateYearEndReadiness: open FX items at balansdagen (ÅRL 4 kap. 13
             invoice_id: 'inv-late-paid',
             amount: 5000,
             payment_date: '2025-03-10',
+            journal_entry_id: null,
           },
         ],
       })
@@ -891,6 +892,7 @@ describe('validateYearEndReadiness: open FX items at balansdagen (ÅRL 4 kap. 13
             invoice_id: 'inv-partial',
             amount: 400,
             payment_date: '2024-12-01',
+            journal_entry_id: null,
           },
         ],
       })

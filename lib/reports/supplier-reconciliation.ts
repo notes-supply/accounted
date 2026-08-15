@@ -2,6 +2,7 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 import { resolveSekAmount } from '@/lib/bookkeeping/currency-utils'
 import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import { fetchEntryLines, type EntryLinesQuery } from '@/lib/bookkeeping/entry-lines'
+import { reconstructReskontraAsOf } from './reskontra-payments'
 
 export interface ReconciliationResult {
   supplier_ledger_total: number
@@ -15,6 +16,16 @@ export interface ReconciliationResult {
    * than a true reconciliation break.
    */
   unconverted_fx_count: number
+}
+interface SupplierInvoiceForReconciliation {
+  id: string
+  total: number | string | null
+  remaining_amount: number | string | null
+  paid_at: string | null
+  currency: string | null
+  exchange_rate: number | string | null
+  is_credit_note: boolean
+  registration_journal_entry_id: string | null
 }
 
 /**
@@ -30,47 +41,66 @@ export interface ReconciliationResult {
 export async function generateReconciliation(
   supabase: SupabaseClient,
   companyId: string,
-  periodId: string
+  periodId: string,
+  asOfDate?: string,
 ): Promise<ReconciliationResult> {
-
-  // remaining_amount is stored in invoice currency; account 2440 is in SEK
-  // (booked at invoice-date rate), so convert each row before summing.
-  // Paginated: a company with >1000 open supplier invoices would otherwise be
-  // silently truncated, manufacturing a phantom reconciliation gap.
-  const invoices = await fetchAllRows<{
-    id: string
-    remaining_amount: number | null
-    currency: string | null
-    exchange_rate: number | null
-  }>(({ from, to }) =>
-    supabase
+  const invoices = await fetchAllRows<SupplierInvoiceForReconciliation>(({ from, to }) => {
+    let query = supabase
       .from('supplier_invoices')
-      .select('id, remaining_amount, currency, exchange_rate')
+      .select(
+        'id, total, remaining_amount, paid_at, currency, exchange_rate, is_credit_note, registration_journal_entry_id',
+      )
       .eq('company_id', companyId)
-      .in('status', ['registered', 'approved', 'partially_paid', 'overdue'])
-      .order('id', { ascending: true })
-      .range(from, to)
-  )
+    query = asOfDate
+      ? query.lte('invoice_date', asOfDate)
+      : query.in('status', ['registered', 'approved', 'partially_paid', 'overdue'])
+    return query.order('id', { ascending: true }).range(from, to)
+  })
+
+  const reconstructed = asOfDate
+    ? await reconstructReskontraAsOf(
+        supabase,
+        companyId,
+        asOfDate,
+        'supplier_invoice_payments',
+        'supplier_invoice_id',
+        invoices.map((invoice) => ({
+          id: invoice.id,
+          total: Math.abs(Number(invoice.total) || 0),
+          liveOutstanding: Math.abs(Number(invoice.remaining_amount) || 0),
+          paidAt: invoice.paid_at,
+          sign: invoice.is_credit_note ? -1 : 1,
+          registrationEvidence: 'required',
+          registrationJournalEntryId: invoice.registration_journal_entry_id,
+        })),
+      )
+    : null
 
   let unconvertedFxCount = 0
-  const supplierLedgerTotal = (invoices || [])
-    .reduce((sum, inv) => {
-      const isFx = inv.currency && inv.currency !== 'SEK'
-      const hasRate = inv.exchange_rate != null && Number(inv.exchange_rate) > 0
-      // Skip unconvertible FX rows from the sum: adding raw foreign amounts
-      // to a SEK total is arithmetically unsound. Counted instead.
-      if (isFx && !hasRate) {
-        unconvertedFxCount += 1
-        return sum
-      }
-      const sek = resolveSekAmount(
-        Number(inv.remaining_amount) || 0,
-        null,
-        inv.currency,
-        inv.exchange_rate
-      )
-      return Math.round((sum + sek) * 100) / 100
-    }, 0)
+  const supplierLedgerTotal = invoices.reduce((sum, invoice) => {
+    const outstanding = reconstructed
+      ? reconstructed.outstandingByInvoice.get(invoice.id)
+      : Math.abs(Number(invoice.remaining_amount) || 0) * (invoice.is_credit_note ? -1 : 1)
+    if (outstanding == null || outstanding === 0) return sum
+
+    const isFx = invoice.currency != null && invoice.currency !== 'SEK'
+    const hasRate = invoice.exchange_rate != null && Number(invoice.exchange_rate) > 0
+    if (isFx && !hasRate) {
+      unconvertedFxCount += 1
+      return sum
+    }
+    return Math.round(
+      (
+        sum +
+        resolveSekAmount(
+          outstanding,
+          null,
+          invoice.currency,
+          invoice.exchange_rate == null ? null : Number(invoice.exchange_rate),
+        )
+      ) * 100,
+    ) / 100
+  }, 0)
 
   // Get account 2440 balance from the ledger in this period. We count posted
   // AND reversed entries together: the SAME inclusion rule the trial balance /
@@ -90,11 +120,18 @@ export async function generateReconciliation(
   }>({
     supabase,
     lineColumns: 'id, debit_amount, credit_amount',
-    filterEntries: (q: EntryLinesQuery) =>
-      q
+    filterEntries: (q: EntryLinesQuery) => {
+      let filtered = q
         .eq('company_id', companyId)
         .eq('fiscal_period_id', periodId)
-        .in('status', ['posted', 'reversed']),
+        .in('status', ['posted', 'reversed'])
+      if (asOfDate) {
+        filtered = filtered
+          .lte('entry_date', asOfDate)
+          .lte('committed_at', `${asOfDate}T23:59:59.999Z`)
+      }
+      return filtered
+    },
     filterLines: (q: EntryLinesQuery) => q.eq('account_number', '2440'),
     attachEntriesAs: null,
   })

@@ -163,6 +163,15 @@ export async function insertTransaction(params: {
 
 // Insert a draft journal entry and return its id. Uses a placeholder
 // voucher_number=0 which commit_journal_entry() will overwrite on commit.
+type JournalCommitMethod =
+  | 'user_accept'
+  | 'bulk_accept'
+  | 'timing_ceiling'
+  | 'migration'
+  | 'legacy'
+  | 'agent'
+  | 'api_key'
+
 export async function insertDraftJournalEntry(params: {
   userId: string
   companyId: string
@@ -175,9 +184,10 @@ export async function insertDraftJournalEntry(params: {
   sourceType?: string
   sourceId?: string | null
   createdAt?: string
-  // Inserting directly as 'posted' skips the set_committed_at() trigger (it
-  // fires on draft->posted UPDATE), so committed_at stays null unless set here.
+  // Direct durable states must carry the same publication metadata as entries
+  // posted through commit_journal_entry().
   committedAt?: string | null
+  commitMethod?: JournalCommitMethod
 }): Promise<string> {
   if (params.status === 'posted') {
     return insertPostedJournalEntry(params)
@@ -187,8 +197,10 @@ export async function insertDraftJournalEntry(params: {
   await getPool().query(
     `INSERT INTO public.journal_entries
        (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-        entry_date, description, source_type, source_id, status, created_at, committed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12::timestamptz, now()), $13::timestamptz)`,
+        entry_date, description, source_type, source_id, status, created_at,
+        committed_at, commit_method)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+             COALESCE($12::timestamptz, now()), $13::timestamptz, $14)`,
     [
       id,
       params.userId,
@@ -203,6 +215,7 @@ export async function insertDraftJournalEntry(params: {
       params.status ?? 'draft',
       params.createdAt ?? null,
       params.committedAt ?? null,
+      params.commitMethod ?? null,
     ],
   )
   return id
@@ -234,6 +247,7 @@ export async function insertPostedJournalEntry(params: {
   sourceId?: string | null
   createdAt?: string
   committedAt?: string | null
+  commitMethod?: JournalCommitMethod
   lines?: PostedJournalEntryLine[]
 }): Promise<string> {
   const id = randomUUID()
@@ -248,9 +262,11 @@ export async function insertPostedJournalEntry(params: {
     await client.query(
       `INSERT INTO public.journal_entries
          (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-          entry_date, description, source_type, source_id, status, created_at, committed_at)
+          entry_date, description, source_type, source_id, status, created_at,
+          committed_at, commit_method)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'posted',
-               COALESCE($11::timestamptz, now()), $12::timestamptz)`,
+               COALESCE($11::timestamptz, now()),
+               COALESCE($12::timestamptz, $11::timestamptz, now()), $13)`,
       [
         id,
         params.userId,
@@ -264,6 +280,7 @@ export async function insertPostedJournalEntry(params: {
         params.sourceId ?? null,
         params.createdAt ?? null,
         params.committedAt ?? null,
+        params.commitMethod ?? 'legacy',
       ],
     )
 
@@ -289,6 +306,237 @@ export async function insertPostedJournalEntry(params: {
     await client.query('SET CONSTRAINTS check_balance_on_posted_insert IMMEDIATE')
     await client.query('COMMIT')
     return id
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
+// Build a complete reversed or corrected lineage in one transaction. Durable
+// lineage validation is deferred, so the original, storno, optional correction,
+// and reverse pointer must reach their coherent final state before COMMIT.
+export async function insertReversedJournalEntryGraph(params: {
+  userId: string
+  companyId: string
+  fiscalPeriodId: string
+  entryDate?: string
+  description?: string
+  voucherSeries?: string
+  voucherNumber?: number
+  sourceType?: string
+  sourceId?: string | null
+  lines?: PostedJournalEntryLine[]
+  correction?: {
+    description?: string
+    voucherNumber?: number
+    lines?: PostedJournalEntryLine[]
+  }
+}): Promise<{ originalId: string; stornoId: string; correctionId: string | null }> {
+  const originalId = randomUUID()
+  const stornoId = randomUUID()
+  const correctionId = params.correction ? randomUUID() : null
+  const originalLines = params.lines ?? [
+    { accountNumber: '1930', debitAmount: 1000, creditAmount: 0 },
+    { accountNumber: '3001', debitAmount: 0, creditAmount: 1000 },
+  ]
+  const stornoLines = originalLines.map((line) => ({
+    ...line,
+    debitAmount: line.creditAmount,
+    creditAmount: line.debitAmount,
+  }))
+  const correctionLines = params.correction?.lines ?? originalLines
+  const client = await getPool().connect()
+
+  const insertNode = async (node: {
+    id: string
+    voucherNumber: number
+    description: string
+    sourceType: string
+    reversesId?: string
+    correctionOfId?: string
+    lines: PostedJournalEntryLine[]
+  }) => {
+    await client.query(
+      `INSERT INTO public.journal_entries
+         (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
+          entry_date, description, source_type, source_id, status, reverses_id,
+          correction_of_id, committed_at, commit_method)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'posted', $11, $12,
+               now(), 'legacy')`,
+      [
+        node.id,
+        params.userId,
+        params.companyId,
+        params.fiscalPeriodId,
+        node.voucherNumber,
+        params.voucherSeries ?? 'A',
+        params.entryDate ?? '2026-06-01',
+        node.description,
+        node.sourceType,
+        params.sourceId ?? null,
+        node.reversesId ?? null,
+        node.correctionOfId ?? null,
+      ],
+    )
+    for (const [index, line] of node.lines.entries()) {
+      await client.query(
+        `INSERT INTO public.journal_entry_lines
+           (journal_entry_id, account_number, debit_amount, credit_amount,
+            currency, line_description, sort_order, dimensions)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
+        [
+          node.id,
+          line.accountNumber,
+          line.debitAmount,
+          line.creditAmount,
+          line.currency ?? 'SEK',
+          line.lineDescription ?? null,
+          line.sortOrder ?? index,
+          JSON.stringify(line.dimensions ?? {}),
+        ],
+      )
+    }
+  }
+
+  try {
+    await client.query('BEGIN')
+    const voucherNumber =
+      params.voucherNumber ??
+      (
+        await client.query<{ next_number: number }>(
+          `SELECT COALESCE(max(voucher_number), 0)::int + 1 AS next_number
+           FROM public.journal_entries
+           WHERE company_id = $1
+             AND fiscal_period_id = $2
+             AND voucher_series = $3`,
+          [params.companyId, params.fiscalPeriodId, params.voucherSeries ?? 'A'],
+        )
+      ).rows[0]!.next_number
+    await insertNode({
+      id: originalId,
+      voucherNumber,
+      description: params.description ?? 'Test entry',
+      sourceType: params.sourceType ?? 'manual',
+      lines: originalLines,
+    })
+    await insertNode({
+      id: stornoId,
+      voucherNumber: voucherNumber + 1,
+      description: `Storno: ${params.description ?? 'Test entry'}`,
+      sourceType: 'storno',
+      reversesId: originalId,
+      lines: stornoLines,
+    })
+    if (params.correction && correctionId) {
+      await insertNode({
+        id: correctionId,
+        voucherNumber: params.correction.voucherNumber ?? voucherNumber + 2,
+        description: params.correction.description ?? `Correction: ${params.description ?? 'Test entry'}`,
+        sourceType: 'correction',
+        correctionOfId: originalId,
+        lines: correctionLines,
+      })
+    }
+    await client.query(
+      `UPDATE public.journal_entries
+       SET status = 'reversed', reversed_by_id = $2
+       WHERE id = $1`,
+      [originalId, stornoId],
+    )
+    await client.query('SET CONSTRAINTS check_balance_on_posted_insert IMMEDIATE')
+    await client.query('COMMIT')
+    return { originalId, stornoId, correctionId }
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
+// Reverse an already-posted fixture entry with a complete storno graph in one
+// transaction. This is distinct from insertReversedJournalEntryGraph: callers
+// can attach state to the live original first, then prove that the real
+// posted -> reversed transition fires its cleanup triggers.
+export async function reversePostedJournalEntry(originalId: string): Promise<string> {
+  const stornoId = randomUUID()
+  const client = await getPool().connect()
+
+  try {
+    await client.query('BEGIN')
+    const original = await client.query<{
+      user_id: string
+      company_id: string
+      fiscal_period_id: string
+      voucher_series: string
+      entry_date: string
+      description: string | null
+      source_id: string | null
+      status: string
+    }>(
+      `SELECT user_id, company_id, fiscal_period_id, voucher_series,
+              entry_date::text, description, source_id, status
+       FROM public.journal_entries
+       WHERE id = $1
+       FOR UPDATE`,
+      [originalId],
+    )
+    if (original.rows.length !== 1 || original.rows[0]!.status !== 'posted') {
+      throw new Error(`Expected posted journal entry ${originalId}`)
+    }
+    const entry = original.rows[0]!
+    const nextVoucher = await client.query<{ next_number: number }>(
+      `SELECT COALESCE(max(voucher_number), 0)::int + 1 AS next_number
+       FROM public.journal_entries
+       WHERE company_id = $1
+         AND fiscal_period_id = $2
+         AND voucher_series = $3`,
+      [entry.company_id, entry.fiscal_period_id, entry.voucher_series],
+    )
+
+    await client.query(
+      `INSERT INTO public.journal_entries
+         (id, user_id, company_id, fiscal_period_id, voucher_number,
+          voucher_series, entry_date, description, source_type, source_id,
+          status, reverses_id, committed_at, commit_method)
+       VALUES ($1, $2, $3, $4, $5, $6, $7,
+               'Storno: ' || COALESCE($8, 'Test entry'),
+               'storno', $9, 'posted', $10, now(), 'legacy')`,
+      [
+        stornoId,
+        entry.user_id,
+        entry.company_id,
+        entry.fiscal_period_id,
+        nextVoucher.rows[0]!.next_number,
+        entry.voucher_series,
+        entry.entry_date,
+        entry.description,
+        entry.source_id,
+        originalId,
+      ],
+    )
+    await client.query(
+      `INSERT INTO public.journal_entry_lines
+         (journal_entry_id, account_number, debit_amount, credit_amount,
+          currency, line_description, sort_order, dimensions)
+       SELECT $2, account_number, credit_amount, debit_amount,
+              currency, line_description, sort_order, dimensions
+       FROM public.journal_entry_lines
+       WHERE journal_entry_id = $1
+       ORDER BY sort_order, id`,
+      [originalId, stornoId],
+    )
+    await client.query(
+      `UPDATE public.journal_entries
+       SET status = 'reversed', reversed_by_id = $2
+       WHERE id = $1`,
+      [originalId, stornoId],
+    )
+    await client.query('SET CONSTRAINTS check_balance_on_posted_insert IMMEDIATE')
+    await client.query('COMMIT')
+    return stornoId
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {})
     throw error

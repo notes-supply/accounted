@@ -49,6 +49,27 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
         )
         if (structured) return structured
       }
+      if (result.code === 'partial_commit') {
+        const partialData = result.data ?? {}
+        const status = result.http_status ?? 500
+        const message = getErrorMessage(result.error ?? null, { statusCode: status })
+        log.warn('pending operation commit reached terminal partial state', {
+          operationId: id,
+          status,
+          postedIds: partialData.posted_ids,
+          publicationIds: partialData.publication_ids,
+        })
+        return NextResponse.json(
+          {
+            status: 'failed_partial',
+            error: message,
+            code: result.code,
+            retryable: false,
+            data: partialData,
+          },
+          { status },
+        )
+      }
       // The executor's error strings mix Swedish user messages with raw
       // Supabase/Zod English; the pending page toasts this field verbatim, so
       // map it here. Swedish passes through untouched, English falls to the
@@ -60,8 +81,13 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
         status,
       })
       return NextResponse.json(
-        { error: getErrorMessage(result.error ?? null, { statusCode: status }) },
-        { status }
+        {
+          error: getErrorMessage(result.error ?? null, { statusCode: status }),
+          ...(result.code ? { code: result.code } : {}),
+          ...(result.retryable !== undefined ? { retryable: result.retryable } : {}),
+          ...(result.data ? { data: result.data } : {}),
+        },
+        { status },
       )
     } catch (err) {
       const typed = bookkeepingErrorResponse(err)

@@ -23,7 +23,10 @@
  */
 
 import { eventBus } from '@/lib/events/bus'
-import type { CoreEventType } from '@/lib/events/types'
+import {
+  hasDurablePublicationMarker,
+  type CoreEventType,
+} from '@/lib/events/types'
 import { createServiceClientNoCookies } from '@/lib/auth/api-keys'
 import { createLogger } from '@/lib/logger'
 import { API_V1_VERSION } from '@/lib/api/v1/version'
@@ -79,6 +82,10 @@ export function registerWebhookHandler(): void {
 
   for (const eventType of PUBLIC_WEBHOOK_EVENTS) {
     eventBus.on(eventType, async (payload) => {
+      // M2/M3/M5 already persisted event_log and webhook delivery projections
+      // for this marker. Keep the event visible to extension handlers, but do
+      // not enqueue a second core delivery.
+      if (hasDurablePublicationMarker(payload)) return
       // payload type depends on eventType but every variant carries
       // companyId: the only field we structurally need here.
       const companyId = (payload as { companyId?: string }).companyId

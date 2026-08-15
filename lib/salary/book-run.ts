@@ -97,6 +97,7 @@ async function bookLoadedRun(
   const nothingToBook =
     Math.round(((run.total_gross as number) ?? 0) * 100) === 0 &&
     Math.round(((run.total_tax as number) ?? 0) * 100) === 0 &&
+    Math.round(((run.total_net as number) ?? 0) * 100) === 0 &&
     Math.round(((run.total_avgifter as number) ?? 0) * 100) === 0 &&
     Math.round(((run.total_vacation_accrual as number) ?? 0) * 100) === 0
 
@@ -204,13 +205,16 @@ async function bookLoadedRun(
     },
   )
 
-  const entryIds = [salaryEntry.id, avgifterEntry.id]
+  const entryIds = [salaryEntry.id]
   const updates: Record<string, unknown> = {
     status: 'booked',
     salary_entry_id: salaryEntry.id,
-    avgifter_entry_id: avgifterEntry.id,
+    avgifter_entry_id: avgifterEntry?.id ?? null,
     booked_at: new Date().toISOString(),
     booked_by: userId,
+  }
+  if (avgifterEntry) {
+    entryIds.push(avgifterEntry.id)
   }
   if (vacationEntry) {
     updates.vacation_entry_id = vacationEntry.id
