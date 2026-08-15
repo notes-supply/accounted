@@ -27,11 +27,13 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 20
+          node-version: 22
       - name: Require pg-real coverage for trigger/RPC/RLS migrations
         env:
           PG_GATE_BASE: origin/${{ github.base_ref }}
         run: node scripts/check-pg-test-coverage.mjs
+      - name: Verify production migration lineage
+        run: npm run check:migrations
 
   # Proves that an EXISTING database survives the PR's migrations, which the
   # pg-real job below cannot: it applies every migration to an empty database,
@@ -46,7 +48,7 @@ jobs:
 
     services:
       postgres:
-        image: supabase/postgres:15.8.1.060
+        image: supabase/postgres:17.6.1.136@sha256:f371b5f3f2ac0a05703f33d6e6134515fb2498cab708fb948a0aeb7481467c00
         env:
           POSTGRES_PASSWORD: postgres
         ports:
@@ -64,76 +66,51 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # Full history so the merge-base with the PR base branch exists.
-          fetch-depth: 0
           persist-credentials: false
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
 
       - name: Install psql client
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
 
-      - name: Identify the migrations this PR adds
-        id: newmig
-        env:
-          BASE_REF: origin/${{ github.base_ref }}
+      - name: Verify and derive the exact production upgrade
         run: |
           set -euo pipefail
-          MERGE_BASE=$(git merge-base "$BASE_REF" HEAD)
-          echo "merge_base=$MERGE_BASE" >> "$GITHUB_OUTPUT"
-          echo "Merge base: $MERGE_BASE"
-
-          # Migrations present at HEAD but not at the merge base. Uses the git
-          # tree, not the filesystem, so a rebase or a merge commit cannot make
-          # an already-shipped migration look new.
-          git ls-tree -r --name-only HEAD -- supabase/migrations \
-            | grep '\.sql$' | sort > /tmp/head-migrations.txt
-          git ls-tree -r --name-only "$MERGE_BASE" -- supabase/migrations \
-            | grep '\.sql$' | sort > /tmp/base-migrations.txt
-          comm -23 /tmp/head-migrations.txt /tmp/base-migrations.txt > /tmp/new-migrations.txt
-
-          COUNT=$(wc -l < /tmp/new-migrations.txt | tr -d ' ')
-          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
-          echo "New migrations ($COUNT):"
-          cat /tmp/new-migrations.txt
+          node scripts/check-migration-lineage.mjs --write-lists /tmp/accounted-lineage
+          test "$(wc -l < /tmp/accounted-lineage/predecessor.txt)" -eq 548
+          test "$(wc -l < /tmp/accounted-lineage/upgrade.txt)" -eq 89
 
       - name: Bootstrap storage schema
-        if: steps.newmig.outputs.count != '0'
-        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f tests/pg/bootstrap.sql
-
-      - name: Apply the schema as it stands at the merge base
-        if: steps.newmig.outputs.count != '0'
-        env:
-          MERGE_BASE: ${{ steps.newmig.outputs.merge_base }}
         run: |
           set -euo pipefail
-          # Read each migration out of the merge-base tree rather than the
-          # working tree: a PR that EDITS a shipped migration (forbidden, but
-          # this job must not be the thing that hides it) still gets the
-          # original applied here, so the edit shows up as a failure below.
+          PGUSER=supabase_admin psql -X -v ON_ERROR_STOP=1 -q -c 'GRANT CREATE ON SCHEMA storage TO postgres'
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f tests/pg/bootstrap.sql
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c 'CREATE UNIQUE INDEX IF NOT EXISTS bucketid_objname ON storage.objects (bucket_id, name)'
+          PGUSER=supabase_admin psql -X -v ON_ERROR_STOP=1 -q -c 'REVOKE CREATE ON SCHEMA storage FROM postgres'
+
+      - name: Apply the exact 548-entry production predecessor
+        run: |
+          set -euo pipefail
           while read -r f; do
-            echo "Applying (base) $f"
-            git show "$MERGE_BASE:$f" | psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q
-          done < /tmp/base-migrations.txt
+            echo "Applying (production predecessor) $f"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          done < /tmp/accounted-lineage/predecessor.txt
 
       - name: Seed a real company with posted verifikat
-        if: steps.newmig.outputs.count != '0'
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f tests/pg/upgrade/seed.sql
 
-      - name: Apply ONLY the new migrations, against existing data
-        if: steps.newmig.outputs.count != '0'
+      - name: Apply the exact 89-entry production upgrade
         run: |
           set -euo pipefail
           while read -r f; do
-            echo "Applying (new) $f"
+            echo "Applying (production upgrade) $f"
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
-          done < /tmp/new-migrations.txt
+          done < /tmp/accounted-lineage/upgrade.txt
 
       - name: Assert the existing data survived
-        if: steps.newmig.outputs.count != '0'
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/pg/upgrade/assert.sql
-
-      - name: No migrations in this PR
-        if: steps.newmig.outputs.count == '0'
-        run: echo "This PR adds no migration; nothing to upgrade-test."
 
   pg-real:
     runs-on: ubuntu-latest
@@ -142,8 +119,8 @@ jobs:
       postgres:
         # Supabase image ships the auth schema, auth.uid(), and the extensions
         # (uuid-ossp, pg_cron, btree_gist, vector) this repo's migrations need.
-        # Plain postgres:15 would require manual bootstrap SQL.
-        image: supabase/postgres:15.8.1.060
+        # Plain Postgres would require manual Supabase bootstrap SQL.
+        image: supabase/postgres:17.6.1.136@sha256:f371b5f3f2ac0a05703f33d6e6134515fb2498cab708fb948a0aeb7481467c00
         env:
           POSTGRES_PASSWORD: postgres
         ports:
@@ -172,7 +149,7 @@ jobs:
       # actions/cache/restore here, which is the only shape that gets hits.
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 20
+          node-version: 22
 
       - run: npm ci
 
@@ -183,7 +160,15 @@ jobs:
         # The supabase/postgres image ships a partial storage schema; the rest
         # is provisioned by the storage-api service at runtime, which we do
         # not run in CI. This aligns the schema with what migrations expect.
-        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f tests/pg/bootstrap.sql
+        run: |
+          set -euo pipefail
+          PGUSER=supabase_admin psql -X -v ON_ERROR_STOP=1 -q -c 'GRANT CREATE ON SCHEMA storage TO postgres'
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f tests/pg/bootstrap.sql
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c 'CREATE UNIQUE INDEX IF NOT EXISTS bucketid_objname ON storage.objects (bucket_id, name)'
+          PGUSER=supabase_admin psql -X -v ON_ERROR_STOP=1 -q -c 'REVOKE CREATE ON SCHEMA storage FROM postgres'
+
+      - name: Verify production migration lineage
+        run: npm run check:migrations
 
       - name: Apply migrations
         run: |
