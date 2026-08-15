@@ -1,0 +1,2746 @@
+{
+  "count": 548,
+  "entries": [
+    {
+      "filename": "20230101000000_extension_function_wrappers.sql",
+      "sha256": "cfa937b53ebabeac8a740adb14e55436bb323408a0b2ee04963e00c9f51c10a5",
+      "version": "20230101000000"
+    },
+    {
+      "filename": "20240101000001_core_schema.sql",
+      "sha256": "29913867801b0c2013b7172805a67879fcb0598b5206309c188cd39af70ca718",
+      "version": "20240101000001"
+    },
+    {
+      "filename": "20240101000002_bookkeeping.sql",
+      "sha256": "c4cf1a6b71e5ccb08b705bb9262b426ed3940e40b6c25dbb417ab6d1b3bbe3f4",
+      "version": "20240101000002"
+    },
+    {
+      "filename": "20240101000003_deadlines_calendar.sql",
+      "sha256": "8ad009e68e513ce18499ecd26000337d05c924c556c07b1de740c8db60d855f0",
+      "version": "20240101000003"
+    },
+    {
+      "filename": "20240101000004_receipts.sql",
+      "sha256": "f2039042933647b7b77b413365a7cacd12faeca1afc9933e9c9ff3bf04ce999a",
+      "version": "20240101000004"
+    },
+    {
+      "filename": "20240101000005_invoice_reminders.sql",
+      "sha256": "20f6107b18f9d8cfb143b356ed9943c8a39ac95ca8be481766bb47f03d8a90c5",
+      "version": "20240101000005"
+    },
+    {
+      "filename": "20240101000006_schablonavdrag.sql",
+      "sha256": "9669a5ed530449803cd3bdb490a2ced95b445c6bb9a1345b0d6108af248e78dd",
+      "version": "20240101000006"
+    },
+    {
+      "filename": "20240101000007_sie_imports.sql",
+      "sha256": "58284202f398deef3ad8aa922294bb7030636cf00eef0a24767febba3678d575",
+      "version": "20240101000007"
+    },
+    {
+      "filename": "20240101000008_push_notifications.sql",
+      "sha256": "96500d8477ac291c603e583504991ad0664b04e9bc9616eca9812219b67a3729",
+      "version": "20240101000008"
+    },
+    {
+      "filename": "20240101000009_functions_triggers.sql",
+      "sha256": "c3fef6f3069e8654dbc2a8db3de4e1ad8565899529e448b8869460fb2b73103b",
+      "version": "20240101000009"
+    },
+    {
+      "filename": "20240101000010_module_toggles.sql",
+      "sha256": "af22c92fee54530be283d8d5237c83da289d2599e9d9ec33481618d2d294404e",
+      "version": "20240101000010"
+    },
+    {
+      "filename": "20240101000011_alter_existing_tables.sql",
+      "sha256": "c0d18b14498ebb140f27fac649a713fe8118a97cbf73e94026268d06d320ff22",
+      "version": "20240101000011"
+    },
+    {
+      "filename": "20240101000012_tax_codes_placeholder.sql",
+      "sha256": "a5901d815541c2ffe850e1434dc105c47329b09606aa8b81185e5957e88f905e",
+      "version": "20240101000012"
+    },
+    {
+      "filename": "20240101000013_document_archive.sql",
+      "sha256": "e2400f6ff3700967b8b9c519a76d269969628c6aa4a22004315802cc60f5942b",
+      "version": "20240101000013"
+    },
+    {
+      "filename": "20240101000014_audit_log.sql",
+      "sha256": "db217e20ca3acb702a9a61818a851a0e7f10c2d5924e02ed8e87d96032f23796",
+      "version": "20240101000014"
+    },
+    {
+      "filename": "20240101000015_dimensions.sql",
+      "sha256": "7fa395520ceaf86fd7a1e32116b43e269905915212b77c446c1ed9f1c61b5709",
+      "version": "20240101000015"
+    },
+    {
+      "filename": "20240101000016_voucher_sequences.sql",
+      "sha256": "4ea11d4c780ad55124afb75b0748ce4dab7c5e81d46255b0d00cbe3ea8d8f1a9",
+      "version": "20240101000016"
+    },
+    {
+      "filename": "20240101000017_enforcement_triggers.sql",
+      "sha256": "2673f58b7409ba284859e0ed432cfb110b2e05bb5acd517bb9492ce5b772ed6c",
+      "version": "20240101000017"
+    },
+    {
+      "filename": "20240101000018_audit_triggers.sql",
+      "sha256": "04278b99042f3b6ac0e3676089bbf071d828873766712257a568678ee32f6044",
+      "version": "20240101000018"
+    },
+    {
+      "filename": "20240101000019_period_closing.sql",
+      "sha256": "ee74c0a887f3af17dbcfabc1ac1589b26897f8eed6439fae5d620d45cf32bedb",
+      "version": "20240101000019"
+    },
+    {
+      "filename": "20240101000020_extension_data.sql",
+      "sha256": "60b02fa307558e74b127a04548d5b76a6ac8064e14f8e988fbd908269eb183bb",
+      "version": "20240101000020"
+    },
+    {
+      "filename": "20240101000021_sru_codes.sql",
+      "sha256": "dbc6ea786413168c61a9fe46eb6b806c3cfe49153c7a26d62aed8f4b30d6b3f8",
+      "version": "20240101000021"
+    },
+    {
+      "filename": "20240101000022_drop_module_toggles.sql",
+      "sha256": "dbf3ea728d2cb18ff59f0dcba6c94f81e831506b300271429805260cc6b7f1f7",
+      "version": "20240101000022"
+    },
+    {
+      "filename": "20240101000023_document_version_chain_placeholder.sql",
+      "sha256": "0476b1268b29142ad9982b74ed1fe6ea1b9c84abd387f077b10c14bc6c8d8fe1",
+      "version": "20240101000023"
+    },
+    {
+      "filename": "20240101000024_storage_bucket_policies.sql",
+      "sha256": "489cf0d44498cf3441291002759e71eb02aa65690556ab1bad305279881f6942",
+      "version": "20240101000024"
+    },
+    {
+      "filename": "20240101000025_supplier_invoices.sql",
+      "sha256": "b438daa1d115f0903f36be7734bde9f9d7c1f3575437741e7130bfcb0aa30f78",
+      "version": "20240101000025"
+    },
+    {
+      "filename": "20240101000026_drop_restaurant_module.sql",
+      "sha256": "452979e77bbc78c43a39473cdbb2665bb891c62b435ff6877d578cbd4bece5c7",
+      "version": "20240101000026"
+    },
+    {
+      "filename": "20240101000027_drop_unused_module_tables.sql",
+      "sha256": "f001eb81addfe563192a12c412b874aae58bbaa773195d064fac3eb903428616",
+      "version": "20240101000027"
+    },
+    {
+      "filename": "20240101000028_bank_file_import_support.sql",
+      "sha256": "6a9d6ef2674481e44b95e1f07176e01489efd6d081b4612f0d7bc031991c82db",
+      "version": "20240101000028"
+    },
+    {
+      "filename": "20240101000029_add_receipt_document_id.sql",
+      "sha256": "07187bccd008e7a71d48bfde00a40081ee324826aeb0e812d7b564747ac41350",
+      "version": "20240101000029"
+    },
+    {
+      "filename": "20240101000030_bank_reconciliation.sql",
+      "sha256": "2c88dd3f3ce69124d0b72c1aa06e1d13c31ee7a437b22139fa6b8582177afc42",
+      "version": "20240101000030"
+    },
+    {
+      "filename": "20240101000031_invoice_document_type.sql",
+      "sha256": "b9f16320ef76cdaf976f5a0dbfae6f907b2c728a491ae110e83c2ede69ad2f20",
+      "version": "20240101000031"
+    },
+    {
+      "filename": "20240101000032_add_accounting_method.sql",
+      "sha256": "7b538eba62bde0d431e3fbea67ea902b81ad7c75299fbadcee6fda3c7d0533ec",
+      "version": "20240101000032"
+    },
+    {
+      "filename": "20240101000033_ai_chat_schema.sql",
+      "sha256": "8bc9dec2f152ab83733b3649b7d980c3e5d95323ed5502779f578d508992256b",
+      "version": "20240101000033"
+    },
+    {
+      "filename": "20240101000034_fix_extension_data_trigger.sql",
+      "sha256": "34a66d54adc6ceea92545bb8e10c8f37ae81915a50ec206d2921c75cfbc17f83",
+      "version": "20240101000034"
+    },
+    {
+      "filename": "20240101000035_fix_push_notifications.sql",
+      "sha256": "fe40fec68e8104cb1a4645d4f1ab846b07fcf161e96be4eba67aa6094fdbcaa9",
+      "version": "20240101000035"
+    },
+    {
+      "filename": "20240101000036_fix_enable_banking.sql",
+      "sha256": "4ba8752428158a73c8b22927995a37bfb7a2d8ce2eb18b6cc4d8a6319c568d49",
+      "version": "20240101000036"
+    },
+    {
+      "filename": "20240101000037_extension_toggles.sql",
+      "sha256": "74f0f6711adeefacde7e1f1a8c6ee47b5dce61aed6b58b2b7baccc54813ddb84",
+      "version": "20240101000037"
+    },
+    {
+      "filename": "20240101000038_fix_match_documents_search_path.sql",
+      "sha256": "d0480d390484c895d31eda3c939322cc66f5bcda5cef8e9345a78d0ce3951bb1",
+      "version": "20240101000038"
+    },
+    {
+      "filename": "20260223150836_invoice_inbox.sql",
+      "sha256": "e5388924b04c095c77c74240be2404c094fcd572944348956bdda89741479072",
+      "version": "20260223150836"
+    },
+    {
+      "filename": "20260224101905_booking_template_embeddings.sql",
+      "sha256": "d0ae299044c3350532ac02b784870b7f28035ab907e101e0714e09adfdabf27f",
+      "version": "20260224101905"
+    },
+    {
+      "filename": "20260224132407_create_extension_data.sql",
+      "sha256": "4302565f2e02b9f2d5881a397932f1e5558cf1ef2f9e6f154aed64c61ec73b5c",
+      "version": "20260224132407"
+    },
+    {
+      "filename": "20260224132419_user_description_matching.sql",
+      "sha256": "1a97f3f3625ccf7ac63eca71a366987e179285ef01228daa5808117ded5e817c",
+      "version": "20260224132419"
+    },
+    {
+      "filename": "20260224142453_add_missing_dimension_columns.sql",
+      "sha256": "7ff0c27c87a68df3347209fb6347b66395af49f76154fe7530e362fb64f69a06",
+      "version": "20260224142453"
+    },
+    {
+      "filename": "20260224142843_add_tax_code_column.sql",
+      "sha256": "85b5088e6958b3197250729d028a9f8c024b317360da2718214785b9cd416a20",
+      "version": "20260224142843"
+    },
+    {
+      "filename": "20260224165254_prevent_overlapping_fiscal_periods.sql",
+      "sha256": "f06fc9ae11d3f5db2d981fc6b05fc8380b17fb402fdefd9e5542f103764aeab8",
+      "version": "20260224165254"
+    },
+    {
+      "filename": "20260224190818_enforce_fiscal_period_month_boundaries.sql",
+      "sha256": "61547bbcb6c63cc2d7e76908c64cf8b293aca487dc64f197ca2e6b6b8f701e74",
+      "version": "20260224190818"
+    },
+    {
+      "filename": "20260225100240_document_inbox_expansion.sql",
+      "sha256": "e2423bd769cecbcfdf8066ab3e139c15ef5182505d8b400d527dff23f6421d80",
+      "version": "20260225100240"
+    },
+    {
+      "filename": "20260225100248_supplier_invoice_transaction_match.sql",
+      "sha256": "625323f2e174a61791e36f9c444b524495a491a741f5f106ac22e967effd345d",
+      "version": "20260225100248"
+    },
+    {
+      "filename": "20260225103139_full_bas_2026.sql",
+      "sha256": "25908cb817d1b3d8d531f38743fdbf1af270b6a1506af5d04940d9ac043d2184",
+      "version": "20260225103139"
+    },
+    {
+      "filename": "20260225135645_document_matching.sql",
+      "sha256": "5ef593f4c5afcd82bf08e4b81c2dbdbedbffbce52f808c5abdd5b50ddee2508d",
+      "version": "20260225135645"
+    },
+    {
+      "filename": "20260226120553_expand_account_type_untaxed_reserves.sql",
+      "sha256": "25b4914636a766b6e02c128000739e139139e98550776b0bba11031b0152ae0d",
+      "version": "20260226120553"
+    },
+    {
+      "filename": "20260226154251_add_journal_entry_reversal_columns.sql",
+      "sha256": "72f3eaae331edb9a1765268ab581771c929375a7effeb9b04b12c345391da90d",
+      "version": "20260226154251"
+    },
+    {
+      "filename": "20260226161915_recreate_supplier_invoices_schema.sql",
+      "sha256": "72c753c966562c98e544f30872cb779d82386ac117a0c7d8bd66635c6902a499",
+      "version": "20260226161915"
+    },
+    {
+      "filename": "20260226162634_align_suppliers_schema.sql",
+      "sha256": "b362ee061b16e3296a6b1003c7dbeb48d0a4c412355012f3e00e0c738a5fb15c",
+      "version": "20260226162634"
+    },
+    {
+      "filename": "20260226162913_add_supplier_invoice_items_vat_code.sql",
+      "sha256": "1b831519601d34a8a0981a6d28784130162debd6138eddda21cdfb72dd1665de",
+      "version": "20260226162913"
+    },
+    {
+      "filename": "20260226163135_fix_audit_triggers_child_tables.sql",
+      "sha256": "5c041c095c0472840c2b6f32ec4f6849932e228ec8a0bd1d1ace6f565a139427",
+      "version": "20260226163135"
+    },
+    {
+      "filename": "20260226201355_chat_artifacts.sql",
+      "sha256": "8da6477310433ba6e4be603e86293fa0ff809d38974b27c254ac2a75343a2e56",
+      "version": "20260226201355"
+    },
+    {
+      "filename": "20260302095533_ai_usage_tracking.sql",
+      "sha256": "ef8b330942db8f6f7a54f99a1ffec75fdd640850ad1d6c7d635c8244ef64cb65",
+      "version": "20260302095533"
+    },
+    {
+      "filename": "20260303145744_supplier_invoice_overdue_cron.sql",
+      "sha256": "205e73cc910fd75cbe7a0b90323ed4f2056752e26e678d65cf45c1d83553d26e",
+      "version": "20260303145744"
+    },
+    {
+      "filename": "20260304075837_currency_revaluation_source_type.sql",
+      "sha256": "3462da4cb524b479927c0cb6d984439327ef6ff6f617e5f3c13f095b28eb522d",
+      "version": "20260304075837"
+    },
+    {
+      "filename": "20260304191528_set_search_path_on_functions.sql",
+      "sha256": "35f3a17ca728d73e97d3c9aace64a0c8015bb8228a99247f50dd50105d283215",
+      "version": "20260304191528"
+    },
+    {
+      "filename": "20260305161912_fix_vat_account_names.sql",
+      "sha256": "9cff9d7d804523c72ddbf2ae37a73042101e626a3ea16d53bc78636128a50fb5",
+      "version": "20260305161912"
+    },
+    {
+      "filename": "20260306084837_invoice_delivery_note_sequences.sql",
+      "sha256": "aa41410bea1fad38c00606f9339dc9676504bd17b925a7b3a21d11b8b615492f",
+      "version": "20260306084837"
+    },
+    {
+      "filename": "20260311120000_sandbox_support.sql",
+      "sha256": "ba99d6e76536dee711a8831d6becbf7db527250f0b7c2e0888b90c9b09157eb4",
+      "version": "20260311120000"
+    },
+    {
+      "filename": "20260311140000_add_bas_range_match_type.sql",
+      "sha256": "4121a49ac982b5d68344b5c90a89d9fe2184d795f8fbfa1d7354f80fc5a49cd2",
+      "version": "20260311140000"
+    },
+    {
+      "filename": "20260316120000_bank_connections_oauth_state_and_expiry_notification.sql",
+      "sha256": "381b990e865a0fd83ae67ef4820961c227151a62ae65cb76a45d64247e35008e",
+      "version": "20260316120000"
+    },
+    {
+      "filename": "20260316120100_sie_import_fixes.sql",
+      "sha256": "2e22b6d590aeeaa3e19e57d71dde0aa1e76ed200ca3b51f4274d2f863b982dfa",
+      "version": "20260316120100"
+    },
+    {
+      "filename": "20260319000001_add_cancelled_journal_status.sql",
+      "sha256": "fc923e264de58965c6454348ff33402db984b978e37f3e90014318334c1ee430",
+      "version": "20260319000001"
+    },
+    {
+      "filename": "20260320120000_api_keys.sql",
+      "sha256": "83d48f5c15c15e2bcc6e28433545a6b14c587769d51482ad41249b216cda5040",
+      "version": "20260320120000"
+    },
+    {
+      "filename": "20260321120000_oauth_used_codes.sql",
+      "sha256": "604994e8ca17bd2f26825e8ada5e9bac68a74e7edec785eb6730f9d0cf2012c8",
+      "version": "20260321120000"
+    },
+    {
+      "filename": "20260323120000_payment_match_log.sql",
+      "sha256": "ca8261b87b39d4537629346d03cf673d2ff7d764a354ffddb44299cdc6ca9e86",
+      "version": "20260323120000"
+    },
+    {
+      "filename": "20260323120001_invoice_partial_payments.sql",
+      "sha256": "14ed8fb1d6312718fd092b25c1fcc57afedb11dd8350d2fcd689be4d6cad0f07",
+      "version": "20260323120001"
+    },
+    {
+      "filename": "20260324120000_categorization_templates.sql",
+      "sha256": "196d0976a0e419511253e6012f60202e56f6eccd74d1a1e257b1a2e5584248ee",
+      "version": "20260324120000"
+    },
+    {
+      "filename": "20260324120001_skatteverket_tokens.sql",
+      "sha256": "46361d35bf7f9bbfb45104ff71cecc1356425b54f5f1dce4275045e3a4c8c1f2",
+      "version": "20260324120001"
+    },
+    {
+      "filename": "20260324120002_categorization_templates_line_pattern.sql",
+      "sha256": "cbbad21dce4f1afceb99e09c045d14a4027d38d96ce36b76c81d1180d668fd6c",
+      "version": "20260324120002"
+    },
+    {
+      "filename": "20260325120000_event_log.sql",
+      "sha256": "6c295e17d5bb5e7829414a88c790a4b5ae4b4feaeccc585513faa0870d208c69",
+      "version": "20260325120000"
+    },
+    {
+      "filename": "20260325130000_pending_operations.sql",
+      "sha256": "fa3918655498e74646ed5e1f2d557d0d25e6910c5055d2b69e4404705d3b3118",
+      "version": "20260325130000"
+    },
+    {
+      "filename": "20260326120000_pending_operations_expand_types.sql",
+      "sha256": "9573865c743d9bebd7011ad4f6d84b406fbf700bd8c01dfda4da90c12343dd40",
+      "version": "20260326120000"
+    },
+    {
+      "filename": "20260326130000_api_key_scopes.sql",
+      "sha256": "c5ffdcbc2b40777c3cd62543471541f3948d95ecec3ee038b02710c60f6a988e",
+      "version": "20260326130000"
+    },
+    {
+      "filename": "20260329120000_calendar_feed_expiry.sql",
+      "sha256": "60334d26e184fbd817ef31e22894c5a0a297c56ad159b56a35f6203ab7eb8317",
+      "version": "20260329120000"
+    },
+    {
+      "filename": "20260330120000_add_last_integrity_check_at.sql",
+      "sha256": "ade54f17201d59ad159d8cc4697f056a7609d04f8aed058771a40516665b9ab2",
+      "version": "20260330120000"
+    },
+    {
+      "filename": "20260330130000_multi_tenant_company_refactor.sql",
+      "sha256": "b3fd6f466788b738a293d6519ef5292dbfe00fab08ed2cded4678e56d9a38864",
+      "version": "20260330130000"
+    },
+    {
+      "filename": "20260330140000_company_invitations.sql",
+      "sha256": "67caabdfefa59478a102bfb2efb7de59c27a42ba31fc094cdaa53344ed0e0cfe",
+      "version": "20260330140000"
+    },
+    {
+      "filename": "20260330150000_create_company_with_owner_rpc.sql",
+      "sha256": "022f9cba69b8bfcade365d758d2c4e7dddf3860cf68eb5f6867f27589c44bd90",
+      "version": "20260330150000"
+    },
+    {
+      "filename": "20260330160000_team_members.sql",
+      "sha256": "03469827eed394c92989471eea39673917ac6477fc7cbc5a526ddacceb8d47b2",
+      "version": "20260330160000"
+    },
+    {
+      "filename": "20260330170000_delete_user_account_rpc.sql",
+      "sha256": "e693129b741b3d5db4496ed96b7b464df12775a61d8d1fcc89e41f8295c33887",
+      "version": "20260330170000"
+    },
+    {
+      "filename": "20260331010000_teams_table_refactor.sql",
+      "sha256": "9a03bbb34c4d547661a848eb28d55074bf90ecd8377a8c86fe6e977604cbf381",
+      "version": "20260331010000"
+    },
+    {
+      "filename": "20260401000000_add_pays_salaries_column.sql",
+      "sha256": "057f2e905734136d9987b40158b52fe28d8bbe6c3e37835df1792e59d7ddec1f",
+      "version": "20260401000000"
+    },
+    {
+      "filename": "20260401100000_fix_unlinked_1930_lines_company_id.sql",
+      "sha256": "c8a415a26665bf2dc9ebfff762944366cdcf1ac81ed2a31b7936500100c19db2",
+      "version": "20260401100000"
+    },
+    {
+      "filename": "20260401200000_settings_restructure.sql",
+      "sha256": "e95b922e627785fe8d0afe1f4268dd4795899763cb13a816fb895138ef303888",
+      "version": "20260401200000"
+    },
+    {
+      "filename": "20260401300000_add_continuity_verified.sql",
+      "sha256": "2d8818bce28cd6a36cec33672a009b2d30033bd66f2016418a31582017cc80f2",
+      "version": "20260401300000"
+    },
+    {
+      "filename": "20260402010000_provider_consents.sql",
+      "sha256": "d6f40f8a6ce3a75f207b2e8a2674a610376fe94e444300d2cf519c2e48dc0364",
+      "version": "20260402010000"
+    },
+    {
+      "filename": "20260402075153_fix_reserve_voucher_range.sql",
+      "sha256": "242bea100e3bded4115fd43d6d1ab51106b3e33694ba22631cd83a05beb3ee06",
+      "version": "20260402075153"
+    },
+    {
+      "filename": "20260402100000_voucher_number_unique_index.sql",
+      "sha256": "e5c90f056c9919927935c5a274e218441393179a2f527f26c2c476b382ca3f6b",
+      "version": "20260402100000"
+    },
+    {
+      "filename": "20260402100100_voucher_gap_explanations.sql",
+      "sha256": "050da016c5d13cf8a380d37c6cf513e29697273d4e70140a446bdaff4235eace",
+      "version": "20260402100100"
+    },
+    {
+      "filename": "20260402100200_atomic_commit_entry.sql",
+      "sha256": "8d751038888ee6e9d1ecf1b63596c0cfdd60e7fbc3ab43f08e316075136d9606",
+      "version": "20260402100200"
+    },
+    {
+      "filename": "20260402120000_inbox_classification.sql",
+      "sha256": "f20d3c746aa57978394f698c8c1764eee2581b32fb409d37594c6b550f9920e5",
+      "version": "20260402120000"
+    },
+    {
+      "filename": "20260413160000_booking_template_library.sql",
+      "sha256": "3ce7e9727860637f25c5f38ee6477b9a83d50a39f77f41333e2830a58624963e",
+      "version": "20260413160000"
+    },
+    {
+      "filename": "20260414120000_salary_module.sql",
+      "sha256": "318eb81f4dc0d2c1f186c76286a06e99db96039497aede28efb00cae4a74e3b8",
+      "version": "20260414120000"
+    },
+    {
+      "filename": "20260414130000_salary_correction_support.sql",
+      "sha256": "12198af04a97fa4c940beae287cef041c4659fcb6d9c61b201d76f6f91abdda1",
+      "version": "20260414130000"
+    },
+    {
+      "filename": "20260415000000_schema_sync.sql",
+      "sha256": "91d51fdd3712a2f3ca3c3fa27f7181f62123a85ebd8c63ba762b65f2ba2d5f73",
+      "version": "20260415000000"
+    },
+    {
+      "filename": "20260415120000_salary_review_fixes.sql",
+      "sha256": "22399cac680cb022b5e7656b83db4b4c63aaeacdebc034f6e31b3404d6017f4b",
+      "version": "20260415120000"
+    },
+    {
+      "filename": "20260416120000_sie_files_and_fiscal_period_sync.sql",
+      "sha256": "f881624f11011c35aef06c4b668f4ccdd633187a829fb87ff941fa06f0d2238e",
+      "version": "20260416120000"
+    },
+    {
+      "filename": "20260418120000_allow_retroactive_first_fiscal_year.sql",
+      "sha256": "f8fb27d21979b25c96eda2cf6ff9e740c9e01b12329f6067724decf639c83382",
+      "version": "20260418120000"
+    },
+    {
+      "filename": "20260418130000_processing_history.sql",
+      "sha256": "11455bc7472e5b6b327107e280d78ec91ff06bca9775ed6795d004d3a49579ee",
+      "version": "20260418130000"
+    },
+    {
+      "filename": "20260418140000_processing_history_delete_trigger.sql",
+      "sha256": "4c6f09ba9a6834747e99412c3dba767456afbc91afe7efd91036d106b314bcf0",
+      "version": "20260418140000"
+    },
+    {
+      "filename": "20260418150000_company_settings_default_voucher_series.sql",
+      "sha256": "393164bcb3899145c9d8afefed24511670656b10b66ad85cafbc8a8c8d6d429b",
+      "version": "20260418150000"
+    },
+    {
+      "filename": "20260420000000_arcim_inbox.sql",
+      "sha256": "d34a4d5ea93224011e0eafc38159b31ce45e0193a005acac264f1aea95c54996",
+      "version": "20260420000000"
+    },
+    {
+      "filename": "20260420120000_logos_bucket.sql",
+      "sha256": "d025ebf9fce2b9cb9dc7a3806a52e07f44193cc5fbe48929130e2ea97746f5ef",
+      "version": "20260420120000"
+    },
+    {
+      "filename": "20260420120001_journal_entry_commit_metadata.sql",
+      "sha256": "866b351f4454104d4f949ae135ddad1d938beb45f1b0050965d6b164938e3669",
+      "version": "20260420120001"
+    },
+    {
+      "filename": "20260420130000_drop_phantom_commit_journal_entry_overload.sql",
+      "sha256": "e7f39ce4cac4bfde44ff032f925cb469878ed9315a868334a22328affc7081b4",
+      "version": "20260420130000"
+    },
+    {
+      "filename": "20260420170000_inbox_attachment_composite.sql",
+      "sha256": "f0f4c2e99cf614e7e07efd2d33059ceba29c6554a94c592f6fec7b2c6154a186",
+      "version": "20260420170000"
+    },
+    {
+      "filename": "20260420180000_inbox_smart_match.sql",
+      "sha256": "90c99f5febf2a101094d72163acde7dca7b98d227c18390cbdbab82a896fd7bd",
+      "version": "20260420180000"
+    },
+    {
+      "filename": "20260420190000_inbox_hardening.sql",
+      "sha256": "07eeded09e015582ab32b2d5db5376cb1c2ce62786b8db9f3c0146e844975d04",
+      "version": "20260420190000"
+    },
+    {
+      "filename": "20260421120000_journal_entries_with_related_rpc.sql",
+      "sha256": "392c46b8f157552da1f394e6f97b311052314b5fbccea23996bd79ca2db1e246",
+      "version": "20260421120000"
+    },
+    {
+      "filename": "20260421130000_drop_legacy_supplier_invoice_user_id_uniqueness.sql",
+      "sha256": "91ed746e93fdad6bcf832e98114a38a847f72a8c08ae5799df6b57c8f4e5a261",
+      "version": "20260421130000"
+    },
+    {
+      "filename": "20260421132742_backfill_sie_opening_balance_links.sql",
+      "sha256": "ac29c0e267af2f9637a9ada66e1b729027a7432d3cb047cd9580e436518230c1",
+      "version": "20260421132742"
+    },
+    {
+      "filename": "20260421140000_consolidate_commit_journal_entry.sql",
+      "sha256": "220d33cd09f7429a60df4581d5ac5d8c9643097b2a6bb77207d7c17409fd81c7",
+      "version": "20260421140000"
+    },
+    {
+      "filename": "20260421150000_journal_entry_source_voucher.sql",
+      "sha256": "0550fd10ca10f8f602aa9c1a10623154254f6995bf0ee8eeb0849d3f34cc46d4",
+      "version": "20260421150000"
+    },
+    {
+      "filename": "20260421160000_booking_template_usage.sql",
+      "sha256": "7eeb873e2e9f7e6076165cd718185ce39503ee98f08af8c9de43167c937254df",
+      "version": "20260421160000"
+    },
+    {
+      "filename": "20260421160500_opening_balances_rpc.sql",
+      "sha256": "e7db23a99a8803ba5215ab908458c86f7c045e2919f53e106f36506b14addcc9",
+      "version": "20260421160500"
+    },
+    {
+      "filename": "20260421170000_booking_template_usage_updated_at.sql",
+      "sha256": "b5defc123774145a991befd3f2d3a0038250a67f7372e680f97083b4aea0fcec",
+      "version": "20260421170000"
+    },
+    {
+      "filename": "20260421170500_commit_journal_entry_user_id_fallback.sql",
+      "sha256": "96746c28b666f86d03631e46369b9471bd514e105f4bb76e5abb1a0ed591779a",
+      "version": "20260421170500"
+    },
+    {
+      "filename": "20260421180000_opening_balances_rpc_fix_reversed_and_new_accounts.sql",
+      "sha256": "41d476c5e332288cefa85991fd1d76222e0d98365cc13e0a594583a1a8522f4e",
+      "version": "20260421180000"
+    },
+    {
+      "filename": "20260422120000_fix_rls_role_gates_on_membership_tables.sql",
+      "sha256": "ab5d3b2ed16c46d685d093461e3714469d8a7e4fc3407fc3cf1ea78ac4264d75",
+      "version": "20260422120000"
+    },
+    {
+      "filename": "20260422130000_close_company_members_insert_role_bypass.sql",
+      "sha256": "6107b525d3295cb36eb83bff5b1276ee8a0ad5ab484e00ae1be7aa8694e49572",
+      "version": "20260422130000"
+    },
+    {
+      "filename": "20260423120000_supplier_invoice_number_partial_unique_excludes_credited.sql",
+      "sha256": "ceec970f8ba48b8931e43d6963b3cc1ecd0921c7c7c1c4e7b77135d59285a675",
+      "version": "20260423120000"
+    },
+    {
+      "filename": "20260423121000_supplier_invoice_reversed_status.sql",
+      "sha256": "0729aeb1d432901276b30b0698b68caa7b67e9e5967e033581768b1326effba0",
+      "version": "20260423121000"
+    },
+    {
+      "filename": "20260423140000_ai_requests.sql",
+      "sha256": "767e86055d534c5caa79cdc6d2214b5c613794b9f561c7a456289916852df513",
+      "version": "20260423140000"
+    },
+    {
+      "filename": "20260423140100_ai_proposals.sql",
+      "sha256": "a82c697f2d3dcafe1347787b204cba7a52827afa0c59e89c2fc35434b649e257",
+      "version": "20260423140100"
+    },
+    {
+      "filename": "20260423140200_journal_entries_ai_provenance.sql",
+      "sha256": "1300ae50e8c057adc2388710bda10f0b5ff7745d468c8ed4da1e730b111d8e64",
+      "version": "20260423140200"
+    },
+    {
+      "filename": "20260423140300_categorization_templates_ai_corrected.sql",
+      "sha256": "dd38387cfd017179f84db7a892cbbbe8f8681ef867ea73d94136347d88c70bac",
+      "version": "20260423140300"
+    },
+    {
+      "filename": "20260423140400_company_settings_ai_flow_toggle.sql",
+      "sha256": "2503d1e27b3d9922b087dfd9c4ed28db7f0a1d544a3ca999b499ad49c2ec0476",
+      "version": "20260423140400"
+    },
+    {
+      "filename": "20260423140500_processing_history_ai_streams.sql",
+      "sha256": "af18e39edb2f8251871ed794f766ee0f6ea91c77a03d913e3411e895a13e41ca",
+      "version": "20260423140500"
+    },
+    {
+      "filename": "20260427120000_invoice_number_nullable.sql",
+      "sha256": "c40a86a9309775c0311edcd1b6a995722140802104864ff8db42556cc4a5672d",
+      "version": "20260427120000"
+    },
+    {
+      "filename": "20260427150000_invoice_sent_requires_number_check.sql",
+      "sha256": "20cf28a77ee520824f2d54b0e4246bd70ae7217f8aa8196bc99cbaff5f1baea6",
+      "version": "20260427150000"
+    },
+    {
+      "filename": "20260427150100_invoice_number_atomic.sql",
+      "sha256": "e0d22923190120c2187dc334944f5e5f59166a1fe06f7a4cdc8f72f5aed44a17",
+      "version": "20260427150100"
+    },
+    {
+      "filename": "20260427160000_restore_retroactive_first_fiscal_year.sql",
+      "sha256": "9f21b358420e7cfd3d3498c2425ba1b7d5b1effca14508e8ddd4de78ae23322f",
+      "version": "20260427160000"
+    },
+    {
+      "filename": "20260428120000_skatteverket_tokens_user_id_unique.sql",
+      "sha256": "fe7631f6cdb5122c5f1e5eec0995e26af4cc9f7a89501957aad963e3ef87a277",
+      "version": "20260428120000"
+    },
+    {
+      "filename": "20260428153500_journal_entries_with_related_exclude_statuses.sql",
+      "sha256": "50cca1ca26cd12dc5e1efa56317a261422295baa1819e012d4d4851f4d292985",
+      "version": "20260428153500"
+    },
+    {
+      "filename": "20260428160000_fix_journal_entry_immutability_delete_bypass.sql",
+      "sha256": "a5e87e184f901d61b528337df45f60e441ccdb23d95533fac24bcbe6d0eea051",
+      "version": "20260428160000"
+    },
+    {
+      "filename": "20260430120000_pending_operations_actor_and_risk.sql",
+      "sha256": "5e710fd59bb400fff4158852e5ee2b70b46b54902577ef4367f735354deb6734",
+      "version": "20260430120000"
+    },
+    {
+      "filename": "20260430120100_pending_operations_expand_types_phase2.sql",
+      "sha256": "3044ada8448e5d3ce2e5dd6eb74590fc140decc2498b1cef1dbd8513a77649fd",
+      "version": "20260430120100"
+    },
+    {
+      "filename": "20260501120000_company_settings_auto_commit.sql",
+      "sha256": "aa11164e44424b7484f8b76ded3c1dbc7d6e0544cb676878852908b88c74699d",
+      "version": "20260501120000"
+    },
+    {
+      "filename": "20260501130000_idempotency_keys.sql",
+      "sha256": "29ac2cafbd4e1a533ff0b067713c9ddaf83bdf8009fe64df45dc82e7a45deb6d",
+      "version": "20260501130000"
+    },
+    {
+      "filename": "20260504100000_ai_native_hardening.sql",
+      "sha256": "8213770f2fd7058076741ffb4523435f07430fd5b86594c3c62db52ba1286f20",
+      "version": "20260504100000"
+    },
+    {
+      "filename": "20260504120000_remove_ai_subsystem.sql",
+      "sha256": "a33ff8ba2e03976b1bf9540429c5dcc0ba5208e491f8085ece5b52abd5cf68f3",
+      "version": "20260504120000"
+    },
+    {
+      "filename": "20260504130000_salary_absence_days.sql",
+      "sha256": "359f5ce47433554cfb3918e34f7cfe51ae3b10ff90a5c9ad79fd7e8d621e3f98",
+      "version": "20260504130000"
+    },
+    {
+      "filename": "20260504160000_skattekonto_transactions.sql",
+      "sha256": "017070a6dac1612376f7403dae393630c3eb0ea33e8f28d87570af0d0cc71ccd",
+      "version": "20260504160000"
+    },
+    {
+      "filename": "20260504170000_skattekonto_transactions_update_with_check.sql",
+      "sha256": "57473ee5a37dbe0c73aec96e822ba12e49cb00c99a2abed3e3ae4bfe11a88251",
+      "version": "20260504170000"
+    },
+    {
+      "filename": "20260504180000_invoice_inbox_remove_ai_columns.sql",
+      "sha256": "e4c28d6b321469a098cf324b74cdd746458685385e4271f7124b1f1eb3f917dd",
+      "version": "20260504180000"
+    },
+    {
+      "filename": "20260505100000_agi_declarations_pending_signature.sql",
+      "sha256": "5197c99b370c4bd14a9efae46d7d1bd014bec27368ec647fae8eb571dc1bbd2d",
+      "version": "20260505100000"
+    },
+    {
+      "filename": "20260505120000_api_keys_refresh_token.sql",
+      "sha256": "490f8843a4d17fbef749c40ed480014b06e5fb09d7a16f21820d5745cdf1c70e",
+      "version": "20260505120000"
+    },
+    {
+      "filename": "20260505140000_transactions_document_id.sql",
+      "sha256": "bc7b9fdc23b879af46c734110e26a9e18501290b4d983b695789469cb7f0d60c",
+      "version": "20260505140000"
+    },
+    {
+      "filename": "20260505160000_fix_corrupted_bas_account_names.sql",
+      "sha256": "7148258cb691879dd30964b8b312efe71d75da576785df7c5d3421da5887b0ca",
+      "version": "20260505160000"
+    },
+    {
+      "filename": "20260505190027_drop_agent_auto_commit.sql",
+      "sha256": "8aab66edb347b3da60ec04bbf5363788d353e044799b777c794a11cccbe1541e",
+      "version": "20260505190027"
+    },
+    {
+      "filename": "20260506090000_transactions_document_immutability.sql",
+      "sha256": "3e670170fa4d86aadbbdda7f05bba8d0c3201ba402b76e3535d90a85e46ff04e",
+      "version": "20260506090000"
+    },
+    {
+      "filename": "20260506100000_transactions_document_fk_restrict.sql",
+      "sha256": "0d0cb2211e668597aceeb813af31bdf0b1c5e780274f963a7ae92487a8da253e",
+      "version": "20260506100000"
+    },
+    {
+      "filename": "20260506110000_transactions_document_trigger_error_prefix.sql",
+      "sha256": "05ffda7be536c73033f62d3f015092887aa9da20c97d1912302fe3518f8520eb",
+      "version": "20260506110000"
+    },
+    {
+      "filename": "20260506120000_transactions_document_trigger_lock.sql",
+      "sha256": "1a326f1b8c5a2802b137d9409a01367d8edabd027f44c225f03a04454ea33c24",
+      "version": "20260506120000"
+    },
+    {
+      "filename": "20260506130000_document_journal_entry_immutability.sql",
+      "sha256": "f1b899485231772a4460328f68a9b9e7727ad838e90e50e5e1c7eb252acfc37f",
+      "version": "20260506130000"
+    },
+    {
+      "filename": "20260506140000_document_journal_entry_immutability_bypass.sql",
+      "sha256": "9fb6adf71293675cb117940d6fe718b6773356b9b922fddf15e310129c4db7b5",
+      "version": "20260506140000"
+    },
+    {
+      "filename": "20260506140100_fiscal_periods_exclude_per_company.sql",
+      "sha256": "9d5f13245a2477a9181a62dabe0b9645fe2d5835209cdb01be0eadf4f1fedf80",
+      "version": "20260506140100"
+    },
+    {
+      "filename": "20260506150000_protect_document_journal_link.sql",
+      "sha256": "27008fc1a4cb5802b4b2315e8270e1907e60fafce970aa539f2fa6d2b6d412f5",
+      "version": "20260506150000"
+    },
+    {
+      "filename": "20260506160000_bankid_enrichment_table.sql",
+      "sha256": "6432b783213e8ea303c1496a6ef4e2e4091995d2a9dc7e69c926f56510cc82ec",
+      "version": "20260506160000"
+    },
+    {
+      "filename": "20260506170000_pending_operations_expand_types_phase3.sql",
+      "sha256": "a980d4514e50ea27d8eac634bc28ab7061756fe16c4197c3f9cff12a4dbcba3f",
+      "version": "20260506170000"
+    },
+    {
+      "filename": "20260508120000_salary_payment_files.sql",
+      "sha256": "65c9b4d3fd668ab4bd835b5ba0966fdc2b6bc14019ad91a7d8875d2b9044caa5",
+      "version": "20260508120000"
+    },
+    {
+      "filename": "20260508120100_agi_tax_payment_tracking.sql",
+      "sha256": "6cd5abd6f87718db72f3eea5f4fd9fffb5ca0e11b8b436508c4cb75e2effe64c",
+      "version": "20260508120100"
+    },
+    {
+      "filename": "20260508120200_salary_payslip_deliveries.sql",
+      "sha256": "3d139de3f199eeb451176c08c8ffc2a73c2c0d1b19558e4149811c398862c19c",
+      "version": "20260508120200"
+    },
+    {
+      "filename": "20260509103736_allow_draft_voucher_delete.sql",
+      "sha256": "5444052765f61a2527a3ea8d783f21a5d5faa1a55dc3a36fea6ba9d0954ed4fb",
+      "version": "20260509103736"
+    },
+    {
+      "filename": "20260510120000_invoice_number_drop_year_prefix.sql",
+      "sha256": "b1d1ff26a0d36345e672c20ae0870fb3a84acb457cd41c17b45e5553a8d8675f",
+      "version": "20260510120000"
+    },
+    {
+      "filename": "20260510120100_peek_next_invoice_number.sql",
+      "sha256": "5073cdb2b81aaf67baf80c2a6d8f32356f1f753ff540963a5b53f1926643c0e4",
+      "version": "20260510120100"
+    },
+    {
+      "filename": "20260510130000_invoice_number_no_truncate.sql",
+      "sha256": "d793a7b47292277b0d3ab0ccf5948a14b0d5abebabd3db415b306f2deb2d15a1",
+      "version": "20260510130000"
+    },
+    {
+      "filename": "20260510140000_harden_invoice_number_rpcs.sql",
+      "sha256": "3f7d7823827ef0497e223f093ca27faf462b63402b1cd3668940ccdfecf2fbff",
+      "version": "20260510140000"
+    },
+    {
+      "filename": "20260511120000_bank_connections_pending_selection.sql",
+      "sha256": "440bbc5f2e96a7c31ac6225c85bd017fa506518294d5219fc57f9b9e429e67a8",
+      "version": "20260511120000"
+    },
+    {
+      "filename": "20260511184255_invoice_inbox_matched_transaction.sql",
+      "sha256": "3950be4164c92c7fbd1f7ddc0f00a2a7bbc37f494a570ec198a6c93275ffc848",
+      "version": "20260511184255"
+    },
+    {
+      "filename": "20260512083712_inbox_rate_limit.sql",
+      "sha256": "f58887d01ebda31af24a32bab849e263671b3aea51258d2345a30219fad7fa2e",
+      "version": "20260512083712"
+    },
+    {
+      "filename": "20260512092446_inbox_rate_counters_trigger_rls.sql",
+      "sha256": "d3d6e1be5a758a5da7eafe8b0a7d0fffe8c38159ca96298d45ff7b6f4915bf7a",
+      "version": "20260512092446"
+    },
+    {
+      "filename": "20260512120000_salary_worked_days.sql",
+      "sha256": "18019dfecd6132a5a6ab3c7ae196c2a95889ab21aab5519c85a5da6e1ac4e371",
+      "version": "20260512120000"
+    },
+    {
+      "filename": "20260512120100_worked_days_absence_conflict_trigger.sql",
+      "sha256": "09c0bfa5aceb7a89b24e30d6565e1bed5f547726c1eb5446ff7987cb00e92c8f",
+      "version": "20260512120100"
+    },
+    {
+      "filename": "20260512135110_pending_operations_expand_types_phase4.sql",
+      "sha256": "2e42974219dcfd81d2177813ce759abef885b1784d605edd27d7143463a4ff68",
+      "version": "20260512135110"
+    },
+    {
+      "filename": "20260512162506_api_v1_test_mode.sql",
+      "sha256": "df34ce9f2e211a202eb3a0e5b6fa4543ea90829bb1af9c8883288cd0ab5d415f",
+      "version": "20260512162506"
+    },
+    {
+      "filename": "20260512200000_salary_optional_vacation_accrual.sql",
+      "sha256": "4356657229de22de94fa70d518e3257d6c3238e22c7139185fabbdd0ba662000",
+      "version": "20260512200000"
+    },
+    {
+      "filename": "20260512200100_employee_benefits.sql",
+      "sha256": "c28c10166661611640d769e18a8bf988fe745dc80d0058a75955ca9900992e02",
+      "version": "20260512200100"
+    },
+    {
+      "filename": "20260512200200_remove_trade_name_simplify_invoice_layout.sql",
+      "sha256": "0fdae7ee8301a95a073ce8547d1ee00a42f399809db63e8fe4b4eab0f1962402",
+      "version": "20260512200200"
+    },
+    {
+      "filename": "20260513120000_invoice_show_company_name.sql",
+      "sha256": "c8c7f18b6bd65e19265f616c6f3c0ca7e9db932161408a46d4fbe4dbfcf6a8ed",
+      "version": "20260513120000"
+    },
+    {
+      "filename": "20260513120001_extension_data_delete_policy.sql",
+      "sha256": "06c4fd9a560b881349a77167fcc6a0cf924e373acc7d821aab9028ca081befbb",
+      "version": "20260513120001"
+    },
+    {
+      "filename": "20260513120100_fix_vat_seed_chart_of_accounts.sql",
+      "sha256": "4aa36d0a142214df8a8a07a072e5a004d616ff43a1826e1d09bde1820eb97eda",
+      "version": "20260513120100"
+    },
+    {
+      "filename": "20260513130000_invoice_company_name_position.sql",
+      "sha256": "b256a313bf011524aa80dfca2cdf69b69411c7df182d61945b0f58a460ad1f75",
+      "version": "20260513130000"
+    },
+    {
+      "filename": "20260513130001_backfill_vat_account_labels.sql",
+      "sha256": "c438b19f87496a5bfb19e1407ac5075707b142c2bc1a5795d5f347c1925d5b29",
+      "version": "20260513130001"
+    },
+    {
+      "filename": "20260513140000_backfill_bas_2026_account_labels.sql",
+      "sha256": "516202a0ea31fc039a6564da8fc0a413e10d5dcae7e6101c6db1368a90f37fea",
+      "version": "20260513140000"
+    },
+    {
+      "filename": "20260513140100_backfill_bas_2026_periodiseringsfond_years.sql",
+      "sha256": "a1b0e5cc504e1ec0b330e1d87a7575bdfa8d0a6b644321612575b5dc387dfea9",
+      "version": "20260513140100"
+    },
+    {
+      "filename": "20260513150000_archived_at_for_customers_and_suppliers.sql",
+      "sha256": "fb63f43afb33d5fe3321ecf8e34739862924cd0ad43eaa8a725d3d17b97f672f",
+      "version": "20260513150000"
+    },
+    {
+      "filename": "20260513160559_salary_semesterersattning.sql",
+      "sha256": "17d1b2aab6504cff9c026fa4af2db9a24407cba98a8c35bd785feadc49a384c7",
+      "version": "20260513160559"
+    },
+    {
+      "filename": "20260513170000_periodisk_sammanstallning.sql",
+      "sha256": "ede1c2c0f166a0d3c66c01953e997c4e848cd78080bd8050d35ed8ca93cbd1f9",
+      "version": "20260513170000"
+    },
+    {
+      "filename": "20260513170001_supplier_invoice_paid_with_private_funds.sql",
+      "sha256": "3959a9a429a09a969594711815ca28b07f7176a0cbaeb76953d9c5fd931d3e7d",
+      "version": "20260513170001"
+    },
+    {
+      "filename": "20260513200000_api_v1_async_operations.sql",
+      "sha256": "14e1432321e7a02c643dc9a4d457de1882bc03827a60c4bb6e4dadbad6446542",
+      "version": "20260513200000"
+    },
+    {
+      "filename": "20260514120000_invoice_inbox_book_direct.sql",
+      "sha256": "ecf973e075cbd994e7b7d11ebe5bf1dabf4d06288d886ed8144c3f64f2cbd1b1",
+      "version": "20260514120000"
+    },
+    {
+      "filename": "20260514125831_bank_connection_initial_sync_metadata.sql",
+      "sha256": "a992c658959eb9494ff9a262df516801a2e21f17454d15a104d70a720b1cb9b4",
+      "version": "20260514125831"
+    },
+    {
+      "filename": "20260514132534_unlinked_1930_lines_exclude_opening_balance.sql",
+      "sha256": "c804e14634ed3cd8672c66c1ff5ac6dae7edb093690669e3e6c5386bd6dda7bc",
+      "version": "20260514132534"
+    },
+    {
+      "filename": "20260515090000_invoice_inbox_unique_journal_entry.sql",
+      "sha256": "20f0d5c1b550b4e57e5a55a8383d9da2f7257573c1baf3d9668c8266a460e9d1",
+      "version": "20260515090000"
+    },
+    {
+      "filename": "20260515170000_webhooks_v2.sql",
+      "sha256": "a65ad2fc77f50ac0fef30efc50efb876e6234cd8e614b364821d2fa8787c3345",
+      "version": "20260515170000"
+    },
+    {
+      "filename": "20260515180000_webhook_deliveries_retention.sql",
+      "sha256": "994811b4999fd65c0dae68662065dbe99a3a20a8963bdb816ea2275e7673fa07",
+      "version": "20260515180000"
+    },
+    {
+      "filename": "20260515190000_webhook_deliveries_db_guards.sql",
+      "sha256": "f56b154243bab3ffb4648643f4fcc87231a1febe2b1521c48e78ddc7f23aeacb",
+      "version": "20260515190000"
+    },
+    {
+      "filename": "20260515200000_webhook_deliveries_updated_at.sql",
+      "sha256": "4adce7877f4b42179d8f065c1beee97107541944b616c0013b8b695eb0a3a0e1",
+      "version": "20260515200000"
+    },
+    {
+      "filename": "20260515210000_operations_immutability.sql",
+      "sha256": "946f5a119fd71a9c1663eba9a95e6ad3a49dcd945ccacde546a8738873200f7b",
+      "version": "20260515210000"
+    },
+    {
+      "filename": "20260515220000_claim_due_webhook_deliveries.sql",
+      "sha256": "e9a8ed4003ce2b5a32457639f0361421266bcf735d21d3cce65f5450f779cccd",
+      "version": "20260515220000"
+    },
+    {
+      "filename": "20260515230000_webhook_deliveries_body_length_check.sql",
+      "sha256": "661a1f5b9b336b6972f600af274e860a95769fabe0a2b2b0bf4cc6ee896be50c",
+      "version": "20260515230000"
+    },
+    {
+      "filename": "20260516060000_journal_entries_source_type_inbox_item.sql",
+      "sha256": "21cf284e72e1b3cbab2fac2dfbfa7faf4c0d8df7308a36c9efb9e81d3d61d461",
+      "version": "20260516060000"
+    },
+    {
+      "filename": "20260516120000_assets_and_depreciation.sql",
+      "sha256": "492fdf7a8c606cb0b42729114815b2fa1659d8dbe6434567c276f13411f02ae5",
+      "version": "20260516120000"
+    },
+    {
+      "filename": "20260516130000_seed_chart_of_accounts_restore_swedish_chars.sql",
+      "sha256": "01af1eb5852e452c6a161513f3067d8b53f646e21f51add22da61a23073adbb2",
+      "version": "20260516130000"
+    },
+    {
+      "filename": "20260516140000_depreciation_schedules_updated_at.sql",
+      "sha256": "0c4e4b115f7f1ff62d85d4439311b69be9cdca98ea5b491df0227fb41ce6aedb",
+      "version": "20260516140000"
+    },
+    {
+      "filename": "20260516170000_arsredovisning_signature_requests.sql",
+      "sha256": "a8ab195ffc28ecff03b8dd93c35cb5d28cc76f52137ed45777826d84c7344783",
+      "version": "20260516170000"
+    },
+    {
+      "filename": "20260517090000_signature_immutability_full.sql",
+      "sha256": "87e77915af654800ada5e9f5c026dab27341a06d535c2aaf96341c7247d480b0",
+      "version": "20260517090000"
+    },
+    {
+      "filename": "20260517100000_salary_run_employees_agi_removed.sql",
+      "sha256": "004daf4e4d4a26b30d25bea32b2275a2a1265b37780d59a0523e126b4075e067",
+      "version": "20260517100000"
+    },
+    {
+      "filename": "20260517105000_signature_delete_blocks_declined.sql",
+      "sha256": "4d0aec1d3552ec604ff8cbb15af2fda5a3681211a68945bad6b08e87c7b8e024",
+      "version": "20260517105000"
+    },
+    {
+      "filename": "20260517110000_salary_run_employees_benefits_adjusted.sql",
+      "sha256": "030038a506ce74785eb9cf47f167e218bdd4ffee674468c3fa32ef9a8ec2ae81",
+      "version": "20260517110000"
+    },
+    {
+      "filename": "20260517120000_salary_absence_days_franvaro_specifikationsnummer.sql",
+      "sha256": "305fc3bd4aa4f7fe65ad6b61769bcc75379b3d0004640e9ce7253327a2b2704a",
+      "version": "20260517120000"
+    },
+    {
+      "filename": "20260517130000_employees_housing_benefit_type.sql",
+      "sha256": "33bed9483a41c37c61905dfa160c85694182da82df2adaf9379e4187eeeae101",
+      "version": "20260517130000"
+    },
+    {
+      "filename": "20260517135000_skatteverket_audit_franvaro_lock.sql",
+      "sha256": "7c6ec4bc2c93ae152cfda74ba496c45b4f5ac75f68436575c99175d832470158",
+      "version": "20260517135000"
+    },
+    {
+      "filename": "20260517140000_arsredovisning_narratives.sql",
+      "sha256": "067319a0e6a246e66f5d67db3616da44ceb75dd284a8c7b4c43983ea480baf36",
+      "version": "20260517140000"
+    },
+    {
+      "filename": "20260517150000_sie_imports_active_partial_unique.sql",
+      "sha256": "753b5f24c2b1d5df6b45992019be03bff8e83e69cb6d1963eb5de01572772724",
+      "version": "20260517150000"
+    },
+    {
+      "filename": "20260517160000_narrative_agm_date_and_composite_unique.sql",
+      "sha256": "dca058ccaf4fde67be031383cdbe2a1280258c0232bdeac75995165bc313b96c",
+      "version": "20260517160000"
+    },
+    {
+      "filename": "20260517180000_narrative_signature_user_set_null.sql",
+      "sha256": "70f17181f85c78e790ddd8d76ae59ca41a6a29eb9afe27c837cf07b6222269e2",
+      "version": "20260517180000"
+    },
+    {
+      "filename": "20260517200000_agent_atom_registry.sql",
+      "sha256": "5dd316f2ab785262358a52951d7f308239f287106325ea3a21fb47ece287ebce",
+      "version": "20260517200000"
+    },
+    {
+      "filename": "20260517201000_companies_tic_snapshot.sql",
+      "sha256": "a34aef402f9c8a08d12dba5d93b80cda6a22b6b0d123b383d2094900a1ae9ba0",
+      "version": "20260517201000"
+    },
+    {
+      "filename": "20260517202000_agent_profiles.sql",
+      "sha256": "01916bcb00c22cc65590af0c9784ed2e55e90af22574a8ca1d5acad2db3ded4e",
+      "version": "20260517202000"
+    },
+    {
+      "filename": "20260517203000_agent_memory.sql",
+      "sha256": "342fd2685d3d7b3f563dde55011cbc1d71890cf23557e470b2bb589296d0d589",
+      "version": "20260517203000"
+    },
+    {
+      "filename": "20260517204000_agent_conversations_messages.sql",
+      "sha256": "e15acfd9411c23458404d2760ff078e5ea955e96968e771bb59a5e1d62f187de",
+      "version": "20260517204000"
+    },
+    {
+      "filename": "20260517205000_pending_operations_agent_metadata.sql",
+      "sha256": "b10e326c7e4080f345b14954ca463d5920b66a31df8bdbfc75fd66a42b93e5a3",
+      "version": "20260517205000"
+    },
+    {
+      "filename": "20260517210000_agent_profiles_insert_policy.sql",
+      "sha256": "fd2a704bc444984070edde5c3131ba29913852b27530f001717e2ad6292aed8b",
+      "version": "20260517210000"
+    },
+    {
+      "filename": "20260518090000_document_attachments_extraction_columns.sql",
+      "sha256": "375567484315ea149005753bb491d1383e019b90189b97f8d737fc88d2cd3beb",
+      "version": "20260518090000"
+    },
+    {
+      "filename": "20260518120000_oauth_client_registrations.sql",
+      "sha256": "0d1ebdaae4cf08e70e627db99473dfa359b93663b7bf32a7b41d68bc08db0c69",
+      "version": "20260518120000"
+    },
+    {
+      "filename": "20260518130000_agent_profiles_identity.sql",
+      "sha256": "89f897828591c3a69d9ffc0f8bd8aa0c194a818fc04f35d1ef40f246742c514a",
+      "version": "20260518130000"
+    },
+    {
+      "filename": "20260518150000_recurring_invoice_schedules.sql",
+      "sha256": "ce79c776361057a60692fcc04c3f690b7980f6024e10647415af4da36b5129d6",
+      "version": "20260518150000"
+    },
+    {
+      "filename": "20260518160000_agent_profiles_intake.sql",
+      "sha256": "037630c0215abb523ce5ac5b1d1db8e710daee292dc321057e319dd547ef860a",
+      "version": "20260518160000"
+    },
+    {
+      "filename": "20260518170000_agent_memory_pinned.sql",
+      "sha256": "381ee6c0b4bbc4b14d884a7dd4c7beefbb15e06adf9d85a2b2648974184f356f",
+      "version": "20260518170000"
+    },
+    {
+      "filename": "20260518220000_agent_messages_hidden.sql",
+      "sha256": "c1db6a9d9cd2f50092d734d023d1acba4e6ac7b4b12b205983d354d45bd58e8b",
+      "version": "20260518220000"
+    },
+    {
+      "filename": "20260519090000_actor_type_agent_chat.sql",
+      "sha256": "d984d6722606490d2fe3e9492a1b13e0e79af294e6d7fa0aab33eb299320bcf9",
+      "version": "20260519090000"
+    },
+    {
+      "filename": "20260519100000_skattekonto_rules.sql",
+      "sha256": "77e673c856bb10f63d27a592b48c6ac9276ef5b8e42146bf86d84df3aba1a23a",
+      "version": "20260519100000"
+    },
+    {
+      "filename": "20260519110000_cash_accounts.sql",
+      "sha256": "1dfb6045576c64f2ded0ddd8e72d20c16ecd7eaa07ab3e0b17cd70ddba377833",
+      "version": "20260519110000"
+    },
+    {
+      "filename": "20260519120000_get_unlinked_gl_lines.sql",
+      "sha256": "733af59a6353db5608d3bb8c69a2e3a4cba05d664b6a755e01e362e3dc120dcf",
+      "version": "20260519120000"
+    },
+    {
+      "filename": "20260519130000_transactions_counterparty_iban.sql",
+      "sha256": "4e509d06f160f837947f74af357a01c85c8818d7bb7933ed007a44891d2cffcd",
+      "version": "20260519130000"
+    },
+    {
+      "filename": "20260519154732_seed_default_cash_account.sql",
+      "sha256": "88453d6738556ca971698b294dc66b6cae88851452119a950a86902176dd9c43",
+      "version": "20260519154732"
+    },
+    {
+      "filename": "20260519154800_cash_accounts_set_primary_atomic.sql",
+      "sha256": "0f6b918ee2a641921bf3fc90835e39fd3bdb7db636fd5e03fe9afc2266fda415",
+      "version": "20260519154800"
+    },
+    {
+      "filename": "20260519160000_skattekonto_rules_arbetsgivaravgift_2730.sql",
+      "sha256": "9629b5ff0770e4397f363882f033440c9e513fc959fc996268d4f73c2053b2ed",
+      "version": "20260519160000"
+    },
+    {
+      "filename": "20260519170000_fix_create_company_with_owner_overload.sql",
+      "sha256": "ee78510326bd8520e1681e0213b62e8b25570667986a224843626e3e1090c730",
+      "version": "20260519170000"
+    },
+    {
+      "filename": "20260519180000_enforce_team_membership_in_create_company.sql",
+      "sha256": "76e723f92bec12608364fd125eaa1eedc3598d77010565fb36c3dee5e3be449e",
+      "version": "20260519180000"
+    },
+    {
+      "filename": "20260520120000_pending_operations_add_create_supplier.sql",
+      "sha256": "a89db9b6fcba216f16c5b5ac166c9d2d9a6f10e3703fc74ef8b7694bf7ee6f17",
+      "version": "20260520120000"
+    },
+    {
+      "filename": "20260520120100_pending_ops_realtime_publication.sql",
+      "sha256": "e6d88d38b11249f3fd47f43c05547dfadebd9cef2379a2a4b4e4552df55641dc",
+      "version": "20260520120100"
+    },
+    {
+      "filename": "20260521120000_add_user_locale.sql",
+      "sha256": "f5e96e306fdcb11b2178b180eb146abc245d964c613e8b160dca3a4f7ce67dce",
+      "version": "20260521120000"
+    },
+    {
+      "filename": "20260521120050_company_settings_swish.sql",
+      "sha256": "819eefaa6c423a5e6c74ce36db7ebad5b01db66619285832aab0ca8063880d8c",
+      "version": "20260521120050"
+    },
+    {
+      "filename": "20260521120100_company_settings_send_invoice_reminders.sql",
+      "sha256": "43590ceac39382dc119ee6eee73dd2437ebb85d2e2c0a97d26bed283a7dd598e",
+      "version": "20260521120100"
+    },
+    {
+      "filename": "20260521130000_invoice_inbox_extraction_skipped.sql",
+      "sha256": "87bd78eddf5d59bbac2768ddd1383a77ca724f42ae338339f02e2876d255e4b5",
+      "version": "20260521130000"
+    },
+    {
+      "filename": "20260522110000_add_customer_type.sql",
+      "sha256": "56190815ccfb4431985be5faad35a6d7d76d2b4be312e97d9b7e64ae0ab5e549",
+      "version": "20260522110000"
+    },
+    {
+      "filename": "20260522110100_add_invoice_items_vat_columns.sql",
+      "sha256": "d7c63e77ac72dadb2d8e0c19800dd7f99cb47d3d8ddef0215527bbeca201d7e9",
+      "version": "20260522110100"
+    },
+    {
+      "filename": "20260522120000_pending_operations_add_create_supplier_invoice_from_inbox.sql",
+      "sha256": "b13b5d2cfc9fb750b2d1ec1d7f9124a6029adabe6276e03a81a9fa398cb907f7",
+      "version": "20260522120000"
+    },
+    {
+      "filename": "20260522130000_add_customer_personal_number.sql",
+      "sha256": "24e454a8f3c640175d71ea45d5fa20b43807e9d34108d420fba847b8f2975e9b",
+      "version": "20260522130000"
+    },
+    {
+      "filename": "20260522140000_add_customer_language.sql",
+      "sha256": "8d335243a8dafd7dd23a2c1a24f8bf530f6f9d5b090c32249fa1f27e3448305d",
+      "version": "20260522140000"
+    },
+    {
+      "filename": "20260523120000_agent_conversations_last_message_preview.sql",
+      "sha256": "01975e7171e80a87fa434ff6eacd4f87ae3b44d74ad89716d007b7ffae5f63a0",
+      "version": "20260523120000"
+    },
+    {
+      "filename": "20260523121000_pending_operations_chat_insert_policy.sql",
+      "sha256": "47647b4ba3bf58b84c8b92650c270b8c2b52325d1ae19623effc89ffa99a115c",
+      "version": "20260523121000"
+    },
+    {
+      "filename": "20260523122000_pending_ops_rejection_reason.sql",
+      "sha256": "c6aa2d61caa3230a3a4d96f9a1c14304e26fa2c74649be507e955c5522a76f8c",
+      "version": "20260523122000"
+    },
+    {
+      "filename": "20260526120000_fix_replace_sie_import_hard_delete.sql",
+      "sha256": "a8a597ab8a9a345a890fe50716f9478e4b7052f95d6906b1f4b44f2b4845ecd1",
+      "version": "20260526120000"
+    },
+    {
+      "filename": "20260526120050_agent_atom_registry_add_body_mcp_exposed.sql",
+      "sha256": "ac4f1107d3dcd1ebd7088d17c4e2f849e59ea43f6ba21dac551ab971a79a5c88",
+      "version": "20260526120050"
+    },
+    {
+      "filename": "20260526120051_seed_agent_atom_bodies.sql",
+      "sha256": "41418834537c330d06de3e9a4257f20a3a41455255d5471e8b6b5609d95369cf",
+      "version": "20260526120051"
+    },
+    {
+      "filename": "20260526120100_restvardeavskrivning.sql",
+      "sha256": "620f3b2b26c4fe0e19a152385b7140c57f63f33c2f298c013020798c1710fa14",
+      "version": "20260526120100"
+    },
+    {
+      "filename": "20260526120200_invoice_branding.sql",
+      "sha256": "d803015721796db62980d06f15aa571935758b4085064b7f9cb97a4d0919bb93",
+      "version": "20260526120200"
+    },
+    {
+      "filename": "20260526120300_asset_disposal_vat_jamkning.sql",
+      "sha256": "b9fbbdfa5da13f52436ab18e74d340c9498a2aaad0c7d504e644d951f005adcf",
+      "version": "20260526120300"
+    },
+    {
+      "filename": "20260526120400_drojsmalsranta_paminnelseavgift.sql",
+      "sha256": "0ed5a10d6fa710b12a26759975e85ea133eb063ef322dabd2e09d5c78dce7ea7",
+      "version": "20260526120400"
+    },
+    {
+      "filename": "20260526120700_voucher_series_defaults.sql",
+      "sha256": "f8c735f03b67696d69f77d14b041de377a2f36066253964ce8243580273a86ea",
+      "version": "20260526120700"
+    },
+    {
+      "filename": "20260526120900_ob_overtime_premiums.sql",
+      "sha256": "2592682472b1a78a902ce3c50ebfae83fb570722536ca0644c22a7fa8a28a12c",
+      "version": "20260526120900"
+    },
+    {
+      "filename": "20260526121500_k3_framework.sql",
+      "sha256": "7ea122f4bbc7409cff65dd47d46ad8bd1c481abe6715471c26ea819a7d4104c9",
+      "version": "20260526121500"
+    },
+    {
+      "filename": "20260526121600_latent_tax.sql",
+      "sha256": "3a649dafd0a91f8c585db55a684f8fc273b62905fb4b3c46f2abd1551b962a8d",
+      "version": "20260526121600"
+    },
+    {
+      "filename": "20260526121700_rot_rut_avdrag.sql",
+      "sha256": "2c1e880aea4dde8e7e76e8962064467f825f5399cd3004d4dbebccea45e23297",
+      "version": "20260526121700"
+    },
+    {
+      "filename": "20260526122000_k3_component_depreciation.sql",
+      "sha256": "121a1867bab30c46b5c0b2f66abb58002b7daea3966e1f30809b6ff130697078",
+      "version": "20260526122000"
+    },
+    {
+      "filename": "20260526130000_pending_operations_add_depreciation_and_reverse.sql",
+      "sha256": "fcbfa300d1af90d37b0a079b3d3df84463c3555a7b7f0b8872910f45cdb55825",
+      "version": "20260526130000"
+    },
+    {
+      "filename": "20260526140000_agent_rate_limit.sql",
+      "sha256": "443faed1f9b2af0ea24ac4e92864a740e5b535ae35f6c610fc033ee7cca0ac57",
+      "version": "20260526140000"
+    },
+    {
+      "filename": "20260526182000_cap_reminder_fee_at_60.sql",
+      "sha256": "e66fb8e3060c44a6c0725e657dd8d8c7031666726776dd31e28c69461a9beaf7",
+      "version": "20260526182000"
+    },
+    {
+      "filename": "20260526190000_swish_default_off.sql",
+      "sha256": "c34baccc9e9fc920b97af264879dba0b6916355505869749145d714f31f1396d",
+      "version": "20260526190000"
+    },
+    {
+      "filename": "20260527000000_agent_atom_registry_parent_atom_id.sql",
+      "sha256": "9425d425f45c3d8518ab07e7413e64e7ecbd36a8b3791164899f54e711257ac4",
+      "version": "20260527000000"
+    },
+    {
+      "filename": "20260527000001_seed_agent_atom_bodies.sql",
+      "sha256": "123b9bbf4a3982d71ebac4a602d149575bf6062b09fd0b1db2212ad2a550edbb",
+      "version": "20260527000001"
+    },
+    {
+      "filename": "20260527120000_arsredovisning_disclosure_fields.sql",
+      "sha256": "7c6b6e61652578ebbaff7c8224b0014e6a3064038da9e77e7f770b804d89e9fe",
+      "version": "20260527120000"
+    },
+    {
+      "filename": "20260527122059_allow_document_supersession.sql",
+      "sha256": "7a74bf8302fb7e915e7ab829b6ad6d6d41099e2bbdab0d6828a3564ac9619d93",
+      "version": "20260527122059"
+    },
+    {
+      "filename": "20260527130000_allow_document_supersession.sql",
+      "sha256": "df0652bda0be09d10d2fbdcf0e6b64451959ab61f29b9b0a89cb029cec7f11bc",
+      "version": "20260527130000"
+    },
+    {
+      "filename": "20260527160000_fix_supersede_audit_actor.sql",
+      "sha256": "4e8ca50bebd120520e29c9fc2920747b86f1a19f4c23534fcdba230430abdd47",
+      "version": "20260527160000"
+    },
+    {
+      "filename": "20260527170000_agent_rls_with_check.sql",
+      "sha256": "6d7974261f60277f8a009b6c23af6050bc1564dad85c619b9e58fa322f11ba6c",
+      "version": "20260527170000"
+    },
+    {
+      "filename": "20260527170100_journal_entry_no_doc_required.sql",
+      "sha256": "6d5631e6cd319cda9032986e539557db5e04c7bc64d1b5b096866520672bd465",
+      "version": "20260527170100"
+    },
+    {
+      "filename": "20260527180000_backfill_companies_org_number_from_settings.sql",
+      "sha256": "3a19d0aee756ed17581d9dfc37971092a532aef50c383f0cddf5c1c567a4c1b1",
+      "version": "20260527180000"
+    },
+    {
+      "filename": "20260528120000_delete_last_voucher_clears_ib_link.sql",
+      "sha256": "381adaab42c298cb286bc5247b226789af4f41c0c544113f68660ec79de583e1",
+      "version": "20260528120000"
+    },
+    {
+      "filename": "20260528120001_pending_operations_add_link_invoice_voucher.sql",
+      "sha256": "ca73580723690ac6b7d79daba75620aa62ee80532d352215491d9a828435d57d",
+      "version": "20260528120001"
+    },
+    {
+      "filename": "20260528120100_undo_sie_import.sql",
+      "sha256": "9e08fdf0c0b232b7a0bfb0d774e689bfcad8e5860167452edf14fb4c563752a5",
+      "version": "20260528120100"
+    },
+    {
+      "filename": "20260528120200_replace_period_opening_balance_link.sql",
+      "sha256": "af21d1bff37e859a5915b2c6d680283caa2483da3c065b030554914d1b5eef63",
+      "version": "20260528120200"
+    },
+    {
+      "filename": "20260528120300_salary_run_employee_overrides.sql",
+      "sha256": "19f24f9571f9fc0720d2129faa5b09cadc7787a40ee73d143683ebaa5e35df65",
+      "version": "20260528120300"
+    },
+    {
+      "filename": "20260528120400_sie_imports_undone_partial_unique.sql",
+      "sha256": "7632127f318aa866fa29c6f316f16b3639fc9485d16f68c5c9eac39da22eba2c",
+      "version": "20260528120400"
+    },
+    {
+      "filename": "20260528120500_replace_period_opening_balance_link_tighten_role.sql",
+      "sha256": "3d7b1e4cc14ffef97702b228fcc933b3d41bfdc52bfe02d9fc30a92ab205245c",
+      "version": "20260528120500"
+    },
+    {
+      "filename": "20260528120600_delete_last_voucher_audit_company_id.sql",
+      "sha256": "276879731f4c1a680245c78fac91e0c1f7f671cc7b7e222150cf931b701ac1eb",
+      "version": "20260528120600"
+    },
+    {
+      "filename": "20260529120000_transaction_voucher_links.sql",
+      "sha256": "39cd4d9baa92a813dab0b043127a2f0b8c205772476b9f41d6a66ac3987535b5",
+      "version": "20260529120000"
+    },
+    {
+      "filename": "20260529120100_match_batch_allocate.sql",
+      "sha256": "b68824277a669bd323a48873cff69477b821b18855508808736f64fc1e36bf26",
+      "version": "20260529120100"
+    },
+    {
+      "filename": "20260529130000_link_supplier_invoice_to_voucher_rpc.sql",
+      "sha256": "9c24bec00c0dd207fe8e29277a0d59558a5fb5dcb6eb1fffcab6d1b9573bf4ff",
+      "version": "20260529130000"
+    },
+    {
+      "filename": "20260529140000_link_supplier_invoice_to_voucher_ap_prefix.sql",
+      "sha256": "791463469fc050270925e8469db054960f22fe50922603c34b1dc91ee1fbc6dd",
+      "version": "20260529140000"
+    },
+    {
+      "filename": "20260529150000_match_batch_allocate_fixes.sql",
+      "sha256": "6d538ea1932afc0110e8456397a8766df24f04e4d253f3bdfd5a015752d9047c",
+      "version": "20260529150000"
+    },
+    {
+      "filename": "20260529160000_match_batch_allocate_compliance.sql",
+      "sha256": "43672eb01d0afa0e0a574e9a4a91ae6a64fb4b7ab123f643dec5ab44fe85a1e5",
+      "version": "20260529160000"
+    },
+    {
+      "filename": "20260529170000_sie_imports_undone_release_slot.sql",
+      "sha256": "4854768f7b3698b7018d3594df7716ead89f1cbf78e5a22c5e9533ceeb8f9e71",
+      "version": "20260529170000"
+    },
+    {
+      "filename": "20260529180000_company_settings_last_supplier_payment_account.sql",
+      "sha256": "0e21b1d8b899999b9b378d1cf84e75e80e395224d5c40b10fc8edae92fce5227",
+      "version": "20260529180000"
+    },
+    {
+      "filename": "20260529190000_transactions_is_ignored.sql",
+      "sha256": "31f196cca62c5b4077df07398103473184c377f1f85be2ab0e63e98d84810723",
+      "version": "20260529190000"
+    },
+    {
+      "filename": "20260529200000_salary_absence_add_unpaid_leave.sql",
+      "sha256": "575b600bf5ef4a5f71dd2394cdf9866a77c5d70d11be1149488544fcd8b44da8",
+      "version": "20260529200000"
+    },
+    {
+      "filename": "20260530120000_bulk_book_transactions.sql",
+      "sha256": "0294e58cfd94b24766d7a9ebffa07abfb44bfdc599c8eeaecd94d03fdac2fb4f",
+      "version": "20260530120000"
+    },
+    {
+      "filename": "20260530130000_bulk_book_n1_reconciliation_method.sql",
+      "sha256": "df5fc085eba81d72741ffb8c0499c6980197bd3dcd8247fe1ce6765a0d831faf",
+      "version": "20260530130000"
+    },
+    {
+      "filename": "20260531120000_match_batch_allocate_cross_currency.sql",
+      "sha256": "c24d8ee917294c62841adf231f01051b71eb6036dc104301c4ddd861bc34dc08",
+      "version": "20260531120000"
+    },
+    {
+      "filename": "20260601120000_match_batch_allocate_round1_fixes.sql",
+      "sha256": "c94bd1f73c83177a119c002bbd13c9ef6fd8160fb9c3e32932f7f143d1cce3d8",
+      "version": "20260601120000"
+    },
+    {
+      "filename": "20260601121000_match_batch_allocate_round2_fixes.sql",
+      "sha256": "45993d3af0231e33479f139a99b60c3273d3388afc7722f480b3c8bc52e9e4ac",
+      "version": "20260601121000"
+    },
+    {
+      "filename": "20260601122000_match_batch_allocate_round3_fixes.sql",
+      "sha256": "12d93a038c7ec8d551bbf5531155b6f686499c0817f65307960cbfd09abd47f0",
+      "version": "20260601122000"
+    },
+    {
+      "filename": "20260602120000_bulk_book_documents_and_signature.sql",
+      "sha256": "9bf7a373aa010bddc60cd3ce4f3b9e4a3d3557032be492cb0f40fd0c2d752cfb",
+      "version": "20260602120000"
+    },
+    {
+      "filename": "20260602121000_bulk_book_round2_fixes.sql",
+      "sha256": "f6ed4dff478de5c6ab74f88f449f87f0dd26359e950ea678c0c7cab4d2b2839b",
+      "version": "20260602121000"
+    },
+    {
+      "filename": "20260602145425_lock_down_oauth_used_codes.sql",
+      "sha256": "89293af62f7c6c60c671c19add93a9ec4218864c43a16fa0959b17e0891065c2",
+      "version": "20260602145425"
+    },
+    {
+      "filename": "20260603120000_pending_operations_add_batch_allocate_and_bulk_book.sql",
+      "sha256": "bd416204df69ed7a5af18893e21556018dc880ee60f8102c590166b557a9722e",
+      "version": "20260603120000"
+    },
+    {
+      "filename": "20260603121000_pending_operations_add_salary_run_and_agi.sql",
+      "sha256": "95bfd7b4036fdb70153cc2f00f42052effa7eedf3234b0bf5db268aed8ec0a06",
+      "version": "20260603121000"
+    },
+    {
+      "filename": "20260604120000_pending_operations_add_link_transaction_journal_entry.sql",
+      "sha256": "2ac5f8a9d4b5e3fb3b459f0c17b9785229fc2d63c3812da0725bbb0880e7cea1",
+      "version": "20260604120000"
+    },
+    {
+      "filename": "20260605120000_transactions_original_description.sql",
+      "sha256": "45d9b9fa1a12fd49d2a56b41d2bce0aff9eeb0f6ba52937662dcb21cc59ee5e8",
+      "version": "20260605120000"
+    },
+    {
+      "filename": "20260605120500_invoice_inbox_realtime_publication.sql",
+      "sha256": "030c25500f0c3592eef319f9b95843e0f80bf35e875651953904ac493aa6e3c0",
+      "version": "20260605120500"
+    },
+    {
+      "filename": "20260605130000_unlinked_gl_lines_exclude_storno_correction.sql",
+      "sha256": "c4a3d3977d44de62d29a9770b196d97280d0dac140ac5398f4986edb9381bb1d",
+      "version": "20260605130000"
+    },
+    {
+      "filename": "20260606120000_transactions_cash_account_id.sql",
+      "sha256": "547b58ab33dfa1f93860a1c1e2ab25be0b0581fa6139d6204f04abd0b52c172d",
+      "version": "20260606120000"
+    },
+    {
+      "filename": "20260606120100_transactions_cash_account_id_backfill.sql",
+      "sha256": "9a59f41c8d9e1c2fb3462f489318963c822ed13b17bc2b08cf25e47ad8f11607",
+      "version": "20260606120100"
+    },
+    {
+      "filename": "20260607120000_supplier_invoice_overdue_skip_paid_and_credit_notes.sql",
+      "sha256": "43a4e17a0a92845d03331e2fa701763db97c677480bcd04419fde6604032c9c2",
+      "version": "20260607120000"
+    },
+    {
+      "filename": "20260608120000_allow_journal_entry_notes_edit.sql",
+      "sha256": "d79157e84ab2b3f756259373935bc58caf86e741e3bd2d081a230cdf228b68bd",
+      "version": "20260608120000"
+    },
+    {
+      "filename": "20260609120000_transactions_cash_account_id_repair_backfill.sql",
+      "sha256": "d17a6f1c61fc329a71bcffe25eb22df61d3205e4c098db0a6d148cd4a28ef9e3",
+      "version": "20260609120000"
+    },
+    {
+      "filename": "20260610120000_gl_lines_for_matching.sql",
+      "sha256": "37ceb0302d8a80fb1892a36705764b06f913b14675a49b6571492754e38fb6cd",
+      "version": "20260610120000"
+    },
+    {
+      "filename": "20260611120000_gl_lines_rpc_tenant_guard.sql",
+      "sha256": "758e04075fc7ca9e3c5fe518e23f876e73388611f14a0282432912bc219f7cd8",
+      "version": "20260611120000"
+    },
+    {
+      "filename": "20260611130000_gl_lines_rpc_revoke_public_execute.sql",
+      "sha256": "d731ea9f21f20eba7bda6b26e7430b076ee4cd2aedae3cbd0ec430083d3131b6",
+      "version": "20260611130000"
+    },
+    {
+      "filename": "20260611140000_gl_lines_rpc_guard_claims_read.sql",
+      "sha256": "c8ce80515736cf95cdf868941e0800f67b186e7a78ff6272cb5893246711e893",
+      "version": "20260611140000"
+    },
+    {
+      "filename": "20260612120000_pending_operations_add_link_supplier_invoice_voucher.sql",
+      "sha256": "c9564bf27e7b575d9254143a5effb52cb8469ba8c8807e1d016a5b53d5cd4c62",
+      "version": "20260612120000"
+    },
+    {
+      "filename": "20260612121000_supplier_invoice_items_add_reverse_charge_rate.sql",
+      "sha256": "0646fbf521f7e452c7ea542f7125de4e456458c8b2063dfcf70232103cb36f42",
+      "version": "20260612121000"
+    },
+    {
+      "filename": "20260612130000_drop_create_company_with_owner_business_profile_overload.sql",
+      "sha256": "b1260f720a5a0b75f5d3bafe5956c183b05919601721897a1ed9ea0964ed3876",
+      "version": "20260612130000"
+    },
+    {
+      "filename": "20260613100000_self_billing_received_invoices.sql",
+      "sha256": "6c69c1f4ca35cb1f6cff96bf95ab69a74853eb2dde44dc5c9655c64041b52bef",
+      "version": "20260613100000"
+    },
+    {
+      "filename": "20260613120000_mark_entry_as_opening_balance.sql",
+      "sha256": "40399ef19600b9a7e796feaa5b3e26edefc2fe1405ab734ebad1564c4e39bdf4",
+      "version": "20260613120000"
+    },
+    {
+      "filename": "20260613120002_seed_agent_atom_bodies.sql",
+      "sha256": "3f84c0894d7d07319a6cccf12dd3eccb1e2e78a501346c567e792f7a23f9e6aa",
+      "version": "20260613120002"
+    },
+    {
+      "filename": "20260614120000_link_invoice_to_voucher_rpc.sql",
+      "sha256": "e54bf816500f74a0e0f44bd7a9dd36505652f0b9fe1ef19b40d3ba9dd5f3a41f",
+      "version": "20260614120000"
+    },
+    {
+      "filename": "20260615120000_link_voucher_rpcs_tenant_guard.sql",
+      "sha256": "7cd8ddcf3bc2f8f9104a7dd1bf9e6fa6b0f1217f06d4360e080a450ce694a765",
+      "version": "20260615120000"
+    },
+    {
+      "filename": "20260615180918_backfill_chart_of_accounts_diacritics.sql",
+      "sha256": "e7cb56bbb286d84b73e754ac298ee5a3c2352da3a8e40b32a8f219bcd1496a29",
+      "version": "20260615180918"
+    },
+    {
+      "filename": "20260616120000_transactions_date_sane_range.sql",
+      "sha256": "b4b3e860f1295077781b7172f476bdf70e78eb1eb5691e1e2c59fd42fcb55334",
+      "version": "20260616120000"
+    },
+    {
+      "filename": "20260617120000_worklist_indexes.sql",
+      "sha256": "727417d902ee04c4bb912a96db753a6e13dd5480da410b86e249797c91aabb9c",
+      "version": "20260617120000"
+    },
+    {
+      "filename": "20260618120000_event_log_type_index.sql",
+      "sha256": "0d08403d1932a08b9fdc7ca4048c7a4f816ef5c6d20e520d71f5983af1a5fe49",
+      "version": "20260618120000"
+    },
+    {
+      "filename": "20260618120001_commit_method_agent_provenance.sql",
+      "sha256": "58409e7df07e64d4733b8ffb3f7d0334def96b7247310a9793abbc8c1bec788c",
+      "version": "20260618120001"
+    },
+    {
+      "filename": "20260619120000_journal_entry_committed_actor.sql",
+      "sha256": "7cd4c5a057935bff0f6a9eda34e4ca5833b3aa9a914449ef06c334712fe572fb",
+      "version": "20260619120000"
+    },
+    {
+      "filename": "20260619130000_payment_company_consistency.sql",
+      "sha256": "9587aa58f69308e8841172f9a875b96d7c7ccec906fbca5c74250debe3a156d5",
+      "version": "20260619130000"
+    },
+    {
+      "filename": "20260619130100_securitydefiner_write_rpc_tenant_guards.sql",
+      "sha256": "d07abc6f27307f5fc27db5f26d8ecb816d29fd62a897017563e27551bf6ba26d",
+      "version": "20260619130100"
+    },
+    {
+      "filename": "20260619140000_api_keys_sod_ack_and_agent_write.sql",
+      "sha256": "eb21ae022f4468b1a69873822fc387e55a95ccd6154e02e0a7a8a6eee2545ba8",
+      "version": "20260619140000"
+    },
+    {
+      "filename": "20260620120000_pending_operations_add_skatteverket_submit.sql",
+      "sha256": "caefb2bb85e8ab6be86269d01e6a8e5a051998742659ef3b454557ccb738c041",
+      "version": "20260620120000"
+    },
+    {
+      "filename": "20260620130000_link_invoice_to_voucher_cash_method.sql",
+      "sha256": "43566ab581f2fc49896ce04d958fee7441de7c4fa227faf86b388400bc9cfd38",
+      "version": "20260620130000"
+    },
+    {
+      "filename": "20260620140000_invoice_items_line_type.sql",
+      "sha256": "23fc47d0a25e9d17042caa63f4f1eb051b2de72bc4881397493e81ff807777c9",
+      "version": "20260620140000"
+    },
+    {
+      "filename": "20260621120000_artikelregister.sql",
+      "sha256": "ad8e852f10e7c4e5ab7cfb206fb34c11609fda20b19dd92a57378af65542414f",
+      "version": "20260621120000"
+    },
+    {
+      "filename": "20260621120100_pending_operations_add_articles.sql",
+      "sha256": "607d84169c70218f742f6563084b08aff6f1adb7ddf46a8e32784392c6ada76b",
+      "version": "20260621120100"
+    },
+    {
+      "filename": "20260621130000_api_keys_rotation_grace.sql",
+      "sha256": "c9b1b31a43789b7ec4d8729e0ba1168a36c6abecbe1111cc7948dc78bdb02aee",
+      "version": "20260621130000"
+    },
+    {
+      "filename": "20260621130500_journal_entries_list_draft_correction_filters.sql",
+      "sha256": "bbd4b9a45712a1cc90f713cf11b71b3edfa86c712adc41bd988c62c5345f7502",
+      "version": "20260621130500"
+    },
+    {
+      "filename": "20260621131000_backfill_fiscal_period_previous_id.sql",
+      "sha256": "17f3b11e9a41b3fd35351fd36e46d1ff62f78fc7f42748a30d43263e2e3495e5",
+      "version": "20260621131000"
+    },
+    {
+      "filename": "20260621132000_add_default_our_reference.sql",
+      "sha256": "3d48e7cb9e7ef6a3c82153b9e6baae21ff187ac97f38908e8be36eab7ca06485",
+      "version": "20260621132000"
+    },
+    {
+      "filename": "20260622120000_bolagsverket_arsredovisning_submissions.sql",
+      "sha256": "5a97f52fd41b7a42af54532ac962ed87ebf8925107c7cc02d146e5c1a03d81d8",
+      "version": "20260622120000"
+    },
+    {
+      "filename": "20260622121000_invoices_journal_entry_id_backfill.sql",
+      "sha256": "ff459088433c117cc9f1138e8b502866ece37fec7b18f2c7c56330fd11f8bd68",
+      "version": "20260622121000"
+    },
+    {
+      "filename": "20260623120000_accrual_schedules.sql",
+      "sha256": "67acd2deae3ec3f11936ac6da6e96fa0596a444024e6e62069495a94579fe298",
+      "version": "20260623120000"
+    },
+    {
+      "filename": "20260623130000_next_voucher_number_user_id_fallback.sql",
+      "sha256": "3d6db422e572ab771c342128dab292588e5d519cd06a1f2f1da0a9b2c313c3fb",
+      "version": "20260623130000"
+    },
+    {
+      "filename": "20260624120000_undo_sie_import_explicit_actor.sql",
+      "sha256": "572ccae32217c95f4afbde894a96f099c5782aec5cb96b95aba94e2afadb1c41",
+      "version": "20260624120000"
+    },
+    {
+      "filename": "20260624130000_invoices_ore_rounding_toggle.sql",
+      "sha256": "6174f3fe1480d820b6447b155a6c315b78d5981c55d0b4c0794bab5fb9f7c31a",
+      "version": "20260624130000"
+    },
+    {
+      "filename": "20260626120000_processing_history_book_duplicate_dismissed.sql",
+      "sha256": "a990192329ea09a9f65ce99e4d50295f839f35a396c8a2fafe4848ff38f03fc3",
+      "version": "20260626120000"
+    },
+    {
+      "filename": "20260627120000_journal_source_type_result_appropriation.sql",
+      "sha256": "2783506f13a51af8a78ae7994025cf49ace3d3ea9630394295e0f7db4ed1beca",
+      "version": "20260627120000"
+    },
+    {
+      "filename": "20260627130000_backfill_company_vat_number_drop_century.sql",
+      "sha256": "1964e5b17c6e8b54eb17e6283765b73862fb079ccca14f2c302fc8a82eaa65a0",
+      "version": "20260627130000"
+    },
+    {
+      "filename": "20260628120000_ef_no_owner_employee.sql",
+      "sha256": "99054023045d693ebd5c118cf15a9c1b0fb1d6c3e848f9b6c63a3563b1afa86a",
+      "version": "20260628120000"
+    },
+    {
+      "filename": "20260628140000_capability_grants_and_metered_events.sql",
+      "sha256": "d985fbd93347b1caa2043faacc07ac395c35f3d9645e35372fa55e69e5944f1a",
+      "version": "20260628140000"
+    },
+    {
+      "filename": "20260629120000_seed_trial_and_comp_capability_grants.sql",
+      "sha256": "9dc2a86a99cf4fc32844cb503cbf78c48e034e7c0a8ea978e6fc2445476bd997",
+      "version": "20260629120000"
+    },
+    {
+      "filename": "20260629140000_stripe_subscriptions.sql",
+      "sha256": "1258c1c16846b62d9d1e10c5874bc3fdecc574d995bb756a514177368793df7e",
+      "version": "20260629140000"
+    },
+    {
+      "filename": "20260629150000_bank_connections_psu_type.sql",
+      "sha256": "84878d38979db682ff21b675cccce74a3d224dad703dedd80772343afa5ae2c3",
+      "version": "20260629150000"
+    },
+    {
+      "filename": "20260629160000_journal_entries_list_series_filter.sql",
+      "sha256": "0a2493fbb2ba22d1a513f3b341a23f3c543590b51f56a4a0bf5f398dbf49d2fa",
+      "version": "20260629160000"
+    },
+    {
+      "filename": "20260629160100_sie_bulk_delete_statement_timeout.sql",
+      "sha256": "c9c54a0c3e2eb5774217392eb4e38894cd4535e0198549207d4f868be58aaee7",
+      "version": "20260629160100"
+    },
+    {
+      "filename": "20260629170000_customers_add_address_line2_default_payment_terms.sql",
+      "sha256": "e344e721cf5c15df8160326e94bb96f8e40c867016fa749218e83a2a03eb2272",
+      "version": "20260629170000"
+    },
+    {
+      "filename": "20260629170100_customers_add_vat_number_validated.sql",
+      "sha256": "67868b6e836a96588ebff54b8e78dff2d1bbfbb28555af96f3c332ebb15e82a6",
+      "version": "20260629170100"
+    },
+    {
+      "filename": "20260629180000_transactions_realtime_publication.sql",
+      "sha256": "e9f9fe2d666ef6e5132aa95859dee4c46df0345a6e5dbc1d97a5898e0e34b4a8",
+      "version": "20260629180000"
+    },
+    {
+      "filename": "20260630120000_pending_operations_add_bulk_book_inbox_items.sql",
+      "sha256": "1acc46f85f9d08d70338d8bb855d4e3d7086cca3b9e4d487f7f9c15ee95cb25a",
+      "version": "20260630120000"
+    },
+    {
+      "filename": "20260701090000_company_inbound_domains.sql",
+      "sha256": "b81af13cf47fa8c9ccbce1af7b7ab63bd4dac35196cae8f009858417660dfc31",
+      "version": "20260701090000"
+    },
+    {
+      "filename": "20260702084500_dimensions_substrate.sql",
+      "sha256": "6fbc10d1ae4f9d38f8fa82ac33feed1b5c93cced104da49ffd4e040e3003306e",
+      "version": "20260702084500"
+    },
+    {
+      "filename": "20260702093000_rls_role_gate_and_voucher_rpc_guards.sql",
+      "sha256": "57f35198ad59faf197a48c84929bfc24f19e66bd39c54d0fe69d015711c4508e",
+      "version": "20260702093000"
+    },
+    {
+      "filename": "20260702100000_company_settings_dimensions_enabled.sql",
+      "sha256": "f4924f71cca4bedd5aa387704596550921fee0e43cee7b1712fe0a7846cc1344",
+      "version": "20260702100000"
+    },
+    {
+      "filename": "20260702130000_pending_operations_add_create_dimension_value.sql",
+      "sha256": "efed2363e309bb33fb68ca7fd397b9fa3f39a4a4c79049843a868b991cca9ace",
+      "version": "20260702130000"
+    },
+    {
+      "filename": "20260702154500_dimension_import_provenance_undo_lockstep.sql",
+      "sha256": "d7be8c8605530068fa7ad570f815e6ba9c8bd7baeac6434ea77d3d1810e6cd50",
+      "version": "20260702154500"
+    },
+    {
+      "filename": "20260702170000_dimension_retag_log_and_rpc.sql",
+      "sha256": "0ed8d7d2b7fd24d5bec742bec64eaf147774d78f598b2d70e357f6b8dcddcd85",
+      "version": "20260702170000"
+    },
+    {
+      "filename": "20260702171000_pending_operations_add_retag_line_dimensions.sql",
+      "sha256": "8986e06b019b3b743030f7e45c3c0e49d01f04c837993d6ca167364814a0f7ca",
+      "version": "20260702171000"
+    },
+    {
+      "filename": "20260702200000_producer_document_dimensions.sql",
+      "sha256": "5b0faf506b79d2f42c40e04c97f0279ec64962f1d3bf847d8deb721aa4e4f17e",
+      "version": "20260702200000"
+    },
+    {
+      "filename": "20260702201000_bulk_book_transactions_dimensions.sql",
+      "sha256": "80b77ea33d4fceefe2ee8893fa5b4a8ef8b1ef66d8019a370424e13f58a6ea36",
+      "version": "20260702201000"
+    },
+    {
+      "filename": "20260702220000_employees_default_dimensions.sql",
+      "sha256": "b889ffcdf23e17a20899bc1a104df58b9c7bcec93d8fd576082e477b005892a7",
+      "version": "20260702220000"
+    },
+    {
+      "filename": "20260702230000_dimensions_generated_column_cutover.sql",
+      "sha256": "a666d113b04fe444e836b04157958bc0d7f8f4462e77ed7a6f827e1aed01697e",
+      "version": "20260702230000"
+    },
+    {
+      "filename": "20260703090000_rot_rut_payout_requests.sql",
+      "sha256": "7f9a51f41773b790c77ddd16479e57cbd89ebf711274e5dd2eb78f84804cfb08",
+      "version": "20260703090000"
+    },
+    {
+      "filename": "20260703091000_invoice_email_texts.sql",
+      "sha256": "64f5de45db42ed1217253a37f7ac0b34e5d7012edf3ad438d63383d29a5321b3",
+      "version": "20260703091000"
+    },
+    {
+      "filename": "20260703120000_pending_operations_add_link_document_to_voucher.sql",
+      "sha256": "93f24591424461db92014b4279406fb802e8074736669d879de34fe23a50f447",
+      "version": "20260703120000"
+    },
+    {
+      "filename": "20260703130000_verifikat_without_documents_rpc.sql",
+      "sha256": "baa875525ab052cddaa1e23c7dd8c417800c8e5c148a5866f48c1b6f5a2c16d6",
+      "version": "20260703130000"
+    },
+    {
+      "filename": "20260703160000_document_surfaces_unification.sql",
+      "sha256": "0c305d6366da43a219f15bbb419b0b35abc9882a79393cc13c258518e2df28e5",
+      "version": "20260703160000"
+    },
+    {
+      "filename": "20260703160001_seed_agent_atom_bodies.sql",
+      "sha256": "91f5803fad9d9fab4d7c8a19f397570c6273d41683e706699c562f2d53e8439c",
+      "version": "20260703160001"
+    },
+    {
+      "filename": "20260703180000_null_safe_tenant_guards.sql",
+      "sha256": "ad2f1a15d718cc59bcb6b20fa4aaa7e63906192fb04136780ca5b15c1443ebce",
+      "version": "20260703180000"
+    },
+    {
+      "filename": "20260703180001_seed_agent_atom_bodies.sql",
+      "sha256": "063b44320831588b213477ef321142aebffc6a0001bc4f1c7fbed5ba5c9bc6f8",
+      "version": "20260703180001"
+    },
+    {
+      "filename": "20260703190000_salary_settings_p1.sql",
+      "sha256": "923e2cb9ebb170b2bc45707a88e48677881d0ea33fa626b30c9c841d27e1c73b",
+      "version": "20260703190000"
+    },
+    {
+      "filename": "20260703191000_salary_payslip_links.sql",
+      "sha256": "e6563981400e1c5f05bdc093a1c18a64ab9b1d610f0fc90aa88a5991658268bc",
+      "version": "20260703191000"
+    },
+    {
+      "filename": "20260703200000_account_dimension_rules.sql",
+      "sha256": "d002622c08b31f9a676c37e9e2279d4326f1712293e2acbf7c130bad35e51cc0",
+      "version": "20260703200000"
+    },
+    {
+      "filename": "20260704100000_deadlines_user_id_nullable.sql",
+      "sha256": "368b1701aeb4bae7b0e1f1207d041f949f0c4711b28249a709623e37e53dc789",
+      "version": "20260704100000"
+    },
+    {
+      "filename": "20260704101000_exchange_rates_cache.sql",
+      "sha256": "1b7434c2cb7322cffb5786c81a4629cbd3af88e51ad3d3600bcb41fd92a0930e",
+      "version": "20260704101000"
+    },
+    {
+      "filename": "20260704102000_skatteverket_token_health.sql",
+      "sha256": "0aa920412bd4e18ab4feb335264486013532030f5a7f395ecb10840bb93fe5bc",
+      "version": "20260704102000"
+    },
+    {
+      "filename": "20260704103000_allow_correction_document_relink.sql",
+      "sha256": "40c4a129094bb9e3fb4640db5696b7c7fd9051286ca5a695183318397d2fae11",
+      "version": "20260704103000"
+    },
+    {
+      "filename": "20260704110000_account_usage_counts_rpc.sql",
+      "sha256": "7e2f55978d3b4365d912c18560722e9d88396bcc3871205dd8f3f573083aa9e7",
+      "version": "20260704110000"
+    },
+    {
+      "filename": "20260705100000_fix_correction_relink_role_detection.sql",
+      "sha256": "9412e20421c829f6624c217757c4326d07786a734f618b3bd595d5c0c61d8770",
+      "version": "20260705100000"
+    },
+    {
+      "filename": "20260706100000_drop_delete_user_account.sql",
+      "sha256": "bc24821989ab17b2788180f5d0136c0cbc86ebc53724e9fcb70bc61556b16b0c",
+      "version": "20260706100000"
+    },
+    {
+      "filename": "20260706120000_journal_entry_lines_entry_account_index.sql",
+      "sha256": "a695089bcdb46e8c3282e1cd2c336b16f9f73ca1a728f00a6d01472a11bf8aa5",
+      "version": "20260706120000"
+    },
+    {
+      "filename": "20260706140000_recurring_send_hour_and_pause.sql",
+      "sha256": "4330ed5cec2cd2e96a241f3a309a431ee5d33559d2e25e6067278675a1d3b10b",
+      "version": "20260706140000"
+    },
+    {
+      "filename": "20260706193007_context_graph_counterparties.sql",
+      "sha256": "33e3a1a4d7a30fef0b71d76886fce4f7e66063864a28effc5b5310493922c776",
+      "version": "20260706193007"
+    },
+    {
+      "filename": "20260707113729_add_transactions_enrichment.sql",
+      "sha256": "bbc2830275f6e2d78e807a759495f066f8b905a840b78bff9fb9e1bdb07fa147",
+      "version": "20260707113729"
+    },
+    {
+      "filename": "20260707120000_ledger_usage_stats_rpc.sql",
+      "sha256": "f3aa3e62a31f39927b1eb98bc1b78b269c807b1e62475056d76ba44cb54bf3f6",
+      "version": "20260707120000"
+    },
+    {
+      "filename": "20260707130000_bank_file_imports_company_scoped_hash.sql",
+      "sha256": "ca05e18f575e51a2fdd8cd96d43de577e5a299e65adf7409c2fd1aaacb15229e",
+      "version": "20260707130000"
+    },
+    {
+      "filename": "20260708100000_journal_source_type_vat_settlement.sql",
+      "sha256": "9e00f0772718debd3b31fbe2d1f03e5bd2b607d05b86c61d54c8fba8cc03fceb",
+      "version": "20260708100000"
+    },
+    {
+      "filename": "20260708110000_ledger_stats_exclude_vat_contra.sql",
+      "sha256": "f438620e419c5c29a320fbecd884e39fc9b2cb75f2aeba1f19a6cc3eb9847a0d",
+      "version": "20260708110000"
+    },
+    {
+      "filename": "20260708120000_ledger_stats_committed_at_lag.sql",
+      "sha256": "9b91925e08d88c71c19c8674c5f6f165a3a86c138d96b838c28aae9626f1daea",
+      "version": "20260708120000"
+    },
+    {
+      "filename": "20260708130000_ledger_deep_context.sql",
+      "sha256": "7f00a3bed9afe02e4fde4bdc6dad534fffd5cf5aae2ad2a4b2564d01a0e72555",
+      "version": "20260708130000"
+    },
+    {
+      "filename": "20260709090000_invoice_payment_link.sql",
+      "sha256": "e2fecf862880784a86ff027d8d064d9f9c075e68768a938acd43fd58a8c5068a",
+      "version": "20260709090000"
+    },
+    {
+      "filename": "20260709120000_account_default_vat_rate.sql",
+      "sha256": "721d668a4f40c1b714c79c01d96c00b22673c9c5dfa7934f88a090aeedc9757c",
+      "version": "20260709120000"
+    },
+    {
+      "filename": "20260709130000_supplier_invoice_start_number.sql",
+      "sha256": "2186183b57961bde01c5cf4fb5a6daec18b58ea82a051d06d3313e2e9409b4fe",
+      "version": "20260709130000"
+    },
+    {
+      "filename": "20260709140000_add_customer_number_to_customers.sql",
+      "sha256": "d3c955be3e129ea716aeeb0d964bfc04abc6b8637d59cbe071972ffa1e8f5428",
+      "version": "20260709140000"
+    },
+    {
+      "filename": "20260710100000_exchange_rates_service_role_writes.sql",
+      "sha256": "648cbb28d3eaf53daabe68e9de3c2bb32313c5729b67f19ac03fb4ad3128361b",
+      "version": "20260710100000"
+    },
+    {
+      "filename": "20260710101000_drop_duplicate_jel_entry_index.sql",
+      "sha256": "c88c3f55f0298425d775e6eb61a2029eb679b87d560864519cc4ef6e16d92a1e",
+      "version": "20260710101000"
+    },
+    {
+      "filename": "20260710102000_receipts_bucket_drop_public_read.sql",
+      "sha256": "395fc6d576e86868c707e692c814665909c761b6ffd76a015d9dfcc9760bd6ae",
+      "version": "20260710102000"
+    },
+    {
+      "filename": "20260711100000_categorization_templates_learning_fix.sql",
+      "sha256": "9dae75ba92ac8b98a9ec91ecd4a771b9bc2a27e57d2a89a3876468ec05663e74",
+      "version": "20260711100000"
+    },
+    {
+      "filename": "20260712090000_notification_type_skv_kvittens.sql",
+      "sha256": "d9400eed164b4cb4684dc88600fb232a8a0970fb75db025e97204dcf5b537dc8",
+      "version": "20260712090000"
+    },
+    {
+      "filename": "20260712091000_rot_rut_skv_referensnummer.sql",
+      "sha256": "2729eec77493c5297c363a43078d034039654e3f61c65d4f35cfe0f9f5030610",
+      "version": "20260712091000"
+    },
+    {
+      "filename": "20260712092000_skatteverket_company_connections.sql",
+      "sha256": "3252c716ab6a705336b6afe4613a47bef83cecf4d22190baab029dd188c1deeb",
+      "version": "20260712092000"
+    },
+    {
+      "filename": "20260712100000_stripe_connections.sql",
+      "sha256": "0a50f6e7366f4d337726cc14103db541e8eb4c5cf70e835c1601c1c20f902166",
+      "version": "20260712100000"
+    },
+    {
+      "filename": "20260712100100_stripe_payments_capability_backfill.sql",
+      "sha256": "440ec3a7f8166c39601bcc5675aae404ada34f9eddd0eba86f1567ba1c5a655b",
+      "version": "20260712100100"
+    },
+    {
+      "filename": "20260712100200_invoice_stripe_payment_link.sql",
+      "sha256": "8bc015058b5a9072d3b14cc92c73b0d15c25d110553d13410c969df9e690d0f2",
+      "version": "20260712100200"
+    },
+    {
+      "filename": "20260712100300_stripe_payment_events.sql",
+      "sha256": "226111d52fab224c7eea3c76bde116902d163185ecc52e1b1c19a16dc40909e1",
+      "version": "20260712100300"
+    },
+    {
+      "filename": "20260712100400_stripe_payouts.sql",
+      "sha256": "3fc4a5fed6ede61b4b46ff3982314d072f67b027f770cc53dd85df7f7cbe1e66",
+      "version": "20260712100400"
+    },
+    {
+      "filename": "20260712100500_journal_source_type_stripe_payout.sql",
+      "sha256": "83988bf5b4b1af92d6904cb8975ca22b959ad27d8f4f8606ea69488c2f445502",
+      "version": "20260712100500"
+    },
+    {
+      "filename": "20260712112000_rot_rut_apply_beslut_rpc.sql",
+      "sha256": "4dab9c32c27605ba70cd69e6364159c9528c9b57af4e0cd20d4852900c8ccee0",
+      "version": "20260712112000"
+    },
+    {
+      "filename": "20260712113000_notification_log_kvittens_dedup_idx.sql",
+      "sha256": "f4b6161307b0c980268b38d615242f2e4f935f9053c840f0d8a90ccf6a3dcd60",
+      "version": "20260712113000"
+    },
+    {
+      "filename": "20260712120000_document_last_supplier_payment_account_scope.sql",
+      "sha256": "81afd147bd3aab6e965a7b8879ea3fcbd1f3a9692f1e95e2b75c54614501cc9c",
+      "version": "20260712120000"
+    },
+    {
+      "filename": "20260712130000_ledger_deep_context_laplace_share.sql",
+      "sha256": "b949e9cede867bf4c76558a20c996765d1f5d155949994eb9ad9a7659ac3b79f",
+      "version": "20260712130000"
+    },
+    {
+      "filename": "20260712140000_currencies_reference_table.sql",
+      "sha256": "bd35516ff9fcdfb366d91bd367ee19115dd876b18d7e729cb873d0267f7814a1",
+      "version": "20260712140000"
+    },
+    {
+      "filename": "20260712140100_articles_add_currency.sql",
+      "sha256": "2a60cc200cdbfb8a6c193ec8c0d975a531d1308a56b7605c8e6bab9163fe96c5",
+      "version": "20260712140100"
+    },
+    {
+      "filename": "20260712150000_import_sie_journal_entries_rpc.sql",
+      "sha256": "01352efead06fbc71b1d37ac0fff42560d316f7839b1f349e397e2b0ba381547",
+      "version": "20260712150000"
+    },
+    {
+      "filename": "20260713100000_pending_operations_add_payroll_gap_closure_ops.sql",
+      "sha256": "53be763507560b8ea6b234fc710f55a229509c1a7660ef3ffa02f973b56cdf13",
+      "version": "20260713100000"
+    },
+    {
+      "filename": "20260713101000_employee_opening_balances.sql",
+      "sha256": "b05f8da1719e362c5f8967d481a2e4c08b3817c7976c09d527e82a3d2147f1e9",
+      "version": "20260713101000"
+    },
+    {
+      "filename": "20260713110000_employees_work_schedule.sql",
+      "sha256": "5fe1335277b88d6e502bcadc13f18335c758f0c64719d2905fb589bd120d95ed",
+      "version": "20260713110000"
+    },
+    {
+      "filename": "20260713120000_vat_declaration_totals_rpc.sql",
+      "sha256": "6718767e18266c386063d84245fd3aac3e70d4230f8de43ab3e9b63de883ae0a",
+      "version": "20260713120000"
+    },
+    {
+      "filename": "20260713121000_pending_operations_add_vacation_year_close.sql",
+      "sha256": "7d835e524add1aac78db4b4452eae13ac652975cdd8c128cbdc2a74ac75bc87b",
+      "version": "20260713121000"
+    },
+    {
+      "filename": "20260713122000_vacation_ledger.sql",
+      "sha256": "e537481066410e2956b11e6c688e89fa2e72eaa2cd79d88fffc94dbc9a7c4efa",
+      "version": "20260713122000"
+    },
+    {
+      "filename": "20260713123000_validate_pending_operations_op_type_check.sql",
+      "sha256": "40eab1bb60e2eacf0523fee843ad1714f221ae1491aead3a90b178b03109b674",
+      "version": "20260713123000"
+    },
+    {
+      "filename": "20260714121345_prevent_credit_note_paid_status.sql",
+      "sha256": "6472b00fee2304c9e646ed8788f6115f2eff1d1af426c63070d68ff3fdfb6777",
+      "version": "20260714121345"
+    },
+    {
+      "filename": "20260714122431_validate_credit_note_paid_status.sql",
+      "sha256": "c670c579e946e21c1c3e648705b0510c7cffb8277256aa0e5e85e96d133ae23e",
+      "version": "20260714122431"
+    },
+    {
+      "filename": "20260714133716_add_invoice_reminder_days.sql",
+      "sha256": "a8bfacc5ebd46b9bced16786f3b82b7f5d986249474140cb773dfd11d591a877",
+      "version": "20260714133716"
+    },
+    {
+      "filename": "20260714133717_validate_invoice_reminder_days.sql",
+      "sha256": "0a7ec9d3772f4a307521da9f0ee934a093ec568b1e70c48570dcd53fe753a5ba",
+      "version": "20260714133717"
+    },
+    {
+      "filename": "20260715120000_credit_note_creation_and_posting_guards.sql",
+      "sha256": "864ea4a87b245b313cabc047251ff35f10eb85035e01d8f92f1119049c87d954",
+      "version": "20260715120000"
+    },
+    {
+      "filename": "20260715181301_reconcile_credit_note_paid_status.sql",
+      "sha256": "c993e4bcf294603b368535b802e64e674316f8d6184e5650ed6e07c23f44dc1a",
+      "version": "20260715181301"
+    },
+    {
+      "filename": "20260716072211_tax_deadline_filing_profile.sql",
+      "sha256": "617e31ece7ac20745cbfb2cf0ab1101460fbdcefed25427c414adb017beff9d4",
+      "version": "20260716072211"
+    },
+    {
+      "filename": "20260716120353_split_tax_deadline_thresholds.sql",
+      "sha256": "2e1bc383f44a5eace9433f93660d6bd092a443b17ca7f71e201ae877be62e2d5",
+      "version": "20260716120353"
+    },
+    {
+      "filename": "20260716140000_journal_entries_list_same_date_order.sql",
+      "sha256": "bec51c3687a7b754f2c6d4b064a906f014ad8ed97097175c40ab62fc9fa74b48",
+      "version": "20260716140000"
+    },
+    {
+      "filename": "20260716150000_company_settings_defer_invoice_booking.sql",
+      "sha256": "541d9ebf3fbd56aeb8bf54230c0487dee5820a0d9c8639a00c13fa4d76964031",
+      "version": "20260716150000"
+    },
+    {
+      "filename": "20260717070000_agi_follows_vat_taxable_base.sql",
+      "sha256": "06cc5c7ad50374d9a3aecb3debb609127dca5a1bd7931a13d3efb761733dc918",
+      "version": "20260717070000"
+    },
+    {
+      "filename": "20260717090000_pending_operations_add_account_and_voucher_note_ops.sql",
+      "sha256": "e9a0e5f05473b6f6ac280591c5e49d3649fc76e477e8fa2d5a517b4f3e6532cf",
+      "version": "20260717090000"
+    },
+    {
+      "filename": "20260717091000_validate_pending_operations_op_type_check_accounts.sql",
+      "sha256": "9193b34246f3a4723cffcc536c8b36270c2ae66a172f8dfc8d7e8579b84c02f0",
+      "version": "20260717091000"
+    },
+    {
+      "filename": "20260717150000_fskatt_deadline_amount_gate_and_dismiss.sql",
+      "sha256": "c04c658ee6a4ade873f5f0da1420bbc0148ccabb2d9090be7114a11adfb76904",
+      "version": "20260717150000"
+    },
+    {
+      "filename": "20260717151000_agi_employer_registration_gate.sql",
+      "sha256": "8342b714c753a369b7e51122f4c30a7659f4b8caae14f48d8b72feaa20d79541",
+      "version": "20260717151000"
+    },
+    {
+      "filename": "20260717152000_replace_bokslut_with_arsstamma.sql",
+      "sha256": "9d1e5500c61bf909ba8f088a77c7cf06ceb78a0f795c2b57a7f20be71688e7dd",
+      "version": "20260717152000"
+    },
+    {
+      "filename": "20260717153000_cleanup_legacy_deadline_types.sql",
+      "sha256": "2e3d22a4b54ee7654e1ac51da2a5f312ce20a51d533a48cd268de9e69c63b6dd",
+      "version": "20260717153000"
+    },
+    {
+      "filename": "20260719100000_resync_voucher_sequences_behind_max.sql",
+      "sha256": "882f6fe2a395a3c13c18ad0dc95c1e27fc6a002b5adb452a140ad4c9497f7f7c",
+      "version": "20260719100000"
+    },
+    {
+      "filename": "20260719101000_rot_rut_deadline_setting.sql",
+      "sha256": "4513eafaa8de34f98fbf7c4f465d5077d0e19f0f5398b1df92e850376823a407",
+      "version": "20260719101000"
+    },
+    {
+      "filename": "20260719102000_deadline_horizon_cleanup.sql",
+      "sha256": "e076fa32a9493e7bcd8bbc55f3ae4c4d0fd8f28c968edd91d9ba2a17e57ae7be",
+      "version": "20260719102000"
+    },
+    {
+      "filename": "20260719103000_kontrolluppgifter_deadline_setting.sql",
+      "sha256": "5a63f0599b21702aa436813cc4c561e16e7e8e2f8234a576eeefc5de683ebb91",
+      "version": "20260719103000"
+    },
+    {
+      "filename": "20260719104000_long_tail_deadline_settings.sql",
+      "sha256": "d108fb71fa1fcf6de4b08dc7d467488a18a50c74ab8c7a8cb8837055154af7d7",
+      "version": "20260719104000"
+    },
+    {
+      "filename": "20260720090000_notification_type_skv_connection_expired.sql",
+      "sha256": "610d9a2b707da2a4c19cd979da18ef959ee52680def8effd4732625690b3c76a",
+      "version": "20260720090000"
+    },
+    {
+      "filename": "20260720103000_pending_operations_add_payroll_e2e_ops.sql",
+      "sha256": "e0a377cfcec3683e4e67adad5fc233a3a2b00aa3213e7299dca147a95f394023",
+      "version": "20260720103000"
+    },
+    {
+      "filename": "20260720103100_validate_pending_operations_op_type_check_payroll.sql",
+      "sha256": "3d2b65487319133d60e289e6c54ef0fd42d0f4c621a695a03d7638dbe2e254e9",
+      "version": "20260720103100"
+    },
+    {
+      "filename": "20260720120000_company_settings_invoice_payment_links.sql",
+      "sha256": "676ccb27ae9c74b6efceab781a4204e3b5a08f82aed51a994691e1e2606280e8",
+      "version": "20260720120000"
+    },
+    {
+      "filename": "20260720140000_closing_entry_detach_escape_hatch.sql",
+      "sha256": "0d3153b3a439e731e60414818fc76532f82cbc799a441cd16bdf9c2f73966782",
+      "version": "20260720140000"
+    },
+    {
+      "filename": "20260721081951_add_tax_notices_and_initial_setup_state.sql",
+      "sha256": "8bae087483d634b7009e77331ea76b872ac730971c6d2d56322e9201fe91c9be",
+      "version": "20260721081951"
+    },
+    {
+      "filename": "20260721085314_fiscal_period_tax_adjustments.sql",
+      "sha256": "48cb08c4c97fd32724edb9cc26d144ea63cb679329b4a60e153231ce7b3cbddc",
+      "version": "20260721085314"
+    },
+    {
+      "filename": "20260721101500_harden_tax_assessment_notices.sql",
+      "sha256": "1370b6c7d9967d677ad1077fa362140c6e5648159c7b543260f2d27b9f15fcba",
+      "version": "20260721101500"
+    },
+    {
+      "filename": "20260721103000_production_error_root_causes.sql",
+      "sha256": "c99192f8c885d24a809defc72b4d4863487ebb06b6707a1b7bd153e0519defc0",
+      "version": "20260721103000"
+    },
+    {
+      "filename": "20260721110750_pending_operations_add_update_company_settings.sql",
+      "sha256": "3d0596fd56996ba228269cbed67935f6527e6d27caa768c4cf66c6e0d3fef8ea",
+      "version": "20260721110750"
+    },
+    {
+      "filename": "20260721110751_validate_pending_operations_update_company_settings.sql",
+      "sha256": "147994b254e5389ac8928ae60f383040fcfd7f0fb305386ce1f6298e12ded22b",
+      "version": "20260721110751"
+    },
+    {
+      "filename": "20260721111331_pending_operations_add_update_customer.sql",
+      "sha256": "e4a3fb5a410ac0e38132c6b5dfde0d1e6f3fe125bac44ab20d48f9d488696716",
+      "version": "20260721111331"
+    },
+    {
+      "filename": "20260721111332_validate_pending_operations_update_customer.sql",
+      "sha256": "907881dc2cceaebd1fc2f4b6a4179d401c80ad40fe54764f7ceb71fddce3065d",
+      "version": "20260721111332"
+    },
+    {
+      "filename": "20260721115701_suppress_api_key_usage_audit_noise.sql",
+      "sha256": "33b79b1c1835d1f397f824622e35718f7822eb4990b2bd0516e78cf3d6b20ae7",
+      "version": "20260721115701"
+    },
+    {
+      "filename": "20260721130847_harden_fiscal_period_tax_adjustment_rls.sql",
+      "sha256": "76722143ccc6a80a1c2f8e075cec96fbdf2189b813981b82511f58dcab4ffc05",
+      "version": "20260721130847"
+    },
+    {
+      "filename": "20260721132000_correct_bfl_retention_expiry.sql",
+      "sha256": "eea6b0ca0c4d595cc10c3ed9d1ea5d6c87eab24f009e79f502f13bfd7e84f6e3",
+      "version": "20260721132000"
+    },
+    {
+      "filename": "20260721144311_import_sie_statement_timeout.sql",
+      "sha256": "a56bdff6724981849f046fd47e40d370283bcc838cc4047d90985b19103389f0",
+      "version": "20260721144311"
+    },
+    {
+      "filename": "20260721160000_annual_report_versions_and_compliance.sql",
+      "sha256": "91fe5fa3a7c500216df91dd9dea7bda78d777bc2af2018c6d15a754508fd19e6",
+      "version": "20260721160000"
+    },
+    {
+      "filename": "20260721161708_increase_invoice_logo_limit.sql",
+      "sha256": "b82967cb36be3bc7fdd4b860ce31e0cdb8b86942fe95f11303d522e1bad79d0d",
+      "version": "20260721161708"
+    },
+    {
+      "filename": "20260721162121_expand_invoice_font_support.sql",
+      "sha256": "46608d1d3a8cf695e8c8d3199b636e04666c77766b9365a9b64ac1fc82553c24",
+      "version": "20260721162121"
+    },
+    {
+      "filename": "20260721201747_harden_annual_report_signature_transitions.sql",
+      "sha256": "dd7f3f0e6b2f37b6fda8725b435449c75fb83def71e3b5291a447efddc7682dc",
+      "version": "20260721201747"
+    },
+    {
+      "filename": "20260722070000_normalize_counterparty_key_card_descriptors.sql",
+      "sha256": "21c0e89ed051e4727bf30b1fd844a98532de086b38d2f4f73ad450a700031316",
+      "version": "20260722070000"
+    },
+    {
+      "filename": "20260722101319_invoice_deliveries.sql",
+      "sha256": "7b9a958e4a941291ccfdd94b4889ce4485491bbb3f3ceebba69f4961c51befd5",
+      "version": "20260722101319"
+    },
+    {
+      "filename": "20260722134114_pending_operations_failed_partial_status.sql",
+      "sha256": "0ca50aeb5805874f732004e6609ad37ac4c8dd9c2b25de52d6873d1f1569b503",
+      "version": "20260722134114"
+    },
+    {
+      "filename": "20260722150000_harden_invoice_delivery_history.sql",
+      "sha256": "5057e28a18e618cb73781506ff6af29cb000f94c08438fc006c11b9fa5e61328",
+      "version": "20260722150000"
+    },
+    {
+      "filename": "20260722190000_invoice_email_cc_bcc.sql",
+      "sha256": "3485f7e6d4e03ed9688bd99c3e2736bd6bed0c3c48e8bda0d6ee813f1e49b99a",
+      "version": "20260722190000"
+    },
+    {
+      "filename": "20260722190500_company_settings_invoice_bank_fields.sql",
+      "sha256": "38231f671e8871dbbc34b313dcbaf7adaf1cf5482733ae3ba7839ebe85c7545a",
+      "version": "20260722190500"
+    },
+    {
+      "filename": "20260722191000_invoice_payment_accounts_by_currency.sql",
+      "sha256": "b72fafccc29ea1b5fe4853f1053c1e6d46f8dedfb67010a79882fe50d005c46a",
+      "version": "20260722191000"
+    },
+    {
+      "filename": "20260723003000_restrict_invoice_delivery_payload_select.sql",
+      "sha256": "3a73b2a797151bdf45520438ad6e9f1958c807ab14fab6beb2e95d65bbc3f2f4",
+      "version": "20260723003000"
+    },
+    {
+      "filename": "20260723003500_backfill_final_closing_entry_links.sql",
+      "sha256": "24d0bb67747536fcb12f4a9d2126efd7c4ca18a5812ae88d053e282ac3ee60cf",
+      "version": "20260723003500"
+    },
+    {
+      "filename": "20260723103000_company_settings_share_capital.sql",
+      "sha256": "dc257ecb2f8a9a903667f868cc0de38aa22556e0f0960cbe292da18123504165",
+      "version": "20260723103000"
+    },
+    {
+      "filename": "20260723120000_add_user_preferences_ui_state.sql",
+      "sha256": "cce016b345bfd0f29c9222464d66ea5a1dd2ef3f24b30818d93974b84c59e404",
+      "version": "20260723120000"
+    },
+    {
+      "filename": "20260723150000_expose_invoice_delivery_attachment_filename.sql",
+      "sha256": "b8bcf41354719f7bee75ae7ca1a9554db25848d6812b56d9174a36b628bf9c9e",
+      "version": "20260723150000"
+    },
+    {
+      "filename": "20260723160000_gl_lines_matching_account_scoped_count.sql",
+      "sha256": "4e36b19b1d073335e074b3c995f14ffa04a2553dd768aa4e09e7782d487c0d23",
+      "version": "20260723160000"
+    },
+    {
+      "filename": "20260723161000_resolve_active_company_rpc.sql",
+      "sha256": "652804b5a423db2e69c850406e4f650dd77b618b5bceccc915ecf45fed385e5f",
+      "version": "20260723161000"
+    },
+    {
+      "filename": "20260723170000_list_company_accounts_rpc.sql",
+      "sha256": "628bb4fe81299b44b75423e1a0085a92c8e2d79badbe36f0bb78129e0d20273a",
+      "version": "20260723170000"
+    },
+    {
+      "filename": "20260723180000_kpi_report_aggregates_rpc.sql",
+      "sha256": "5d96ae5ce2c9851176da373095446272f598fc94ee0176e552db12ad9bd65534",
+      "version": "20260723180000"
+    },
+    {
+      "filename": "20260723190000_block_transaction_links_to_opening_balance.sql",
+      "sha256": "8bc7e2e9957588f129e82435b77981b6844ffda0cdc9752df83fe714eedf959d",
+      "version": "20260723190000"
+    },
+    {
+      "filename": "20260723200000_stripe_transaction_sync.sql",
+      "sha256": "174e9944f8e5f826fbbb51f8f012ddcabb82965123c668e795eb2d783d3424d3",
+      "version": "20260723200000"
+    },
+    {
+      "filename": "20260723210000_verifikat_inline_rattelse.sql",
+      "sha256": "585c39896e57e52859d24713db2b337f342be72cb8e71cf8f55ea537a3d4e766",
+      "version": "20260723210000"
+    },
+    {
+      "filename": "20260723210001_seed_agent_atom_bodies.sql",
+      "sha256": "c1d7f8a90e664f1e19b26b55d2ca2dbae097b5bbf790f2a18086d06378f8ef7c",
+      "version": "20260723210001"
+    },
+    {
+      "filename": "20260723213000_add_hide_assistant_fab.sql",
+      "sha256": "3501f5ff99cb64ab90ac3bbc0b6911f0862a16e80dd4bc97a01f1691de676dba",
+      "version": "20260723213000"
+    },
+    {
+      "filename": "20260724090000_underlag_reference_awareness.sql",
+      "sha256": "e9ed6d0225a4a89cabe2d75c3c3b8542ae208becb964ad467cd96df0081ee933",
+      "version": "20260724090000"
+    },
+    {
+      "filename": "20260724150000_anonymize_scrub_auth_metadata.sql",
+      "sha256": "ee21bd2eb67ff27a9bd00e9c37b1da4ee9f7652df1e855c86ca5d5ef34f06609",
+      "version": "20260724150000"
+    },
+    {
+      "filename": "20260724160000_invoice_delivery_provider_status.sql",
+      "sha256": "1023727c660e2d5c0f5bc127a45bd4e521dd21486e23d83e1842dc4beb65b9e1",
+      "version": "20260724160000"
+    },
+    {
+      "filename": "20260726090000_agent_quota_rpc_caller_guard.sql",
+      "sha256": "1b2a55fe173f6792a8c5fd4e0b60ba3348417aeb2d4d75db0b707f82d36033d6",
+      "version": "20260726090000"
+    },
+    {
+      "filename": "20260726092000_documents_bucket_company_scope.sql",
+      "sha256": "3a57a0bdc331792407e776903942c116d84dbec892f67d73c4d9d224f9abf386",
+      "version": "20260726092000"
+    },
+    {
+      "filename": "20260726100000_bulk_book_transactions_currency_guard.sql",
+      "sha256": "20a5c906399f6f95d1c035b5c347dccef102feefb24a8832d271a927ed19a9a6",
+      "version": "20260726100000"
+    },
+    {
+      "filename": "20260726110000_customers_personal_number_ciphertext_check.sql",
+      "sha256": "5bd35248a07fe96e87f27ce9c369eb9886815167d1527187f538eec2cfbb9de8",
+      "version": "20260726110000"
+    },
+    {
+      "filename": "20260726110001_validate_customers_personal_number_ciphertext.sql",
+      "sha256": "113bc5b191f73594ecf1231f654a2c748a8b31b847dac425d75438738de41acd",
+      "version": "20260726110001"
+    },
+    {
+      "filename": "20260726120000_backfill_supplier_invoice_sek_amounts.sql",
+      "sha256": "17b52e76cdcead55b791c1824bfc2fd352289b3579e68b5e90999ec2aa94346f",
+      "version": "20260726120000"
+    },
+    {
+      "filename": "20260726130000_credit_note_amount_cap_replaces_count_cap.sql",
+      "sha256": "08b427fb76ed175bd5e32a7a205a24b721fcfa0bab4c59f137c2a1df3ab13a9c",
+      "version": "20260726130000"
+    },
+    {
+      "filename": "20260726140000_link_voucher_rpcs_resolve_amount_in_invoice_currency.sql",
+      "sha256": "cf734876c53a101d661b023bc77ea55d4d37e9d4e33e9a91788889d878212c0c",
+      "version": "20260726140000"
+    },
+    {
+      "filename": "20260726150000_ledger_deep_context_honest_sek_amounts.sql",
+      "sha256": "e99f6be1dc0857b013917b2c26514b0e1f627c6911850e6fb4702fe597358b3b",
+      "version": "20260726150000"
+    },
+    {
+      "filename": "20260726174500_notification_settings_missing_underlag_enabled.sql",
+      "sha256": "4fafe16ad8b8d5fbe12eafea141718d9e94f031d042a80d2f95480fb5d75d8e2",
+      "version": "20260726174500"
+    },
+    {
+      "filename": "20260726181500_company_settings_restore_invoice_default_notes.sql",
+      "sha256": "604a1d1c6d9cb4018b307e566f458db4009752e84da8c04bbd78d9e323ca97e0",
+      "version": "20260726181500"
+    },
+    {
+      "filename": "20260727090000_pending_operations_add_update_invoice.sql",
+      "sha256": "45e1aa86f2f66a031eaba0cb2d11b644e817e40c720c6162b78fb05419968fbc",
+      "version": "20260727090000"
+    },
+    {
+      "filename": "20260727090001_validate_pending_operations_update_invoice.sql",
+      "sha256": "2bfbc56afa671b812a93a5a10ae0f904b8e591bb144d9464dae00f5931f8cfac",
+      "version": "20260727090001"
+    },
+    {
+      "filename": "20260727100000_list_invoice_delivery_summaries_for_service.sql",
+      "sha256": "4b50b300c7450ad809c86e0d129ac29f54cd8c11fcf5cfc4c86aff3938a069a6",
+      "version": "20260727100000"
+    },
+    {
+      "filename": "20260727110000_pending_operations_add_recurring_schedule.sql",
+      "sha256": "484f2f68c7c3bc4c6ec49c58917c72ffb3cb5ea616fd25493c8cfa1ef4eec8db",
+      "version": "20260727110000"
+    },
+    {
+      "filename": "20260727110001_validate_pending_operations_recurring_schedule.sql",
+      "sha256": "2ab191a5d4fe265ac7d04ada670682068061747197d8a88cb35ecdfa625e8a50",
+      "version": "20260727110001"
+    },
+    {
+      "filename": "20260727120000_replace_sie_import_authorize_actor.sql",
+      "sha256": "463fe3dfe5414c1d2bb5f61c0f9cc046180db651a6ffe429e66c78cb5e5ce191",
+      "version": "20260727120000"
+    },
+    {
+      "filename": "20260727121000_undo_sie_import_caller_guard.sql",
+      "sha256": "ad07790f91e44cdd2ad99293db5234e332caaaa6fce8aaa9dab52e72fa2ba6d1",
+      "version": "20260727121000"
+    },
+    {
+      "filename": "20260727121001_seed_agent_atom_bodies.sql",
+      "sha256": "5362cab7865407d87a1954668fcb123e57f52ae8d145bbe4f61d1fcdc20d8f41",
+      "version": "20260727121001"
+    },
+    {
+      "filename": "20260727130000_link_voucher_rpcs_null_safe_tenant_guard.sql",
+      "sha256": "0dd14ab992bfe593b7e2748a55d571fe3ded62c53d0ab29489f48105e0a8e8b8",
+      "version": "20260727130000"
+    },
+    {
+      "filename": "20260727160000_supplier_invoice_overdue_symmetric.sql",
+      "sha256": "18e6e315e1bccaf65364aec2b8d897493d7b2f238d39e57ceedf71c3783130e5",
+      "version": "20260727160000"
+    },
+    {
+      "filename": "20260727170000_fix_bankid_personal_number_enc_encoding.sql",
+      "sha256": "2aadd38f4ce2f7ec28a959387489edf6c8cbab6297229b58a93766508e3f1346",
+      "version": "20260727170000"
+    },
+    {
+      "filename": "20260727180000_reanchor_floating_supplier_invoice_documents.sql",
+      "sha256": "35f95385495349fa63d1d351b0cdf687f4eb5feb1546892ac2c5df8f7c4a562a",
+      "version": "20260727180000"
+    },
+    {
+      "filename": "20260727190000_drop_documents_bucket_delete_policy.sql",
+      "sha256": "8bcc3a09d843595cae291791e93b5ec1f4121312a85fb695c59e65e5961247df",
+      "version": "20260727190000"
+    },
+    {
+      "filename": "20260728120000_seed_revenue_default_vat_rate.sql",
+      "sha256": "680e9f48f18a4926403de4df43cacb4380561b4598edb20c19e4c8b281592588",
+      "version": "20260728120000"
+    },
+    {
+      "filename": "20260729094000_create_mcp_tasks.sql",
+      "sha256": "7cf7fb14c69537c1bbad175b4d20a2d606fe46dad17ddaba3e34dc9173107b80",
+      "version": "20260729094000"
+    },
+    {
+      "filename": "20260729100000_recurring_schedule_dimensions.sql",
+      "sha256": "8715b4576cba144e403951a284fce8a3503676e2ce783e6a538a616cf8d8dda7",
+      "version": "20260729100000"
+    },
+    {
+      "filename": "20260729101000_categorization_template_default_dimensions.sql",
+      "sha256": "7955fa070ac76b619eec7f384a20d7f091272303faedbafbcd52b49357967eac",
+      "version": "20260729101000"
+    },
+    {
+      "filename": "20260729110000_vat_totals_exclude_closing_entry.sql",
+      "sha256": "3d9785692d73259faa9d333997b4d61eb8b6c0183942ea5349578a334872f4ee",
+      "version": "20260729110000"
+    },
+    {
+      "filename": "20260730090000_kpi_monthly_exclude_year_end.sql",
+      "sha256": "2bc6bd9cf3af5be30a2e3b7294d9a655cd42e52cdb3ba2cecf4e2c9ca15dbdaf",
+      "version": "20260730090000"
+    },
+    {
+      "filename": "20260730120000_clear_stale_invoice_match_pointers.sql",
+      "sha256": "08e51df0495102fef331ed6c84fcce7972b07cb76f0d734c54307f12e85d1bd7",
+      "version": "20260730120000"
+    },
+    {
+      "filename": "20260730123000_recover_stuck_webhook_deliveries.sql",
+      "sha256": "a2864e0bd83a1a706e4dc4beb9aec33b4e8e304df8f4f5d3ffac3f6cb9c20237",
+      "version": "20260730123000"
+    },
+    {
+      "filename": "20260731090000_fix_seed_chart_account_names.sql",
+      "sha256": "1a8234bbb2666c68761994365eec510943fb3c7e3d421f873111c35fc5fa731b",
+      "version": "20260731090000"
+    }
+  ],
+  "schema_version": 1
+}

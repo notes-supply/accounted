@@ -21,6 +21,7 @@
     "start": "next start",
     "lint": "eslint",
     "check:guards": "node scripts/checks/no-new-antipatterns.mjs",
+    "check:migrations": "node scripts/check-migration-lineage.mjs",
     "validate:packs": "npx tsx scripts/validate-packs.ts",
     "validate:registry": "npx tsx scripts/validate-registry.ts",
     "check:lint": "node scripts/checks/no-new-lint-errors.mjs",
