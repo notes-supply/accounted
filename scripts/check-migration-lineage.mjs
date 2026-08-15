@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const migrationsDir = join(root, 'supabase', 'migrations')
-const predecessorPath = join(root, 'release', 'production-migration-lineage.json')
+const predecessorPath = join(root, 'release', 'production-migration-lineage.txt')
 
 const expected = {
   candidateCount: 637,
@@ -33,6 +33,21 @@ function parseFilename(filename) {
   return { filename, version: match[1] }
 }
 
+function parsePredecessorManifest(text) {
+  if (!text.endsWith('\n')) fail('predecessor manifest must end with a newline')
+  if (text.includes('\r')) fail('predecessor manifest must use LF line endings')
+
+  const lines = text.slice(0, -1).split('\n')
+  return lines.map((line, index) => {
+    const match = /^(\d{14}) ([0-9a-f]{64}) ((\d{14})_[a-z0-9_]+\.sql)$/.exec(line)
+    if (!match) fail(`invalid predecessor manifest line ${index + 1}`)
+    if (match[1] !== match[4]) {
+      fail(`predecessor version does not match filename on line ${index + 1}`)
+    }
+    return { version: match[1], sha256: match[2], filename: match[3] }
+  })
+}
+
 const filenames = (await readdir(migrationsDir))
   .filter((filename) => filename.endsWith('.sql'))
   .sort()
@@ -50,17 +65,16 @@ for (const entry of candidate) {
   versions.add(entry.version)
 }
 
-const predecessor = JSON.parse(await readFile(predecessorPath, 'utf8'))
-if (predecessor.count !== expected.predecessorCount) {
-  fail(`expected ${expected.predecessorCount} predecessor migrations, found ${predecessor.count}`)
-}
-if (!Array.isArray(predecessor.entries) || predecessor.entries.length !== predecessor.count) {
-  fail('predecessor manifest count does not match its entries')
+const predecessorEntries = parsePredecessorManifest(await readFile(predecessorPath, 'utf8'))
+if (predecessorEntries.length !== expected.predecessorCount) {
+  fail(
+    `expected ${expected.predecessorCount} predecessor migrations, found ${predecessorEntries.length}`,
+  )
 }
 
 const candidateByVersion = new Map(candidate.map((entry) => [entry.version, entry]))
 const predecessorVersions = new Set()
-for (const entry of predecessor.entries) {
+for (const entry of predecessorEntries) {
   if (predecessorVersions.has(entry.version)) {
     fail(`duplicate predecessor version: ${entry.version}`)
   }
@@ -105,7 +119,7 @@ if (writeListsIndex !== -1) {
   await mkdir(outputDir, { recursive: true })
   await writeFile(
     join(outputDir, 'predecessor.txt'),
-    `${predecessor.entries.map((entry) => `supabase/migrations/${entry.filename}`).join('\n')}\n`,
+    `${predecessorEntries.map((entry) => `supabase/migrations/${entry.filename}`).join('\n')}\n`,
   )
   await writeFile(
     join(outputDir, 'upgrade.txt'),
@@ -116,7 +130,7 @@ if (writeListsIndex !== -1) {
 console.log(
   JSON.stringify({
     candidate: candidate.length,
-    predecessor: predecessor.count,
+    predecessor: predecessorEntries.length,
     upgrade: upgrade.length,
     firstUpgrade: upgrade[0].version,
     latestCandidate: candidate.at(-1).version,
