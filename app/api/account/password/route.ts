@@ -1,10 +1,12 @@
-import { createServiceClient } from '@/lib/supabase/server'
+import { createClient, createServiceClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
 import { requireAuth } from '@/lib/auth/require-auth'
 import { validateBody } from '@/lib/api/validate'
 import { createLogger } from '@/lib/logger'
 import { getErrorMessage as getUserErrorMessage } from '@/lib/errors/get-error-message'
+import type { SupabaseClient } from '@supabase/supabase-js'
+import { userHasPassword } from '@/lib/auth/has-password'
 
 const log = createLogger('api/account/password')
 
@@ -22,6 +24,32 @@ const SetPasswordSchema = z.object({
     ),
 })
 
+function hasRecoveryMethod(amr: unknown): boolean {
+  if (!Array.isArray(amr)) return false
+  return amr.some((entry) => {
+    if (entry === 'recovery') return true
+    return (
+      entry !== null &&
+      typeof entry === 'object' &&
+      'method' in entry &&
+      entry.method === 'recovery'
+    )
+  })
+}
+
+async function isVerifiedRecoverySession(
+  supabase: SupabaseClient,
+  userId: string,
+): Promise<boolean> {
+  try {
+    const { data, error } = await supabase.auth.getClaims()
+    const claims = data?.claims
+    return !error && claims?.sub === userId && hasRecoveryMethod(claims.amr)
+  } catch {
+    return false
+  }
+}
+
 /**
  * POST /api/account/password
  *
@@ -30,7 +58,7 @@ const SetPasswordSchema = z.object({
  *
  * Two paths depending on whether the user already has a real password:
  *
- *   - First-time set (`app_metadata.has_password !== true`): write via the
+ *   - First-time set (`userHasPassword() === false`): write via the
  *     admin API. BankID-only users (and legacy users whose `has_password`
  *     flag was set to false by the backfill) sit at AAL1 with a TOTP factor
  *     enrolled, and `updateUser` on the user session would be rejected with
@@ -46,31 +74,54 @@ const SetPasswordSchema = z.object({
  * the reset-password page, and the /account/set-password page all funnel
  * through here so the flag stays in sync: see lib/auth/has-password.ts.
  *
- * If the password update succeeds but the flag write fails, we log and still
- * return success: the user has a working password and the banner will show one
- * more time, but a retry will re-flip the flag.
+ * First-password writes set the password and marker in one Auth operation. For
+ * existing passwords, a later marker refresh is only normalization for legacy
+ * email users: missing metadata is already classified as having a password, so
+ * a refresh failure cannot reopen the first-password exception.
  */
 export async function POST(request: Request) {
-  const { user, supabase, error: authError } = await requireAuth()
-  if (authError) return authError
+  // This endpoint has two deliberately narrower sinks than the generic AAL2
+  // route guard. Establish identity from Auth first, then authorize the sink:
+  // first-password admin writes use server-owned metadata, while an existing
+  // password requires either a verified recovery JWT or the normal MFA guard.
+  const supabase = await createClient()
+  const { data: userData, error: identityError } = await supabase.auth.getUser()
+  const user = userData?.user ?? null
+  if (identityError || !user) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
 
   const result = await validateBody(request, SetPasswordSchema)
   if (!result.success) return result.response
   const { password } = result.data
 
-  const isFirstTimeSet = user.app_metadata?.has_password !== true
+  const isFirstTimeSet = !userHasPassword(user)
   const service = createServiceClient()
+
+  if (!isFirstTimeSet && !(await isVerifiedRecoverySession(supabase, user.id))) {
+    const guarded = await requireAuth()
+    if (guarded.error) return guarded.error
+    if (guarded.user.id !== user.id) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+  }
 
   let updateError:
     | { message?: string; status?: number; code?: string }
     | null
     | undefined = null
+  let flagWriteOk = false
 
   if (isFirstTimeSet) {
+    // One Auth write makes the transition indivisible. A successful password
+    // set must never leave `has_password=false`, because that would let a later
+    // AAL1 session reuse the first-password exception for an existing password.
     const { error } = await service.auth.admin.updateUserById(user.id, {
       password,
+      app_metadata: { ...(user.app_metadata ?? {}), has_password: true },
     })
     updateError = error
+    flagWriteOk = !error
   } else {
     const { error } = await supabase.auth.updateUser({ password })
     updateError = error
@@ -93,24 +144,24 @@ export async function POST(request: Request) {
     )
   }
 
-  // Read-merge-write so we don't wipe sibling app_metadata keys.
-  // updateUserById replaces app_metadata wholesale (see lib/auth/has-password.ts
-  // and the comment in app/api/account/delete/route.ts).
-  let flagWriteOk = false
-  try {
-    const { data: u } = await service.auth.admin.getUserById(user.id)
-    const prior = u?.user?.app_metadata ?? {}
-    await service.auth.admin.updateUserById(user.id, {
-      app_metadata: { ...prior, has_password: true },
-    })
-    flagWriteOk = true
-  } catch (err) {
-    log.error('failed to flip has_password flag after successful password set', {
-      userId: user.id,
-      err,
-    })
-    // Don't surface the failure: the user has a working password. The
-    // banner will show once more and a retry will succeed.
+  if (!isFirstTimeSet) {
+    // Read-merge-write so legacy email users with an inferred password receive
+    // the explicit marker without wiping sibling app_metadata keys.
+    try {
+      const { data: u } = await service.auth.admin.getUserById(user.id)
+      const prior = u?.user?.app_metadata ?? {}
+      await service.auth.admin.updateUserById(user.id, {
+        app_metadata: { ...prior, has_password: true },
+      })
+      flagWriteOk = true
+    } catch (err) {
+      log.error('failed to flip has_password flag after successful password set', {
+        userId: user.id,
+        err,
+      })
+      // Existing-password authorization remains safe: missing metadata on a
+      // non-BankID user is classified as already having a password.
+    }
   }
 
   log.info('password set', { userId: user.id, isFirstTimeSet, flagWriteOk })

@@ -219,6 +219,7 @@ describe('invite handoff after a password reset', () => {
  */
 describe('a session that still owes an MFA step-up', () => {
   beforeEach(() => {
+    vi.stubEnv('REQUIRE_MFA', 'true')
     vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'true')
     vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', '')
     getAssuranceLevel.mockResolvedValue({
@@ -241,7 +242,7 @@ describe('a session that still owes an MFA step-up', () => {
     expect(destination).toBeNull()
   })
 
-  it('does not defer a BankID-linked user, whom nothing would bounce', async () => {
+  it('defers a BankID-linked user under the server policy', async () => {
     const jar = installCookieJar({ [INVITE_COOKIE_NAME]: TOKEN })
     respondWith(200)
 
@@ -249,38 +250,58 @@ describe('a session that still owes an MFA step-up', () => {
       deps({ getUser: async () => ({ app_metadata: { bankid_linked: true } }) }),
     )
 
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(destination).toBeNull()
+    expect(jar.get(INVITE_COOKIE_NAME)).toBe(TOKEN)
+  })
+
+  it('defers on self-hosted when the server requires MFA', async () => {
+    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'true')
+    const jar = installCookieJar({ [INVITE_COOKIE_NAME]: TOKEN })
+    respondWith(200)
+
+    const destination = await handoffPendingInvite(deps())
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(destination).toBeNull()
+    expect(jar.get(INVITE_COOKIE_NAME)).toBe(TOKEN)
+  })
+
+  it('does not inspect the session when the public policy disables MFA', async () => {
+    vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'false')
+    const jar = installCookieJar({ [INVITE_COOKIE_NAME]: TOKEN })
+    respondWith(200)
+
+    const destination = await handoffPendingInvite(
+      deps({
+        getUser: async () => {
+          throw new Error('must not be called')
+        },
+      }),
+    )
+
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(destination).toBe(INVITE_ACCEPTED_DESTINATION)
     expect(jar.has(INVITE_COOKIE_NAME)).toBe(false)
   })
 
-  it('does not defer on self-hosted, where MFA is never enforced', async () => {
-    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'true')
-    installCookieJar({ [INVITE_COOKIE_NAME]: TOKEN })
-    respondWith(200)
-
-    const destination = await handoffPendingInvite(deps())
-
-    expect(fetchMock).toHaveBeenCalledTimes(1)
-    expect(destination).toBe(INVITE_ACCEPTED_DESTINATION)
-  })
-
-  it('still attempts when the assurance level cannot be read', async () => {
-    installCookieJar({ [INVITE_COOKIE_NAME]: TOKEN })
+  it('defers when the assurance level cannot be read', async () => {
+    const jar = installCookieJar({ [INVITE_COOKIE_NAME]: TOKEN })
     respondWith(200)
 
     const destination = await handoffPendingInvite(
       deps({ getAssuranceLevel: async () => null }),
     )
 
-    expect(fetchMock).toHaveBeenCalledTimes(1)
-    expect(destination).toBe(INVITE_ACCEPTED_DESTINATION)
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(destination).toBeNull()
+    expect(jar.get(INVITE_COOKIE_NAME)).toBe(TOKEN)
   })
 
   // A throw here must never surface as "could not save password": the password
   // was saved before this ran.
-  it('still attempts, without throwing, when the session read fails outright', async () => {
-    installCookieJar({ [INVITE_COOKIE_NAME]: TOKEN })
+  it('defers without throwing when the session read fails outright', async () => {
+    const jar = installCookieJar({ [INVITE_COOKIE_NAME]: TOKEN })
     respondWith(200)
 
     const destination = await handoffPendingInvite(
@@ -291,8 +312,9 @@ describe('a session that still owes an MFA step-up', () => {
       }),
     )
 
-    expect(fetchMock).toHaveBeenCalledTimes(1)
-    expect(destination).toBe(INVITE_ACCEPTED_DESTINATION)
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(destination).toBeNull()
+    expect(jar.get(INVITE_COOKIE_NAME)).toBe(TOKEN)
   })
 })
 

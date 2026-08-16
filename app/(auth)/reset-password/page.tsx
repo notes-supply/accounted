@@ -160,7 +160,8 @@ function ResetPasswordInner() {
       })
 
       // Only now, with the reset finished and the session proven by the 2xx
-      // above (that route runs requireAuth()), pick up a pending invitation.
+      // above (that route verifies the session and password sink), pick up a
+      // pending invitation.
       // This is the recovery flow's copy of what login, register and
       // /mfa/verify already do, and it is the only chance an invitee who
       // already has a company of their own gets: the server-side retry on

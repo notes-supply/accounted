@@ -29,7 +29,8 @@ vi.mock('@/lib/extensions/context-factory', () => ({
 
 // Default to "MFA not enforced" so existing tests authenticate normally;
 // the AAL2-gate regression test below flips this on.
-vi.mock('@/lib/auth/mfa', () => ({
+vi.mock('@/lib/auth/mfa', async importOriginal => ({
+  ...(await importOriginal<typeof import('@/lib/auth/mfa')>()),
   shouldEnforceMfa: vi.fn(() => false),
 }))
 
