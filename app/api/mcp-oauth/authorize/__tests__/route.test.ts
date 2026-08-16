@@ -255,6 +255,7 @@ describe('MFA step-up on /api/mcp-oauth/authorize', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-key'
+    vi.stubEnv('REQUIRE_MFA', 'true')
     vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'true')
     vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'false')
     mocks.isAllowedRedirectUri.mockResolvedValue(true)
@@ -310,7 +311,7 @@ describe('MFA step-up on /api/mcp-oauth/authorize', () => {
     expect(response.status).toBe(200)
   })
 
-  it('GET skips step-up for BankID-linked users (inherently 2FA)', async () => {
+  it('GET does not let BankID metadata bypass the server step-up policy', async () => {
     const supabase = buildSupabase(
       { id: 'user-1' },
       'Test AB',
@@ -323,7 +324,9 @@ describe('MFA step-up on /api/mcp-oauth/authorize', () => {
     mocks.createClient.mockResolvedValue(supabase)
 
     const response = await GET(new Request(buildAuthorizeUrl(authorizeParams)))
-    expect(response.status).toBe(200)
+    expect(response.status).toBeGreaterThanOrEqual(300)
+    expect(response.status).toBeLessThan(400)
+    expect(new URL(response.headers.get('location')!).pathname).toBe('/mfa/verify')
   })
 })
 

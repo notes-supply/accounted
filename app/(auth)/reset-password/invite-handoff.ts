@@ -3,7 +3,7 @@ import {
   readInviteCookie,
   type InviteAcceptProblem,
 } from '@/lib/auth/consume-invite-cookie'
-import { shouldEnforceMfa } from '@/lib/auth/mfa'
+import { hasValidAssuranceLevel, isMfaRequired } from '@/lib/auth/mfa'
 
 /**
  * Invite handoff for the password-recovery flow.
@@ -64,9 +64,11 @@ export const INVITE_ACCEPTED_DESTINATION = '/'
  * Accept a pending invitation once the password reset itself is finished.
  *
  * MUST be called only after `POST /api/account/password` has returned 2xx.
- * That route runs `requireAuth()`, so its success proves a server-validated
- * session exists, and waiting for it means no membership is ever created off a
- * half-completed recovery. Authorization is not this function's business:
+ * That route verifies the session with Auth and authorizes either a recovery
+ * claim, an AAL2 session, or a server-marked first-password write. Its success
+ * therefore proves a server-validated password transition, and waiting for it
+ * means no membership is ever created off a half-completed recovery.
+ * Authorization is not this function's business:
  * `/api/team/accept` re-authorizes every attempt with `requireAuth()` plus an
  * email equality check against the invitation.
  *
@@ -110,26 +112,24 @@ export async function handoffPendingInvite(
  * which the shared classifier cannot tell apart from an email mismatch, so a
  * legitimate invitee would be told their invitation belongs to someone else.
  *
- * The predicate mirrors the middleware's own condition exactly
- * (`shouldEnforceMfa` plus aal1-with-aal2-required), which makes "we skipped"
- * and "the middleware will bounce this user to /mfa/verify" the same statement:
- * the cookie survives untouched and `/mfa/verify` consumes it once the second
- * factor is in. A user whose MFA is not enforced (self-hosted, BankID-linked)
- * is deliberately never deferred, because nothing would bounce them and the
- * token would sit there unused.
- *
- * A failed read is not evidence of a pending step-up, so it falls through to
- * the attempt: the server is the authority, and a 403 keeps the token anyway.
+ * The predicate mirrors the middleware's server policy. Missing or malformed
+ * assurance is treated as step-up still owed, so a gate 403 cannot be
+ * misreported as an invitation belonging to another address.
  */
 async function mfaStepUpOwed(deps: InviteHandoffDeps): Promise<boolean> {
   try {
+    // This module is imported by the client page. The Docker entrypoint rejects
+    // any mismatch between this public display flag and the private server
+    // enforcement flag, so the browser can mirror the middleware safely.
+    if (!isMfaRequired()) return false
+
     const user = await deps.getUser()
-    if (!user || !shouldEnforceMfa(user)) return false
+    if (!user) return true
 
     const aal = await deps.getAssuranceLevel()
-    return aal?.nextLevel === 'aal2' && aal.currentLevel === 'aal1'
+    return !hasValidAssuranceLevel(aal) || aal.currentLevel !== 'aal2'
   } catch (err) {
     console.error('[reset-password] could not read the session MFA state', err)
-    return false
+    return true
   }
 }
