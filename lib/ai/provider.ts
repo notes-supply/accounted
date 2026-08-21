@@ -49,20 +49,19 @@ export type AiClient = Anthropic | AnthropicBedrock
  * Precedence is deliberate:
  *
  *   1. `AI_PROVIDER` wins when set. The escape hatch for a deployment that has
- *      both credential sets and needs to say which one it means.
- *   2. Static AWS keys mean Bedrock. This is what keeps hosted byte-identical:
- *      an operator who adds an Anthropic key for a side experiment must not
- *      silently move production inference out of eu-north-1.
- *   3. Otherwise an Anthropic key means the direct API. This is the
+ *      several credential sets and needs to say which one it means.
+ *   2. A Bedrock bearer token means Bedrock. Within Bedrock it takes precedence
+ *      over static keys and the AWS credential provider chain.
+ *   3. Static AWS keys mean Bedrock. This keeps hosted inference in eu-north-1
+ *      if an operator adds an Anthropic key for a side experiment.
+ *   4. Otherwise an Anthropic key means the direct API. This is the
  *      self-hosted path.
- *   3b. Otherwise an OpenAI-compatible base URL + key means that endpoint.
+ *   4b. Otherwise an OpenAI-compatible base URL means that endpoint.
  *      This is the sovereign self-hosted path (BYO Swedish provider).
- *   4. Otherwise Bedrock without static keys, so the AWS credential provider
- *      chain (instance profile, IRSA, EKS pod identity) still resolves on
- *      hosted infrastructure that injects credentials rather than setting env
- *      vars. `hasAiCredentials()` reports false here: we cannot see the chain
- *      from this side, so callers that need a cheap pre-flight treat it as
- *      unconfigured rather than paying a request to find out.
+ *   5. Otherwise Bedrock without explicit credentials, so the AWS credential
+ *      provider chain (instance profile, IRSA, EKS pod identity) still gets a
+ *      chance. `hasAiCredentials()` reports false here because the chain is
+ *      not visible from this process.
  */
 export function resolveAiProvider(): AiProvider {
   const explicit = (process.env.AI_PROVIDER ?? '').trim().toLowerCase()
@@ -70,6 +69,8 @@ export function resolveAiProvider(): AiProvider {
     return explicit
   }
 
+
+  if (process.env.AWS_BEARER_TOKEN_BEDROCK) return 'bedrock'
   if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) return 'bedrock'
   if (process.env.ANTHROPIC_API_KEY) return 'anthropic'
   if (process.env.AI_BASE_URL) return 'openai-compatible'
@@ -93,7 +94,8 @@ export function hasAiCredentials(): boolean {
   // as configured. When a hosted Swedish provider needs a key, the operator
   // sets AI_API_KEY and the service sends it as a Bearer token.
   if (provider === 'openai-compatible') return !!process.env.AI_BASE_URL
-  return !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY)
+  return !!process.env.AWS_BEARER_TOKEN_BEDROCK ||
+    !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY)
 }
 
 /**
@@ -116,6 +118,10 @@ export function createAiClient(): AiClient {
   }
 
   const awsRegion = process.env.AWS_REGION || 'eu-north-1'
+  const bearerToken = process.env.AWS_BEARER_TOKEN_BEDROCK
+  if (bearerToken) {
+    return new AnthropicBedrock({ apiKey: bearerToken, awsRegion })
+  }
   const awsAccessKey = process.env.AWS_ACCESS_KEY_ID
   const awsSecretKey = process.env.AWS_SECRET_ACCESS_KEY
   // When both static keys are present, pass them. Otherwise omit them so the
@@ -147,8 +153,9 @@ export function toProviderModelId(bareModelId: string, provider = resolveAiProvi
  * Non-secret identification of the configured credential, for startup logs.
  * Anthropic keys carry a public prefix (`sk-ant-api03` for a standard API key,
  * `sk-ant-oat` for an OAuth token); AWS access key ids carry `AKIA` for a
- * long-term IAM user key and `ASIA` for an STS/role credential. Never returns
- * any part of a secret.
+ * long-term IAM user key and `ASIA` for an STS/role credential. Bedrock bearer
+ * tokens have no public portion, so they are identified only as `bearer`.
+ * Never returns any part of a secret.
  */
 export function aiCredentialPrefix(): string | null {
   const provider = resolveAiProvider()
@@ -158,5 +165,6 @@ export function aiCredentialPrefix(): string | null {
   // OpenAI-compatible keys have no standard public prefix, so there is no
   // non-secret slice to log: identify the endpoint instead.
   if (provider === 'openai-compatible') return null
+  if (process.env.AWS_BEARER_TOKEN_BEDROCK) return 'bearer'
   return process.env.AWS_ACCESS_KEY_ID?.slice(0, 4) ?? null
 }

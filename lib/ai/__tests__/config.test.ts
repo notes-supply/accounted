@@ -17,6 +17,7 @@ const KEYS = [
   'AI_PDF_MAX_PAGES',
   'ANTHROPIC_API_KEY',
   'AWS_ACCESS_KEY_ID',
+  'AWS_BEARER_TOKEN_BEDROCK',
   'AWS_SECRET_ACCESS_KEY',
   'AWS_REGION',
   'BEDROCK_MODEL_ID',
@@ -197,6 +198,16 @@ describe('getAiStatus', () => {
     expect(s.assistantAvailable).toBe(true)
     expect(s.capabilities.pdfNative).toBe(true)
     expect(s.models.extraction).toBe('eu.anthropic.claude-sonnet-5')
+  })
+
+  it('is configured through the job-shaped service with a Bedrock bearer token', () => {
+    process.env.AWS_BEARER_TOKEN_BEDROCK = 'bedrock-bearer-example'
+    const status = getAiStatus()
+
+    expect(status.provider).toBe('bedrock')
+    expect(status.configured).toBe(true)
+    expect(status.assistantAvailable).toBe(true)
+    expect(status.models.extraction).toBe('eu.anthropic.claude-sonnet-5')
   })
 
   it('needs a model id on an OpenAI-compatible endpoint before it counts as configured', () => {

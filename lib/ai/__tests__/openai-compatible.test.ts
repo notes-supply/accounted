@@ -27,7 +27,7 @@ vi.mock('../rasterize-pdf', () => ({
 import { readAiConfig } from '../config'
 import { createOpenAICompatibleService } from '../services/openai-compatible'
 
-const ENV = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'ANTHROPIC_API_KEY', 'AI_PROVIDER', 'AI_BASE_URL', 'AI_API_KEY', 'AI_MODEL', 'AI_EXTRACTION_MODEL', 'AI_VISION', 'AI_STRICT_JSON', 'AI_PDF_MODE', 'AI_PDF_MAX_PAGES'] as const
+const ENV = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_BEARER_TOKEN_BEDROCK', 'ANTHROPIC_API_KEY', 'AI_PROVIDER', 'AI_BASE_URL', 'AI_API_KEY', 'AI_MODEL', 'AI_EXTRACTION_MODEL', 'AI_VISION', 'AI_STRICT_JSON', 'AI_PDF_MODE', 'AI_PDF_MAX_PAGES'] as const
 let saved: Record<string, string | undefined> = {}
 
 function textResponse(text: string) {

@@ -1,6 +1,6 @@
 import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
-import { shouldEnforceMfa } from '@/lib/auth/mfa'
+import { hasValidAssuranceLevel, shouldEnforceMfa } from '@/lib/auth/mfa'
 import { apiPathSkipsMfaGate } from '@/lib/auth/api-mfa-gate'
 import { DEFAULT_LOCALE, LOCALE_COOKIE, isLocale } from '@/i18n/config'
 import { userHasPassword } from '@/lib/auth/has-password'
@@ -184,9 +184,9 @@ export async function updateSession(request: NextRequest) {
       hasAuthorizationHeader,
     )
     if (!skipMfaGate && user && shouldEnforceMfa(user)) {
-      const { data: aal } =
+      const { data: aal, error: aalError } =
         await supabase.auth.mfa.getAuthenticatorAssuranceLevel()
-      if (aal?.nextLevel === 'aal2' && aal?.currentLevel === 'aal1') {
+      if (aalError || !hasValidAssuranceLevel(aal) || aal.currentLevel !== 'aal2') {
         return NextResponse.json({ error: 'MFA-verifiering krävs.' }, { status: 403 })
       }
     }
@@ -314,15 +314,21 @@ export async function updateSession(request: NextRequest) {
 
   // MFA enforcement (application-side only, not RLS)
   if (shouldEnforceMfa(user)) {
-    const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel()
+    const { data: aal, error: aalError } =
+      await supabase.auth.mfa.getAuthenticatorAssuranceLevel()
 
-    // User has MFA enrolled but hasn't verified this session → redirect to verify
-    if (aal?.nextLevel === 'aal2' && aal?.currentLevel === 'aal1') {
+    // Missing or malformed assurance must not bypass the gate.
+    if (aalError || !hasValidAssuranceLevel(aal)) {
       return bounceToAuth(request, '/mfa/verify')
     }
 
-    // MFA required but user has no factor enrolled yet → force enrollment
-    // Skip for users with no companies (still setting up)
+    // User has MFA enrolled but has not verified this session.
+    if (aal.nextLevel === 'aal2' && aal.currentLevel !== 'aal2') {
+      return bounceToAuth(request, '/mfa/verify')
+    }
+
+    // MFA required but user has no factor enrolled yet.
+    // Skip for users with no companies (still setting up).
     const { companyId: companyIdForMfa } = await resolveCompanyOnce()
     if (companyIdForMfa) {
       const { data: factors } = await supabase.auth.mfa.listFactors()

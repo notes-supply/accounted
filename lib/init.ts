@@ -26,17 +26,16 @@ const REQUIRED_CORE_VARS = [
 // fallback in extensions/general/enable-banking/lib/jwt.ts (_PRODUCTION ||
 // base) so Vercel prod (which only sets the _PRODUCTION variants) doesn't
 // warn on every cold start.
-// AI features run Claude via AWS Bedrock (see lib/agent/composer/client.ts and
-// extensions/general/invoice-inbox/lib/extract-invoice-fields.ts), so the
-// static AWS keys are what actually gates them. The assistant's client can
-// fall back to the AWS credential provider chain (instance profile, IRSA),
-// but document extraction requires both static keys, so this log-only warning
-// stays useful even on AWS infrastructure.
+// AI features run through the central provider in lib/ai. Bedrock accepts
+// either its bearer token or a complete static AWS key pair; the provider can
+// also fall back to the AWS credential chain, which is not visible here.
+// These checks are log-only, so they describe explicit configuration without
+// blocking instance-profile or IRSA deployments.
 const REQUIRED_EXTENSION_VARS: ReadonlyArray<readonly string[]> = [
   ['ENABLE_BANKING_APP_ID_PRODUCTION', 'ENABLE_BANKING_APP_ID'],
   ['ENABLE_BANKING_PRIVATE_KEY_PRODUCTION', 'ENABLE_BANKING_PRIVATE_KEY'],
-  ['AWS_ACCESS_KEY_ID'],
-  ['AWS_SECRET_ACCESS_KEY'],
+  ['AWS_ACCESS_KEY_ID', 'AWS_BEARER_TOKEN_BEDROCK'],
+  ['AWS_SECRET_ACCESS_KEY', 'AWS_BEARER_TOKEN_BEDROCK'],
   // whatsapp-inbox extension (Meta Cloud API + phone PII at rest)
   ['WHATSAPP_ACCESS_TOKEN'],
   ['WHATSAPP_PHONE_NUMBER_ID'],

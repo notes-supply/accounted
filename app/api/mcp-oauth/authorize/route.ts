@@ -3,11 +3,12 @@ import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
 import type { SupabaseClient, User } from '@supabase/supabase-js'
 import { createAuthCode } from '@/lib/auth/oauth-codes'
-import { shouldEnforceMfa } from '@/lib/auth/mfa'
+import { hasValidAssuranceLevel, shouldEnforceMfa } from '@/lib/auth/mfa'
 import { requireCompanyId } from '@/lib/company/context'
 import { getBranding } from '@/lib/branding/service'
 import { isAllowedRedirectUri } from '@/lib/auth/oauth-allowlist'
 import { resolveDiscoveryBaseUrl } from '@/lib/api/v1/base-url'
+import { resolveRequestAppOrigin } from '@/lib/domains/trusted-app-origin'
 import {
   ALL_SCOPES,
   API_KEY_SCOPES,
@@ -104,7 +105,7 @@ function buildLoginRedirect(request: Request): Response {
   const url = new URL(request.url)
   const next = `${url.pathname}${url.search}`
   return NextResponse.redirect(
-    new URL(`/login?next=${encodeURIComponent(next)}`, url.origin)
+    new URL(`/login?next=${encodeURIComponent(next)}`, resolveRequestAppOrigin(request))
   )
 }
 
@@ -122,12 +123,16 @@ async function requireAal2(
   request: Request,
 ): Promise<Response | null> {
   if (!shouldEnforceMfa(user)) return null
-  const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel()
-  if (aal?.nextLevel === 'aal2' && aal?.currentLevel !== 'aal2') {
+  const { data: aal, error: aalError } =
+    await supabase.auth.mfa.getAuthenticatorAssuranceLevel()
+  if (aalError || !hasValidAssuranceLevel(aal) || aal.currentLevel !== 'aal2') {
     const url = new URL(request.url)
     const returnTo = `${url.pathname}${url.search}`
     return NextResponse.redirect(
-      new URL(`/mfa/verify?returnTo=${encodeURIComponent(returnTo)}`, url.origin),
+      new URL(
+        `/mfa/verify?returnTo=${encodeURIComponent(returnTo)}`,
+        resolveRequestAppOrigin(request),
+      ),
     )
   }
   return null

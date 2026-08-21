@@ -93,7 +93,8 @@ function run(path: string, init?: RequestInit) {
 
 describe('updateSession redirect destinations', () => {
   const envBackup = {
-    require: process.env.NEXT_PUBLIC_REQUIRE_MFA,
+    require: process.env.REQUIRE_MFA,
+    publicRequire: process.env.NEXT_PUBLIC_REQUIRE_MFA,
     selfHosted: process.env.NEXT_PUBLIC_SELF_HOSTED,
     signingSecret: process.env.SESSION_TIMEOUT_SECRET,
     idleTimeout: process.env.NEXT_PUBLIC_SESSION_IDLE_TIMEOUT_MS,
@@ -114,7 +115,8 @@ describe('updateSession redirect destinations', () => {
     }
     state.userPreferences = null
     state.userPreferencesError = null
-    delete process.env.NEXT_PUBLIC_REQUIRE_MFA
+    process.env.REQUIRE_MFA = 'false'
+    process.env.NEXT_PUBLIC_REQUIRE_MFA = 'false'
     delete process.env.NEXT_PUBLIC_SELF_HOSTED
     process.env.SESSION_TIMEOUT_SECRET = 'middleware-test-secret'
     delete process.env.NEXT_PUBLIC_SESSION_IDLE_TIMEOUT_MS
@@ -123,8 +125,10 @@ describe('updateSession redirect destinations', () => {
   })
 
   afterEach(() => {
-    if (envBackup.require === undefined) delete process.env.NEXT_PUBLIC_REQUIRE_MFA
-    else process.env.NEXT_PUBLIC_REQUIRE_MFA = envBackup.require
+    if (envBackup.require === undefined) delete process.env.REQUIRE_MFA
+    else process.env.REQUIRE_MFA = envBackup.require
+    if (envBackup.publicRequire === undefined) delete process.env.NEXT_PUBLIC_REQUIRE_MFA
+    else process.env.NEXT_PUBLIC_REQUIRE_MFA = envBackup.publicRequire
     if (envBackup.selfHosted === undefined) delete process.env.NEXT_PUBLIC_SELF_HOSTED
     else process.env.NEXT_PUBLIC_SELF_HOSTED = envBackup.selfHosted
     if (envBackup.signingSecret === undefined) delete process.env.SESSION_TIMEOUT_SECRET
@@ -470,6 +474,7 @@ describe('updateSession redirect destinations', () => {
 
   describe('MFA step-up bounce to /mfa/verify', () => {
     beforeEach(() => {
+      process.env.REQUIRE_MFA = 'true'
       process.env.NEXT_PUBLIC_REQUIRE_MFA = 'true'
       state.user = SIGNED_IN
       state.aal = { currentLevel: 'aal1', nextLevel: 'aal2' }
@@ -502,6 +507,7 @@ describe('updateSession redirect destinations', () => {
 
   describe('forced enrollment bounce to /mfa/enroll', () => {
     beforeEach(() => {
+      process.env.REQUIRE_MFA = 'true'
       process.env.NEXT_PUBLIC_REQUIRE_MFA = 'true'
       state.user = SIGNED_IN
       state.aal = { currentLevel: 'aal1', nextLevel: 'aal1' }
@@ -535,8 +541,8 @@ describe('updateSession redirect destinations', () => {
 
   // ── MFA semantics that must not change ────────────────────────────────
 
-  describe('MFA-disabled and self-hosted paths are unchanged', () => {
-    it('does not redirect when NEXT_PUBLIC_REQUIRE_MFA is unset', async () => {
+  describe('private MFA policy and existing exemptions', () => {
+    it('does not redirect when REQUIRE_MFA is false', async () => {
       state.user = SIGNED_IN
       state.aal = { currentLevel: 'aal1', nextLevel: 'aal2' }
 
@@ -545,7 +551,8 @@ describe('updateSession redirect destinations', () => {
       expect(response.status).toBe(200)
     })
 
-    it('does not redirect on self-hosted even with MFA required', async () => {
+    it('redirects on self-hosted when the private policy requires MFA', async () => {
+      process.env.REQUIRE_MFA = 'true'
       process.env.NEXT_PUBLIC_REQUIRE_MFA = 'true'
       process.env.NEXT_PUBLIC_SELF_HOSTED = 'true'
       state.user = SIGNED_IN
@@ -554,10 +561,11 @@ describe('updateSession redirect destinations', () => {
 
       const response = await run('/settings/tax')
 
-      expect(response.status).toBe(200)
+      expect(new URL(locationOf(response)!).pathname).toBe('/mfa/verify')
     })
 
     it('does not redirect BankID-linked users, who are already 2FA', async () => {
+      process.env.REQUIRE_MFA = 'true'
       process.env.NEXT_PUBLIC_REQUIRE_MFA = 'true'
       state.user = { id: 'user-1', app_metadata: { bankid_linked: true } }
       state.aal = { currentLevel: 'aal1', nextLevel: 'aal2' }

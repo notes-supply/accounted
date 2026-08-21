@@ -53,8 +53,8 @@ export function flagEnabled(value: string | undefined): boolean {
 
 /**
  * Whether this is a self-hosted deployment (Docker), as opposed to the hosted
- * product. Self-hosted disables forced MFA, session timeouts, analytics and the
- * entitlement paywall, and lifts the hosted upload ceiling.
+ * product. Self-hosted disables hosted-only services, session timeout defaults,
+ * analytics and the entitlement paywall, and lifts the hosted upload ceiling.
  *
  * Named accessor rather than a bare `flagEnabled` call because five modules ask
  * this same question and the answer decides legal-ish behaviour (what an AGPL

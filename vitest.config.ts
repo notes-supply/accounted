@@ -15,6 +15,9 @@ const unitProject = {
     name: 'unit',
     globals: true,
     environment: 'node' as const,
+    // Runtime server policy is mandatory in production. Unit tests default it
+    // off and individual MFA tests stub true, malformed, or missing values.
+    env: { REQUIRE_MFA: 'false' },
     include: ['**/*.test.ts'],
     // `.claude/worktrees/*` are ephemeral agent checkouts whose `@/*` imports
     // resolve back to this root: never part of the suite.

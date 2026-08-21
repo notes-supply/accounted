@@ -1,11 +1,20 @@
 import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
-import { shouldEnforceMfa } from './mfa'
+import { hasValidAssuranceLevel, shouldEnforceMfa } from './mfa'
 import type { User, SupabaseClient, JwtPayload } from '@supabase/supabase-js'
 
 type AuthResult =
   | { user: User; supabase: SupabaseClient; error: null }
   | { user: null; supabase: SupabaseClient; error: NextResponse }
+
+interface RequireAuthOptions {
+  /**
+   * Permit an AAL1 session to set its first password. The caller must still
+   * verify `app_metadata.has_password !== true`; malformed assurance data and
+   * existing-password changes remain fail-closed.
+   */
+  allowInitialPasswordAtAal1?: boolean
+}
 
 /**
  * Maps verified JWT claims onto the User subset routes actually consume
@@ -62,7 +71,7 @@ function userFromClaims(claims: JwtPayload): User {
  * staleness is covered because the middleware MFA gate
  * (lib/supabase/middleware.ts) uses the FRESH getUser result.
  */
-export async function requireAuth(): Promise<AuthResult> {
+export async function requireAuth(options: RequireAuthOptions = {}): Promise<AuthResult> {
   const supabase = await createClient()
 
   let user: User | null = null
@@ -103,8 +112,18 @@ export async function requireAuth(): Promise<AuthResult> {
   }
 
   if (shouldEnforceMfa(user)) {
-    const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel()
-    if (aal?.nextLevel === 'aal2' && aal?.currentLevel !== 'aal2') {
+    const { data: aal, error: aalError } =
+      await supabase.auth.mfa.getAuthenticatorAssuranceLevel()
+    const initialPasswordEscape =
+      options.allowInitialPasswordAtAal1 === true &&
+      user.app_metadata?.has_password !== true &&
+      hasValidAssuranceLevel(aal) &&
+      aal.currentLevel === 'aal1'
+    if (
+      aalError ||
+      !hasValidAssuranceLevel(aal) ||
+      (aal.currentLevel !== 'aal2' && !initialPasswordEscape)
+    ) {
       return {
         user: null,
         supabase,

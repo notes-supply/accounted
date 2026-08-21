@@ -37,6 +37,16 @@ describe('trusted application origins', () => {
     )
   })
 
+  it('preserves only the exact legacy application host over HTTPS', () => {
+    expect(resolveTrustedAppOrigin('APP.GNUBOK.SE')).toBe('https://app.gnubok.se')
+    expect(resolveTrustedAppOrigin('app.gnubok.se.attacker.test')).toBe(
+      'https://app.accounted.test',
+    )
+    expect(resolveTrustedAppOrigin('app.gnubok.se:444')).toBe(
+      'https://app.accounted.test',
+    )
+  })
+
   it('rejects spoofed, credential, wildcard, and non-default-port hosts', () => {
     process.env.NEXT_PUBLIC_WHITELABEL_DOMAINS = 'portal.brand.test,*.wildcard.test'
 
@@ -67,17 +77,21 @@ describe('trusted application origins', () => {
     expect(getCanonicalAppOrigin()).toBe('http://localhost:3000')
   })
 
-  it('validates the request URL and ignores a spoofed forwarded host', () => {
+  it('accepts only trusted request hosts and ignores forwarded host headers', () => {
     process.env.NEXT_PUBLIC_WHITELABEL_DOMAINS = 'portal.brand.test'
 
-    const trusted = new Request('https://portal.brand.test/api/company/members/invite', {
-      headers: { 'x-forwarded-host': 'attacker.test' },
+    const trusted = new Request('http://10.0.0.12:3000/api/company/members/invite', {
+      headers: { host: 'portal.brand.test', 'x-forwarded-host': 'attacker.test' },
     })
-    const spoofed = new Request('https://attacker.test/api/company/members/invite', {
-      headers: { 'x-forwarded-host': 'portal.brand.test' },
+    const legacy = new Request('http://10.0.0.12:3000/auth/callback', {
+      headers: { host: 'app.gnubok.se' },
+    })
+    const spoofed = new Request('https://portal.brand.test/api/company/members/invite', {
+      headers: { host: 'attacker.test', 'x-forwarded-host': 'portal.brand.test' },
     })
 
     expect(resolveRequestAppOrigin(trusted)).toBe('https://portal.brand.test')
+    expect(resolveRequestAppOrigin(legacy)).toBe('https://app.gnubok.se')
     expect(resolveRequestAppOrigin(spoofed)).toBe('https://app.accounted.test')
   })
 })

@@ -36,6 +36,7 @@ function workingSharpChain(outputBuffer: Buffer) {
 
 const ORIG_AWS_ACCESS_KEY_ID = process.env.AWS_ACCESS_KEY_ID
 const ORIG_AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY
+const ORIG_AWS_BEARER_TOKEN_BEDROCK = process.env.AWS_BEARER_TOKEN_BEDROCK
 
 function aiResponse(json: string | object) {
   const text = typeof json === 'string' ? json : JSON.stringify(json)
@@ -79,6 +80,7 @@ describe('extractInvoiceFields', () => {
     vi.clearAllMocks()
     process.env.AWS_ACCESS_KEY_ID = 'test-key'
     process.env.AWS_SECRET_ACCESS_KEY = 'test-secret'
+    delete process.env.AWS_BEARER_TOKEN_BEDROCK
   })
 
   it('returns empty result for unsupported mime type (HEIC)', async () => {
@@ -451,5 +453,8 @@ describe('extractInvoiceFields', () => {
     else delete process.env.AWS_ACCESS_KEY_ID
     if (ORIG_AWS_SECRET_ACCESS_KEY) process.env.AWS_SECRET_ACCESS_KEY = ORIG_AWS_SECRET_ACCESS_KEY
     else delete process.env.AWS_SECRET_ACCESS_KEY
+    if (ORIG_AWS_BEARER_TOKEN_BEDROCK)
+      process.env.AWS_BEARER_TOKEN_BEDROCK = ORIG_AWS_BEARER_TOKEN_BEDROCK
+    else delete process.env.AWS_BEARER_TOKEN_BEDROCK
   })
 })
