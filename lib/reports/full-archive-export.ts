@@ -876,6 +876,16 @@ export const MASTER_DATA_DUMP_TABLES: MasterDataTableSpec[] = [
     denormalize: { prefix: 'supplier_invoice_', columns: ['currency', 'exchange_rate'] },
   },
   { name: 'supplier_invoice_payments', file: 'supplier_invoice_payments.json' },
+  {
+    name: 'supplier_invoice_payment_history',
+    file: 'supplier_invoice_payment_history.json',
+    orderBy: 'reversed_at',
+  },
+  {
+    name: 'supplier_payment_reversals',
+    file: 'supplier_payment_reversals.json',
+    orderBy: 'applied_at',
+  },
   // Payment batches (betalfil): the immutable instruction snapshots a
   // generated bank payment file derives from; underlag for the payments it
   // initiated, so they leave with the archive.
@@ -934,6 +944,11 @@ export const MASTER_DATA_DUMP_TABLES: MasterDataTableSpec[] = [
   { name: 'cash_accounts', file: 'cash_accounts.json' },
   { name: 'mapping_rules', file: 'mapping_rules.json' },
   { name: 'categorization_templates', file: 'categorization_templates.json' },
+  {
+    name: 'transaction_categorization_compensations',
+    file: 'transaction_categorization_compensations.json',
+    orderBy: 'applied_at',
+  },
   { name: 'booking_template_library', file: 'booking_template_library.json' },
   { name: 'skattekonto_rules', file: 'skattekonto_rules.json' },
   // Salary (räkenskapsinformation with 7-year retention)
@@ -991,6 +1006,18 @@ export const MASTER_DATA_DUMP_TABLES: MasterDataTableSpec[] = [
   { name: 'arsredovisning_submissions', file: 'arsredovisning_submissions.json' },
   // Settings
   { name: 'company_settings', file: 'company_settings.json' },
+  // Durable accounting publication evidence links correction commands to the
+  // exact events and subscriber snapshots they emitted.
+  {
+    name: 'accounting_publications',
+    file: 'accounting_publications.json',
+    orderBy: 'created_at',
+  },
+  {
+    name: 'accounting_publication_subscribers',
+    file: 'accounting_publication_subscribers.json',
+    orderBy: 'created_at',
+  },
 ]
 
 /**

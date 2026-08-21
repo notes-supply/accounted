@@ -460,6 +460,13 @@ function applyStatement(
     return
   }
 
+  const qualifiedCreateTable = /^CREATE\s+(?:UNLOGGED\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"?([A-Za-z_][A-Za-z0-9_$]*)"?\./i.exec(
+    flat
+  )
+  if (qualifiedCreateTable && qualifiedCreateTable[1].toLowerCase() !== 'public') {
+    return
+  }
+
   const createTable = /^CREATE\s+(?:UNLOGGED\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:public\.)?"?([A-Za-z_][A-Za-z0-9_$]*)"?/i.exec(
     flat
   )
