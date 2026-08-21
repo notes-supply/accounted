@@ -84,7 +84,7 @@ jobs:
           set -euo pipefail
           node scripts/check-migration-lineage.mjs --write-lists /tmp/accounted-lineage
           test "$(wc -l < /tmp/accounted-lineage/predecessor.txt)" -eq 548
-          test "$(wc -l < /tmp/accounted-lineage/upgrade.txt)" -eq 89
+          test "$(wc -l < /tmp/accounted-lineage/upgrade.txt)" -eq 90
 
       - name: Bootstrap storage schema
         run: |
