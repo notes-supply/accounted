@@ -74,23 +74,26 @@ VALUES (
 -- immutability triggers protect.
 INSERT INTO public.journal_entries
   (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-   entry_date, description, source_type, status)
+   entry_date, description, source_type, status, committed_at)
 VALUES
   ('44444444-4444-4444-4444-444444444401',
    '11111111-1111-1111-1111-111111111111',
    '22222222-2222-2222-2222-222222222222',
    '33333333-3333-3333-3333-333333333333',
-   1, 'A', '2026-03-01', 'Försäljning', 'manual', 'posted'),
+   1, 'A', '2026-03-01', 'Försäljning', 'manual', 'posted',
+   '2026-03-01T10:00:00Z'),
   ('44444444-4444-4444-4444-444444444402',
    '11111111-1111-1111-1111-111111111111',
    '22222222-2222-2222-2222-222222222222',
    '33333333-3333-3333-3333-333333333333',
-   2, 'A', '2026-03-15', 'Lokalhyra', 'manual', 'posted'),
+   2, 'A', '2026-03-15', 'Lokalhyra', 'manual', 'posted',
+   '2026-03-15T10:00:00Z'),
   ('44444444-4444-4444-4444-444444444403',
    '11111111-1111-1111-1111-111111111111',
    '22222222-2222-2222-2222-222222222222',
    '33333333-3333-3333-3333-333333333333',
-   3, 'A', '2026-04-01', 'Bankavgift', 'manual', 'posted');
+   3, 'A', '2026-04-01', 'Bankavgift', 'manual', 'posted',
+   '2026-04-01T10:00:00Z');
 
 INSERT INTO public.journal_entry_lines
   (journal_entry_id, account_number, debit_amount, credit_amount)
