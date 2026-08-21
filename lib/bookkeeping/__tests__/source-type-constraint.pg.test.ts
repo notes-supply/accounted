@@ -14,14 +14,27 @@ describe('journal_entries.source_type CHECK constraint', () => {
     'accepts source_type=%s',
     async (sourceType) => {
       const { userId, companyId, fiscalPeriodId } = await seedCompany()
+      const parentId = randomUUID()
+      if (sourceType === 'storno' || sourceType === 'correction') {
+        await getPool().query(
+          `INSERT INTO public.journal_entries
+             (id, user_id, company_id, fiscal_period_id, voucher_number,
+              voucher_series, entry_date, description, source_type, status)
+           VALUES ($1, $2, $3, $4, 0, 'A', '2026-06-01', 'lineage parent', 'manual', 'draft')`,
+          [parentId, userId, companyId, fiscalPeriodId],
+        )
+      }
 
       await expect(
         getPool().query(
           `INSERT INTO public.journal_entries
              (id, user_id, company_id, fiscal_period_id, voucher_number,
-              voucher_series, entry_date, description, source_type, status)
-           VALUES ($1, $2, $3, $4, 0, 'A', '2026-06-01', $5, $6, 'draft')`,
-          [randomUUID(), userId, companyId, fiscalPeriodId, `src=${sourceType}`, sourceType],
+              voucher_series, entry_date, description, source_type, status,
+              reverses_id, correction_of_id)
+           VALUES ($1, $2, $3, $4, 0, 'A', '2026-06-01', $5, $6, 'draft',
+                   CASE WHEN $6 = 'storno' THEN $7::uuid END,
+                   CASE WHEN $6 = 'correction' THEN $7::uuid END)`,
+          [randomUUID(), userId, companyId, fiscalPeriodId, `src=${sourceType}`, sourceType, parentId],
         ),
       ).resolves.toBeDefined()
     },

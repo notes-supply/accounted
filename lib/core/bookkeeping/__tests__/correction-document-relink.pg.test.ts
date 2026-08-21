@@ -6,6 +6,7 @@ import {
   insertBalancedLines,
   insertCompanyMember,
   insertDraftJournalEntry,
+  insertReversedJournalEntry,
   seedCompany,
 } from '@/tests/pg/fixtures'
 
@@ -60,16 +61,10 @@ async function insertEntryAtStatus(params: {
     companyId: params.companyId,
     fiscalPeriodId: params.fiscalPeriodId,
     voucherNumber: params.voucherNumber,
+    sourceType: params.correctionOfId ? 'correction' : 'manual',
+    correctionOfId: params.correctionOfId,
   })
   await insertBalancedLines(entryId)
-  if (params.correctionOfId) {
-    // Drafts are mutable — set the correction link before posting; the
-    // immutability trigger blocks changing it afterwards.
-    await getPool().query(
-      `UPDATE public.journal_entries SET correction_of_id = $2 WHERE id = $1`,
-      [entryId, params.correctionOfId],
-    )
-  }
   await getPool().query(
     `UPDATE public.journal_entries SET status = 'posted' WHERE id = $1`,
     [entryId],
@@ -89,10 +84,9 @@ async function seedCorrectionPair(seed: {
   companyId: string
   fiscalPeriodId: string
 }): Promise<{ originalId: string; correctionId: string }> {
-  const originalId = await insertEntryAtStatus({
+  const { entryId: originalId } = await insertReversedJournalEntry({
     ...seed,
     voucherNumber: 1,
-    status: 'reversed',
   })
   const correctionId = await insertEntryAtStatus({
     ...seed,
@@ -199,10 +193,9 @@ describe('correction-document-relink.pg — relink_documents_to_correction RPC',
 
   it('rejects when the target is not the correction of the source', async () => {
     const seed = await seedCompany()
-    const originalId = await insertEntryAtStatus({
+    const { entryId: originalId } = await insertReversedJournalEntry({
       ...seed,
       voucherNumber: 1,
-      status: 'reversed',
     })
     // Posted, but with no correction_of_id link back to the original.
     const unrelatedId = await insertEntryAtStatus({ ...seed, voucherNumber: 2 })

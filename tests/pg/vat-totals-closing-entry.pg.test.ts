@@ -85,8 +85,9 @@ async function insertEntry(params: {
     await client.query(
       `INSERT INTO public.journal_entries
          (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-          entry_date, description, source_type, status, reverses_id)
-       VALUES ($1, $2, $3, $4, $5, 'A', $6, 'VAT closing-entry test', $7, $8, $9)`,
+          entry_date, description, source_type, status, reverses_id, committed_at)
+       VALUES ($1, $2, $3, $4, $5, 'A', $6, 'VAT closing-entry test', $7, $8, $9,
+               now())`,
       [
         id,
         params.userId,
@@ -124,7 +125,7 @@ async function insertEntry(params: {
  * One EU-services sale in January, then a December resultatavslut that debits
  * the same revenue account: the shape that produced the production bug.
  */
-async function seedClosedYear(closingStatus: 'posted' | 'reversed') {
+async function seedClosedYear(_closingStatus: 'posted' | 'reversed') {
   const userId = await insertAuthUser()
   const companyId = await insertCompany({ createdBy: userId })
   await insertCompanyMember({ companyId, userId, role: 'owner' })
@@ -159,7 +160,7 @@ async function seedClosedYear(closingStatus: 'posted' | 'reversed') {
     voucherNumber: 2,
     entryDate: '2026-12-31',
     sourceType: 'year_end',
-    status: closingStatus,
+    status: 'posted',
     lines: [
       { account: '3308', debit: 800_000, credit: 0 },
       { account: '2099', debit: 0, credit: 800_000 },
@@ -206,7 +207,7 @@ describe('get_vat_declaration_totals: year-end closing entry', () => {
 
     // Undo year-end: the closing entry is reversed and a posted storno mirrors
     // it. Both must be counted, or the storno alone negates turnover again.
-    await insertEntry({
+    const stornoEntryId = await insertEntry({
       userId,
       companyId,
       fiscalPeriodId,
@@ -219,6 +220,12 @@ describe('get_vat_declaration_totals: year-end closing entry', () => {
         { account: '2099', debit: 800_000, credit: 0 },
       ],
     })
+    await getPool().query(
+      `UPDATE public.journal_entries
+          SET status = 'reversed', reversed_by_id = $2
+        WHERE id = $1`,
+      [closingEntryId, stornoEntryId],
+    )
 
     const december = await callRpc(companyId, '2026-12-01', '2026-12-31')
 

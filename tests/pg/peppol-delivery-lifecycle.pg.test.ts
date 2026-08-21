@@ -132,6 +132,9 @@ describe('stage_peppol_delivery', () => {
 describe('Peppol delivery audit lifecycle', () => {
   it('keeps events append-only and does not let late events regress a terminal projection', async () => {
     const seeded = await seedStagedDelivery()
+    const providerSubmissionId = randomUUID()
+    const eventIds = [0, 1, 2, 3].map(() => randomUUID())
+    const fingerprints = eventIds.map((id) => createHash('sha256').update(id).digest('hex'))
     const eventSql = `SELECT (public.record_peppol_delivery_event(
       $1, $2, 'storecove', 'tenant-42', $3, $4, $5, $6, $7, $8,
       $9::jsonb, $10, 'hmac-sha256', $11::timestamptz
@@ -139,30 +142,30 @@ describe('Peppol delivery audit lifecycle', () => {
 
     await runAsServiceRole(async (client) => {
       await client.query(eventSql, [
-        seeded.companyId, seeded.idempotencyKey, 'submission-guid', 'event-1',
+        seeded.companyId, seeded.idempotencyKey, providerSubmissionId, eventIds[0],
         'succeeded', 'transport_succeeded', false, 'Delivered to Corner 3',
-        JSON.stringify({ event: 'succeeded' }), '1'.repeat(64), '2026-08-13T16:01:00Z',
+        JSON.stringify({ event: 'succeeded' }), fingerprints[0], '2026-08-13T16:01:00Z',
       ])
       await client.query(eventSql, [
-        seeded.companyId, seeded.idempotencyKey, 'submission-guid', 'event-2',
+        seeded.companyId, seeded.idempotencyKey, providerSubmissionId, eventIds[1],
         'temporary_error', 'retryable_failure', false, 'Late retry notice',
-        JSON.stringify({ event: 'temporary_error' }), '2'.repeat(64), '2026-08-13T16:00:00Z',
+        JSON.stringify({ event: 'temporary_error' }), fingerprints[1], '2026-08-13T16:00:00Z',
       ])
       await client.query(eventSql, [
-        seeded.companyId, seeded.idempotencyKey, 'submission-guid', 'event-3',
+        seeded.companyId, seeded.idempotencyKey, providerSubmissionId, eventIds[2],
         'accepted', 'business_accepted', true, 'Buyer accepted',
-        JSON.stringify({ event: 'accepted' }), '3'.repeat(64), '2026-08-13T16:02:00Z',
+        JSON.stringify({ event: 'accepted' }), fingerprints[2], '2026-08-13T16:02:00Z',
       ])
       await client.query(eventSql, [
-        seeded.companyId, seeded.idempotencyKey, 'submission-guid', 'event-4',
+        seeded.companyId, seeded.idempotencyKey, providerSubmissionId, eventIds[3],
         'failed', 'failed', true, 'Late contradictory event',
-        JSON.stringify({ event: 'failed' }), '4'.repeat(64), '2026-08-13T16:03:00Z',
+        JSON.stringify({ event: 'failed' }), fingerprints[3], '2026-08-13T16:03:00Z',
       ])
-      // Provider retry of event-3: same fingerprint and event id is a no-op.
+      // Provider retry of the accepted event: same fingerprint and event id is a no-op.
       await client.query(eventSql, [
-        seeded.companyId, seeded.idempotencyKey, 'submission-guid', 'event-3',
+        seeded.companyId, seeded.idempotencyKey, providerSubmissionId, eventIds[2],
         'accepted', 'business_accepted', true, 'Buyer accepted',
-        JSON.stringify({ event: 'accepted' }), '3'.repeat(64), '2026-08-13T16:02:00Z',
+        JSON.stringify({ event: 'accepted' }), fingerprints[2], '2026-08-13T16:02:00Z',
       ])
     })
 
@@ -175,7 +178,7 @@ describe('Peppol delivery audit lifecycle', () => {
     expect(delivery.rows[0]).toMatchObject({
       provider: 'storecove',
       provider_tenant_id: 'tenant-42',
-      provider_submission_id: 'submission-guid',
+      provider_submission_id: providerSubmissionId,
       status: 'business_accepted',
       status_detail: 'Buyer accepted',
     })
@@ -187,7 +190,7 @@ describe('Peppol delivery audit lifecycle', () => {
       [seeded.deliveryId],
     )
     expect(events.rows.map((row) => row.provider_event_id)).toEqual([
-      'event-2', 'event-1', 'event-3', 'event-4',
+      eventIds[1], eventIds[0], eventIds[2], eventIds[3],
     ])
 
     await expect(getPool().query(

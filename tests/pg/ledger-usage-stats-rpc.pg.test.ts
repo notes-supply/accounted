@@ -17,6 +17,7 @@ import {
   seedCompany,
   insertDraftJournalEntry,
   insertPostedJournalEntry,
+  insertReversedJournalEntry,
 } from './fixtures'
 
 async function insertLines(
@@ -265,22 +266,13 @@ describe('get_ledger_usage_stats', () => {
     // A storno pair: original already excluded via status='reversed'; the
     // storno entry itself is posted and must be excluded from account_usage
     // by the source_type filter. 4010 must NOT gain postings from either.
-    const stornoOriginalId = await insertDraftJournalEntry({
+    const { stornoEntryId: stornoId } = await insertReversedJournalEntry({
       userId, companyId, fiscalPeriodId,
-      entryDate: '2026-06-15', status: 'reversed', voucherNumber: 8,
+      entryDate: '2026-06-15', voucherNumber: 8,
       sourceType: 'bank_transaction',
-    })
-    await insertLines(stornoOriginalId, [
-      { account: '4010', debit: 300, credit: 0 },
-      { account: '1930', debit: 0, credit: 300 },
-    ])
-    const stornoId = await insertPostedJournalEntry({
-      userId, companyId, fiscalPeriodId,
-      entryDate: '2026-06-15', voucherNumber: 9,
-      sourceType: 'storno',
       lines: [
-        { accountNumber: '1930', debitAmount: 300, creditAmount: 0 },
-        { accountNumber: '4010', debitAmount: 0, creditAmount: 300 },
+        { accountNumber: '4010', debitAmount: 300, creditAmount: 0 },
+        { accountNumber: '1930', debitAmount: 0, creditAmount: 300 },
       ],
     })
     // Legacy shape: a transaction still linked to the storno entry (predates

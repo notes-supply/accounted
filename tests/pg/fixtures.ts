@@ -177,6 +177,9 @@ export async function insertDraftJournalEntry(params: {
   voucherNumber?: number
   sourceType?: string
   sourceId?: string | null
+  reversesId?: string | null
+  correctionOfId?: string | null
+  reversedById?: string | null
   createdAt?: string
   // Inserting directly as 'posted' skips the set_committed_at() trigger (it
   // fires on draft->posted UPDATE), so committed_at stays null unless set here.
@@ -190,8 +193,10 @@ export async function insertDraftJournalEntry(params: {
   await getPool().query(
     `INSERT INTO public.journal_entries
        (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-        entry_date, description, source_type, source_id, status, created_at, committed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12::timestamptz, now()), $13::timestamptz)`,
+        entry_date, description, source_type, source_id, status, created_at, committed_at,
+        reverses_id, correction_of_id, reversed_by_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+             COALESCE($12::timestamptz, now()), $13::timestamptz, $14, $15, $16)`,
     [
       id,
       params.userId,
@@ -206,6 +211,9 @@ export async function insertDraftJournalEntry(params: {
       params.status ?? 'draft',
       params.createdAt ?? null,
       params.committedAt ?? null,
+      params.reversesId ?? null,
+      params.correctionOfId ?? null,
+      params.reversedById ?? null,
     ],
   )
   return id
@@ -235,6 +243,9 @@ export async function insertPostedJournalEntry(params: {
   voucherNumber?: number
   sourceType?: string
   sourceId?: string | null
+  reversesId?: string | null
+  correctionOfId?: string | null
+  reversedById?: string | null
   createdAt?: string
   committedAt?: string | null
   lines?: PostedJournalEntryLine[]
@@ -251,9 +262,11 @@ export async function insertPostedJournalEntry(params: {
     await client.query(
       `INSERT INTO public.journal_entries
          (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-          entry_date, description, source_type, source_id, status, created_at, committed_at)
+          entry_date, description, source_type, source_id, status, created_at, committed_at,
+          reverses_id, correction_of_id, reversed_by_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'posted',
-               COALESCE($11::timestamptz, now()), $12::timestamptz)`,
+               COALESCE($11::timestamptz, now()),
+               COALESCE($12::timestamptz, $11::timestamptz, now()), $13, $14, $15)`,
       [
         id,
         params.userId,
@@ -267,6 +280,9 @@ export async function insertPostedJournalEntry(params: {
         params.sourceId ?? null,
         params.createdAt ?? null,
         params.committedAt ?? null,
+        params.reversesId ?? null,
+        params.correctionOfId ?? null,
+        params.reversedById ?? null,
       ],
     )
 
@@ -298,6 +314,52 @@ export async function insertPostedJournalEntry(params: {
   } finally {
     client.release()
   }
+}
+
+export async function insertReversedJournalEntry(params: {
+  userId: string
+  companyId: string
+  fiscalPeriodId: string
+  entryDate?: string
+  description?: string
+  voucherSeries?: string
+  voucherNumber?: number
+  sourceType?: string
+  sourceId?: string | null
+  createdAt?: string
+  committedAt?: string | null
+  lines?: PostedJournalEntryLine[]
+}): Promise<{ entryId: string; stornoEntryId: string }> {
+  const lines = params.lines ?? [
+    { accountNumber: '1930', debitAmount: 1000, creditAmount: 0 },
+    { accountNumber: '3001', debitAmount: 0, creditAmount: 1000 },
+  ]
+  const entryId = await insertPostedJournalEntry({ ...params, lines })
+  const stornoEntryId = await insertPostedJournalEntry({
+    userId: params.userId,
+    companyId: params.companyId,
+    fiscalPeriodId: params.fiscalPeriodId,
+    entryDate: params.entryDate,
+    description: `Storno: ${params.description ?? 'Test entry'}`,
+    voucherSeries: params.voucherSeries,
+    voucherNumber: (params.voucherNumber ?? 0) + 1_000_000_000,
+    sourceType: 'storno',
+    reversesId: entryId,
+    createdAt: params.createdAt,
+    committedAt: params.committedAt,
+    lines: lines.map((line) => ({
+      ...line,
+      debitAmount: line.creditAmount,
+      creditAmount: line.debitAmount,
+    })),
+  })
+  await getPool().query(
+    `UPDATE public.journal_entries
+        SET status = 'reversed', reversed_by_id = $2
+      WHERE id = $1`,
+    [entryId, stornoEntryId],
+  )
+  return { entryId, stornoEntryId }
 }
 
 // Insert a balanced pair of journal entry lines (1 debit row + 1 credit row

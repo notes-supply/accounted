@@ -30,6 +30,7 @@ import {
   insertCompany,
   insertCompanyMember,
   insertFiscalPeriod,
+  insertReversedJournalEntry,
 } from './fixtures'
 
 interface AccountSums {
@@ -87,8 +88,10 @@ async function insertJournalEntry(params: {
     await client.query(
       `INSERT INTO public.journal_entries
          (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-          entry_date, description, source_type, status, reverses_id, correction_of_id)
-       VALUES ($1, $2, $3, $4, $5, 'A', $6, 'KPI RPC test', $7, $8, $9, $10)`,
+          entry_date, description, source_type, status, reverses_id, correction_of_id,
+          committed_at)
+       VALUES ($1, $2, $3, $4, $5, 'A', $6, 'KPI RPC test', $7, $8, $9, $10,
+               CASE WHEN $8 IN ('posted', 'reversed') THEN now() END)`,
       [
         id,
         params.userId,
@@ -169,9 +172,12 @@ async function seedFullScenario() {
       { account: '1930', debit: 0, credit: 3000 },
     ],
   })
-  await insertJournalEntry({
-    ...ctx, voucherNumber: 4, status: 'reversed', entryDate: '2026-02-20',
-    lines: [{ account: '3001', debit: 0, credit: 700 }],
+  await insertReversedJournalEntry({
+    ...ctx, voucherNumber: 4, entryDate: '2026-02-20',
+    lines: [
+      { accountNumber: '2999', debitAmount: 700, creditAmount: 0 },
+      { accountNumber: '3001', debitAmount: 0, creditAmount: 700 },
+    ],
   })
   // March: mixed-sign class 8 lines in the same entry
   await insertJournalEntry({
@@ -196,13 +202,13 @@ async function seedFullScenario() {
   })
   // Undone year-end chain: reversed year_end + its storno + a correction
   const reversedYearEndId = await insertJournalEntry({
-    ...ctx, voucherNumber: 7, sourceType: 'year_end', status: 'reversed', entryDate: '2026-12-31',
+    ...ctx, voucherNumber: 7, sourceType: 'year_end', entryDate: '2026-12-31',
     lines: [
       { account: '8999', debit: 400, credit: 0 },
       { account: '2099', debit: 0, credit: 400 },
     ],
   })
-  await insertJournalEntry({
+  const yearEndStornoId = await insertJournalEntry({
     ...ctx, voucherNumber: 8, sourceType: 'storno', entryDate: '2026-12-31',
     reversesId: reversedYearEndId,
     lines: [
@@ -218,6 +224,12 @@ async function seedFullScenario() {
       { account: '1930', debit: 0, credit: 250 },
     ],
   })
+  await getPool().query(
+    `UPDATE public.journal_entries
+        SET status = 'reversed', reversed_by_id = $2
+      WHERE id = $1`,
+    [reversedYearEndId, yearEndStornoId],
+  )
 
   return { ...ctx, obEntryId }
 }
@@ -232,7 +244,7 @@ describe('get_kpi_report_aggregates RPC', () => {
     expect(tb.get('1930')).toMatchObject({ debit: 12500, credit: 3250 })
     expect(tb.has('2010')).toBe(false)
     // Reversed manual entry included (posted + reversed base filter).
-    expect(tb.get('3001')).toMatchObject({ debit: 0, credit: 10700 })
+    expect(tb.get('3001')).toMatchObject({ debit: 700, credit: 10700 })
     expect(tb.get('2611')).toMatchObject({ debit: 0, credit: 2500 })
     expect(tb.get('5010')).toMatchObject({ debit: 3000, credit: 0 })
     // Year-end chain present in the plain tb.
@@ -257,7 +269,7 @@ describe('get_kpi_report_aggregates RPC', () => {
     const tb = byAccount(payload.tb_ex_year_end)
 
     // Ordinary activity retained...
-    expect(tb.get('3001')).toMatchObject({ debit: 0, credit: 10700 })
+    expect(tb.get('3001')).toMatchObject({ debit: 700, credit: 10700 })
     expect(tb.get('5010')).toMatchObject({ debit: 3000, credit: 0 })
     expect(tb.get('8310')).toMatchObject({ debit: 0, credit: 200 })
     expect(tb.get('8410')).toMatchObject({ debit: 500, credit: 0 })
@@ -275,10 +287,13 @@ describe('get_kpi_report_aggregates RPC', () => {
   it('keeps stornos/corrections that do not point at a reversed year-end', async () => {
     const ctx = await seedCompany()
     const plainReversed = await insertJournalEntry({
-      ...ctx, voucherNumber: 1, status: 'reversed', entryDate: '2026-04-01',
-      lines: [{ account: '5010', debit: 100, credit: 0 }],
+      ...ctx, voucherNumber: 1, entryDate: '2026-04-01',
+      lines: [
+        { account: '5010', debit: 100, credit: 0 },
+        { account: '2999', debit: 0, credit: 100 },
+      ],
     })
-    await insertJournalEntry({
+    const plainStornoId = await insertJournalEntry({
       ...ctx, voucherNumber: 2, sourceType: 'storno', entryDate: '2026-04-02',
       reversesId: plainReversed,
       lines: [
@@ -287,6 +302,12 @@ describe('get_kpi_report_aggregates RPC', () => {
         { account: '2999', debit: 100, credit: 0 },
       ],
     })
+    await getPool().query(
+      `UPDATE public.journal_entries
+          SET status = 'reversed', reversed_by_id = $2
+        WHERE id = $1`,
+      [plainReversed, plainStornoId],
+    )
 
     const payload = await callRpc(ctx.companyId, ctx.fiscalPeriodId)
     // Only reversals of REVERSED year_end entries are chained out.
@@ -327,8 +348,8 @@ describe('get_kpi_report_aggregates RPC', () => {
 
     // January: revenue only (class 2 VAT line ignored).
     expect(monthOf(payload, 2026, 1)).toMatchObject({ income: 10000, expenses: 0 })
-    // February: the reversed 3001 entry (700) must NOT appear.
-    expect(monthOf(payload, 2026, 2)).toMatchObject({ income: 0, expenses: 3000 })
+    // February: the reversed entry is excluded, while its posted storno reverses the revenue.
+    expect(monthOf(payload, 2026, 2)).toMatchObject({ income: -700, expenses: 3000 })
     // March: 8310 credit 200 -> income; 8410 debit 500 -> expenses.
     expect(monthOf(payload, 2026, 3)).toMatchObject({ income: 200, expenses: 500 })
     // December: year_end entries ARE excluded from monthly as of migration
@@ -371,7 +392,7 @@ describe('get_kpi_report_aggregates RPC', () => {
       )
       return rows[0].payload as RpcPayload
     })
-    expect(byAccount(asMember.tb).get('3001')).toMatchObject({ debit: 0, credit: 10700 })
+    expect(byAccount(asMember.tb).get('3001')).toMatchObject({ debit: 700, credit: 10700 })
     expect(byAccount(asMember.ob).get('1930')).toMatchObject({ debit: 5000, credit: 0 })
 
     const asOutsider = await withUserContext(outsider.userId, async (client) => {

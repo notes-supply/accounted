@@ -1,12 +1,11 @@
 import { randomUUID } from 'crypto'
 import { beforeAll, describe, expect, it } from 'vitest'
 import { NEEDS_DOC_SOURCE_TYPES } from '@/lib/worklist/categories'
-import { getPool } from './setup'
+import { getPool, runAsServiceRole } from './setup'
 import {
   seedCompany,
-  insertDraftJournalEntry,
   insertPostedJournalEntry,
-  insertBalancedLines,
+  insertReversedJournalEntry,
   insertTransaction,
 } from './fixtures'
 
@@ -137,12 +136,12 @@ async function insertSupplierInvoicePayment(params: {
   supplierInvoiceId: string
   journalEntryId: string
 }): Promise<void> {
-  await getPool().query(
+  await runAsServiceRole((client) => client.query(
     `INSERT INTO public.supplier_invoice_payments
        (user_id, company_id, supplier_invoice_id, payment_date, amount, journal_entry_id)
      VALUES ($1, $2, $3, '2026-06-10', 500, $4)`,
     [params.userId, params.companyId, params.supplierInvoiceId, params.journalEntryId],
-  )
+  ))
 }
 
 describe('document surfaces unification', () => {
@@ -194,7 +193,6 @@ describe('document surfaces unification', () => {
     jeSiRegWithDoc = await mkJe(7, 'supplier_invoice_registered')
     jeSiPaymentCovered = await mkJe(8, 'supplier_invoice_paid')
     jeSiRegNoDoc = await mkJe(9, 'supplier_invoice_registered')
-    jeSiPartialCovered = await mkJe(10, 'supplier_invoice_paid')
     jeSiPayUnanchored = await mkJe(11, 'supplier_invoice_paid')
 
     // Bank transactions pointing at the bank-driven entries. The with-doc tx
@@ -258,6 +256,20 @@ describe('document surfaces unification', () => {
       supplierId,
       arrivalNumber: 3,
       documentId: siPartialDoc,
+    })
+    jeSiPartialCovered = await insertPostedJournalEntry({
+      userId,
+      companyId,
+      fiscalPeriodId,
+      voucherNumber: 10,
+      entryDate: '2026-06-10',
+      description: 'supplier_invoice_paid 10',
+      sourceType: 'supplier_invoice_paid',
+      sourceId: siPartial,
+      lines: [
+        { accountNumber: '2440', debitAmount: 500, creditAmount: 0 },
+        { accountNumber: '1930', debitAmount: 0, creditAmount: 500 },
+      ],
     })
     await insertSupplierInvoicePayment({
       userId,
@@ -554,18 +566,20 @@ describe('floating supplier-invoice document backfill (migration 20260727180000)
           ],
         })
       }
-      const id = await insertDraftJournalEntry({
+      const { entryId } = await insertReversedJournalEntry({
         userId: s.userId,
         companyId: s.companyId,
         fiscalPeriodId: s.fiscalPeriodId,
-        status,
         voucherNumber: n,
         entryDate: '2026-06-15',
         description: `anchor ${n}`,
         sourceType,
+        lines: [
+          { accountNumber: '1930', debitAmount: 100 * n, creditAmount: 0 },
+          { accountNumber: '3001', debitAmount: 0, creditAmount: 100 * n },
+        ],
       })
-      await insertBalancedLines(id, 100 * n)
-      return id
+      return entryId
     }
 
     const jeReg = await mkJe(1, 'reversed', 'supplier_invoice_registered')

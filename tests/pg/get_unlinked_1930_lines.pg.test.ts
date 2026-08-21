@@ -24,6 +24,8 @@ async function insertPostedJournalEntry(params: {
   sourceType: 'opening_balance' | 'manual' | 'bank_transaction' | 'import' | 'storno' | 'correction'
   voucherNumber: number
   amount?: number
+  reversesId?: string | null
+  correctionOfId?: string | null
 }): Promise<string> {
   const amount = params.amount ?? 1000
   // Insert as posted directly. This bypasses commit_journal_entry's voucher
@@ -40,6 +42,8 @@ async function insertPostedJournalEntry(params: {
     entryDate: params.entryDate,
     description: `Test ${params.sourceType}`,
     sourceType: params.sourceType,
+    reversesId: params.reversesId,
+    correctionOfId: params.correctionOfId,
     lines: [
       { accountNumber: '1930', debitAmount: amount, creditAmount: 0 },
       { accountNumber: '2091', debitAmount: 0, creditAmount: amount },
@@ -110,17 +114,23 @@ describe('get_unlinked_gl_lines RPC: opening_balance exclusion', () => {
     // flow), plus a normal bank voucher. Stornos/corrections are book-only
     // reversals with no bank-feed counterpart: they must be EXCLUDED so a
     // reconciled period doesn't show them as omatchade verifikationer.
-    await insertPostedJournalEntry({
+    const lineageParent = await insertPostedJournalEntry({
       userId, companyId, fiscalPeriodId,
-      entryDate: '2026-05-02', sourceType: 'storno', voucherNumber: 20, amount: 25000,
+      entryDate: '2026-05-01', sourceType: 'manual', voucherNumber: 20, amount: 25000,
     })
     await insertPostedJournalEntry({
       userId, companyId, fiscalPeriodId,
-      entryDate: '2026-05-02', sourceType: 'correction', voucherNumber: 21, amount: 25000,
+      entryDate: '2026-05-02', sourceType: 'storno', voucherNumber: 21, amount: 25000,
+      reversesId: lineageParent,
+    })
+    await insertPostedJournalEntry({
+      userId, companyId, fiscalPeriodId,
+      entryDate: '2026-05-02', sourceType: 'correction', voucherNumber: 22, amount: 25000,
+      correctionOfId: lineageParent,
     })
     const bankEntryId = await insertPostedJournalEntry({
       userId, companyId, fiscalPeriodId,
-      entryDate: '2026-05-03', sourceType: 'bank_transaction', voucherNumber: 22, amount: 1500,
+      entryDate: '2026-05-03', sourceType: 'bank_transaction', voucherNumber: 23, amount: 1500,
     })
 
     const { rows } = await getPool().query(

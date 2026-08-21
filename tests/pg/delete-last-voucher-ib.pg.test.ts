@@ -42,7 +42,7 @@ async function commitPostedEntryAsIB(params: {
   // delete RPC's FOR UPDATE lookup succeeds.
   await getPool().query(
     `UPDATE public.journal_entries
-       SET status = 'posted'
+       SET status = 'posted', committed_at = now()
      WHERE id = $1`,
     [entryId],
   )
@@ -68,7 +68,7 @@ async function linkAsIB(periodId: string, entryId: string): Promise<void> {
 }
 
 describe('delete_last_voucher with IB link', () => {
-  it('deletes an IB entry and clears the period FK + sets opening_balances_set=false', async () => {
+  it('rejects deleting a posted IB entry and preserves the period link', async () => {
     const userId = await insertAuthUser()
     const companyId = await insertCompany({ createdBy: userId })
     await insertCompanyMember({ companyId, userId, role: 'owner' })
@@ -86,47 +86,27 @@ describe('delete_last_voucher with IB link', () => {
     expect(pre.rows[0]!.ob_id).toBe(ibEntryId)
     expect(pre.rows[0]!.ob_set).toBe(true)
 
-    // withUserContext rolls back at the end, so all assertions about the
-    // RPC's effects must be observed inside the same transaction: a fresh
-    // getPool() connection would only see pre-RPC state.
     await withUserContext(userId, async (client) => {
-      const r = await client.query<{ delete_last_voucher: { deleted: boolean; was_period_ib: boolean } }>(
-        `SELECT delete_last_voucher($1, $2)`,
-        [companyId, ibEntryId],
-      )
-      const result = r.rows[0]!.delete_last_voucher
-      expect(result.deleted).toBe(true)
-      expect(result.was_period_ib).toBe(true)
-
-      const after = await client.query<{ count: string }>(
-        `SELECT COUNT(*)::text AS count FROM public.journal_entries WHERE id = $1`,
-        [ibEntryId],
-      )
-      expect(after.rows[0]!.count).toBe('0')
-
-      const post = await client.query<{ ob_id: string | null; ob_set: boolean }>(
-        `SELECT opening_balance_entry_id AS ob_id, opening_balances_set AS ob_set
-           FROM public.fiscal_periods WHERE id = $1`,
-        [fiscalPeriodId],
-      )
-      expect(post.rows[0]!.ob_id).toBeNull()
-      expect(post.rows[0]!.ob_set).toBe(false)
-
-      // Two audit rows land on the DELETE: the generic one from the
-      // write_audit_log() trigger and the RPC's explicit "was period IB"
-      // entry. They share statement_timestamp(), so ordering by created_at
-      // is non-deterministic: assert against the specific marker directly.
-      const audit = await client.query<{ count: string }>(
-        `SELECT COUNT(*)::text AS count FROM public.audit_log
-           WHERE table_name = 'journal_entries' AND record_id = $1 AND action = 'DELETE'
-             AND description LIKE '%was period IB%'`,
-        [ibEntryId],
-      )
-      expect(Number(audit.rows[0]!.count)).toBeGreaterThanOrEqual(1)
+      await expect(
+        client.query(`SELECT delete_last_voucher($1, $2)`, [companyId, ibEntryId]),
+      ).rejects.toThrow(/Posted and reversed vouchers cannot be deleted/i)
     })
+
+    const after = await getPool().query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM public.journal_entries WHERE id = $1`,
+      [ibEntryId],
+    )
+    expect(after.rows[0]!.count).toBe('1')
+    const post = await getPool().query<{ ob_id: string | null; ob_set: boolean }>(
+      `SELECT opening_balance_entry_id AS ob_id, opening_balances_set AS ob_set
+         FROM public.fiscal_periods WHERE id = $1`,
+      [fiscalPeriodId],
+    )
+    expect(post.rows[0]!.ob_id).toBe(ibEntryId)
+    expect(post.rows[0]!.ob_set).toBe(true)
   })
 
-  it('also clears sie_imports.opening_balance_entry_id when present', async () => {
+  it('preserves sie_imports.opening_balance_entry_id when posted deletion is rejected', async () => {
     const userId = await insertAuthUser()
     const companyId = await insertCompany({ createdBy: userId })
     await insertCompanyMember({ companyId, userId, role: 'owner' })
@@ -144,14 +124,15 @@ describe('delete_last_voucher with IB link', () => {
       [importId, userId, companyId, randomUUID().replace(/-/g, ''), fiscalPeriodId, ibEntryId],
     )
 
-    // Same caveat as the previous test: assert inside the tx, not after.
     await withUserContext(userId, async (client) => {
-      await client.query(`SELECT delete_last_voucher($1, $2)`, [companyId, ibEntryId])
-      const imp = await client.query<{ ob_id: string | null }>(
-        `SELECT opening_balance_entry_id AS ob_id FROM public.sie_imports WHERE id = $1`,
-        [importId],
-      )
-      expect(imp.rows[0]!.ob_id).toBeNull()
+      await expect(
+        client.query(`SELECT delete_last_voucher($1, $2)`, [companyId, ibEntryId]),
+      ).rejects.toThrow(/Posted and reversed vouchers cannot be deleted/i)
     })
+    const imp = await getPool().query<{ ob_id: string | null }>(
+      `SELECT opening_balance_entry_id AS ob_id FROM public.sie_imports WHERE id = $1`,
+      [importId],
+    )
+    expect(imp.rows[0]!.ob_id).toBe(ibEntryId)
   })
 })

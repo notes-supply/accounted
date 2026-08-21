@@ -688,6 +688,7 @@ export async function commitEntry(
 
 export interface CommitAssetDisposalInput {
   asset_id: string
+  expected_asset_updated_at: string
   fiscal_period_id: string
   disposal_type: AssetDisposalType
   disposed_at: string
@@ -722,6 +723,7 @@ export async function commitAssetDisposal(
     p_company_id: companyId,
     p_asset_id: input.asset_id,
     p_entry_id: entryId,
+    p_expected_asset_updated_at: input.expected_asset_updated_at,
     p_fiscal_period_id: input.fiscal_period_id,
     p_disposal_type: input.disposal_type,
     p_disposed_at: input.disposed_at,

@@ -66,9 +66,9 @@ async function seedOpeningBalance(params: {
     await client.query(
       `INSERT INTO public.journal_entries
          (id, user_id, company_id, fiscal_period_id, voucher_number,
-          voucher_series, entry_date, description, source_type, status)
+          voucher_series, entry_date, description, source_type, status, committed_at)
        VALUES ($1, $2, $3, $4, $5, 'A', '2026-01-01',
-               'Old opening balance', 'opening_balance', 'posted')`,
+               'Old opening balance', 'opening_balance', 'posted', now())`,
       [
         oldEntryId,
         params.userId,
