@@ -377,7 +377,7 @@ describe('shared journal lineage contract', () => {
     }
   })
 
-  it('allows transitional reversal writes but rejects a malformed final state at COMMIT', async () => {
+  it('allows a bounded posted-parent staging state at COMMIT', async () => {
     const tenant = await seedCompany()
     const client = await getPool().connect()
     try {
@@ -409,9 +409,18 @@ describe('shared journal lineage contract', () => {
         },
       ].sort((left, right) => left.id.localeCompare(right.id)))
 
-      await expect(client.query('COMMIT')).rejects.toThrow(
-        /journal lineage final state is contradictory/i,
+      await client.query('COMMIT')
+
+      const validity = await getPool().query<{
+        final_valid: boolean
+        staged_valid: boolean
+      }>(
+        `SELECT
+           public.journal_lineage_final_state_is_valid($1) AS final_valid,
+           public.journal_lineage_state_is_valid($1) AS staged_valid`,
+        [originalId],
       )
+      expect(validity.rows[0]).toEqual({ final_valid: false, staged_valid: true })
     } finally {
       await client.query('ROLLBACK').catch(() => {})
       client.release()
