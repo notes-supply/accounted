@@ -10,11 +10,11 @@ const migrationsDir = join(root, 'supabase', 'migrations')
 const predecessorPath = join(root, 'release', 'production-migration-lineage.txt')
 
 const expected = {
-  candidateCount: 637,
+  candidateCount: 638,
   predecessorCount: 548,
-  upgradeCount: 89,
+  upgradeCount: 90,
   firstUpgrade: '20260801204551',
-  latestCandidate: '20260815130600',
+  latestCandidate: '20260821090000',
   upstreamCollision: '20260813120000',
 }
 
