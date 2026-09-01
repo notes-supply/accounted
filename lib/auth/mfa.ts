@@ -2,18 +2,20 @@
  * MFA (Multi-Factor Authentication) helpers.
  *
  * Client display follows the public runtime flag. Server enforcement follows
- * the private runtime policy and is application-side, not RLS.
+ * the private runtime policy. The documented self-hosted mode exempts both.
  */
 
-import { flagEnabled } from '@/lib/env/public-flags'
+import { flagEnabled, isSelfHosted } from '@/lib/env/public-flags'
 
 /** Public runtime flag for client-visible MFA state. */
 export function isMfaRequired(): boolean {
+  if (isSelfHosted()) return false
   return flagEnabled(process.env.NEXT_PUBLIC_REQUIRE_MFA)
 }
 
-/** Private server policy. Missing or malformed values fail closed. */
+/** Private server policy. Self-hosted is exempt; hosted config fails closed. */
 export function isMfaEnforcementRequired(): boolean {
+  if (isSelfHosted()) return false
   const privateValue = process.env.REQUIRE_MFA
   if (privateValue !== 'true' && privateValue !== 'false') {
     throw new Error('REQUIRE_MFA must be explicitly set to exactly "true" or "false"')

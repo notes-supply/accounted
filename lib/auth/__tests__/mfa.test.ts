@@ -18,10 +18,10 @@ describe('mfa helpers', () => {
       expect(isMfaRequired()).toBe(false)
     })
 
-    it('allows self-hosted deployments to display mandatory MFA', () => {
+    it('hides mandatory MFA on self-hosted deployments', () => {
       vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'true')
       vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'true')
-      expect(isMfaRequired()).toBe(true)
+      expect(isMfaRequired()).toBe(false)
     })
   })
 
@@ -33,6 +33,13 @@ describe('mfa helpers', () => {
       vi.stubEnv('REQUIRE_MFA', value)
       vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', value)
       expect(isMfaEnforcementRequired()).toBe(expected)
+    })
+
+    it('exempts self-hosted deployments before hosted policy validation', () => {
+      vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'true')
+      vi.stubEnv('REQUIRE_MFA', undefined)
+      vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'true')
+      expect(isMfaEnforcementRequired()).toBe(false)
     })
 
     it.each([undefined, '', 'TRUE', '1', ' true '])(
@@ -64,8 +71,15 @@ describe('mfa helpers', () => {
       expect(shouldEnforceMfa({ app_metadata: { bankid_linked: true } })).toBe(false)
     })
 
-    it('enforces MFA in self-hosted mode when the private policy requires it', () => {
+    it('does not enforce MFA in self-hosted mode', () => {
       vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'true')
+      vi.stubEnv('REQUIRE_MFA', 'true')
+      vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'true')
+      expect(shouldEnforceMfa({ app_metadata: {} })).toBe(false)
+    })
+
+    it('keeps hosted enforcement enabled', () => {
+      vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'false')
       vi.stubEnv('REQUIRE_MFA', 'true')
       vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'true')
       expect(shouldEnforceMfa({ app_metadata: {} })).toBe(true)

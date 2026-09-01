@@ -9,9 +9,10 @@ type AuthResult =
 
 interface RequireAuthOptions {
   /**
-   * Permit an AAL1 session to set its first password. The caller must still
-   * verify `app_metadata.has_password !== true`; malformed assurance data and
-   * existing-password changes remain fail-closed.
+   * Permit an AAL1 session to set its first password. Before allowing the
+   * escape, the guard re-fetches the user from Supabase Auth and verifies the
+   * authoritative `app_metadata.has_password` state. Existing-password
+   * changes and failed refreshes remain fail-closed.
    */
   allowInitialPasswordAtAal1?: boolean
 }
@@ -63,13 +64,12 @@ function userFromClaims(claims: JwtPayload): User {
  * Fast path: getClaims() performs local WebCrypto verification against the
  * shared 10-minute JWKS cache instead of a per-request network getUser()
  * round trip. HS256/self-hosted projects fall back to a server call inside
- * getClaims itself (identical semantics; NEXT_PUBLIC_SELF_HOSTED needs no
- * special-casing). Revocation is still checked on every request by proxy.ts
+ * getClaims itself. Revocation is still checked on every request by proxy.ts
  * middleware getUser() before any route runs. Claims-sourced metadata
  * (email, app_metadata, is_anonymous) can be up to one access-token TTL
- * stale, which is acceptable for all current consumers: bankid_linked
- * staleness is covered because the middleware MFA gate
- * (lib/supabase/middleware.ts) uses the FRESH getUser result.
+ * stale, which is acceptable for ordinary consumers. Security decisions that
+ * permit the initial-password AAL1 escape re-fetch authoritative user state
+ * below; the middleware MFA gate also uses a fresh getUser result.
  */
 export async function requireAuth(options: RequireAuthOptions = {}): Promise<AuthResult> {
   const supabase = await createClient()
@@ -114,11 +114,25 @@ export async function requireAuth(options: RequireAuthOptions = {}): Promise<Aut
   if (shouldEnforceMfa(user)) {
     const { data: aal, error: aalError } =
       await supabase.auth.mfa.getAuthenticatorAssuranceLevel()
-    const initialPasswordEscape =
+    let initialPasswordEscape = false
+    if (
       options.allowInitialPasswordAtAal1 === true &&
       user.app_metadata?.has_password !== true &&
+      !aalError &&
       hasValidAssuranceLevel(aal) &&
       aal.currentLevel === 'aal1'
+    ) {
+      const { data: authoritative, error: authoritativeError } =
+        await supabase.auth.getUser()
+      if (
+        !authoritativeError &&
+        authoritative.user?.id === user.id &&
+        authoritative.user.app_metadata?.has_password !== true
+      ) {
+        user = authoritative.user
+        initialPasswordEscape = true
+      }
+    }
     if (
       aalError ||
       !hasValidAssuranceLevel(aal) ||

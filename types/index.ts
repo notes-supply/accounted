@@ -2369,6 +2369,10 @@ export interface CreateJournalEntryInput {
   source_id?: string
   voucher_series?: string
   notes?: string
+  // Immutable provenance used by the guarded bank-transaction attachment RPC.
+  // Only bank_transaction drafts set these fields.
+  categorization_category?: TransactionCategory
+  categorization_is_business?: boolean
   lines: CreateJournalEntryLineInput[]
 }
 

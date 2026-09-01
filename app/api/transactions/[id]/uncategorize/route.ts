@@ -1,5 +1,4 @@
 import { NextResponse } from 'next/server'
-import { reverseEntry } from '@/lib/bookkeeping/engine'
 import { bookkeepingErrorResponse } from '@/lib/bookkeeping/errors'
 import { ensureInitialized } from '@/lib/init'
 import { withRouteContext } from '@/lib/api/with-route-context'
@@ -44,34 +43,43 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
       return NextResponse.json({ error: 'Journal entry is not posted' }, { status: 400 })
     }
 
-    // Storno reversal (legally compliant: never deletes)
-    try {
-      await reverseEntry(supabase, companyId, user.id, transaction.journal_entry_id)
-    } catch (err) {
-      const typed = bookkeepingErrorResponse(err)
+    // The M5 command performs the storno, exact pointer clear, durable
+    // publications, and idempotent recovery in one database transaction.
+    const { data: compensation, error: compensationError } = await supabase.rpc(
+      'compensate_transaction_categorization',
+      {
+        p_company_id: companyId,
+        p_transaction_id: id,
+        p_original_journal_entry_id: transaction.journal_entry_id,
+        p_actor_type: 'user',
+        p_actor_id: user.id,
+        p_actor_label: null,
+      },
+    )
+
+    if (compensationError) {
+      const typed = bookkeepingErrorResponse(compensationError)
       if (typed) return typed
       return NextResponse.json(
-        { error: getErrorMessage(err, { context: 'transaction' }) },
+        { error: getErrorMessage(compensationError, { context: 'transaction' }) },
         { status: 500 },
       )
     }
 
-    // Reset transaction categorization
-    const { error: updateError } = await supabase
-      .from('transactions')
-      .update({
-        is_business: null,
-        category: null,
-        journal_entry_id: null,
-      })
-      .eq('id', id)
-      .eq('company_id', companyId)
-
-    if (updateError) {
-      return NextResponse.json({ error: 'Failed to reset transaction' }, { status: 500 })
+    if (
+      !compensation
+      || typeof compensation !== 'object'
+      || !('status' in compensation)
+      || (compensation.status !== 'applied' && compensation.status !== 'already_applied')
+    ) {
+      return NextResponse.json(
+        { error: 'Transaction changed during uncategorization' },
+        { status: 409 },
+      )
     }
 
     return NextResponse.json({ success: true })
+
   },
   { requireWrite: true },
 )

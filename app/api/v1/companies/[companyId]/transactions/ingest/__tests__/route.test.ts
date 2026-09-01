@@ -44,6 +44,25 @@ vi.mock('@/lib/transactions/ingest', () => ({
 vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
   createTransactionJournalEntry: createTxJE,
 }))
+vi.mock('@/lib/transactions/categorization-attachment', () => ({
+  attachTransactionCategorization: vi.fn(
+    async (
+      _supabase: unknown,
+      _companyId: string,
+      _userId: string,
+      transaction: Record<string, unknown>,
+      journalEntry: { id: string },
+      category: string,
+      isBusiness: boolean,
+    ) => ({
+      ...transaction,
+      category,
+      is_business: isBusiness,
+      is_ignored: false,
+      journal_entry_id: journalEntry.id,
+    }),
+  ),
+}))
 vi.mock('@/lib/bookkeeping/account-validation', async () => {
   const actual = await vi.importActual<typeof import('@/lib/bookkeeping/account-validation')>(
     '@/lib/bookkeeping/account-validation',

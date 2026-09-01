@@ -551,7 +551,7 @@ describe('updateSession redirect destinations', () => {
       expect(response.status).toBe(200)
     })
 
-    it('redirects on self-hosted when the private policy requires MFA', async () => {
+    it('does not redirect on self-hosted even when hosted MFA flags are true', async () => {
       process.env.REQUIRE_MFA = 'true'
       process.env.NEXT_PUBLIC_REQUIRE_MFA = 'true'
       process.env.NEXT_PUBLIC_SELF_HOSTED = 'true'
@@ -561,7 +561,8 @@ describe('updateSession redirect destinations', () => {
 
       const response = await run('/settings/tax')
 
-      expect(new URL(locationOf(response)!).pathname).toBe('/mfa/verify')
+      expect(response.status).toBe(200)
+      expect(locationOf(response)).toBeNull()
     })
 
     it('does not redirect BankID-linked users, who are already 2FA', async () => {

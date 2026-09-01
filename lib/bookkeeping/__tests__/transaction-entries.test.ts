@@ -466,6 +466,27 @@ describe('createTransactionJournalEntry', () => {
     expect(input.source_id).toBe('tx-abc-123')
   })
 
+  it('stages the exact categorization provenance before posting', async () => {
+    const tx = makeTransaction({ id: 'tx-abc-123', amount: -100 })
+    const mapping = makeMappingResult()
+
+    await createTransactionJournalEntry(
+      null as never,
+      'company-1',
+      'user-1',
+      tx,
+      mapping,
+      undefined,
+      { category: 'expense_other', isBusiness: true },
+    )
+
+    const input = mockedCreateEntry.mock.calls[0][3]
+    expect(input).toMatchObject({
+      categorization_category: 'expense_other',
+      categorization_is_business: true,
+    })
+  })
+
   it('uses transaction.date as entry_date', async () => {
     const tx = makeTransaction({ date: '2024-09-15', amount: -100 })
     const mapping = makeMappingResult()

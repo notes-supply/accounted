@@ -36,6 +36,12 @@ vi.mock('@/lib/bookkeeping/engine', () => ({
   createJournalEntry: (...args: unknown[]) => mockCreateJournalEntry(...args),
 }))
 
+const mockAttachTransactionCategorization = vi.fn()
+vi.mock('@/lib/transactions/categorization-attachment', () => ({
+  attachTransactionCategorization: (...args: unknown[]) =>
+    mockAttachTransactionCategorization(...args),
+}))
+
 const mockReverseOrphanedJournalEntry = vi.fn()
 vi.mock('@/lib/bookkeeping/cancel-orphaned-entry', () => ({
   reverseOrphanedJournalEntry: (...args: unknown[]) => mockReverseOrphanedJournalEntry(...args),
@@ -85,6 +91,57 @@ describe('POST /api/transactions/[id]/book', () => {
     mockDetectDup.mockResolvedValue(null)
     mockAppendProcessingHistory.mockResolvedValue('evt-1')
     mockReverseOrphanedJournalEntry.mockResolvedValue(undefined)
+    mockAttachTransactionCategorization.mockImplementation(
+      async (
+        supabase: {
+          from: (table: string) => {
+            update: (value: unknown) => {
+              eq: (column: string, value: unknown) => {
+                eq: (column: string, value: unknown) => {
+                  is: (column: string, value: unknown) => {
+                    select: () => Promise<{
+                      data: Array<Record<string, unknown>> | null
+                      error: unknown
+                    }>
+                  }
+                }
+              }
+            }
+          }
+        },
+        companyId: string,
+        userId: string,
+        transaction: { id: string },
+        journalEntry: { id: string },
+        category: string,
+        isBusiness: boolean,
+      ) => {
+        const { data, error } = await supabase
+          .from('transactions')
+          .update({
+            journal_entry_id: journalEntry.id,
+            is_business: isBusiness,
+            is_ignored: false,
+            category,
+          })
+          .eq('id', transaction.id)
+          .eq('company_id', companyId)
+          .is('journal_entry_id', null)
+          .select()
+        if (error || !data || data.length === 0) {
+          await mockReverseOrphanedJournalEntry(
+            supabase,
+            companyId,
+            userId,
+            journalEntry.id,
+            'Bokföringsverifikation utan transaktionskoppling; automatisk storno misslyckades. Manuell avstämning krävs.',
+          )
+          if (error) throw error
+          throw { code: '40001', message: 'Categorization accounting pointer drifted' }
+        }
+        return data[0]
+      },
+    )
   })
 
   it('returns 401 when not authenticated', async () => {
@@ -230,6 +287,8 @@ describe('POST /api/transactions/[id]/book', () => {
       source_type: 'bank_transaction',
       source_id: 'tx-1',
       lines: validBody.lines,
+      categorization_category: 'uncategorized',
+      categorization_is_business: true,
     })
 
     expect(emitSpy).toHaveBeenCalledWith(

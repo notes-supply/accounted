@@ -37,6 +37,16 @@ function MfaEnrollContent() {
 
   const returnTo = safeReturnTo(searchParams.get('returnTo'), '/')
 
+  const navigateToReturnTarget = () => {
+    if (returnTo.startsWith('/api/')) {
+      // Route handlers such as MCP OAuth return HTML, not an RSC payload.
+      window.location.assign(returnTo)
+      return
+    }
+    router.push(returnTo)
+    router.refresh()
+  }
+
   // UX defense: middleware already blocks this route for BankID-only users
   // without a password, but a stale tab might land here too. Bounce them to
   // the set-password flow before they enroll a factor they cannot later
@@ -152,8 +162,7 @@ function MfaEnrollContent() {
         description: 'Ditt konto är nu skyddat med 2FA.',
       })
 
-      router.push(returnTo)
-      router.refresh()
+      navigateToReturnTarget()
     } catch {
       toast({
         title: 'Verifiering misslyckades',
@@ -217,7 +226,7 @@ function MfaEnrollContent() {
           <Button
             variant="ghost"
             className="w-full mt-4 text-muted-foreground"
-            onClick={() => router.push(returnTo)}
+            onClick={navigateToReturnTarget}
           >
             <ArrowLeft className="mr-2 h-4 w-4" />
             Tillbaka
@@ -316,7 +325,7 @@ function MfaEnrollContent() {
         <Button
           variant="ghost"
           className="w-full mt-4 text-muted-foreground"
-          onClick={() => router.push(returnTo)}
+          onClick={navigateToReturnTarget}
         >
           <ArrowLeft className="mr-2 h-4 w-4" />
           Tillbaka

@@ -807,6 +807,7 @@ export function buildAssetDisposalPlan(args: {
 
 export async function disposeAsset(
   supabase: SupabaseClient,
+  commandSupabase: SupabaseClient,
   companyId: string,
   userId: string,
   assetId: string,
@@ -888,6 +889,7 @@ export async function disposeAsset(
   try {
     disposalEntry = await commitAssetDisposal(
       supabase,
+      commandSupabase,
       companyId,
       userId,
       draft?.id ?? null,

@@ -36,6 +36,11 @@ vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
   createTransactionJournalEntry: (...args: unknown[]) => mockCreateJournalEntry(...args),
 }))
 
+const mockAttachCategorization = vi.fn()
+vi.mock('@/lib/transactions/categorization-attachment', () => ({
+  attachTransactionCategorization: (...args: unknown[]) => mockAttachCategorization(...args),
+}))
+
 vi.mock('@/lib/transactions/booking-duplicate-detection', () => ({
   detectBookingDuplicate: vi.fn().mockResolvedValue(null),
 }))
@@ -63,6 +68,43 @@ describe('POST /api/pending-operations/:id/commit', () => {
     reset()
     mockSupabase.auth.getUser.mockResolvedValue({ data: { user: mockUser } })
     mockCreateJournalEntry.mockResolvedValue({ id: 'je-1' })
+    mockAttachCategorization.mockImplementation(
+      async (
+        supabase: {
+          from: (table: string) => {
+            update: (value: unknown) => {
+              eq: (column: string, value: unknown) => {
+                eq: (column: string, value: unknown) => {
+                  is: (column: string, value: unknown) => {
+                    select: () => Promise<{ data: Array<Record<string, unknown>> | null }>
+                  }
+                }
+              }
+            }
+          }
+        },
+        companyId: string,
+        _userId: string,
+        transaction: { id: string },
+        journalEntry: { id: string },
+        category: string,
+        isBusiness: boolean,
+      ) => {
+        const { data } = await supabase
+          .from('transactions')
+          .update({
+            is_business: isBusiness,
+            category,
+            is_ignored: false,
+            journal_entry_id: journalEntry.id,
+          })
+          .eq('id', transaction.id)
+          .eq('company_id', companyId)
+          .is('journal_entry_id', null)
+          .select()
+        return data?.[0] ?? transaction
+      },
+    )
   })
 
   it('returns 401 when not authenticated', async () => {

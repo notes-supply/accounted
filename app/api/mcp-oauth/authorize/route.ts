@@ -114,8 +114,9 @@ function buildLoginRedirect(request: Request): Response {
  * MFA on every subsequent call: so the consent session itself must be AAL2.
  * The middleware MFA gate deliberately exempts /api/mcp-oauth/* (the token
  * endpoint is Bearer-only), which makes this route responsible for its own
- * step-up. Returns null when the session is AAL2 (or MFA isn't required),
- * otherwise a redirect to /mfa/verify that returns to this authorize URL.
+ * step-up. Returns null when the session is AAL2 (or MFA isn't required).
+ * An enrolled session goes to verification; a session with no verified
+ * factor goes to enrollment. Both paths return to the exact authorize URL.
  */
 async function requireAal2(
   supabase: SupabaseClient,
@@ -125,17 +126,25 @@ async function requireAal2(
   if (!shouldEnforceMfa(user)) return null
   const { data: aal, error: aalError } =
     await supabase.auth.mfa.getAuthenticatorAssuranceLevel()
-  if (aalError || !hasValidAssuranceLevel(aal) || aal.currentLevel !== 'aal2') {
-    const url = new URL(request.url)
-    const returnTo = `${url.pathname}${url.search}`
-    return NextResponse.redirect(
-      new URL(
-        `/mfa/verify?returnTo=${encodeURIComponent(returnTo)}`,
-        resolveRequestAppOrigin(request),
-      ),
-    )
+  if (!aalError && hasValidAssuranceLevel(aal) && aal.currentLevel === 'aal2') {
+    return null
   }
-  return null
+
+  let target: '/mfa/verify' | '/mfa/enroll' = '/mfa/verify'
+  if (!aalError && hasValidAssuranceLevel(aal) && aal.nextLevel !== 'aal2') {
+    const { data: factors } = await supabase.auth.mfa.listFactors()
+    const hasVerifiedFactor = factors?.totp?.some((factor) => factor.status === 'verified')
+    if (!hasVerifiedFactor) target = '/mfa/enroll'
+  }
+
+  const url = new URL(request.url)
+  const returnTo = `${url.pathname}${url.search}`
+  return NextResponse.redirect(
+    new URL(
+      `${target}?returnTo=${encodeURIComponent(returnTo)}`,
+      resolveRequestAppOrigin(request),
+    ),
+  )
 }
 
 function errorRedirect(request: Request, redirectUri: string, state: string | null, error: string, desc: string): Response {

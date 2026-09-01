@@ -4,6 +4,7 @@ import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponse } from '@/lib/errors/get-structured-error'
 import { validateBody } from '@/lib/api/validate'
 import { disposeAsset } from '@/lib/bokslut/assets/asset-service'
+import { createServiceClient } from '@/lib/supabase/server'
 
 const VAT_TREATMENTS = [
   'standard_25',
@@ -68,7 +69,14 @@ export const POST = withRouteContext(
     const validation = await validateBody(request, DisposeAssetSchema)
     if (!validation.success) return validation.response
     try {
-      const result = await disposeAsset(supabase, companyId, user.id, id, validation.data)
+      const result = await disposeAsset(
+        supabase,
+        createServiceClient(),
+        companyId,
+        user.id,
+        id,
+        validation.data,
+      )
       return NextResponse.json({ data: result })
     } catch (err) {
       return errorResponse(err, log, { requestId })

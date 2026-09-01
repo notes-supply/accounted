@@ -32,7 +32,7 @@ import {
   buildMappingResultFromCounterpartyTemplate,
 } from '@/lib/bookkeeping/counterparty-templates'
 import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
-import { reverseOrphanedJournalEntry } from '@/lib/bookkeeping/cancel-orphaned-entry'
+import { attachTransactionCategorization } from '@/lib/transactions/categorization-attachment'
 import { saveUserMappingRule, applySettlementAccount } from '@/lib/bookkeeping/mapping-engine'
 import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
 import { AccountsNotInChartError, isBookkeepingError } from '@/lib/bookkeeping/errors'
@@ -377,6 +377,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     // diverge on neither booking outcomes nor compliance.
     let journalEntryId: string | null = null
     let journalEntryError: string | null = null
+    let updatedTransaction: Transaction | null = null
     try {
       const journalEntry = await createTransactionJournalEntry(
         ctx.supabase,
@@ -384,9 +385,35 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
         ctx.userId,
         transaction as Transaction,
         mappingResult,
+        undefined,
+        { category: finalCategory, isBusiness: is_business },
       )
-      if (journalEntry) journalEntryId = journalEntry.id
+      if (journalEntry) {
+        journalEntryId = journalEntry.id
+        updatedTransaction = await attachTransactionCategorization(
+          ctx.supabase,
+          ctx.companyId!,
+          ctx.userId,
+          transaction as Transaction,
+          journalEntry,
+          finalCategory,
+          is_business,
+        )
+      }
     } catch (err) {
+      if (journalEntryId) {
+        if (
+          err
+          && typeof err === 'object'
+          && 'code' in err
+          && err.code === '40001'
+        ) {
+          return v1ErrorResponseFromCode('TX_CATEGORIZE_RACE', txLog, {
+            requestId: ctx.requestId,
+          })
+        }
+        return v1ErrorResponse(err, txLog, { requestId: ctx.requestId })
+      }
       txLog.error('transactions.categorize: journal entry creation failed', err as Error)
       // AccountsNotInChartError means an account was deactivated between our
       // pre-validation and the engine call (race). Don't fall through to the
@@ -435,50 +462,34 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
       txLog.warn('counterparty template upsert failed (non-critical)', err as Error)
     }
 
-    // CAS guard: another request must not have categorized this transaction
-    // between fetch and write.
-    const { data: updateResult, error: updateErr } = await ctx.supabase
-      .from('transactions')
-      .update({
-        is_business,
-        category: finalCategory,
-        is_ignored: false,
-        journal_entry_id: journalEntryId,
-      })
-      .eq('id', txId)
-      .eq('company_id', ctx.companyId!)
-      .is('journal_entry_id', null)
-      .select('*')
+    if (!updatedTransaction) {
+      // No fiscal period meant no voucher was created. Preserve the established
+      // partial-success response while keeping the guarded pointer unchanged.
+      const { data: updateResult, error: updateErr } = await ctx.supabase
+        .from('transactions')
+        .update({
+          is_business,
+          category: finalCategory,
+          is_ignored: false,
+          journal_entry_id: null,
+        })
+        .eq('id', txId)
+        .eq('company_id', ctx.companyId!)
+        .is('journal_entry_id', null)
+        .select('*')
 
-    if (updateErr) {
-      if (journalEntryId) {
-        await reverseOrphanedJournalEntry(
-          ctx.supabase,
-          ctx.companyId!,
-          ctx.userId,
-          journalEntryId,
-          'Kategoriseringsverifikation utan transaktionskoppling; automatisk storno misslyckades. Manuell avstämning krävs.',
-        )
+      if (updateErr) {
+        return v1ErrorResponse(updateErr, txLog, { requestId: ctx.requestId })
       }
-      return v1ErrorResponse(updateErr, txLog, { requestId: ctx.requestId })
-    }
 
-    if (!updateResult || updateResult.length === 0) {
-      if (journalEntryId) {
-        await reverseOrphanedJournalEntry(
-          ctx.supabase,
-          ctx.companyId!,
-          ctx.userId,
-          journalEntryId,
-          'Kategoriseringsverifikation utan transaktionskoppling; automatisk storno misslyckades. Manuell avstämning krävs.',
-        )
+      if (!updateResult || updateResult.length === 0) {
+        return v1ErrorResponseFromCode('TX_CATEGORIZE_RACE', txLog, {
+          requestId: ctx.requestId,
+        })
       }
-      return v1ErrorResponseFromCode('TX_CATEGORIZE_RACE', txLog, {
-        requestId: ctx.requestId,
-      })
-    }
 
-    const updatedTransaction = updateResult[0] as Transaction
+      updatedTransaction = updateResult[0] as Transaction
+    }
 
     // Propagate the underlag onto the new verifikat: anchor the transaction's
     // pinned document and stamp matched inbox items so they leave the active

@@ -28,7 +28,7 @@ import { applyAccountOverride } from '@/lib/bookkeeping/account-override'
 import { applySettlementAccount } from '@/lib/bookkeeping/mapping-engine'
 import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
 import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
-import { reverseOrphanedJournalEntry } from '@/lib/bookkeeping/cancel-orphaned-entry'
+import { attachTransactionCategorization } from '@/lib/transactions/categorization-attachment'
 import { upsertCounterpartyTemplate } from '@/lib/bookkeeping/counterparty-templates'
 import { isBookkeepingError } from '@/lib/bookkeeping/errors'
 import { renderChannelContextNotes } from '@/lib/documents/channel-context-notes'
@@ -383,65 +383,81 @@ export async function categorizeMatchedTransaction(
   await ensureFiscalPeriod(supabase, userId, companyId, transaction.date, fiscalYearStartMonth)
 
   let journalEntryId: string | null = null
+  let updatedTransaction: Transaction | null = null
   try {
     const journalEntry = await createTransactionJournalEntry(
-      supabase, companyId, userId, transaction as Transaction, mappingResult, notes,
+      supabase,
+      companyId,
+      userId,
+      transaction as Transaction,
+      mappingResult,
+      notes,
+      { category, isBusiness },
     )
-    if (journalEntry) journalEntryId = journalEntry.id
+    if (journalEntry) {
+      journalEntryId = journalEntry.id
+      updatedTransaction = await attachTransactionCategorization(
+        supabase,
+        companyId,
+        userId,
+        transaction as Transaction,
+        journalEntry,
+        category,
+        isBusiness,
+      )
+    }
   } catch (err) {
+    if (journalEntryId) {
+      if (
+        err
+        && typeof err === 'object'
+        && 'code' in err
+        && err.code === '40001'
+      ) {
+        return { error: 'Transaction was categorized by another request.', status: 409 }
+      }
+      const structured = getStructuredError(err)
+      if (structured.code === 'TX_CATEGORIZE_IGNORED_CONFLICT') {
+        return { error: structured.message_sv, status: 409 }
+      }
+    }
     if (isBookkeepingError(err)) throw err
     log.error('Failed to create journal entry:', err)
     return { error: err instanceof Error ? err.message : 'Failed to create journal entry', status: 500 }
   }
 
-  const updateQuery = supabase
-    .from('transactions')
-    .update({
-      is_business: isBusiness,
-      category,
-      is_ignored: false,
-      journal_entry_id: journalEntryId,
-    })
-    .eq('id', txId)
-    .eq('company_id', companyId)
+  if (!updatedTransaction) {
+    const updateQuery = supabase
+      .from('transactions')
+      .update({
+        is_business: isBusiness,
+        category,
+        is_ignored: false,
+        journal_entry_id: null,
+      })
+      .eq('id', txId)
+      .eq('company_id', companyId)
 
-  const guardedUpdate = transaction.journal_entry_id
-    ? updateQuery.eq('journal_entry_id', transaction.journal_entry_id)
-    : updateQuery.is('journal_entry_id', null)
+    const guardedUpdate = transaction.journal_entry_id
+      ? updateQuery.eq('journal_entry_id', transaction.journal_entry_id)
+      : updateQuery.is('journal_entry_id', null)
 
-  const { data: updateResult, error: updateError } = await guardedUpdate.select('*')
+    const { data: updateResult, error: updateError } = await guardedUpdate.select('*')
 
-  if (updateError) {
-    log.error('Failed to update transaction:', updateError)
-    if (journalEntryId) {
-      await reverseOrphanedJournalEntry(
-        supabase,
-        companyId,
-        userId,
-        journalEntryId,
-        'Kategoriseringsverifikation utan transaktionskoppling; automatisk storno misslyckades. Manuell avstämning krävs.',
-      )
+    if (updateError) {
+      log.error('Failed to update transaction:', updateError)
+      const structured = getStructuredError(updateError)
+      return structured.code === 'TX_CATEGORIZE_IGNORED_CONFLICT'
+        ? { error: structured.message_sv, status: 409 }
+        : { error: 'Failed to update transaction', status: 500 }
     }
-    const structured = getStructuredError(updateError)
-    return structured.code === 'TX_CATEGORIZE_IGNORED_CONFLICT'
-      ? { error: structured.message_sv, status: 409 }
-      : { error: 'Failed to update transaction', status: 500 }
-  }
 
-  if (!updateResult || updateResult.length === 0) {
-    if (journalEntryId) {
-      await reverseOrphanedJournalEntry(
-        supabase,
-        companyId,
-        userId,
-        journalEntryId,
-        'Kategoriseringsverifikation utan transaktionskoppling; automatisk storno misslyckades. Manuell avstämning krävs.',
-      )
+    if (!updateResult || updateResult.length === 0) {
+      return { error: 'Transaction was categorized by another request.', status: 409 }
     }
-    return { error: 'Transaction was categorized by another request.', status: 409 }
-  }
 
-  const updatedTransaction = updateResult[0] as Transaction
+    updatedTransaction = updateResult[0] as Transaction
+  }
 
   // Propagate the underlag from matched invoice-inbox items onto the new
   // verifikation and stamp them consumed (BFL 7 kap): shared with the other

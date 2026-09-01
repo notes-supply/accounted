@@ -6,6 +6,16 @@ const { supabase, reset } = createQueuedMockSupabase()
 const requireAuthMock = vi.fn()
 const requireWriteMock = vi.fn()
 
+const { commandSupabase, createServiceClientMock } = vi.hoisted(() => {
+  const command = { rpc: vi.fn() }
+  return {
+    commandSupabase: command,
+    createServiceClientMock: vi.fn(() => command),
+  }
+})
+vi.mock('@/lib/supabase/server', () => ({
+  createServiceClient: createServiceClientMock,
+}))
 vi.mock('@/lib/auth/require-auth', () => ({
   requireAuth: (...args: unknown[]) => requireAuthMock(...args),
 }))
@@ -56,13 +66,35 @@ describe('POST /api/assets/[id]/dispose', () => {
 
     expect(response.status).toBe(401)
     expect(mockDisposeAsset).not.toHaveBeenCalled()
+    expect(createServiceClientMock).not.toHaveBeenCalled()
+  })
+
+  it('returns 403 before disposal when the caller lacks write permission', async () => {
+    requireWriteMock.mockResolvedValue({
+      ok: false,
+      response: NextResponse.json({ error: 'Forbidden' }, { status: 403 }),
+    })
+
+    const response = await POST(
+      createMockRequest('/api/assets/asset-1/dispose', { method: 'POST', body: validBody }),
+      routeParams,
+    )
+
+    expect(response.status).toBe(403)
+    expect(mockDisposeAsset).not.toHaveBeenCalled()
+    expect(createServiceClientMock).not.toHaveBeenCalled()
   })
 
   it('returns 400 for inconsistent scrapping proceeds', async () => {
     const response = await POST(
       createMockRequest('/api/assets/asset-1/dispose', {
         method: 'POST',
-        body: { ...validBody, disposal_type: 'scrap', disposed_proceeds: 100, vat_treatment: undefined },
+        body: {
+          ...validBody,
+          disposal_type: 'scrap',
+          disposed_proceeds: 100,
+          vat_treatment: undefined,
+        },
       }),
       routeParams,
     )
@@ -72,7 +104,9 @@ describe('POST /api/assets/[id]/dispose', () => {
   })
 
   it('returns 404 when the asset does not exist', async () => {
-    mockDisposeAsset.mockRejectedValue(Object.assign(new Error('Asset not found'), { code: 'ASSET_NOT_FOUND' }))
+    mockDisposeAsset.mockRejectedValue(
+      Object.assign(new Error('Asset not found'), { code: 'ASSET_NOT_FOUND' }),
+    )
 
     const { status, body } = await parseJsonResponse<{ error: { code: string } }>(
       await POST(
@@ -83,6 +117,22 @@ describe('POST /api/assets/[id]/dispose', () => {
 
     expect(status).toBe(404)
     expect(body.error.code).toBe('ASSET_NOT_FOUND')
+  })
+
+  it('returns 409 when the asset version changes before the service RPC commits', async () => {
+    mockDisposeAsset.mockRejectedValue(
+      Object.assign(new Error('Asset version changed before disposal'), { code: '40001' }),
+    )
+
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(
+      await POST(
+        createMockRequest('/api/assets/asset-1/dispose', { method: 'POST', body: validBody }),
+        routeParams,
+      ),
+    )
+
+    expect(status).toBe(409)
+    expect(body.error.code).toBe('CONFLICT')
   })
 
   it('returns the atomically posted disposal', async () => {
@@ -101,8 +151,10 @@ describe('POST /api/assets/[id]/dispose', () => {
 
     expect(status).toBe(200)
     expect(body.data.gain_or_loss).toBe(10_000)
+    expect(createServiceClientMock).toHaveBeenCalledTimes(1)
     expect(mockDisposeAsset).toHaveBeenCalledWith(
       supabase,
+      commandSupabase,
       'company-1',
       'user-1',
       'asset-1',

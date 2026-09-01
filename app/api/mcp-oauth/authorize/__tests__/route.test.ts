@@ -49,12 +49,16 @@ function buildSupabase(
   user: { id: string } | null,
   companyName = 'Test AB',
   aal: { currentLevel: string; nextLevel: string } = { currentLevel: 'aal2', nextLevel: 'aal2' },
+  factors: { totp: Array<{ status: string }> } = {
+    totp: aal.nextLevel === 'aal2' ? [{ status: 'verified' }] : [],
+  },
 ) {
   return {
     auth: {
       getUser: vi.fn().mockResolvedValue({ data: { user }, error: null }),
       mfa: {
         getAuthenticatorAssuranceLevel: vi.fn().mockResolvedValue({ data: aal, error: null }),
+        listFactors: vi.fn().mockResolvedValue({ data: factors, error: null }),
       },
     },
     from: vi.fn().mockReturnValue({
@@ -266,7 +270,7 @@ describe('MFA step-up on /api/mcp-oauth/authorize', () => {
     process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-key'
     vi.stubEnv('REQUIRE_MFA', 'true')
     vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'true')
-    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'true')
+    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'false')
     mocks.isAllowedRedirectUri.mockResolvedValue(true)
     mocks.requireCompanyId.mockResolvedValue('company-1')
     mocks.getBranding.mockReturnValue({ appName: 'gnubok' })
@@ -290,6 +294,27 @@ describe('MFA step-up on /api/mcp-oauth/authorize', () => {
     const returnTo = new URL(location.searchParams.get('returnTo')!, location.origin)
     expect(returnTo.pathname).toBe('/api/mcp-oauth/authorize')
     expect(returnTo.searchParams.get('state')).toBe('xyz')
+  })
+
+  it('GET sends a session with no verified factor to enrollment and preserves the authorize target', async () => {
+    mocks.createClient.mockResolvedValue(
+      buildSupabase(
+        { id: 'user-1' },
+        'Test AB',
+        { currentLevel: 'aal1', nextLevel: 'aal1' },
+        { totp: [] },
+      ),
+    )
+
+    const response = await GET(new Request(buildAuthorizeUrl(authorizeParams)))
+
+    expect(response.status).toBeGreaterThanOrEqual(300)
+    expect(response.status).toBeLessThan(400)
+    const location = new URL(response.headers.get('location')!)
+    expect(location.pathname).toBe('/mfa/enroll')
+    const returnTo = new URL(location.searchParams.get('returnTo')!, location.origin)
+    expect(returnTo.pathname).toBe('/api/mcp-oauth/authorize')
+    expect(Object.fromEntries(returnTo.searchParams)).toEqual(authorizeParams)
   })
 
   it('POST rejects an AAL1 session even when the consent form is forged', async () => {
@@ -372,7 +397,7 @@ describe('public-origin redirects on /api/mcp-oauth/authorize', () => {
   it('redirects an AAL1 internal request to canonical MFA verification', async () => {
     vi.stubEnv('REQUIRE_MFA', 'true')
     vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'true')
-    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'true')
+    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'false')
     mocks.createClient.mockResolvedValue(
       buildSupabase({ id: 'user-1' }, 'Test AB', {
         currentLevel: 'aal1',
