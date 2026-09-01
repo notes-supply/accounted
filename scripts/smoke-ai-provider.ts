@@ -98,7 +98,7 @@ async function main(): Promise<void> {
   if (!status.configured) {
     console.error(
       status.reason === 'no_credentials'
-        ? 'No AI credentials found. Set AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY (Bedrock), ANTHROPIC_API_KEY (direct API), or AI_BASE_URL + AI_API_KEY (OpenAI-compatible endpoint).'
+        ? 'No AI credentials found. Set AWS_BEARER_TOKEN_BEDROCK or AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY (Bedrock), ANTHROPIC_API_KEY (direct API), or AI_BASE_URL + AI_API_KEY (OpenAI-compatible endpoint).'
         : 'No model id configured. An OpenAI-compatible endpoint has no default: set AI_MODEL (and optionally AI_EXTRACTION_MODEL for a vision model).'
     )
     process.exit(1)

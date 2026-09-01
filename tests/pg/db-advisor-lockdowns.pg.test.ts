@@ -85,9 +85,13 @@ describe('db-advisor lockdowns.pg', () => {
          ON CONFLICT (id) DO NOTHING`,
       )
       await getPool().query(
+        `DELETE FROM storage.objects
+          WHERE bucket_id = 'receipts'
+            AND name = 'someone-elses-folder/receipt.jpg'`,
+      )
+      await getPool().query(
         `INSERT INTO storage.objects (bucket_id, name)
-         VALUES ('receipts', 'someone-elses-folder/receipt.jpg')
-         ON CONFLICT (bucket_id, name) DO NOTHING`,
+         VALUES ('receipts', 'someone-elses-folder/receipt.jpg')`,
       )
       const client = await getClient()
       try {

@@ -1,6 +1,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { evaluateMappingRules } from '@/lib/bookkeeping/mapping-engine'
 import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
+import { attachTransactionCategorization } from '@/lib/transactions/categorization-attachment'
 import { upsertCounterpartyTemplate } from '@/lib/bookkeeping/counterparty-templates'
 import { getBestInvoiceMatch } from '@/lib/invoices/invoice-matching'
 import { findSupplierInvoiceMatch } from '@/lib/invoices/supplier-invoice-matching'
@@ -1079,22 +1080,31 @@ export async function ingestTransactions(
         )
 
         if (mappingResult.confidence >= 0.8 && !mappingResult.requires_review) {
+          const category = mappingResult.default_private
+            ? 'private'
+            : Number(newTransaction.amount) >= 0
+              ? 'income_other'
+              : 'expense_other'
           const journalEntry = await createTransactionJournalEntry(
             supabase,
             companyId,
             userId,
             newTransaction as Transaction,
-            mappingResult
+            mappingResult,
+            undefined,
+            { category, isBusiness: !mappingResult.default_private },
           )
 
           if (journalEntry) {
-            await supabase
-              .from('transactions')
-              .update({
-                journal_entry_id: journalEntry.id,
-                is_business: !mappingResult.default_private,
-              })
-              .eq('id', newTransaction.id)
+            await attachTransactionCategorization(
+              supabase,
+              companyId,
+              userId,
+              newTransaction as Transaction,
+              journalEntry,
+              category,
+              !mappingResult.default_private,
+            )
 
             // Upsert counterparty template (auto-learned, lower confidence)
             try {

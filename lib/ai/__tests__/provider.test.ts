@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import Anthropic from '@anthropic-ai/sdk'
 import AnthropicBedrock from '@anthropic-ai/bedrock-sdk'
 import {
@@ -15,6 +15,7 @@ const AI_ENV_KEYS = [
   'AI_API_KEY',
   'ANTHROPIC_API_KEY',
   'AWS_ACCESS_KEY_ID',
+  'AWS_BEARER_TOKEN_BEDROCK',
   'AWS_SECRET_ACCESS_KEY',
   'AWS_REGION',
 ] as const
@@ -46,6 +47,11 @@ describe('resolveAiProvider', () => {
   it('uses the direct API when only an Anthropic key is set (self-hosted)', () => {
     process.env.ANTHROPIC_API_KEY = 'sk-ant-api03-example'
     expect(resolveAiProvider()).toBe('anthropic')
+  })
+
+  it('uses Bedrock when only a bearer token is set', () => {
+    process.env.AWS_BEARER_TOKEN_BEDROCK = 'bedrock-bearer-example'
+    expect(resolveAiProvider()).toBe('bedrock')
   })
 
   // The load-bearing precedence case: an operator who adds an Anthropic key
@@ -97,6 +103,11 @@ describe('hasAiCredentials', () => {
     expect(hasAiCredentials()).toBe(true)
   })
 
+  it('is true for a Bedrock bearer token', () => {
+    process.env.AWS_BEARER_TOKEN_BEDROCK = 'bedrock-bearer-example'
+    expect(hasAiCredentials()).toBe(true)
+  })
+
   it('is false for a half-configured AWS key pair', () => {
     process.env.AWS_ACCESS_KEY_ID = 'AKIAEXAMPLE'
     expect(hasAiCredentials()).toBe(false)
@@ -126,6 +137,61 @@ describe('hasAiCredentials', () => {
 })
 
 describe('createAiClient', () => {
+  const request = {
+    model: 'eu.anthropic.claude-sonnet-5',
+    max_tokens: 16,
+    messages: [{ role: 'user' as const, content: 'test' }],
+  }
+
+  it('sends a Bedrock bearer token as authorization without static credentials', async () => {
+    const token = 'bedrock-bearer-example'
+    process.env.AWS_BEARER_TOKEN_BEDROCK = token
+    process.env.AWS_ACCESS_KEY_ID = 'AKIAEXAMPLE'
+    process.env.AWS_SECRET_ACCESS_KEY = 'secret'
+
+    const client = createAiClient() as AnthropicBedrock
+    const fetchWithTimeout = vi.spyOn(client, 'fetchWithTimeout').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: 'msg_test',
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'ok' }],
+          model: request.model,
+          stop_reason: 'end_turn',
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    )
+
+    await client.messages.create(request)
+
+    const headers = new Headers(fetchWithTimeout.mock.calls[0]?.[1]?.headers)
+    expect(headers.get('authorization')).toBe(`Bearer ${token}`)
+    expect(client.awsAccessKey).toBeNull()
+    expect(client.awsSecretKey).toBeNull()
+  })
+
+  it('does not expose a Bedrock bearer token in API errors', async () => {
+    const token = 'bedrock-bearer-example'
+    process.env.AWS_BEARER_TOKEN_BEDROCK = token
+    const client = createAiClient() as AnthropicBedrock
+    vi.spyOn(client, 'fetchWithTimeout').mockResolvedValue(
+      new Response(JSON.stringify({ message: 'unauthorized' }), {
+        status: 401,
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+
+    const error = await client.messages.create(request).then(
+      () => null,
+      (caught: unknown) => caught,
+    )
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).not.toContain(token)
+  })
   it('builds a Bedrock client when AWS keys are set', () => {
     process.env.AWS_ACCESS_KEY_ID = 'AKIAEXAMPLE'
     process.env.AWS_SECRET_ACCESS_KEY = 'secret'
@@ -182,6 +248,17 @@ describe('aiCredentialPrefix', () => {
     const prefix = aiCredentialPrefix()
     expect(prefix).toBe('AKIA')
     expect(prefix).not.toContain('SECRET')
+  })
+
+  it('identifies bearer authentication without returning token bytes', () => {
+    const token = 'opaque-SECRETSECRET'
+    process.env.AWS_BEARER_TOKEN_BEDROCK = token
+    process.env.AWS_ACCESS_KEY_ID = 'AKIASECRETSECRET'
+    process.env.AWS_SECRET_ACCESS_KEY = 'secret'
+
+    expect(aiCredentialPrefix()).toBe('bearer')
+    expect(aiCredentialPrefix()).not.toContain('SECRET')
+    expect(token).not.toContain(aiCredentialPrefix()!)
   })
 
   it('returns null when nothing is configured', () => {

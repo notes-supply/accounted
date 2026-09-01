@@ -23,6 +23,12 @@ vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
     mockCreateTransactionJournalEntry(...args),
 }))
 
+const mockAttachTransactionCategorization = vi.fn()
+vi.mock('@/lib/transactions/categorization-attachment', () => ({
+  attachTransactionCategorization: (...args: unknown[]) =>
+    mockAttachTransactionCategorization(...args),
+}))
+
 const mockGetBestInvoiceMatch = vi.fn()
 vi.mock('@/lib/invoices/invoice-matching', () => ({
   getBestInvoiceMatch: (...args: unknown[]) => mockGetBestInvoiceMatch(...args),
@@ -142,6 +148,7 @@ function makeMappingResult(overrides: Record<string, unknown> = {}) {
 describe('ingestTransactions', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mockAttachTransactionCategorization.mockResolvedValue({})
   })
 
   // -----------------------------------------------------------------------
@@ -1879,7 +1886,9 @@ describe('ingestTransactions', () => {
       COMPANY_ID,
       USER_ID,
       expect.objectContaining({ id: 'tx-cat' }),
-      expect.objectContaining({ confidence: 0.85 })
+      expect.objectContaining({ confidence: 0.85 }),
+      undefined,
+      { category: 'expense_other', isBusiness: true },
     )
   })
 

@@ -29,10 +29,6 @@ vi.mock('@/lib/auth/require-write', () => ({
   requireWritePermission: (...args: unknown[]) => requireWriteMock(...args),
 }))
 
-const mockReverseEntry = vi.fn()
-vi.mock('@/lib/bookkeeping/engine', () => ({
-  reverseEntry: (...args: unknown[]) => mockReverseEntry(...args),
-}))
 
 import { POST } from '../route'
 
@@ -74,7 +70,7 @@ describe('POST /api/transactions/[id]/uncategorize', () => {
 
     expect(status).toBe(403)
     expect(body).toEqual({ error: 'Forbidden' })
-    expect(mockReverseEntry).not.toHaveBeenCalled()
+    expect(mockSupabase.rpc).not.toHaveBeenCalled()
   })
 
   it('returns 404 when transaction not found', async () => {
@@ -111,10 +107,10 @@ describe('POST /api/transactions/[id]/uncategorize', () => {
     expect(body).toEqual({ error: 'Journal entry is not posted' })
   })
 
-  it('returns 500 when reversal fails', async () => {
+  it('returns 500 when atomic compensation fails', async () => {
     enqueue({ data: { id: 'tx-1', journal_entry_id: 'je-1' }, error: null })
     enqueue({ data: { id: 'je-1', status: 'posted' }, error: null })
-    mockReverseEntry.mockRejectedValue(new Error('Period is locked'))
+    enqueue({ data: null, error: { message: 'Period is locked' } })
 
     const request = createMockRequest('/api/transactions/tx-1/uncategorize', { method: 'POST' })
     const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
@@ -124,11 +120,10 @@ describe('POST /api/transactions/[id]/uncategorize', () => {
     expect(body).toEqual({ error: 'Kunde inte hantera transaktionen. Försök igen.' })
   })
 
-  it('returns 200 and reverses entry on success', async () => {
+  it('returns 200 after the atomic compensation command succeeds', async () => {
     enqueue({ data: { id: 'tx-1', journal_entry_id: 'je-1' }, error: null })
     enqueue({ data: { id: 'je-1', status: 'posted' }, error: null })
-    mockReverseEntry.mockResolvedValue({ id: 'je-reversal' })
-    enqueue({ data: { id: 'tx-1' }, error: null })
+    enqueue({ data: { status: 'applied' }, error: null })
 
     const request = createMockRequest('/api/transactions/tx-1/uncategorize', { method: 'POST' })
     const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
@@ -136,6 +131,29 @@ describe('POST /api/transactions/[id]/uncategorize', () => {
 
     expect(status).toBe(200)
     expect(body).toEqual({ success: true })
-    expect(mockReverseEntry).toHaveBeenCalledWith(mockSupabase, 'company-1', 'user-1', 'je-1')
+    expect(mockSupabase.rpc).toHaveBeenCalledWith(
+      'compensate_transaction_categorization',
+      {
+        p_company_id: 'company-1',
+        p_transaction_id: 'tx-1',
+        p_original_journal_entry_id: 'je-1',
+        p_actor_type: 'user',
+        p_actor_id: 'user-1',
+        p_actor_label: null,
+      },
+    )
+  })
+
+  it('returns 409 when the compensation readback reports a lost pointer race', async () => {
+    enqueue({ data: { id: 'tx-1', journal_entry_id: 'je-1' }, error: null })
+    enqueue({ data: { id: 'je-1', status: 'posted' }, error: null })
+    enqueue({ data: { status: 'conflict' }, error: null })
+
+    const request = createMockRequest('/api/transactions/tx-1/uncategorize', { method: 'POST' })
+    const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
+    const { status, body } = await parseJsonResponse(response)
+
+    expect(status).toBe(409)
+    expect(body).toEqual({ error: 'Transaction changed during uncategorization' })
   })
 })

@@ -93,6 +93,26 @@ vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
   createTransactionJournalEntry: (...args: unknown[]) => mockCreateTransactionJournalEntry(...args),
 }))
 
+vi.mock('@/lib/transactions/categorization-attachment', () => ({
+  attachTransactionCategorization: vi.fn(
+    async (
+      _supabase: unknown,
+      _companyId: string,
+      _userId: string,
+      transaction: Record<string, unknown>,
+      journalEntry: { id: string },
+      category: string,
+      isBusiness: boolean,
+    ) => ({
+      ...transaction,
+      category,
+      is_business: isBusiness,
+      is_ignored: false,
+      journal_entry_id: journalEntry.id,
+    }),
+  ),
+}))
+
 // Only the DB-backed detector is stubbed; the pure helpers the route imports
 // from this module (resolveTransactionAmountSek) keep their real behaviour.
 const mockDetectDup = vi.fn()
@@ -116,6 +136,7 @@ vi.mock('@/lib/bookkeeping/counterparty-templates', () => ({
 
 vi.mock('@/lib/bookkeeping/cancel-orphaned-entry', () => ({
   cancelOrphanedPaymentEntry: vi.fn().mockResolvedValue(undefined),
+  reverseOrphanedJournalEntry: vi.fn().mockResolvedValue(undefined),
 }))
 
 vi.mock('@/lib/bookkeeping/account-validation', async () => {

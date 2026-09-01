@@ -17,6 +17,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 const mockCreateJE = vi.fn()
+const mockAttachCategorization = vi.fn()
 const mockDetectDup = vi.fn()
 const mockMapping = vi.fn()
 const mockUpsertTemplate = vi.fn()
@@ -24,6 +25,9 @@ const mockLinkToJE = vi.fn()
 
 vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
   createTransactionJournalEntry: (...args: unknown[]) => mockCreateJE(...args),
+}))
+vi.mock('@/lib/transactions/categorization-attachment', () => ({
+  attachTransactionCategorization: (...args: unknown[]) => mockAttachCategorization(...args),
 }))
 vi.mock('@/lib/transactions/booking-duplicate-detection', () => ({
   detectBookingDuplicate: (...args: unknown[]) => mockDetectDup(...args),
@@ -78,6 +82,46 @@ beforeEach(() => {
     description: 'Programvara',
   })
   mockCreateJE.mockResolvedValue({ id: 'je-1' })
+  mockAttachCategorization.mockImplementation(
+    async (
+      supabase: {
+        from: (table: string) => {
+          update: (value: unknown) => {
+            eq: (column: string, value: unknown) => {
+              eq: (column: string, value: unknown) => {
+                select: () => Promise<{ data: Array<Record<string, unknown>> | null }>
+              }
+            }
+          }
+        }
+      },
+      _companyId: string,
+      _userId: string,
+      transaction: Record<string, unknown>,
+      journalEntry: { id: string },
+      category: string,
+      isBusiness: boolean,
+    ) => {
+      const { data } = await supabase
+        .from('transactions')
+        .update({
+          is_business: isBusiness,
+          category,
+          is_ignored: false,
+          journal_entry_id: journalEntry.id,
+        })
+        .eq('id', transaction.id)
+        .eq('company_id', transaction.company_id)
+        .select()
+      return data?.[0] ?? {
+        ...transaction,
+        category,
+        is_business: isBusiness,
+        is_ignored: false,
+        journal_entry_id: journalEntry.id,
+      }
+    },
+  )
 })
 
 describe('BulkBookInboxSchema', () => {
@@ -293,6 +337,7 @@ describe('bulkBookMatchedInboxItems: booking', () => {
       expect.objectContaining({ id: 'tx-1', cash_account_id: 'cash-1' }),
       expect.objectContaining({ debit_account: '5420', credit_account: '1931' }),
       undefined,
+      { category: 'expense_software', isBusiness: true },
     )
   })
 
@@ -334,6 +379,7 @@ describe('bulkBookMatchedInboxItems: booking', () => {
       expect.objectContaining({ id: 'tx-1' }),
       expect.objectContaining({ dimensions: { '6': 'P001' } }),
       undefined,
+      { category: 'expense_software', isBusiness: true },
     )
   })
 
@@ -404,6 +450,7 @@ describe('bulkBookMatchedInboxItems: WhatsApp channel-context notes threading', 
       expect.objectContaining({ id: 'tx-1' }),
       expect.anything(),
       RENDERED,
+      { category: 'expense_software', isBusiness: true },
     )
   })
 
@@ -423,6 +470,7 @@ describe('bulkBookMatchedInboxItems: WhatsApp channel-context notes threading', 
       expect.objectContaining({ id: 'tx-1' }),
       expect.anything(),
       `Gemensam batchanteckning · ${RENDERED}`,
+      { category: 'expense_software', isBusiness: true },
     )
   })
 
@@ -465,6 +513,7 @@ describe('bulkBookMatchedInboxItems: WhatsApp channel-context notes threading', 
       expect.objectContaining({ id: 'tx-1' }),
       expect.anything(),
       'Gemensam batchanteckning',
+      { category: 'expense_software', isBusiness: true },
     )
     const passedNotes = mockCreateJE.mock.calls[0][5] as string | undefined
     expect(passedNotes).not.toContain('sjukbesök')
@@ -500,6 +549,7 @@ describe('bulkBookMatchedInboxItems: WhatsApp channel-context notes threading', 
       expect.objectContaining({ id: 'tx-1' }),
       expect.anything(),
       RENDERED,
+      { category: 'expense_software', isBusiness: true },
     )
   })
 
@@ -526,6 +576,7 @@ describe('bulkBookMatchedInboxItems: WhatsApp channel-context notes threading', 
       expect.objectContaining({ id: 'tx-1' }),
       expect.anything(),
       'Bara batchanteckningen',
+      { category: 'expense_software', isBusiness: true },
     )
   })
 })

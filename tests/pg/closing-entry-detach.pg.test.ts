@@ -29,8 +29,9 @@ async function insertStornoOf(params: {
     await client.query(
       `INSERT INTO public.journal_entries
          (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-          entry_date, description, source_type, status, reverses_id)
-       VALUES ($1, $2, $3, $4, $5, 'A', '2026-12-31', 'Makulering', $6, $7, $8)`,
+          entry_date, description, source_type, status, reverses_id, committed_at)
+       VALUES ($1, $2, $3, $4, $5, 'A', '2026-12-31', 'Makulering', $6, $7, $8,
+               CASE WHEN $7 = 'posted' THEN now() ELSE NULL END)`,
       [
         id,
         params.userId,
@@ -104,22 +105,17 @@ describe('closing_entry_id detach escape hatch', () => {
     ).rejects.toThrow(/year-end closing is immutable/)
   })
 
-  it('blocks detaching when status is reversed but no storno chain exists', async () => {
-    await getPool().query(
-      `UPDATE public.journal_entries SET status = 'reversed' WHERE id = $1`,
-      [closingEntryId],
-    )
-
+  it('blocks creating a reversed state without a complete storno chain', async () => {
     await expect(
       getPool().query(
-        `UPDATE public.fiscal_periods SET closing_entry_id = NULL WHERE id = $1`,
-        [fiscalPeriodId],
+        `UPDATE public.journal_entries SET status = 'reversed' WHERE id = $1`,
+        [closingEntryId],
       ),
-    ).rejects.toThrow(/year-end closing is immutable/)
+    ).rejects.toThrow(/must identify its storno|Journal lineage state/i)
   })
 
   it('blocks the escape hatch when the storno is not posted', async () => {
-    // closingEntryId is status='reversed' from the previous test.
+    // A cancelled storno does not complete a reversal chain.
     await insertStornoOf({
       userId,
       companyId,
@@ -139,13 +135,19 @@ describe('closing_entry_id detach escape hatch', () => {
 
   it('blocks replacing a reversed closing entry with a non-year_end entry', async () => {
     // Complete the storno chain so the reversal itself is now legitimate.
-    await insertStornoOf({
+    const stornoId = await insertStornoOf({
       userId,
       companyId,
       fiscalPeriodId,
       reversesId: closingEntryId,
       voucherNumber: 3,
     })
+    await getPool().query(
+      `UPDATE public.journal_entries
+          SET status = 'reversed', reversed_by_id = $2
+        WHERE id = $1`,
+      [closingEntryId, stornoId],
+    )
 
     const manualId = await insertDraftJournalEntry({
       userId,
@@ -208,17 +210,19 @@ describe('closing_entry_id detach escape hatch', () => {
     )
     const currentClosingId = current[0].closing_entry_id
 
-    await getPool().query(
-      `UPDATE public.journal_entries SET status = 'reversed' WHERE id = $1`,
-      [currentClosingId],
-    )
-    await insertStornoOf({
+    const stornoId = await insertStornoOf({
       userId,
       companyId,
       fiscalPeriodId,
       reversesId: currentClosingId,
       voucherNumber: 6,
     })
+    await getPool().query(
+      `UPDATE public.journal_entries
+          SET status = 'reversed', reversed_by_id = $2
+        WHERE id = $1`,
+      [currentClosingId, stornoId],
+    )
 
     const replacementId = await insertDraftJournalEntry({
       userId,

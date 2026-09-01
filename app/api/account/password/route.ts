@@ -51,7 +51,9 @@ const SetPasswordSchema = z.object({
  * more time, but a retry will re-flip the flag.
  */
 export async function POST(request: Request) {
-  const { user, supabase, error: authError } = await requireAuth()
+  const { user, supabase, error: authError } = await requireAuth({
+    allowInitialPasswordAtAal1: true,
+  })
   if (authError) return authError
 
   const result = await validateBody(request, SetPasswordSchema)

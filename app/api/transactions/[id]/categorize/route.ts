@@ -5,7 +5,7 @@ import { ensureInitialized } from '@/lib/init'
 import { buildMappingResultFromCategory } from '@/lib/bookkeeping/category-mapping'
 import { getTemplateById, buildMappingResultFromTemplate, validateTemplateForEntity } from '@/lib/bookkeeping/booking-templates'
 import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
-import { reverseOrphanedJournalEntry } from '@/lib/bookkeeping/cancel-orphaned-entry'
+import { attachTransactionCategorization } from '@/lib/transactions/categorization-attachment'
 import { detectBookingDuplicate } from '@/lib/transactions/booking-duplicate-detection'
 import { appendProcessingHistory } from '@/lib/processing-history/append'
 import { saveUserMappingRule, applySettlementAccount } from '@/lib/bookkeeping/mapping-engine'
@@ -771,6 +771,7 @@ export const POST = withRouteContext(
     let journalEntryId: string | null = null
     let journalEntryError: string | null = null
     let documentLinkWarning: string | null = null
+    let updatedTransaction: Transaction | null = null
 
     try {
       const journalEntry = await createTransactionJournalEntry(
@@ -779,13 +780,35 @@ export const POST = withRouteContext(
         user.id,
         transaction as Transaction,
         mappingResult,
+        undefined,
+        { category: finalCategory, isBusiness: is_business },
       )
 
       if (journalEntry) {
         journalEntryCreated = true
         journalEntryId = journalEntry.id
+        updatedTransaction = await attachTransactionCategorization(
+          supabase,
+          companyId,
+          user.id,
+          transaction as Transaction,
+          journalEntry,
+          finalCategory,
+          is_business,
+        )
       }
     } catch (err) {
+      if (journalEntryId) {
+        if (
+          err
+          && typeof err === 'object'
+          && 'code' in err
+          && err.code === '40001'
+        ) {
+          return errorResponseFromCode('TX_CATEGORIZE_RACE', txLog, { requestId })
+        }
+        return errorResponse(err, txLog, { requestId })
+      }
       txLog.error('failed to create transaction journal entry', err as Error)
       // AccountsNotInChartError means an account was deactivated between our
       // pre-validation and the engine call (rare race). Don't fall through to
@@ -917,51 +940,31 @@ export const POST = withRouteContext(
       }
     }
 
-    const { data: updateResult, error: updateError } = await supabase
-      .from('transactions')
-      .update({
-        is_business,
-        category: finalCategory,
-        is_ignored: false,
-        journal_entry_id: journalEntryId,
-      })
-      .eq('id', id)
-      .eq('company_id', companyId)
-      .is('journal_entry_id', null)
-      .select('*')
+    if (!updatedTransaction) {
+      const { data: updateResult, error: updateError } = await supabase
+        .from('transactions')
+        .update({
+          is_business,
+          category: finalCategory,
+          is_ignored: false,
+          journal_entry_id: null,
+        })
+        .eq('id', id)
+        .eq('company_id', companyId)
+        .is('journal_entry_id', null)
+        .select('*')
 
-    if (updateError) {
-      txLog.error('failed to update transaction', updateError)
-      if (journalEntryId) {
-        await reverseOrphanedJournalEntry(
-          supabase,
-          companyId,
-          user.id,
-          journalEntryId,
-          'Kategoriseringsverifikation utan transaktionskoppling; automatisk storno misslyckades. Manuell avstämning krävs.',
-        )
-      }
-      return errorResponse(updateError, txLog, { requestId })
-    }
-
-    if (!updateResult || updateResult.length === 0) {
-      // CAS guard: another request set journal_entry_id between our read and
-      // write. If this request posted an orphan, compensate through the
-      // bookkeeping engine with a storno entry.
-      if (journalEntryId) {
-        await reverseOrphanedJournalEntry(
-          supabase,
-          companyId,
-          user.id,
-          journalEntryId,
-          'Kategoriseringsverifikation utan transaktionskoppling; automatisk storno misslyckades. Manuell avstämning krävs.',
-        )
+      if (updateError) {
+        txLog.error('failed to update transaction', updateError)
+        return errorResponse(updateError, txLog, { requestId })
       }
 
-      return errorResponseFromCode('TX_CATEGORIZE_RACE', txLog, { requestId })
-    }
+      if (!updateResult || updateResult.length === 0) {
+        return errorResponseFromCode('TX_CATEGORIZE_RACE', txLog, { requestId })
+      }
 
-    const updatedTransaction = updateResult[0] as Transaction
+      updatedTransaction = updateResult[0] as Transaction
+    }
 
     // Flag any inbox underlag already matched to this transaction as booked.
     // The block above only fires when the caller passes an explicit

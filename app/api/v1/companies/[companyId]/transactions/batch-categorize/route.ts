@@ -27,7 +27,7 @@ import {
   validateTemplateForEntity,
 } from '@/lib/bookkeeping/booking-templates'
 import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
-import { reverseOrphanedJournalEntry } from '@/lib/bookkeeping/cancel-orphaned-entry'
+import { attachTransactionCategorization } from '@/lib/transactions/categorization-attachment'
 import { AccountsNotInChartError, isBookkeepingError } from '@/lib/bookkeeping/errors'
 import { collectMappingResultAccounts, findUnresolvableAccounts } from '@/lib/bookkeeping/account-validation'
 import { propagateUnderlagForBookedTransaction } from '@/lib/transactions/inbox-underlag'
@@ -340,6 +340,7 @@ async function categorizeOne(
 
   let journalEntryId: string | null = null
   let journalEntryError: string | null = null
+  let updatedTransaction: Transaction | null = null
   try {
     const je = await createTransactionJournalEntry(
       supabase,
@@ -347,9 +348,36 @@ async function categorizeOne(
       userId,
       transaction as Transaction,
       mappingResult,
+      undefined,
+      { category: finalCategory, isBusiness: is_business },
     )
-    if (je) journalEntryId = je.id
+    if (je) {
+      journalEntryId = je.id
+      updatedTransaction = await attachTransactionCategorization(
+        supabase,
+        companyId,
+        userId,
+        transaction as Transaction,
+        je,
+        finalCategory,
+        is_business,
+      )
+    }
   } catch (err) {
+    if (journalEntryId) {
+      return {
+        ok: false,
+        request_index: index,
+        transaction_id: transactionId,
+        error:
+          err
+          && typeof err === 'object'
+          && 'code' in err
+          && err.code === '40001'
+            ? { code: 'TX_CATEGORIZE_RACE', message: 'Concurrent state change.' }
+            : categorizeUpdateError(err),
+      }
+    }
     log.error('batch-categorize: journal entry creation failed', err as Error, {
       request_index: index,
       transactionId,
@@ -378,54 +406,38 @@ async function categorizeOne(
     }
   }
 
-  const { data: updated, error: updateErr } = await supabase
-    .from('transactions')
-    .update({
-      is_business,
-      category: finalCategory,
-      is_ignored: false,
-      journal_entry_id: journalEntryId,
-    })
-    .eq('id', transactionId)
-    .eq('company_id', companyId)
-    .is('journal_entry_id', null)
-    .select('*')
-  if (updateErr) {
-    if (journalEntryId) {
-      await reverseOrphanedJournalEntry(
-        supabase,
-        companyId,
-        userId,
-        journalEntryId,
-        'Kategoriseringsverifikation utan transaktionskoppling; automatisk storno misslyckades. Manuell avstämning krävs.',
-      )
+  if (!updatedTransaction) {
+    const { data: updated, error: updateErr } = await supabase
+      .from('transactions')
+      .update({
+        is_business,
+        category: finalCategory,
+        is_ignored: false,
+        journal_entry_id: null,
+      })
+      .eq('id', transactionId)
+      .eq('company_id', companyId)
+      .is('journal_entry_id', null)
+      .select('*')
+    if (updateErr) {
+      return {
+        ok: false,
+        request_index: index,
+        transaction_id: transactionId,
+        error: categorizeUpdateError(updateErr),
+      }
     }
-    return {
-      ok: false,
-      request_index: index,
-      transaction_id: transactionId,
-      error: categorizeUpdateError(updateErr),
+    if (!updated || updated.length === 0) {
+      return {
+        ok: false,
+        request_index: index,
+        transaction_id: transactionId,
+        error: { code: 'TX_CATEGORIZE_RACE', message: 'Concurrent state change.' },
+      }
     }
-  }
-  if (!updated || updated.length === 0) {
-    if (journalEntryId) {
-      await reverseOrphanedJournalEntry(
-        supabase,
-        companyId,
-        userId,
-        journalEntryId,
-        'Kategoriseringsverifikation utan transaktionskoppling; automatisk storno misslyckades. Manuell avstämning krävs.',
-      )
-    }
-    return {
-      ok: false,
-      request_index: index,
-      transaction_id: transactionId,
-      error: { code: 'TX_CATEGORIZE_RACE', message: 'Concurrent state change.' },
-    }
-  }
 
-  const updatedTransaction = updated[0] as Transaction
+    updatedTransaction = updated[0] as Transaction
+  }
 
   // Propagate the underlag onto the new verifikat: anchor the transaction's
   // pinned document and stamp matched inbox items. Same shared step as the

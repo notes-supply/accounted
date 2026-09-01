@@ -1,4 +1,5 @@
 const LOCAL_APP_ORIGIN = 'http://localhost:3000'
+const LEGACY_APP_HOST = 'app.gnubok.se'
 
 interface ParsedHost {
   hostname: string
@@ -69,12 +70,11 @@ export function getCanonicalAppOrigin(): string {
 }
 
 /**
- * Resolve a browser origin or request host to an application origin.
- *
- * The canonical app host is always trusted. Additional hosts must be exact
- * entries in NEXT_PUBLIC_WHITELABEL_DOMAINS. Wildcards and suffix matching are
+ * The canonical app host and the deliberate app.gnubok.se compatibility host
+ * are trusted. Additional hosts must be exact entries in
+ * NEXT_PUBLIC_WHITELABEL_DOMAINS. Wildcards and suffix matching are
  * intentionally unsupported: auth links may never follow an attacker-chosen
- * Host header. Registered white-label domains are always upgraded to HTTPS.
+ * Host header. Registered public domains are always upgraded to HTTPS.
  */
 export function resolveTrustedAppOrigin(candidate: string | null | undefined): string {
   const canonicalOrigin = getCanonicalAppOrigin()
@@ -85,6 +85,10 @@ export function resolveTrustedAppOrigin(candidate: string | null | undefined): s
 
   if (parsed.hostname === normalizeHostname(canonical.hostname)) {
     return canonicalOrigin
+  }
+
+  if (parsed.hostname === LEGACY_APP_HOST && parsed.port === '') {
+    return `https://${parsed.hostname}`
   }
 
   if (!registeredWhiteLabelHosts().has(parsed.hostname)) {
@@ -98,10 +102,17 @@ export function resolveTrustedAppOrigin(candidate: string | null | undefined): s
   return `https://${parsed.hostname}`
 }
 
-/** Resolve an API request to a trusted application origin. */
+/**
+ * Resolve an API request to a trusted public application origin.
+ *
+ * Reverse proxies may leave request.url on an internal pod origin while
+ * preserving the browser-facing Host header. The host is still untrusted, so
+ * it is accepted only through the exact canonical, legacy, and white-label
+ * checks in resolveTrustedAppOrigin.
+ */
 export function resolveRequestAppOrigin(request: Request): string {
   const requestOrigin = parseHttpOrigin(request.url)?.origin
-  return resolveTrustedAppOrigin(requestOrigin)
+  return resolveTrustedAppOrigin(request.headers.get('host') ?? requestOrigin)
 }
 
 /**

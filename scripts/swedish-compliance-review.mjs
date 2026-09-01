@@ -181,12 +181,15 @@ ${diff}
 }
 
 async function main() {
-  if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
+  const bearerToken = process.env.AWS_BEARER_TOKEN_BEDROCK;
+  const accessKey = process.env.AWS_ACCESS_KEY_ID;
+  const secretKey = process.env.AWS_SECRET_ACCESS_KEY;
+  if (!bearerToken && (!accessKey || !secretKey)) {
     writeFileSync(
       OUTPUT_FILE,
-      `${COMMENT_MARKER}\n\n## Swedish Accounting Compliance Review\n\nSkipped: AWS Bedrock credentials (\`AWS_ACCESS_KEY_ID\` / \`AWS_SECRET_ACCESS_KEY\`) are not set.\n`,
+      `${COMMENT_MARKER}\n\n## Swedish Accounting Compliance Review\n\nSkipped: AWS Bedrock authentication is not configured.\n`,
     );
-    console.warn('AWS credentials missing: wrote skip notice and exiting 0.');
+    console.warn('AWS Bedrock authentication missing: wrote skip notice and exiting 0.');
     return;
   }
 
@@ -201,11 +204,14 @@ async function main() {
     return;
   }
 
-  const client = new AnthropicBedrock({
-    awsRegion: process.env.AWS_REGION || 'eu-north-1',
-    awsAccessKey: process.env.AWS_ACCESS_KEY_ID,
-    awsSecretKey: process.env.AWS_SECRET_ACCESS_KEY,
-  });
+  const awsRegion = process.env.AWS_REGION || 'eu-north-1';
+  const client = bearerToken
+    ? new AnthropicBedrock({ apiKey: bearerToken, awsRegion })
+    : new AnthropicBedrock({
+        awsRegion,
+        awsAccessKey: accessKey,
+        awsSecretKey: secretKey,
+      });
   // Unguessable per-run delimiter so embedded "</tag>" in a hostile diff can't
   // break out of the untrusted-data boundary.
   const diffTag = `UNTRUSTED_DIFF_${randomBytes(8).toString('hex')}`;

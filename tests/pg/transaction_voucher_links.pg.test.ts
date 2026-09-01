@@ -5,8 +5,9 @@ import {
   insertCompany,
   insertCompanyMember,
   insertFiscalPeriod,
+  insertPostedJournalEntry,
 } from '@/tests/pg/fixtures'
-import { getPool } from '@/tests/pg/setup'
+import { getPool, runAsServiceRole } from '@/tests/pg/setup'
 
 /**
  * Covers 20260529120000_transaction_voucher_links per PR #602 review note:
@@ -222,28 +223,25 @@ describe('block_contradictory_invoice_denorm trigger', () => {
     const siB = await insertSupplierInvoice({ userId, companyId, supplierId, total: 2000 })
     const txId = await insertTransaction({ userId, companyId, amount: -1000 })
 
-    const jeId = randomUUID()
-    await getPool().query(
-      `INSERT INTO public.journal_entries
-         (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-          entry_date, description, source_type, status)
-       VALUES ($1, $2, $3, $4, 1, 'A', '2026-06-05', 'Test', 'manual', 'draft')`,
-      [jeId, userId, companyId, fiscalPeriodId],
-    )
-    await getPool().query(
-      `INSERT INTO public.journal_entry_lines (journal_entry_id, account_number, debit_amount, credit_amount)
-       VALUES ($1, '2440', 1000, 0), ($1, '1930', 0, 1000)`,
-      [jeId],
-    )
-    await getPool().query(`UPDATE public.journal_entries SET status = 'posted' WHERE id = $1`, [jeId])
+    const jeId = await insertPostedJournalEntry({
+      userId,
+      companyId,
+      fiscalPeriodId,
+      sourceType: 'supplier_invoice_paid',
+      sourceId: siA,
+      lines: [
+        { accountNumber: '2440', debitAmount: 1000, creditAmount: 0 },
+        { accountNumber: '1930', debitAmount: 0, creditAmount: 1000 },
+      ],
+    })
 
-    await getPool().query(
+    await runAsServiceRole((client) => client.query(
       `INSERT INTO public.supplier_invoice_payments
          (user_id, company_id, supplier_invoice_id, payment_date, amount, currency,
           journal_entry_id, transaction_id)
        VALUES ($1, $2, $3, '2026-06-05', 1000, 'SEK', $4, $5)`,
       [userId, companyId, siA, jeId, txId],
-    )
+    ))
 
     await expect(
       getPool().query(`UPDATE public.transactions SET supplier_invoice_id = $1 WHERE id = $2`, [

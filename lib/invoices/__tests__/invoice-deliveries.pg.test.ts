@@ -159,12 +159,13 @@ describe('invoice_deliveries.pg: immutable delivery evidence', () => {
       documentId,
     })
 
+    const providerMessageId = `provider-${randomUUID()}`
     await getPool().query(
       `UPDATE public.invoice_deliveries
           SET status = 'sent', provider = 'resend',
-              provider_message_id = 'provider-1', sent_at = now()
+              provider_message_id = $2, sent_at = now()
         WHERE id = $1`,
-      [deliveryId],
+      [deliveryId, providerMessageId],
     )
 
     await expect(

@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { seedCompany, insertTransaction, insertDraftJournalEntry } from '@/tests/pg/fixtures'
+import {
+  seedCompany,
+  insertTransaction,
+  insertDraftJournalEntry,
+  insertPostedJournalEntry,
+} from '@/tests/pg/fixtures'
 import { getPool } from '@/tests/pg/setup'
 
 /**
@@ -159,9 +164,23 @@ describe('transactions potential_journal_entry: clear on reversal', () => {
     await setSuggestion(txId, jeId)
 
     // The storno path's status transition (posted -> reversed).
+    const stornoId = await insertPostedJournalEntry({
+      userId,
+      companyId,
+      fiscalPeriodId,
+      voucherNumber: 1_000_000_000,
+      sourceType: 'storno',
+      reversesId: jeId,
+      lines: [
+        { accountNumber: '1930', debitAmount: 0, creditAmount: 1000 },
+        { accountNumber: '3001', debitAmount: 1000, creditAmount: 0 },
+      ],
+    })
     await getPool().query(
-      `UPDATE public.journal_entries SET status = 'reversed' WHERE id = $1`,
-      [jeId],
+      `UPDATE public.journal_entries
+          SET status = 'reversed', reversed_by_id = $2
+        WHERE id = $1`,
+      [jeId, stornoId],
     )
 
     const row = await getSuggestion(txId)

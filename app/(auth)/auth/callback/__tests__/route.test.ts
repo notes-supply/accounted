@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { NextRequest } from 'next/server'
 
 const verifyOtp = vi.fn()
@@ -26,9 +26,14 @@ vi.mock('@/lib/auth/invite-tokens', () => ({
 
 import { GET } from '../route'
 
+afterEach(() => {
+  vi.unstubAllEnvs()
+})
+
 describe('GET /auth/callback: recovery flow', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    vi.unstubAllEnvs()
   })
 
   it('redirects to /reset-password after a successful recovery OTP (token-hash flow)', async () => {
@@ -42,6 +47,44 @@ describe('GET /auth/callback: recovery flow', () => {
     expect(response.status).toBe(307)
     expect(response.headers.get('location')).toBe('http://localhost:3000/reset-password')
     expect(verifyOtp).toHaveBeenCalledWith({ token_hash: 'abc', type: 'recovery' })
+  })
+
+  it('uses the canonical public origin instead of an internal pod origin', async () => {
+    vi.stubEnv('NEXT_PUBLIC_APP_URL', 'https://accounted.example')
+    verifyOtp.mockResolvedValue({ error: null })
+
+    const request = new NextRequest(
+      'http://10.0.0.12:3000/auth/callback?token_hash=abc&type=recovery&next=/reset-password'
+    )
+    const response = await GET(request)
+
+    expect(response.headers.get('location')).toBe('https://accounted.example/reset-password')
+  })
+
+  it('preserves the exact legacy public host behind an internal pod origin', async () => {
+    vi.stubEnv('NEXT_PUBLIC_APP_URL', 'https://accounted.example')
+    verifyOtp.mockResolvedValue({ error: null })
+
+    const request = new NextRequest(
+      'http://10.0.0.12:3000/auth/callback?token_hash=abc&type=recovery&next=/reset-password',
+      { headers: { host: 'app.gnubok.se' } },
+    )
+    const response = await GET(request)
+
+    expect(response.headers.get('location')).toBe('https://app.gnubok.se/reset-password')
+  })
+
+  it('falls back to canonical for an untrusted Host header', async () => {
+    vi.stubEnv('NEXT_PUBLIC_APP_URL', 'https://accounted.example')
+    verifyOtp.mockResolvedValue({ error: null })
+
+    const request = new NextRequest(
+      'http://10.0.0.12:3000/auth/callback?token_hash=abc&type=recovery&next=/reset-password',
+      { headers: { host: 'app.gnubok.se.attacker.test' } },
+    )
+    const response = await GET(request)
+
+    expect(response.headers.get('location')).toBe('https://accounted.example/reset-password')
   })
 
   it('redirects to /reset-password after a successful PKCE exchange when next=/reset-password (no type param)', async () => {

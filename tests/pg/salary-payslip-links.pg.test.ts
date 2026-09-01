@@ -89,7 +89,7 @@ describe('salary_payslip_links schema', () => {
   it('enforces unique token_hash across links', async () => {
     const a = await seedRunAndEmployee()
     const b = await seedRunAndEmployee()
-    const sharedHash = tokenHash('shared')
+    const sharedHash = tokenHash(randomUUID())
     await insertLink({ ...a, hash: sharedHash })
     await expect(insertLink({ ...b, hash: sharedHash })).rejects.toThrow()
   })

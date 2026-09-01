@@ -104,15 +104,20 @@ const PERIOD_2023 = {
 function buildMasterDataQueue(opts: {
   direct?: Record<string, unknown[]>
   via?: Record<string, { parents: unknown[]; children: unknown[] }>
-}): { data: unknown }[] {
-  return MASTER_DATA_DUMP_TABLES.flatMap((t): { data: unknown }[] => {
-    if (t.via) {
-      const spec = opts.via?.[t.name]
-      if (!spec || spec.parents.length === 0) return [{ data: [] }]
-      return [{ data: spec.parents }, { data: spec.children }]
+  errors?: Record<string, string>
+}): { data: unknown; error?: { message: string } }[] {
+  return MASTER_DATA_DUMP_TABLES.flatMap(
+    (t): { data: unknown; error?: { message: string } }[] => {
+      const error = opts.errors?.[t.name]
+      if (error) return [{ data: null, error: { message: error } }]
+      if (t.via) {
+        const spec = opts.via?.[t.name]
+        if (!spec || spec.parents.length === 0) return [{ data: [] }]
+        return [{ data: spec.parents }, { data: spec.children }]
+      }
+      return [{ data: opts.direct?.[t.name] ?? [] }]
     }
-    return [{ data: opts.direct?.[t.name] ?? [] }]
-  })
+  )
 }
 
 describe('generateFullArchive', () => {
@@ -672,6 +677,61 @@ describe('generateFullArchive', () => {
         'export_invoice_delivery_evidence',
         { p_company_id: 'company-1' },
       )
+    })
+
+    it('exports restricted accounting evidence through scoped RPCs', async () => {
+      const restrictedRows = {
+        supplier_payment_reversals: [{ id: 'supplier-reversal-1', company_id: 'company-1' }],
+        transaction_categorization_compensations: [
+          { id: 'categorization-compensation-1', company_id: 'company-1' },
+        ],
+        accounting_publications: [{ id: 'publication-1', company_id: 'company-1' }],
+        accounting_publication_subscribers: [
+          { id: 'subscriber-1', company_id: 'company-1' },
+        ],
+      }
+      enqueueMany([
+        { data: COMPANY_ROW },
+        { data: [PERIOD_2024] },
+        { data: [] }, // sie_imports
+        { data: [] }, // sie_account_mappings
+        ...buildMasterDataQueue({ direct: restrictedRows }),
+      ])
+
+      const buffer = await generateFullArchive(supabase as never, 'company-1', {
+        scope: 'all',
+        include_documents: false,
+      })
+      const zip = await JSZip.loadAsync(buffer)
+
+      for (const [table, rows] of Object.entries(restrictedRows)) {
+        const file = MASTER_DATA_DUMP_TABLES.find((spec) => spec.name === table)!.file
+        expect(JSON.parse(await zip.file(`data/${file}`)!.async('text'))).toEqual(rows)
+        const exportRpc = MASTER_DATA_DUMP_TABLES.find((spec) => spec.name === table)!.exportRpc
+        expect(supabase.rpc).toHaveBeenCalledWith(exportRpc, {
+          p_company_id: 'company-1',
+        })
+        expect(findCall(table, 'select')).toBeUndefined()
+      }
+    })
+
+    it('fails the archive instead of writing an empty stub when a scoped export is denied', async () => {
+      enqueueMany([
+        { data: COMPANY_ROW },
+        { data: [PERIOD_2024] },
+        { data: [] }, // sie_imports
+        { data: [] }, // sie_account_mappings
+        ...buildMasterDataQueue({
+          errors: { supplier_payment_reversals: 'permission denied' },
+        }),
+      ])
+
+      await expect(
+        generateFullArchive(supabase as never, 'company-1', {
+          scope: 'all',
+          include_documents: false,
+        })
+      ).rejects.toThrow('permission denied')
     })
 
     it('makes a foreign-currency invoice line readable without joining the parent', async () => {

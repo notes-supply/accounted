@@ -40,8 +40,10 @@ describe('list_fiscal_period_entries_with_related: draft + correction filters', 
       await client.query(
         `INSERT INTO public.journal_entries
            (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-            entry_date, description, source_type, status, reverses_id, correction_of_id)
-         VALUES ($1,$2,$3,$4,$5,$11,$12,$6,$7,$8,$9,$10)`,
+            entry_date, description, source_type, status, reverses_id, correction_of_id,
+            committed_at)
+         VALUES ($1,$2,$3,$4,$5,$11,$12,$6,$7,$8,$9,$10,
+                 CASE WHEN $8 IN ('posted', 'reversed') THEN now() END)`,
         [
           id,
           p.userId,
@@ -115,9 +117,15 @@ describe('list_fiscal_period_entries_with_related: draft + correction filters', 
     const posted = await insertEntry({ userId, companyId, fiscalPeriodId, status: 'posted', sourceType: 'manual', voucherNumber: 10, withLines: true, description: 'Plain posted' })
     const draft = await insertEntry({ userId, companyId, fiscalPeriodId, status: 'draft', sourceType: 'manual', voucherNumber: 0, description: 'Draft' })
     // Correction group: original is reversed; storno reverses it; correction replaces it.
-    const original = await insertEntry({ userId, companyId, fiscalPeriodId, status: 'reversed', sourceType: 'manual', voucherNumber: 11, withLines: true, description: 'Original' })
+    const original = await insertEntry({ userId, companyId, fiscalPeriodId, status: 'posted', sourceType: 'manual', voucherNumber: 11, withLines: true, description: 'Original' })
     const storno = await insertEntry({ userId, companyId, fiscalPeriodId, status: 'posted', sourceType: 'storno', voucherNumber: 12, reversesId: original, withLines: true, description: 'Storno' })
     const correction = await insertEntry({ userId, companyId, fiscalPeriodId, status: 'posted', sourceType: 'correction', voucherNumber: 13, correctionOfId: original, withLines: true, description: 'Correction' })
+    await getPool().query(
+      `UPDATE public.journal_entries
+          SET status = 'reversed', reversed_by_id = $2
+        WHERE id = $1`,
+      [original, storno],
+    )
 
     // Default (no filters): every row shows.
     const all = await callRpc(companyId, fiscalPeriodId, {})

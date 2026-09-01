@@ -82,7 +82,7 @@ describe('claim_due_webhook_deliveries.pg: atomic SKIP LOCKED claim', () => {
 
     const { rows } = await getPool().query<{ id: string }>(
       `SELECT id FROM public.claim_due_webhook_deliveries($1, now())`,
-      [10],
+      [1_000],
     )
 
     expect(rows.map((r) => r.id)).toContain(deliveryId)
@@ -103,7 +103,7 @@ describe('claim_due_webhook_deliveries.pg: atomic SKIP LOCKED claim', () => {
 
     const { rows } = await getPool().query<{ id: string }>(
       `SELECT id FROM public.claim_due_webhook_deliveries($1, now())`,
-      [10],
+      [1_000],
     )
 
     expect(rows.map((r) => r.id)).toContain(deliveryId)
@@ -122,7 +122,7 @@ describe('claim_due_webhook_deliveries.pg: atomic SKIP LOCKED claim', () => {
 
     const { rows } = await getPool().query<{ id: string }>(
       `SELECT id FROM public.claim_due_webhook_deliveries($1, now())`,
-      [10],
+      [1_000],
     )
 
     expect(rows.map((r) => r.id)).not.toContain(deliveryId)
@@ -141,7 +141,7 @@ describe('claim_due_webhook_deliveries.pg: atomic SKIP LOCKED claim', () => {
 
     const { rows } = await getPool().query<{ id: string }>(
       `SELECT id FROM public.claim_due_webhook_deliveries($1, now())`,
-      [10],
+      [1_000],
     )
 
     expect(rows.map((r) => r.id)).not.toContain(deliveryId)
@@ -163,7 +163,7 @@ describe('claim_due_webhook_deliveries.pg: atomic SKIP LOCKED claim', () => {
 
     const { rows } = await getPool().query<{ id: string }>(
       `SELECT id FROM public.claim_due_webhook_deliveries($1, now())`,
-      [10],
+      [1_000],
     )
 
     const ids = rows.map((r) => r.id)
@@ -187,7 +187,7 @@ describe('claim_due_webhook_deliveries.pg: atomic SKIP LOCKED claim', () => {
 
     const { rows } = await getPool().query<{ id: string }>(
       `SELECT id FROM public.claim_due_webhook_deliveries($1, now())`,
-      [10],
+      [1_000],
     )
 
     expect(rows.map((r) => r.id)).not.toContain(inFlightId)
@@ -256,7 +256,7 @@ describe('claim_due_webhook_deliveries.pg: atomic SKIP LOCKED claim', () => {
       // a row lock by transaction A (UPDATE sets ROW EXCLUSIVE).
       const aClaim = await a.query<{ id: string }>(
         `SELECT id FROM public.claim_due_webhook_deliveries($1, now())`,
-        [10],
+        [1_000],
       )
       expect(aClaim.rows.map((r) => r.id)).toContain(deliveryId)
 
@@ -266,7 +266,7 @@ describe('claim_due_webhook_deliveries.pg: atomic SKIP LOCKED claim', () => {
       // the row simply absent from results.
       const bClaim = await b.query<{ id: string }>(
         `SELECT id FROM public.claim_due_webhook_deliveries($1, now())`,
-        [10],
+        [1_000],
       )
       expect(bClaim.rows.map((r) => r.id)).not.toContain(deliveryId)
 

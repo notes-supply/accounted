@@ -16,25 +16,42 @@ async function insertTrip(params: {
   companyId: string
   userId: string
   status?: 'draft' | 'booked'
+  journalEntryId?: string | null
   odometerStart?: number | null
   odometerEnd?: number | null
 }): Promise<string> {
   const res = await getPool().query<{ id: string }>(
     `INSERT INTO public.mileage_trips
        (company_id, user_id, trip_date, distance_km, from_location,
-        to_location, purpose, status, odometer_start, odometer_end)
+        to_location, purpose, status, journal_entry_id, odometer_start, odometer_end)
      VALUES ($1, $2, '2026-05-10', 32.3, 'Kontoret', 'Kunden', 'Kundbesök',
-             $3, $4, $5)
+             $3, $4, $5, $6)
      RETURNING id`,
     [
       params.companyId,
       params.userId,
       params.status ?? 'draft',
+      params.journalEntryId ?? null,
       params.odometerStart ?? null,
       params.odometerEnd ?? null,
     ],
   )
   return res.rows[0].id
+}
+
+async function insertBookingEntry(params: {
+  companyId: string
+  userId: string
+  fiscalPeriodId: string
+}): Promise<string> {
+  return insertPostedJournalEntry({
+    ...params,
+    sourceType: 'manual',
+    lines: [
+      { accountNumber: '7331', debitAmount: 807.5, creditAmount: 0 },
+      { accountNumber: '2893', debitAmount: 0, creditAmount: 807.5 },
+    ],
+  })
 }
 
 describe('mileage_trips RLS', () => {
@@ -70,8 +87,9 @@ describe('mileage_trips RLS', () => {
 
 describe('mileage_trips retention trigger', () => {
   it('blocks deleting a booked trip (BFL underlag)', async () => {
-    const { companyId, userId } = await seedCompany()
-    const tripId = await insertTrip({ companyId, userId, status: 'booked' })
+    const { companyId, userId, fiscalPeriodId } = await seedCompany()
+    const journalEntryId = await insertBookingEntry({ companyId, userId, fiscalPeriodId })
+    const tripId = await insertTrip({ companyId, userId, status: 'booked', journalEntryId })
     await expect(
       getPool().query(`DELETE FROM public.mileage_trips WHERE id = $1`, [tripId]),
     ).rejects.toThrow(/booked mileage trip/)
@@ -90,16 +108,18 @@ describe('mileage_trips retention trigger', () => {
 
 describe('mileage_trips booked immutability (20260807113215)', () => {
   it('blocks changing core fields on a booked trip', async () => {
-    const { companyId, userId } = await seedCompany()
-    const tripId = await insertTrip({ companyId, userId, status: 'booked' })
+    const { companyId, userId, fiscalPeriodId } = await seedCompany()
+    const journalEntryId = await insertBookingEntry({ companyId, userId, fiscalPeriodId })
+    const tripId = await insertTrip({ companyId, userId, status: 'booked', journalEntryId })
     await expect(
       getPool().query(`UPDATE public.mileage_trips SET distance_km = 999 WHERE id = $1`, [tripId]),
     ).rejects.toThrow(/booked mileage trip/)
   })
 
   it('allows a notes-only edit on a booked trip', async () => {
-    const { companyId, userId } = await seedCompany()
-    const tripId = await insertTrip({ companyId, userId, status: 'booked' })
+    const { companyId, userId, fiscalPeriodId } = await seedCompany()
+    const journalEntryId = await insertBookingEntry({ companyId, userId, fiscalPeriodId })
+    const tripId = await insertTrip({ companyId, userId, status: 'booked', journalEntryId })
     const res = await getPool().query(
       `UPDATE public.mileage_trips SET notes = 'anteckning' WHERE id = $1`,
       [tripId],
@@ -107,53 +127,38 @@ describe('mileage_trips booked immutability (20260807113215)', () => {
     expect(res.rowCount).toBe(1)
   })
 
-  it('allows reverting an UNLINKED claim back to draft', async () => {
+  it('rejects a booked trip without complete booking provenance', async () => {
     const { companyId, userId } = await seedCompany()
-    const tripId = await insertTrip({ companyId, userId, status: 'booked' })
-    const res = await getPool().query(
-      `UPDATE public.mileage_trips SET status = 'draft' WHERE id = $1`,
-      [tripId],
-    )
-    expect(res.rowCount).toBe(1)
+    await expect(
+      insertTrip({ companyId, userId, status: 'booked' }),
+    ).rejects.toThrow(/provenance/i)
   })
 
-  it('forces a revert to draft to clear salary_run_id (20260807114924)', async () => {
-    const { companyId, userId } = await seedCompany()
-    const runRes = await getPool().query<{ id: string }>(
-      `INSERT INTO public.salary_runs (company_id, user_id, period_year, period_month, payment_date)
-       VALUES ($1, $2, 2026, 5, '2026-05-25') RETURNING id`,
-      [companyId, userId],
-    )
-    const runId = runRes.rows[0].id
-    const tripId = await insertTrip({ companyId, userId, status: 'booked' })
-    await getPool().query(
-      `UPDATE public.mileage_trips SET salary_run_id = $2 WHERE id = $1`,
-      [tripId, runId],
-    )
-    // Revert keeping salary_run_id: rejected (draft trip would still carry a
-    // run that holds its allowance = re-bookable double pay).
+  it('rejects a draft trip that retains booked-journal provenance', async () => {
+    const { companyId, userId, fiscalPeriodId } = await seedCompany()
+    const journalEntryId = await insertBookingEntry({ companyId, userId, fiscalPeriodId })
     await expect(
-      getPool().query(`UPDATE public.mileage_trips SET status = 'draft' WHERE id = $1`, [tripId]),
-    ).rejects.toThrow(/clear salary_run_id/)
-    // Revert clearing it in the same statement: allowed.
-    const res = await getPool().query(
-      `UPDATE public.mileage_trips SET status = 'draft', salary_run_id = NULL WHERE id = $1`,
-      [tripId],
-    )
-    expect(res.rowCount).toBe(1)
+      insertTrip({ companyId, userId, status: 'draft', journalEntryId }),
+    ).rejects.toThrow(/provenance/i)
   })
 
   it('blocks unbooking a trip linked to a verifikat', async () => {
     const { companyId, userId, fiscalPeriodId } = await seedCompany()
     const entryId = await insertPostedJournalEntry({ companyId, userId, fiscalPeriodId })
-    const tripId = await insertTrip({ companyId, userId, status: 'booked' })
-    await getPool().query(
-      `UPDATE public.mileage_trips SET journal_entry_id = $2 WHERE id = $1`,
-      [tripId, entryId],
-    )
+    const tripId = await insertTrip({
+      companyId,
+      userId,
+      status: 'booked',
+      journalEntryId: entryId,
+    })
     await expect(
-      getPool().query(`UPDATE public.mileage_trips SET status = 'draft' WHERE id = $1`, [tripId]),
-    ).rejects.toThrow(/linked to a verifikat/)
+      getPool().query(
+        `UPDATE public.mileage_trips
+            SET status = 'draft', journal_entry_id = NULL
+          WHERE id = $1`,
+        [tripId],
+      ),
+    ).rejects.toThrow(/linked to a posted journal entry/i)
   })
 })
 

@@ -30,6 +30,7 @@ import { getErrorEntry } from '@/lib/errors/structured-errors'
 import { applySettlementAccount } from '@/lib/bookkeeping/mapping-engine'
 import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
 import { buildTransactionEntryLines, createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
+import { attachTransactionCategorization } from '@/lib/transactions/categorization-attachment'
 import { upsertCounterpartyTemplate, findCounterpartyTemplatesBatch, formatCounterpartyName } from '@/lib/bookkeeping/counterparty-templates'
 import { formatVoucherLabel, hasLiveJournalEntryLink } from '@/lib/transactions/link-journal-entry'
 import { canApproveSupplierInvoice } from '@/lib/supplier-invoices/lifecycle'
@@ -1165,24 +1166,44 @@ async function categorizeTransactionCore(
       companyId,
       userId,
       transaction as Transaction,
-      mappingResult
+      mappingResult,
+      undefined,
+      { category, isBusiness },
     )
     if (journalEntry) {
       journalEntryId = journalEntry.id
+      await attachTransactionCategorization(
+        supabase,
+        companyId,
+        userId,
+        transaction as Transaction,
+        journalEntry,
+        category,
+        isBusiness,
+      )
     }
   } catch (err) {
+    // A posted voucher reached the atomic attachment boundary. The helper has
+    // already attempted storno or M5 compensation; never downgrade this to the
+    // legacy categorization-only partial-success response.
+    if (journalEntryId) throw err
     journalEntryError = err instanceof Error ? err.message : 'Unknown error'
   }
 
-  // Update transaction
-  await supabase
-    .from('transactions')
-    .update({
-      is_business: isBusiness,
-      category,
-      journal_entry_id: journalEntryId,
-    })
-    .eq('id', txId)
+  // When no voucher could be created, preserve the existing partial-success
+  // contract without attempting a guarded journal pointer transition.
+  if (!journalEntryId) {
+    await supabase
+      .from('transactions')
+      .update({
+        is_business: isBusiness,
+        category,
+        journal_entry_id: null,
+      })
+      .eq('id', txId)
+      .eq('company_id', companyId)
+      .is('journal_entry_id', null)
+  }
 
   // Emit event so extensions (mapping rules, etc.) can react
   await eventBus.emit({

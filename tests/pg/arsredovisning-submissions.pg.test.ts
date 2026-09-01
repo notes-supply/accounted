@@ -77,7 +77,7 @@ describe('arsredovisning_submissions immutability after upload', () => {
     const id = await insertSubmission(companyId, userId, fiscalPeriodId, {
       status: 'uploaded',
       uploadedAt: new Date().toISOString(),
-      idnummer: '49679',
+      idnummer: `49679-${randomUUID()}`,
     })
 
     await expect(
@@ -129,10 +129,11 @@ describe('arsredovisning_submissions audit survival on user deletion', () => {
     const { companyId, fiscalPeriodId } = await seedCompany()
     // A separate filer (not the company creator) so the company itself survives.
     const filer = await insertAuthUser()
+    const idnummer = `70001-${randomUUID()}`
     const id = await insertSubmission(companyId, filer, fiscalPeriodId, {
       status: 'uploaded',
       uploadedAt: new Date().toISOString(),
-      idnummer: '70001',
+      idnummer,
     })
 
     await getPool().query(`DELETE FROM auth.users WHERE id = $1`, [filer])
@@ -144,7 +145,7 @@ describe('arsredovisning_submissions audit survival on user deletion', () => {
     expect(res.rowCount).toBe(1)
     expect(res.rows[0].user_id).toBeNull()
     expect(res.rows[0].status).toBe('uploaded')
-    expect(res.rows[0].idnummer).toBe('70001')
+    expect(res.rows[0].idnummer).toBe(idnummer)
   })
 
   it('keeps avtal acceptances with user_id NULL when the accepting user is deleted', async () => {

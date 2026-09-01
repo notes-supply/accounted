@@ -88,6 +88,7 @@ jobs:
         run: npm install --prefix "$GITHUB_WORKSPACE/.." --no-save --no-package-lock --ignore-scripts @anthropic-ai/bedrock-sdk@0.29.1
       - name: Run compliance review
         env:
+          AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_REGION: ${{ secrets.AWS_REGION || 'eu-north-1' }}

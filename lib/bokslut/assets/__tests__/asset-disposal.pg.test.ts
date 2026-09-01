@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
-import { getPool } from '@/tests/pg/setup'
+import { getPool, runAsServiceRole } from '@/tests/pg/setup'
 import { seedCompany } from '@/tests/pg/fixtures'
 
 describe('commit_asset_disposal (pg-real)', () => {
@@ -62,22 +62,27 @@ describe('commit_asset_disposal (pg-real)', () => {
     disposalType?: string
     currentDepreciation?: number
   }) {
-    return getPool().query(
+    const version = await getPool().query<{ updated_at: string }>(
+      `SELECT updated_at::text FROM public.assets WHERE id = $1`,
+      [args.assetId],
+    )
+    return runAsServiceRole((client) => client.query(
       `SELECT * FROM public.commit_asset_disposal(
-         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::text,
+         $1::uuid, $2::uuid, $3::uuid, $4::timestamptz, $5::uuid, $6::text,
          '2026-06-30'::date, 80000::numeric, 0::numeric, 'exempt'::text,
-         $6::numeric, 0::numeric, 'none'::text, 4::integer, 5::integer,
+         $7::numeric, 0::numeric, 'none'::text, 4::integer, 5::integer,
          0::numeric, 0::numeric, 0::numeric, NULL::text, NULL::text
        )`,
       [
         args.companyId,
         args.assetId,
         args.entryId,
+        version.rows[0]!.updated_at,
         args.fiscalPeriodId,
         args.disposalType ?? 'sale',
         args.currentDepreciation ?? 0,
       ],
-    )
+    ))
   }
 
   it('posts the voucher, schedule, and register state in one transaction', async () => {

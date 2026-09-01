@@ -3,7 +3,7 @@ set -e
 
 # ─── Validate required environment variables ───
 missing=""
-for var in NEXT_PUBLIC_SUPABASE_URL NEXT_PUBLIC_SUPABASE_ANON_KEY SUPABASE_SERVICE_ROLE_KEY NEXT_PUBLIC_APP_URL CRON_SECRET; do
+for var in NEXT_PUBLIC_SUPABASE_URL NEXT_PUBLIC_SUPABASE_ANON_KEY SUPABASE_SERVICE_ROLE_KEY NEXT_PUBLIC_APP_URL CRON_SECRET REQUIRE_MFA NEXT_PUBLIC_REQUIRE_MFA; do
   eval val=\$$var
   if [ -z "$val" ]; then
     missing="$missing  - $var\n"
@@ -12,6 +12,19 @@ done
 
 if [ -n "$missing" ]; then
   printf "ERROR: Missing required environment variables:\n%b\nSee .env.docker.example for reference.\n" "$missing" >&2
+  exit 1
+fi
+
+case "${REQUIRE_MFA:-}" in
+  true|false) ;;
+  *) printf 'ERROR: REQUIRE_MFA must be exactly "true" or "false".\n' >&2; exit 1 ;;
+esac
+case "${NEXT_PUBLIC_REQUIRE_MFA:-}" in
+  true|false) ;;
+  *) printf 'ERROR: NEXT_PUBLIC_REQUIRE_MFA must be exactly "true" or "false".\n' >&2; exit 1 ;;
+esac
+if [ "$REQUIRE_MFA" != "$NEXT_PUBLIC_REQUIRE_MFA" ]; then
+  printf 'ERROR: REQUIRE_MFA and NEXT_PUBLIC_REQUIRE_MFA must match.\n' >&2
   exit 1
 fi
 
@@ -91,7 +104,7 @@ if [ -n "$SUBST_PATHS" ]; then
   E_APP_URL=$(sed_esc "$NEXT_PUBLIC_APP_URL")
   E_VAPID_PUBLIC_KEY=$(sed_esc "${NEXT_PUBLIC_VAPID_PUBLIC_KEY:-}")
   E_SELF_HOSTED=$(sed_esc "${NEXT_PUBLIC_SELF_HOSTED:-true}")
-  E_REQUIRE_MFA=$(sed_esc "${NEXT_PUBLIC_REQUIRE_MFA:-false}")
+  E_REQUIRE_MFA=$(sed_esc "$NEXT_PUBLIC_REQUIRE_MFA")
   E_SESSION_IDLE_TIMEOUT_MS=$(sed_esc "${NEXT_PUBLIC_SESSION_IDLE_TIMEOUT_MS:-}")
   E_SESSION_ABSOLUTE_TIMEOUT_MS=$(sed_esc "${NEXT_PUBLIC_SESSION_ABSOLUTE_TIMEOUT_MS:-}")
   E_SESSION_WARNING_MS=$(sed_esc "${NEXT_PUBLIC_SESSION_WARNING_MS:-}")

@@ -21,7 +21,7 @@
  */
 import { describe, it, expect } from 'vitest'
 import { randomUUID } from 'node:crypto'
-import { getClient, getPool } from '@/tests/pg/setup'
+import { getClient, getPool, runAsServiceRole } from '@/tests/pg/setup'
 import {
   insertAuthUser,
   insertCompany,
@@ -143,8 +143,8 @@ async function seedVoucher(params: {
     await client.query(
       `INSERT INTO public.journal_entries
          (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-          entry_date, description, source_type, status)
-       VALUES ($1, $2, $3, $4, $5, 'A', '2026-05-05', 'Betalning', 'manual', 'posted')`,
+          entry_date, description, source_type, status, committed_at)
+       VALUES ($1, $2, $3, $4, $5, 'A', '2026-05-05', 'Betalning', 'manual', 'posted', now())`,
       [id, params.userId, params.companyId, params.fiscalPeriodId, nextSeq() % 2_000_000_000],
     )
     await client.query(
@@ -200,9 +200,11 @@ async function callLinkSupplierInvoice(args: {
   userId: string
   companyId: string
 }): Promise<RpcResult> {
-  const { rows } = await getPool().query<{ result: RpcResult }>(
-    `SELECT public.link_supplier_invoice_to_voucher($1, $2, $3, $4, NULL) AS result`,
-    [args.supplierInvoiceId, args.voucherId, args.userId, args.companyId],
+  const { rows } = await runAsServiceRole((client) =>
+    client.query<{ result: RpcResult }>(
+      `SELECT public.link_supplier_invoice_to_voucher($1, $2, $3, $4, NULL) AS result`,
+      [args.supplierInvoiceId, args.voucherId, args.userId, args.companyId],
+    ),
   )
   return rows[0].result
 }
@@ -578,8 +580,8 @@ describe('link_supplier_invoice_to_voucher: amount resolved in the invoice curre
       await client.query(
         `INSERT INTO public.journal_entries
            (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-            entry_date, description, source_type, status)
-         VALUES ($1, $2, $3, $4, $5, 'A', '2026-05-05', 'Betalning', 'manual', 'posted')`,
+            entry_date, description, source_type, status, committed_at)
+         VALUES ($1, $2, $3, $4, $5, 'A', '2026-05-05', 'Betalning', 'manual', 'posted', now())`,
         [voucherId, userId, companyId, fiscalPeriodId, nextSeq() % 2_000_000_000],
       )
       await client.query(

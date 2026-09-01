@@ -29,6 +29,12 @@ async function insertAsset(params: {
   companyId: string
   disposedAt?: string | null
   disposedProceeds?: number | null
+  disposedProceedsVat?: number | null
+  disposedVatTreatment?: string | null
+  jamkningAmount?: number | null
+  jamkningRemainingMonths?: number | null
+  jamkningTotalMonths?: number | null
+  jamkningOriginalInputVat?: number | null
   category?: string
 }): Promise<string> {
   const id = randomUUID()
@@ -36,9 +42,11 @@ async function insertAsset(params: {
     `INSERT INTO public.assets
        (id, user_id, company_id, name, category, acquisition_date, acquisition_cost,
         useful_life_months, bas_asset_account, bas_accumulated_account, bas_expense_account,
-        disposed_at, disposed_proceeds)
+        disposed_at, disposed_proceeds, disposed_proceeds_vat, disposed_vat_treatment,
+        jamkning_amount, jamkning_remaining_months, jamkning_total_months,
+        jamkning_original_input_vat)
      VALUES ($1, $2, $3, 'Test Asset', $4, '2025-01-01', 60000, 60,
-             '1220', '1229', '7832', $5, $6)`,
+             '1220', '1229', '7832', $5, $6, $7, $8, $9, $10, $11, $12)`,
     [
       id,
       params.userId,
@@ -46,6 +54,12 @@ async function insertAsset(params: {
       params.category ?? 'equipment',
       params.disposedAt ?? null,
       params.disposedProceeds ?? null,
+      params.disposedProceedsVat ?? 0,
+      params.disposedVatTreatment ?? null,
+      params.jamkningAmount ?? 0,
+      params.jamkningRemainingMonths ?? null,
+      params.jamkningTotalMonths ?? null,
+      params.jamkningOriginalInputVat ?? null,
     ],
   )
   return id
@@ -401,14 +415,11 @@ describe('assets: disposal VAT + jämkning constraints', () => {
     const assetId = await insertAsset({
       userId: companyA.userId,
       companyId: companyA.companyId,
+      disposedAt: '2025-12-31',
+      disposedProceeds: 100_000,
+      disposedProceedsVat: 20_000,
+      disposedVatTreatment: 'standard_25',
     })
-    await getPool().query(
-      `UPDATE public.assets
-         SET disposed_at = '2025-12-31', disposed_proceeds = 100000,
-             disposed_proceeds_vat = 20000, disposed_vat_treatment = 'standard_25'
-       WHERE id = $1`,
-      [assetId],
-    )
     const { rows } = await getPool().query(
       `SELECT disposed_proceeds_vat, disposed_vat_treatment FROM public.assets WHERE id = $1`,
       [assetId],
@@ -418,35 +429,28 @@ describe('assets: disposal VAT + jämkning constraints', () => {
   })
 
   it('rejects a disposed_vat_treatment outside the enum', async () => {
-    const assetId = await insertAsset({
-      userId: companyA.userId,
-      companyId: companyA.companyId,
-    })
     await expect(
-      getPool().query(
-        `UPDATE public.assets
-           SET disposed_at = '2025-12-31', disposed_proceeds = 100000,
-               disposed_vat_treatment = 'reduced_999'
-         WHERE id = $1`,
-        [assetId],
-      ),
+      insertAsset({
+        userId: companyA.userId,
+        companyId: companyA.companyId,
+        disposedAt: '2025-12-31',
+        disposedProceeds: 100_000,
+        disposedVatTreatment: 'reduced_999',
+      }),
     ).rejects.toThrow(/check/i)
   })
 
   it('rejects disposed_proceeds_vat > 0 without a disposed_vat_treatment', async () => {
-    const assetId = await insertAsset({
-      userId: companyA.userId,
-      companyId: companyA.companyId,
-    })
     // Treatment NULL + VAT > 0 must violate the consistency CHECK.
     await expect(
-      getPool().query(
-        `UPDATE public.assets
-           SET disposed_at = '2025-12-31', disposed_proceeds = 100000,
-               disposed_proceeds_vat = 20000, disposed_vat_treatment = NULL
-         WHERE id = $1`,
-        [assetId],
-      ),
+      insertAsset({
+        userId: companyA.userId,
+        companyId: companyA.companyId,
+        disposedAt: '2025-12-31',
+        disposedProceeds: 100_000,
+        disposedProceedsVat: 20_000,
+        disposedVatTreatment: null,
+      }),
     ).rejects.toThrow(/check|consistency/i)
   })
 
@@ -487,18 +491,13 @@ describe('assets: disposal VAT + jämkning constraints', () => {
     const assetId = await insertAsset({
       userId: companyA.userId,
       companyId: companyA.companyId,
+      disposedAt: '2025-12-31',
+      disposedProceeds: 60_000,
+      jamkningAmount: 8_000,
+      jamkningRemainingMonths: 24,
+      jamkningTotalMonths: 60,
+      jamkningOriginalInputVat: 20_000,
     })
-    await getPool().query(
-      `UPDATE public.assets
-         SET disposed_at = '2025-12-31',
-             disposed_proceeds = 60000,
-             jamkning_amount = 8000,
-             jamkning_remaining_months = 24,
-             jamkning_total_months = 60,
-             jamkning_original_input_vat = 20000
-       WHERE id = $1`,
-      [assetId],
-    )
     const { rows } = await getPool().query(
       `SELECT jamkning_amount, jamkning_remaining_months, jamkning_total_months,
               jamkning_original_input_vat

@@ -14,7 +14,7 @@ vi.mock('@anthropic-ai/bedrock-sdk', () => {
 import { readAiConfig } from '../config'
 import { createAnthropicFamilyService, buildAnthropicDocumentContent } from '../services/anthropic-family'
 
-const ENV = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'ANTHROPIC_API_KEY', 'AI_PROVIDER', 'AI_BASE_URL', 'AI_API_KEY', 'BEDROCK_MODEL_ID', 'AI_EXTRACTION_MODEL', 'AI_MODEL'] as const
+const ENV = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_BEARER_TOKEN_BEDROCK', 'ANTHROPIC_API_KEY', 'AI_PROVIDER', 'AI_BASE_URL', 'AI_API_KEY', 'BEDROCK_MODEL_ID', 'AI_EXTRACTION_MODEL', 'AI_MODEL'] as const
 let saved: Record<string, string | undefined> = {}
 beforeEach(() => {
   vi.clearAllMocks()

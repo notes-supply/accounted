@@ -26,14 +26,18 @@ vi.mock('@supabase/supabase-js', async () => {
   return { ...actual, createClient: vi.fn().mockReturnValue({}) }
 })
 
-const { createTxJE, findMissingAccountsMock, reverseEntryMock } = vi.hoisted(() => ({
+const { createTxJE, attachCategorizationMock, findMissingAccountsMock, reverseEntryMock } = vi.hoisted(() => ({
   createTxJE: vi.fn().mockResolvedValue({ id: 'je-fresh' }),
+  attachCategorizationMock: vi.fn(),
   findMissingAccountsMock: vi.fn().mockResolvedValue([]),
   reverseEntryMock: vi.fn().mockResolvedValue(undefined),
 }))
 
 vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
   createTransactionJournalEntry: createTxJE,
+}))
+vi.mock('@/lib/transactions/categorization-attachment', () => ({
+  attachTransactionCategorization: attachCategorizationMock,
 }))
 vi.mock('@/lib/bookkeeping/engine', () => ({
   reverseEntry: reverseEntryMock,
@@ -164,6 +168,55 @@ beforeEach(() => {
   findMissingAccountsMock.mockResolvedValue([])
   reverseEntryMock.mockResolvedValue(undefined)
   createTxJE.mockResolvedValue({ id: 'je-fresh' })
+  attachCategorizationMock.mockImplementation(
+    async (
+      supabase: { from: (table: string) => unknown },
+      companyId: string,
+      userId: string,
+      transaction: { id: string },
+      journalEntry: { id: string },
+      category: string,
+      isBusiness: boolean,
+    ) => {
+      const chain = supabase.from('transactions') as {
+        update: (value: unknown) => {
+          eq: (column: string, value: unknown) => {
+            eq: (column: string, value: unknown) => {
+              is: (column: string, value: unknown) => {
+                select: () => Promise<{ data: Array<Record<string, unknown>> | null; error: unknown }>
+              }
+            }
+          }
+        }
+      }
+      const { data, error } = await chain
+        .update({
+          is_business: isBusiness,
+          category,
+          is_ignored: false,
+          journal_entry_id: journalEntry.id,
+        })
+        .eq('id', transaction.id)
+        .eq('company_id', companyId)
+        .is('journal_entry_id', null)
+        .select()
+      if (error || !data || data.length === 0) {
+        const { reverseOrphanedJournalEntry } = await import(
+          '@/lib/bookkeeping/cancel-orphaned-entry'
+        )
+        await reverseOrphanedJournalEntry(
+          supabase as never,
+          companyId,
+          userId,
+          journalEntry.id,
+          'Kategoriseringsverifikation utan transaktionskoppling; automatisk storno misslyckades. Manuell avstämning krävs.',
+        )
+        if (error) throw error
+        throw { code: '40001', message: 'Categorization accounting pointer drifted' }
+      }
+      return data[0]
+    },
+  )
   mockValidate.mockResolvedValue({
     userId: 'user-1',
     companyId: COMPANY_ID,

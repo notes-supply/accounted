@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { describe, it, expect } from 'vitest'
 import { getPool, withUserContext } from './setup'
 import {
@@ -110,16 +111,18 @@ describe('stripe_connections RLS', () => {
 
   it('only one ACTIVE connection per company is allowed', async () => {
     const { userId, companyId } = await seedCompany()
+    const firstAccountId = `acct_${randomUUID()}`
+    const secondAccountId = `acct_${randomUUID()}`
     await getPool().query(
       `INSERT INTO public.stripe_connections (company_id, user_id, status, stripe_account_id)
-       VALUES ($1, $2, 'active', 'acct_pg_one')`,
-      [companyId, userId],
+       VALUES ($1, $2, 'active', $3)`,
+      [companyId, userId, firstAccountId],
     )
     await expect(
       getPool().query(
         `INSERT INTO public.stripe_connections (company_id, user_id, status, stripe_account_id)
-         VALUES ($1, $2, 'active', 'acct_pg_two')`,
-        [companyId, userId],
+         VALUES ($1, $2, 'active', $3)`,
+        [companyId, userId, secondAccountId],
       ),
     ).rejects.toMatchObject({ code: '23505' }) // unique_violation
   })

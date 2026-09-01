@@ -263,9 +263,10 @@ async function main(): Promise<void> {
 
   if (!hasAiCredentials() && explicitProvider !== 'bedrock') {
     console.error(
-      '\nInga synliga nycklar. Sätt ANTHROPIC_API_KEY, eller AWS_ACCESS_KEY_ID +\n' +
-        'AWS_SECRET_ACCESS_KEY för Bedrock. (Bedrock via instansprofil/IRSA syns\n' +
-        'inte härifrån: kör i så fall vidare med AI_PROVIDER=bedrock.)'
+      '\nInga synliga nycklar. Sätt ANTHROPIC_API_KEY, AWS_BEARER_TOKEN_BEDROCK,\n' +
+        'eller AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY för Bedrock. (Bedrock via\n' +
+        'instansprofil/IRSA syns inte härifrån: kör i så fall vidare med\n' +
+        'AI_PROVIDER=bedrock.)'
     )
     process.exitCode = 1
     return

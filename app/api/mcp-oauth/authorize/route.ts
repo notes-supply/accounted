@@ -3,11 +3,12 @@ import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
 import type { SupabaseClient, User } from '@supabase/supabase-js'
 import { createAuthCode } from '@/lib/auth/oauth-codes'
-import { shouldEnforceMfa } from '@/lib/auth/mfa'
+import { hasValidAssuranceLevel, shouldEnforceMfa } from '@/lib/auth/mfa'
 import { requireCompanyId } from '@/lib/company/context'
 import { getBranding } from '@/lib/branding/service'
 import { isAllowedRedirectUri } from '@/lib/auth/oauth-allowlist'
 import { resolveDiscoveryBaseUrl } from '@/lib/api/v1/base-url'
+import { resolveRequestAppOrigin } from '@/lib/domains/trusted-app-origin'
 import {
   ALL_SCOPES,
   API_KEY_SCOPES,
@@ -104,7 +105,7 @@ function buildLoginRedirect(request: Request): Response {
   const url = new URL(request.url)
   const next = `${url.pathname}${url.search}`
   return NextResponse.redirect(
-    new URL(`/login?next=${encodeURIComponent(next)}`, url.origin)
+    new URL(`/login?next=${encodeURIComponent(next)}`, resolveRequestAppOrigin(request))
   )
 }
 
@@ -113,8 +114,9 @@ function buildLoginRedirect(request: Request): Response {
  * MFA on every subsequent call: so the consent session itself must be AAL2.
  * The middleware MFA gate deliberately exempts /api/mcp-oauth/* (the token
  * endpoint is Bearer-only), which makes this route responsible for its own
- * step-up. Returns null when the session is AAL2 (or MFA isn't required),
- * otherwise a redirect to /mfa/verify that returns to this authorize URL.
+ * step-up. Returns null when the session is AAL2 (or MFA isn't required).
+ * An enrolled session goes to verification; a session with no verified
+ * factor goes to enrollment. Both paths return to the exact authorize URL.
  */
 async function requireAal2(
   supabase: SupabaseClient,
@@ -122,15 +124,27 @@ async function requireAal2(
   request: Request,
 ): Promise<Response | null> {
   if (!shouldEnforceMfa(user)) return null
-  const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel()
-  if (aal?.nextLevel === 'aal2' && aal?.currentLevel !== 'aal2') {
-    const url = new URL(request.url)
-    const returnTo = `${url.pathname}${url.search}`
-    return NextResponse.redirect(
-      new URL(`/mfa/verify?returnTo=${encodeURIComponent(returnTo)}`, url.origin),
-    )
+  const { data: aal, error: aalError } =
+    await supabase.auth.mfa.getAuthenticatorAssuranceLevel()
+  if (!aalError && hasValidAssuranceLevel(aal) && aal.currentLevel === 'aal2') {
+    return null
   }
-  return null
+
+  let target: '/mfa/verify' | '/mfa/enroll' = '/mfa/verify'
+  if (!aalError && hasValidAssuranceLevel(aal) && aal.nextLevel !== 'aal2') {
+    const { data: factors } = await supabase.auth.mfa.listFactors()
+    const hasVerifiedFactor = factors?.totp?.some((factor) => factor.status === 'verified')
+    if (!hasVerifiedFactor) target = '/mfa/enroll'
+  }
+
+  const url = new URL(request.url)
+  const returnTo = `${url.pathname}${url.search}`
+  return NextResponse.redirect(
+    new URL(
+      `${target}?returnTo=${encodeURIComponent(returnTo)}`,
+      resolveRequestAppOrigin(request),
+    ),
+  )
 }
 
 function errorRedirect(request: Request, redirectUri: string, state: string | null, error: string, desc: string): Response {

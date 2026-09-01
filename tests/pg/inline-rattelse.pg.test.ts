@@ -30,12 +30,14 @@ async function insertPostedEntry(params: {
   voucherNumber?: number
   sourceType?: string
   description?: string
+  reversesId?: string | null
 }): Promise<{ entryId: string; debitLineId: string; creditLineId: string }> {
   const entryId = await insertDraftJournalEntry({
     userId: params.userId,
     companyId: params.companyId,
     fiscalPeriodId: params.fiscalPeriodId,
     sourceType: params.sourceType ?? 'manual',
+    reversesId: params.reversesId,
     status: 'draft',
     voucherNumber: params.voucherNumber ?? 1,
     entryDate: params.entryDate,
@@ -185,8 +187,12 @@ describe('inline rättelse: metadata (correct_entry_metadata)', () => {
 
   it('rejects all metadata edits on storno entries', async () => {
     const { companyId, userId, fiscalPeriodId } = await seedCompany()
+    const parent = await insertPostedEntry({
+      companyId, userId, fiscalPeriodId, voucherNumber: 7,
+    })
     const { entryId } = await insertPostedEntry({
       companyId, userId, fiscalPeriodId, sourceType: 'storno', voucherNumber: 8,
+      reversesId: parent.entryId,
     })
 
     await expect(callMetadata(companyId, entryId, 'Omdöpt storno', null, userId)).rejects.toThrow(

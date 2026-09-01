@@ -78,8 +78,8 @@ async function insertPostedEntry(params: {
     await client.query(
       `INSERT INTO public.journal_entries
          (id, user_id, company_id, fiscal_period_id, voucher_number, voucher_series,
-          entry_date, description, source_type, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'Test entry', $8, 'posted')`,
+          entry_date, description, source_type, status, committed_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'Test entry', $8, 'posted', now())`,
       [
         id,
         params.userId,

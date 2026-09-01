@@ -7,6 +7,7 @@ import {
   insertCompany,
   insertCompanyMember,
   insertDraftJournalEntry,
+  insertReversedJournalEntry,
   seedCompany,
 } from '@/tests/pg/fixtures'
 
@@ -61,6 +62,15 @@ async function insertEntryAtStatus(params: {
   voucherNumber: number
   status?: 'posted' | 'reversed'
 }): Promise<string> {
+  if (params.status === 'reversed') {
+    const { entryId } = await insertReversedJournalEntry({
+      userId: params.userId,
+      companyId: params.companyId,
+      fiscalPeriodId: params.fiscalPeriodId,
+      voucherNumber: params.voucherNumber,
+    })
+    return entryId
+  }
   const entryId = await insertDraftJournalEntry({
     userId: params.userId,
     companyId: params.companyId,
@@ -72,12 +82,6 @@ async function insertEntryAtStatus(params: {
     `UPDATE public.journal_entries SET status = 'posted' WHERE id = $1`,
     [entryId],
   )
-  if (params.status === 'reversed') {
-    await getPool().query(
-      `UPDATE public.journal_entries SET status = 'reversed' WHERE id = $1`,
-      [entryId],
-    )
-  }
   return entryId
 }
 

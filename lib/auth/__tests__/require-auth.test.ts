@@ -43,6 +43,7 @@ describe('requireAuth', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     // Deterministic baseline: MFA off unless a test stubs it on.
+    vi.stubEnv('REQUIRE_MFA', 'false')
     vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'false')
     // Matches CLAIMS.iss so the fast path passes the issuer pinning.
     vi.stubEnv('NEXT_PUBLIC_SUPABASE_URL', 'https://test.supabase.co')
@@ -143,8 +144,9 @@ describe('requireAuth', () => {
   })
 
   it('returns 403 when MFA is required and AAL2 is not verified', async () => {
+    vi.stubEnv('REQUIRE_MFA', 'true')
     vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'true')
-    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', '')
+    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'false')
     const getClaims = vi.fn().mockResolvedValue({ data: { claims: CLAIMS }, error: null })
     const getAuthenticatorAssuranceLevel = vi.fn().mockResolvedValue({
       data: { currentLevel: 'aal1', nextLevel: 'aal2' },
@@ -161,8 +163,9 @@ describe('requireAuth', () => {
   })
 
   it('skips the MFA check for bankid_linked users', async () => {
+    vi.stubEnv('REQUIRE_MFA', 'true')
     vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'true')
-    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', '')
+    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'false')
     const claims = { ...CLAIMS, app_metadata: { provider: 'email', bankid_linked: true } }
     const getClaims = vi.fn().mockResolvedValue({ data: { claims }, error: null })
     const getAuthenticatorAssuranceLevel = vi.fn()
@@ -176,8 +179,9 @@ describe('requireAuth', () => {
   })
 
   it('passes when MFA is required and the session is already AAL2', async () => {
+    vi.stubEnv('REQUIRE_MFA', 'true')
     vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'true')
-    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', '')
+    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'false')
     const getClaims = vi.fn().mockResolvedValue({ data: { claims: CLAIMS }, error: null })
     const getAuthenticatorAssuranceLevel = vi.fn().mockResolvedValue({
       data: { currentLevel: 'aal2', nextLevel: 'aal2' },
@@ -190,5 +194,115 @@ describe('requireAuth', () => {
     expect(result.error).toBeNull()
     expect(result.user?.id).toBe('user-1')
     expect(getAuthenticatorAssuranceLevel).toHaveBeenCalledTimes(1)
+  })
+
+  it('allows only a first-password AAL1 session through the scoped escape hatch', async () => {
+    vi.stubEnv('REQUIRE_MFA', 'true')
+    vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'true')
+    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'false')
+    const claims = {
+      ...CLAIMS,
+      app_metadata: { provider: 'email', has_password: false },
+    }
+    const getClaims = vi.fn().mockResolvedValue({ data: { claims }, error: null })
+    const authoritativeUser = {
+      ...MOCK_USER,
+      app_metadata: { provider: 'email', has_password: false },
+    }
+    const getUser = vi.fn().mockResolvedValue({
+      data: { user: authoritativeUser },
+      error: null,
+    })
+    const getAuthenticatorAssuranceLevel = vi.fn().mockResolvedValue({
+      data: { currentLevel: 'aal1', nextLevel: 'aal1' },
+      error: null,
+    })
+    useSupabase({ getClaims, getUser, mfa: { getAuthenticatorAssuranceLevel } })
+
+    const result = await requireAuth({ allowInitialPasswordAtAal1: true })
+
+    expect(result.error).toBeNull()
+    expect(result.user).toEqual(authoritativeUser)
+    expect(getUser).toHaveBeenCalledTimes(1)
+  })
+
+  it('blocks a stale first-password claim when authoritative state has a password', async () => {
+    vi.stubEnv('REQUIRE_MFA', 'true')
+    vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'true')
+    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'false')
+    const claims = {
+      ...CLAIMS,
+      app_metadata: { provider: 'email', has_password: false },
+    }
+    const getClaims = vi.fn().mockResolvedValue({ data: { claims }, error: null })
+    const getUser = vi.fn().mockResolvedValue({
+      data: {
+        user: {
+          ...MOCK_USER,
+          app_metadata: { provider: 'email', has_password: true },
+        },
+      },
+      error: null,
+    })
+    const getAuthenticatorAssuranceLevel = vi.fn().mockResolvedValue({
+      data: { currentLevel: 'aal1', nextLevel: 'aal1' },
+      error: null,
+    })
+    useSupabase({ getClaims, getUser, mfa: { getAuthenticatorAssuranceLevel } })
+
+    const result = await requireAuth({ allowInitialPasswordAtAal1: true })
+
+    expect(result.user).toBeNull()
+    expect(result.error?.status).toBe(403)
+    expect(getUser).toHaveBeenCalledTimes(1)
+  })
+
+  it('fails closed when authoritative first-password state cannot be refreshed', async () => {
+    vi.stubEnv('REQUIRE_MFA', 'true')
+    vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'true')
+    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'false')
+    const claims = {
+      ...CLAIMS,
+      app_metadata: { provider: 'email', has_password: false },
+    }
+    const getClaims = vi.fn().mockResolvedValue({ data: { claims }, error: null })
+    const getUser = vi.fn().mockResolvedValue({
+      data: { user: null },
+      error: { message: 'auth unavailable' },
+    })
+    const getAuthenticatorAssuranceLevel = vi.fn().mockResolvedValue({
+      data: { currentLevel: 'aal1', nextLevel: 'aal1' },
+      error: null,
+    })
+    useSupabase({ getClaims, getUser, mfa: { getAuthenticatorAssuranceLevel } })
+
+    const result = await requireAuth({ allowInitialPasswordAtAal1: true })
+
+    expect(result.user).toBeNull()
+    expect(result.error?.status).toBe(403)
+    expect(getUser).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps existing-password AAL1 sessions blocked despite the scoped option', async () => {
+    vi.stubEnv('REQUIRE_MFA', 'true')
+    vi.stubEnv('NEXT_PUBLIC_REQUIRE_MFA', 'true')
+    vi.stubEnv('NEXT_PUBLIC_SELF_HOSTED', 'false')
+    const claims = {
+      ...CLAIMS,
+      app_metadata: { provider: 'email', has_password: true },
+    }
+    const getClaims = vi.fn().mockResolvedValue({ data: { claims }, error: null })
+    const getUser = vi.fn()
+    const getAuthenticatorAssuranceLevel = vi.fn().mockResolvedValue({
+      data: { currentLevel: 'aal1', nextLevel: 'aal1' },
+      error: null,
+    })
+    useSupabase({ getClaims, getUser, mfa: { getAuthenticatorAssuranceLevel } })
+
+    const result = await requireAuth({ allowInitialPasswordAtAal1: true })
+
+    expect(result.user).toBeNull()
+    expect(result.error?.status).toBe(403)
+    expect(getUser).not.toHaveBeenCalled()
   })
 })

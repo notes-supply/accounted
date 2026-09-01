@@ -3,7 +3,7 @@ import { eventBus } from '@/lib/events'
 import { ensureInitialized } from '@/lib/init'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { createJournalEntry } from '@/lib/bookkeeping/engine'
-import { reverseOrphanedJournalEntry } from '@/lib/bookkeeping/cancel-orphaned-entry'
+import { attachTransactionCategorization } from '@/lib/transactions/categorization-attachment'
 import { bookkeepingErrorResponse } from '@/lib/bookkeeping/errors'
 import { validateBody } from '@/lib/api/validate'
 import { BookTransactionSchema } from '@/lib/api/schemas'
@@ -153,6 +153,8 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
         source_type: 'bank_transaction',
         source_id: id,
         lines,
+        categorization_category: 'uncategorized',
+        categorization_is_business: true,
       })
     } catch (err) {
       const typed = bookkeepingErrorResponse(err)
@@ -166,46 +168,28 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
       )
     }
 
-    // Link transaction to the journal entry
-    const { data: updateResult, error: updateError } = await supabase
-      .from('transactions')
-      .update({
-        journal_entry_id: journalEntry.id,
-        is_business: true,
-        is_ignored: false,
-        category: 'uncategorized',
-      })
-      .eq('id', id)
-      .eq('company_id', companyId)
-      .is('journal_entry_id', null)
-      .select('*')
-
-    if (updateError) {
-      await reverseOrphanedJournalEntry(
+    let updatedTransaction: Transaction
+    try {
+      updatedTransaction = await attachTransactionCategorization(
         supabase,
         companyId,
         user.id,
-        journalEntry.id,
-        'Bokföringsverifikation utan transaktionskoppling; automatisk storno misslyckades. Manuell avstämning krävs.',
+        transaction as Transaction,
+        journalEntry,
+        'uncategorized',
+        true,
       )
-      return errorResponse(updateError, log, { requestId })
+    } catch (err) {
+      if (
+        err
+        && typeof err === 'object'
+        && 'code' in err
+        && err.code === '40001'
+      ) {
+        return errorResponseFromCode('TX_CATEGORIZE_RACE', log, { requestId })
+      }
+      return errorResponse(err, log, { requestId })
     }
-
-    if (!updateResult || updateResult.length === 0) {
-      // CAS guard: another request linked this transaction after our read. The
-      // posted orphan is immutable, so compensate through the engine with a
-      // storno entry instead of overwriting the winning journal entry link.
-      await reverseOrphanedJournalEntry(
-        supabase,
-        companyId,
-        user.id,
-        journalEntry.id,
-        'Bokföringsverifikation utan transaktionskoppling; automatisk storno misslyckades. Manuell avstämning krävs.',
-      )
-      return errorResponseFromCode('TX_CATEGORIZE_RACE', log, { requestId })
-    }
-
-    const updatedTransaction = updateResult[0] as Transaction
 
     // A hunt- or hand-matched inbox item is consumed by this booking even
     // though the dialog never saw it: link its underlag to the verifikat and

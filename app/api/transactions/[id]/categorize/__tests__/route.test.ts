@@ -39,6 +39,12 @@ vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
     mockCreateTransactionJournalEntry(...args),
 }))
 
+const mockAttachTransactionCategorization = vi.fn()
+vi.mock('@/lib/transactions/categorization-attachment', () => ({
+  attachTransactionCategorization: (...args: unknown[]) =>
+    mockAttachTransactionCategorization(...args),
+}))
+
 // Booking-time duplicate guard: mocked to "no duplicate" by default so these
 // tests exercise categorization, not the guard. The detection query is
 // unit-tested in lib/transactions/__tests__/booking-duplicate-detection.test.ts.
@@ -80,11 +86,6 @@ vi.mock('@/lib/bookkeeping/counterparty-templates', () => ({
   upsertCounterpartyTemplate: vi.fn().mockResolvedValue(undefined),
 }))
 
-// Posted-orphan compensation is centralized and routes through engine storno.
-const mockReverseOrphanedJournalEntry = vi.fn()
-vi.mock('@/lib/bookkeeping/cancel-orphaned-entry', () => ({
-  reverseOrphanedJournalEntry: (...args: unknown[]) => mockReverseOrphanedJournalEntry(...args),
-}))
 
 const mockFindMissingActiveAccounts = vi.fn()
 vi.mock('@/lib/bookkeeping/account-validation', async () => {
@@ -125,10 +126,26 @@ describe('POST /api/transactions/[id]/categorize', () => {
     // Default: no booking-time duplicate. The dedicated guard test overrides this.
     mockDetectDup.mockResolvedValue(null)
     mockAppendProcessingHistory.mockResolvedValue('evt-1')
-    mockReverseOrphanedJournalEntry.mockResolvedValue(undefined)
+    mockAttachTransactionCategorization.mockImplementation(
+      async (
+        _supabase: unknown,
+        _companyId: string,
+        _userId: string,
+        transaction: Record<string, unknown>,
+        journalEntry: { id: string },
+        category: string,
+        isBusiness: boolean,
+      ) => ({
+        ...transaction,
+        category,
+        is_business: isBusiness,
+        is_ignored: false,
+        journal_entry_id: journalEntry.id,
+      }),
+    )
   })
 
-  it('delegates the CAS-race orphan to engine-backed storno compensation', async () => {
+  it('delegates guarded attachment conflicts to the atomic attachment service', async () => {
     const tx = makeTransaction({
       id: 'tx-1',
       amount: -500,
@@ -136,15 +153,14 @@ describe('POST /api/transactions/[id]/categorize', () => {
       journal_entry_id: null,
     })
 
-    enqueue({ data: tx, error: null }) // fetch transaction
-    enqueue({ data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null }) // settings
-    enqueue({ data: [{ id: 'period-1' }], error: null }) // ensureFiscalPeriod
-
+    enqueue({ data: tx, error: null })
+    enqueue({ data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null })
+    enqueue({ data: [{ id: 'period-1' }], error: null })
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
-    mockSaveUserMappingRule.mockResolvedValue(undefined)
-
-    // Lost the CAS: another request stamped journal_entry_id first.
-    enqueue({ data: [], error: null })
+    mockAttachTransactionCategorization.mockRejectedValue({
+      code: '40001',
+      message: 'Categorization accounting pointer drifted',
+    })
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
@@ -154,17 +170,17 @@ describe('POST /api/transactions/[id]/categorize', () => {
     const { status, body } = await parseJsonResponse<{ error: unknown }>(response)
 
     expect(status).toBe(409)
-    expect((body.error as { code: string }).code).toBe('TX_CATEGORIZE_RACE')
-
-    // No hand-rolled insert: the helper owns the real column set.
-    expect(mockReverseOrphanedJournalEntry).toHaveBeenCalledTimes(1)
-    expect(mockReverseOrphanedJournalEntry).toHaveBeenCalledWith(
-      expect.anything(),
+    expect(mockAttachTransactionCategorization).toHaveBeenCalledWith(
+      mockSupabase,
       'company-1',
       'user-1',
-      'je-1',
-      'Kategoriseringsverifikation utan transaktionskoppling; automatisk storno misslyckades. Manuell avstämning krävs.',
+      tx,
+      { id: 'je-1' },
+      'expense_software',
+      true,
     )
+    expect(findCalls('transactions', 'update')).toEqual([])
+    expect(body.error).toBeTruthy()
   })
 
   it('returns 401 when not authenticated', async () => {
@@ -252,7 +268,6 @@ describe('POST /api/transactions/[id]/categorize', () => {
 
     expect(status).toBe(409)
     expect(body.error.code).toBe('TX_CATEGORIZE_RACE')
-    expect(mockReverseOrphanedJournalEntry).not.toHaveBeenCalled()
   })
 
   it('creates journal entry for business expense', async () => {
@@ -310,7 +325,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     )
   })
 
-  it('atomically unignores an ignored transaction when categorizing it', async () => {
+  it('uses the atomic attachment readback when categorizing an ignored transaction', async () => {
     const tx = makeTransaction({
       id: 'tx-1',
       amount: -500,
@@ -323,7 +338,6 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null })
     enqueue({ data: [{ id: 'period-1' }], error: null })
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
-    enqueue({ data: [{ ...tx, is_business: false, category: 'private', is_ignored: false, journal_entry_id: 'je-1' }], error: null })
 
     const categorizedHandler = vi.fn()
     eventBus.on('transaction.categorized', categorizedHandler)
@@ -335,14 +349,16 @@ describe('POST /api/transactions/[id]/categorize', () => {
     const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
 
     expect(response.status).toBe(200)
-    expect(findCalls('transactions', 'update')).toContainEqual([
-      expect.objectContaining({
-        is_business: false,
-        category: 'private',
-        is_ignored: false,
-        journal_entry_id: 'je-1',
-      }),
-    ])
+    expect(mockAttachTransactionCategorization).toHaveBeenCalledWith(
+      mockSupabase,
+      'company-1',
+      'user-1',
+      tx,
+      { id: 'je-1' },
+      'private',
+      false,
+    )
+    expect(findCalls('transactions', 'update')).toEqual([])
     expect(categorizedHandler).toHaveBeenCalledWith(
       expect.objectContaining({
         transaction: expect.objectContaining({ is_ignored: false }),
@@ -385,6 +401,8 @@ describe('POST /api/transactions/[id]/categorize', () => {
       'user-1',
       expect.objectContaining({ id: 'tx-1' }),
       expect.objectContaining({ dimensions: { '1': 'KS1', '6': 'P001' } }),
+      undefined,
+      { category: 'expense_software', isBusiness: true },
     )
   })
 
@@ -422,7 +440,6 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null }) // settings
     enqueue({ data: [{ id: 'period-1' }], error: null }) // fiscal period check
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
-    enqueue({ data: [{ id: 'tx-1' }], error: null }) // tx update (CAS matched)
     // Inbox propagation: one matched item with a document
     enqueue({ data: [{ id: 'inbox-1', document_id: 'doc-1' }], error: null })
     enqueue({ data: null, error: null }) // document_attachments update
@@ -545,7 +562,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     expect(body.journal_entry_error).not.toContain('check constraint')
   })
 
-  it('returns 500 when transaction update fails', async () => {
+  it('returns 500 when the atomic attachment command fails', async () => {
     const tx = makeTransaction({
       id: 'tx-1',
       journal_entry_id: null,
@@ -555,31 +572,22 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: tx, error: null })
     enqueue({ data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null })
     enqueue({ data: [{ id: 'period-1' }], error: null })
-
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
-
-    // Transaction update fails
-    enqueue({ data: null, error: { message: 'Update failed' } })
+    mockAttachTransactionCategorization.mockRejectedValue(new Error('Attachment failed'))
 
     const request = createMockRequest('/api/transactions/tx-1/categorize', {
       method: 'POST',
       body: { is_business: true, category: 'expense_software' },
     })
     const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
-    const { status, body } = await parseJsonResponse<{ error: string }>(response)
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(response)
 
     expect(status).toBe(500)
-    expect((body.error as unknown as { code: string }).code).toBe('INTERNAL_ERROR')
-    expect(mockReverseOrphanedJournalEntry).toHaveBeenCalledWith(
-      expect.anything(),
-      'company-1',
-      'user-1',
-      'je-1',
-      expect.any(String),
-    )
+    expect(body.error.code).toBe('INTERNAL_ERROR')
+    expect(findCalls('transactions', 'update')).toEqual([])
   })
 
-  it('maps an ignored-row constraint to a typed conflict and stornos the posted orphan', async () => {
+  it('maps an attachment guard rejection to the existing typed conflict', async () => {
     const tx = makeTransaction({
       id: 'tx-1',
       journal_entry_id: null,
@@ -590,13 +598,10 @@ describe('POST /api/transactions/[id]/categorize', () => {
     enqueue({ data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null })
     enqueue({ data: [{ id: 'period-1' }], error: null })
     mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
-    enqueue({
-      data: null,
-      error: {
-        code: '23514',
-        message:
-          'new row for relation "transactions" violates check constraint "transactions_is_ignored_no_journal_entry"',
-      },
+    mockAttachTransactionCategorization.mockRejectedValue({
+      code: '23514',
+      message:
+        'new row for relation "transactions" violates check constraint "transactions_is_ignored_no_journal_entry"',
     })
 
     const response = await POST(
@@ -611,13 +616,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
     expect(status).toBe(409)
     expect(body.error.code).toBe('TX_CATEGORIZE_IGNORED_CONFLICT')
     expect(body.error.message).not.toContain('check constraint')
-    expect(mockReverseOrphanedJournalEntry).toHaveBeenCalledWith(
-      expect.anything(),
-      'company-1',
-      'user-1',
-      'je-1',
-      expect.any(String),
-    )
+    expect(findCalls('transactions', 'update')).toEqual([])
   })
 
   it('returns 400 when mapping result has empty debit_account', async () => {

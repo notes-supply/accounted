@@ -3,7 +3,10 @@ import {
   readInviteCookie,
   type InviteAcceptProblem,
 } from '@/lib/auth/consume-invite-cookie'
-import { shouldEnforceMfa } from '@/lib/auth/mfa'
+import {
+  hasValidAssuranceLevel,
+  isMfaRequired,
+} from '@/lib/auth/mfa'
 
 /**
  * Invite handoff for the password-recovery flow.
@@ -110,26 +113,24 @@ export async function handoffPendingInvite(
  * which the shared classifier cannot tell apart from an email mismatch, so a
  * legitimate invitee would be told their invitation belongs to someone else.
  *
- * The predicate mirrors the middleware's own condition exactly
- * (`shouldEnforceMfa` plus aal1-with-aal2-required), which makes "we skipped"
- * and "the middleware will bounce this user to /mfa/verify" the same statement:
- * the cookie survives untouched and `/mfa/verify` consumes it once the second
- * factor is in. A user whose MFA is not enforced (self-hosted, BankID-linked)
- * is deliberately never deferred, because nothing would bounce them and the
- * token would sit there unused.
- *
- * A failed read is not evidence of a pending step-up, so it falls through to
- * the attempt: the server is the authority, and a 403 keeps the token anyway.
+ * The client mirrors the server policy through NEXT_PUBLIC_REQUIRE_MFA. The
+ * Docker entrypoint rejects a mismatch with the private REQUIRE_MFA value.
+ * BankID-linked users retain their existing exemption. Missing or malformed
+ * assurance is treated as a step-up still owed so a gate 403 cannot be
+ * misreported as an invitation belonging to another address.
  */
 async function mfaStepUpOwed(deps: InviteHandoffDeps): Promise<boolean> {
   try {
+    if (!isMfaRequired()) return false
+
     const user = await deps.getUser()
-    if (!user || !shouldEnforceMfa(user)) return false
+    if (user?.app_metadata?.bankid_linked) return false
+    if (!user) return true
 
     const aal = await deps.getAssuranceLevel()
-    return aal?.nextLevel === 'aal2' && aal.currentLevel === 'aal1'
+    return !hasValidAssuranceLevel(aal) || aal.currentLevel !== 'aal2'
   } catch (err) {
     console.error('[reset-password] could not read the session MFA state', err)
-    return false
+    return true
   }
 }

@@ -1,5 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { validateBalance, getSwedishLocalDate, createDraftEntry, reverseEntry } from '../engine'
+import {
+  validateBalance,
+  getSwedishLocalDate,
+  createDraftEntry,
+  reverseEntry,
+  commitAssetDisposal,
+} from '../engine'
 import {
   AccountsNotInChartError,
   BookkeepingDatabaseError,
@@ -25,6 +31,8 @@ function createMockChain(overrides: Record<string, unknown> = {}) {
   }
   return chain
 }
+
+const serviceRpc = vi.hoisted(() => vi.fn())
 
 // Mock event bus
 vi.mock('@/lib/events', () => ({
@@ -1079,5 +1087,88 @@ describe('reverseEntry: opening balance unlink', () => {
     await reverseEntry(supabase as never, 'company-1', 'user-1', 'entry-1')
 
     expect(fpUpdates).toEqual([])
+  })
+})
+
+describe('commitAssetDisposal: service-only command boundary', () => {
+  const input: Parameters<typeof commitAssetDisposal>[5] = {
+    asset_id: 'asset-1',
+    expected_asset_updated_at: '2026-06-01T12:00:00.000Z',
+    fiscal_period_id: 'period-1',
+    disposal_type: 'sale',
+    disposed_at: '2026-06-30',
+    disposed_proceeds: 125_000,
+    proceeds_vat: 25_000,
+    vat_treatment: 'standard_25',
+    current_depreciation: 5_000,
+    jamkning_amount: 0,
+    jamkning_direction: 'none',
+    jamkning_remaining_years: null,
+    jamkning_total_years: null,
+    jamkning_original_input_vat: null,
+    jamkning_original_deduction_percent: null,
+    jamkning_new_deduction_percent: null,
+  }
+
+  beforeEach(() => {
+    serviceRpc.mockReset()
+  })
+
+  it('uses the stateless service client only for the RPC and reloads through the caller client', async () => {
+    serviceRpc.mockResolvedValue({ data: null, error: null })
+    const callerRpc = vi.fn()
+    const postedEntry = { id: 'entry-1', status: 'posted', voucher_number: 42 }
+    const reload = {
+      select: vi.fn().mockReturnThis(),
+      eq: vi.fn().mockReturnThis(),
+      single: vi.fn().mockResolvedValue({ data: postedEntry, error: null }),
+    }
+    const caller = {
+      rpc: callerRpc,
+      from: vi.fn().mockReturnValue(reload),
+    }
+
+    const result = await commitAssetDisposal(
+      caller as never,
+      { rpc: serviceRpc } as never,
+      'company-1',
+      'user-1',
+      'entry-1',
+      input,
+    )
+
+    expect(serviceRpc).toHaveBeenCalledWith('commit_asset_disposal', expect.objectContaining({
+      p_company_id: 'company-1',
+      p_asset_id: 'asset-1',
+      p_entry_id: 'entry-1',
+      p_expected_asset_updated_at: input.expected_asset_updated_at,
+    }))
+    expect(callerRpc).not.toHaveBeenCalled()
+    expect(caller.from).toHaveBeenCalledWith('journal_entries')
+    expect(result).toEqual(postedEntry)
+  })
+
+  it('preserves the optimistic version SQLSTATE for route conflict handling', async () => {
+    serviceRpc.mockResolvedValue({
+      data: null,
+      error: { code: '40001', message: 'Asset version changed before disposal' },
+    })
+    const caller = { rpc: vi.fn(), from: vi.fn() }
+
+    await expect(
+      commitAssetDisposal(
+        caller as never,
+        { rpc: serviceRpc } as never,
+        'company-1',
+        'user-1',
+        'entry-1',
+        input,
+      ),
+    ).rejects.toMatchObject({
+      code: '40001',
+      message: 'Asset version changed before disposal',
+    })
+    expect(caller.rpc).not.toHaveBeenCalled()
+    expect(caller.from).not.toHaveBeenCalled()
   })
 })

@@ -1,6 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
-import { eventBus } from '@/lib/events'
 import { createLogger } from '@/lib/logger'
+import { eventBus } from '@/lib/events'
 import {
   AccountsNotInChartError,
   BookkeepingDatabaseError,
@@ -344,6 +344,8 @@ export async function createDraftEntry(
       source_type: input.source_type,
       source_id: input.source_id || null,
       notes: input.notes || null,
+      categorization_category: input.categorization_category ?? null,
+      categorization_is_business: input.categorization_is_business ?? null,
       status: 'draft',
     })
     .select()
@@ -688,6 +690,7 @@ export async function commitEntry(
 
 export interface CommitAssetDisposalInput {
   asset_id: string
+  expected_asset_updated_at: string
   fiscal_period_id: string
   disposal_type: AssetDisposalType
   disposed_at: string
@@ -712,16 +715,21 @@ export interface CommitAssetDisposalInput {
  */
 export async function commitAssetDisposal(
   supabase: SupabaseClient,
+  commandSupabase: SupabaseClient,
   companyId: string,
   userId: string,
   entryId: string | null,
   input: CommitAssetDisposalInput,
 ): Promise<JournalEntry | null> {
   const actor = getActor()
-  const { error } = await supabase.rpc('commit_asset_disposal', {
+  // The command client is service-scoped by the authorized server route.
+  // Keep it explicit so this otherwise client-safe engine module never imports
+  // next/headers through the server Supabase factory.
+  const { error } = await commandSupabase.rpc('commit_asset_disposal', {
     p_company_id: companyId,
     p_asset_id: input.asset_id,
     p_entry_id: entryId,
+    p_expected_asset_updated_at: input.expected_asset_updated_at,
     p_fiscal_period_id: input.fiscal_period_id,
     p_disposal_type: input.disposal_type,
     p_disposed_at: input.disposed_at,
@@ -741,6 +749,7 @@ export async function commitAssetDisposal(
   })
 
   if (error) {
+    const pgCode = typeof error.code === 'string' ? error.code : undefined
     log.error('commit_asset_disposal RPC failed', error, {
       operation: 'commit_asset_disposal',
       companyId,
@@ -748,8 +757,11 @@ export async function commitAssetDisposal(
       entityType: 'asset',
       entityId: input.asset_id,
       journalEntryId: entryId,
-      pgCode: (error as { code?: string }).code,
+      pgCode,
     })
+    if (pgCode === '40001') {
+      throw Object.assign(new Error(error.message), { code: pgCode })
+    }
     throw new BookkeepingDatabaseError('commit_asset_disposal', error.message)
   }
 

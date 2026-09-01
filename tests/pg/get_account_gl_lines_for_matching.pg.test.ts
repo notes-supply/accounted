@@ -35,6 +35,8 @@ async function insertPostedJournalEntry(params: {
   sourceType: 'opening_balance' | 'manual' | 'bank_transaction' | 'import' | 'storno' | 'correction'
   voucherNumber: number
   amount?: number
+  reversesId?: string | null
+  correctionOfId?: string | null
   /** Line rows to book; defaults to the classic 1930 debit / 2091 credit pair. */
   lines?: Array<{ account: string; debit: number; credit: number }>
 }): Promise<string> {
@@ -51,6 +53,8 @@ async function insertPostedJournalEntry(params: {
     entryDate: params.entryDate,
     description: `Test ${params.sourceType}`,
     sourceType: params.sourceType,
+    reversesId: params.reversesId,
+    correctionOfId: params.correctionOfId,
     lines: lines.map((line) => ({
       accountNumber: line.account,
       debitAmount: line.debit,
@@ -116,17 +120,23 @@ describe('get_account_gl_lines_for_matching RPC: N:1 candidates', () => {
       userId, companyId, fiscalPeriodId,
       entryDate: '2026-01-01', sourceType: 'opening_balance', voucherNumber: 1, amount: 50000,
     })
-    await insertPostedJournalEntry({
+    const lineageParent = await insertPostedJournalEntry({
       userId, companyId, fiscalPeriodId,
-      entryDate: '2026-05-02', sourceType: 'storno', voucherNumber: 2, amount: 25000,
+      entryDate: '2026-05-01', sourceType: 'manual', voucherNumber: 2, amount: 25000,
     })
     await insertPostedJournalEntry({
       userId, companyId, fiscalPeriodId,
-      entryDate: '2026-05-02', sourceType: 'correction', voucherNumber: 3, amount: 25000,
+      entryDate: '2026-05-02', sourceType: 'storno', voucherNumber: 3, amount: 25000,
+      reversesId: lineageParent,
+    })
+    await insertPostedJournalEntry({
+      userId, companyId, fiscalPeriodId,
+      entryDate: '2026-05-02', sourceType: 'correction', voucherNumber: 4, amount: 25000,
+      correctionOfId: lineageParent,
     })
     const bankEntry = await insertPostedJournalEntry({
       userId, companyId, fiscalPeriodId,
-      entryDate: '2026-05-03', sourceType: 'bank_transaction', voucherNumber: 4, amount: 1500,
+      entryDate: '2026-05-03', sourceType: 'bank_transaction', voucherNumber: 5, amount: 1500,
     })
 
     const { rows } = await getPool().query(

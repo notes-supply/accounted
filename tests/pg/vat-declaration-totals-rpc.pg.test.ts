@@ -75,6 +75,8 @@ async function insertJournalEntry(params: {
   sourceType?: string
   entryDate?: string
   description?: string
+  reversesId?: string | null
+  correctionOfId?: string | null
   lines: Array<{ account: string; debit: number; credit: number }>
 }): Promise<string> {
   if ((params.status ?? 'posted') === 'posted') {
@@ -86,6 +88,8 @@ async function insertJournalEntry(params: {
       entryDate: params.entryDate ?? '2026-03-15',
       description: params.description ?? 'VAT RPC test',
       sourceType: params.sourceType ?? 'manual',
+      reversesId: params.reversesId,
+      correctionOfId: params.correctionOfId,
       lines: params.lines.map((line) => ({
         accountNumber: line.account,
         debitAmount: line.debit,
@@ -270,7 +274,7 @@ describe('get_vat_declaration_totals RPC', () => {
   it('shapes a storno of a settlement so annullera never re-inflates the rutor', async () => {
     const ctx = await seedCompany()
 
-    await insertJournalEntry({
+    const settlementId = await insertJournalEntry({
       ...ctx, voucherNumber: 1, sourceType: 'invoice_created',
       lines: [
         { account: '2611', debit: 0, credit: 100 },
@@ -280,7 +284,7 @@ describe('get_vat_declaration_totals RPC', () => {
     // The tagged settlement itself is filtered by source_type; its storno
     // reversal is untagged and would otherwise re-credit 2611.
     await insertJournalEntry({
-      ...ctx, voucherNumber: 2, sourceType: 'storno',
+      ...ctx, voucherNumber: 2, sourceType: 'storno', reversesId: settlementId,
       lines: [
         { account: '2611', debit: 0, credit: 100 },
         { account: '2650', debit: 100, credit: 0 },

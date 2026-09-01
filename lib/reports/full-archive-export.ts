@@ -797,6 +797,11 @@ export interface MasterDataTableSpec {
    */
   via?: { parent: string; fk: string }
   /**
+   * Service-only SECURITY DEFINER function used when the underlying accounting
+   * evidence table deliberately grants no direct SELECT privilege.
+   */
+  exportRpc?: string
+  /**
    * PostgREST select list for a narrow projection. Defaults to `*`.
    *
    * Only for tables where part of the row is räkenskapsinformation and the
@@ -856,7 +861,12 @@ export const MASTER_DATA_DUMP_TABLES: MasterDataTableSpec[] = [
   { name: 'invoice_reminders', file: 'invoice_reminders.json' },
   // Delivery metadata proves which recipient received the archived PDF and
   // when, so it is räkenskapsinformation alongside the invoice itself.
-  { name: 'invoice_deliveries', file: 'invoice_deliveries.json', orderBy: 'created_at' },
+  {
+    name: 'invoice_deliveries',
+    file: 'invoice_deliveries.json',
+    orderBy: 'created_at',
+    exportRpc: 'export_invoice_delivery_evidence',
+  },
   // Peppol archive evidence is split so the exact staged UBL, every verified
   // asynchronous event, and provider evidence stay independently auditable.
   { name: 'peppol_deliveries', file: 'peppol_deliveries.json', orderBy: 'created_at' },
@@ -876,6 +886,17 @@ export const MASTER_DATA_DUMP_TABLES: MasterDataTableSpec[] = [
     denormalize: { prefix: 'supplier_invoice_', columns: ['currency', 'exchange_rate'] },
   },
   { name: 'supplier_invoice_payments', file: 'supplier_invoice_payments.json' },
+  {
+    name: 'supplier_invoice_payment_history',
+    file: 'supplier_invoice_payment_history.json',
+    orderBy: 'reversed_at',
+  },
+  {
+    name: 'supplier_payment_reversals',
+    file: 'supplier_payment_reversals.json',
+    orderBy: 'applied_at',
+    exportRpc: 'export_supplier_payment_reversals',
+  },
   // Payment batches (betalfil): the immutable instruction snapshots a
   // generated bank payment file derives from; underlag for the payments it
   // initiated, so they leave with the archive.
@@ -934,6 +955,12 @@ export const MASTER_DATA_DUMP_TABLES: MasterDataTableSpec[] = [
   { name: 'cash_accounts', file: 'cash_accounts.json' },
   { name: 'mapping_rules', file: 'mapping_rules.json' },
   { name: 'categorization_templates', file: 'categorization_templates.json' },
+  {
+    name: 'transaction_categorization_compensations',
+    file: 'transaction_categorization_compensations.json',
+    orderBy: 'applied_at',
+    exportRpc: 'export_transaction_categorization_compensations',
+  },
   { name: 'booking_template_library', file: 'booking_template_library.json' },
   { name: 'skattekonto_rules', file: 'skattekonto_rules.json' },
   // Salary (räkenskapsinformation with 7-year retention)
@@ -991,6 +1018,20 @@ export const MASTER_DATA_DUMP_TABLES: MasterDataTableSpec[] = [
   { name: 'arsredovisning_submissions', file: 'arsredovisning_submissions.json' },
   // Settings
   { name: 'company_settings', file: 'company_settings.json' },
+  // Durable accounting publication evidence links correction commands to the
+  // exact events and subscriber snapshots they emitted.
+  {
+    name: 'accounting_publications',
+    file: 'accounting_publications.json',
+    orderBy: 'created_at',
+    exportRpc: 'export_accounting_publications',
+  },
+  {
+    name: 'accounting_publication_subscribers',
+    file: 'accounting_publication_subscribers.json',
+    orderBy: 'created_at',
+    exportRpc: 'export_accounting_publication_subscribers',
+  },
 ]
 
 /**
@@ -1134,6 +1175,31 @@ async function fetchChildTableRows(
   return rows
 }
 
+async function fetchExportRpcRows(
+  supabase: SupabaseClient,
+  companyId: string,
+  spec: MasterDataTableSpec
+): Promise<Record<string, unknown>[]> {
+  const exportRpc = spec.exportRpc
+  if (!exportRpc) {
+    throw new Error(`Missing export RPC for ${spec.name}`)
+  }
+  const pageKey = spec.pageKey ?? 'id'
+  return fetchAllRows<Record<string, unknown>>(
+    ({ from, to }) => {
+      let query = supabase.rpc(exportRpc, { p_company_id: companyId })
+      if (spec.orderBy) {
+        query = query.order(spec.orderBy, { ascending: true })
+      }
+      return query.order(pageKey, { ascending: true }).range(from, to) as unknown as PromiseLike<{
+        data: Record<string, unknown>[] | null
+        error: { message: string } | null
+      }>
+    },
+    { dedupeBy: (row) => String(row[pageKey]) }
+  )
+}
+
 /**
  * Dump structured master data as JSON under `data/`. These records are implicit
  * in the SIE export (as journal entries) but not recoverable as domain objects
@@ -1152,14 +1218,8 @@ async function writeMasterData(
   for (const t of MASTER_DATA_DUMP_TABLES) {
     const pageKey = t.pageKey ?? 'id'
     try {
-      const rows = t.name === 'invoice_deliveries'
-        ? await fetchAllRows<Record<string, unknown>>(({ from, to }) =>
-            supabase
-              .rpc('export_invoice_delivery_evidence', { p_company_id: companyId })
-              .order('created_at', { ascending: true })
-              .order('id', { ascending: true })
-              .range(from, to),
-          { dedupeBy: (row) => String(row.id) })
+      const rows = t.exportRpc
+        ? await fetchExportRpcRows(supabase, companyId, t)
         : t.via
           ? await fetchChildTableRows(supabase, companyId, t)
           : await fetchAllRows<Record<string, unknown>>(({ from, to }) => {
@@ -1184,7 +1244,7 @@ async function writeMasterData(
           }, { dedupeBy: (r) => String(r[pageKey]) })
       data.file(t.file, JSON.stringify(rows, null, 2))
     } catch (err) {
-      if (t.name === 'invoice_deliveries') throw err
+      if (t.exportRpc) throw err
       data.file(
         t.file,
         JSON.stringify(

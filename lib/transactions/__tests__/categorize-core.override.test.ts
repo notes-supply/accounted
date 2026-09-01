@@ -13,8 +13,12 @@ import { eventBus } from '@/lib/events'
 
 const mockCreateJE = vi.fn()
 const mockReverseOrphanedJE = vi.fn()
+const mockAttachCategorization = vi.fn()
 vi.mock('@/lib/bookkeeping/transaction-entries', () => ({
   createTransactionJournalEntry: (...args: unknown[]) => mockCreateJE(...args),
+}))
+vi.mock('@/lib/transactions/categorization-attachment', () => ({
+  attachTransactionCategorization: (...args: unknown[]) => mockAttachCategorization(...args),
 }))
 vi.mock('@/lib/bookkeeping/cancel-orphaned-entry', () => ({
   reverseOrphanedJournalEntry: (...args: unknown[]) => mockReverseOrphanedJE(...args),
@@ -62,6 +66,57 @@ beforeEach(() => {
   eventBus.clear()
   mockCreateJE.mockResolvedValue({ id: 'je-override-1' })
   mockReverseOrphanedJE.mockResolvedValue(undefined)
+  mockAttachCategorization.mockImplementation(
+    async (
+      supabase: {
+        from: (table: string) => {
+          update: (value: unknown) => {
+            eq: (column: string, value: unknown) => {
+              eq: (column: string, value: unknown) => {
+                is: (column: string, value: unknown) => {
+                  select: () => Promise<{
+                    data: Array<Record<string, unknown>> | null
+                    error: unknown
+                  }>
+                }
+              }
+            }
+          }
+        }
+      },
+      companyId: string,
+      userId: string,
+      transaction: { id: string },
+      journalEntry: { id: string },
+      category: string,
+      isBusiness: boolean,
+    ) => {
+      const { data, error } = await supabase
+        .from('transactions')
+        .update({
+          is_business: isBusiness,
+          category,
+          is_ignored: false,
+          journal_entry_id: journalEntry.id,
+        })
+        .eq('id', transaction.id)
+        .eq('company_id', companyId)
+        .is('journal_entry_id', null)
+        .select()
+      if (error || !data || data.length === 0) {
+        await mockReverseOrphanedJE(
+          supabase,
+          companyId,
+          userId,
+          journalEntry.id,
+          'Kategoriseringsverifikation utan transaktionskoppling; automatisk storno misslyckades. Manuell avstämning krävs.',
+        )
+        if (error) throw error
+        throw { code: '40001', message: 'Categorization accounting pointer drifted' }
+      }
+      return data[0]
+    },
+  )
 })
 
 describe('categorizeMatchedTransaction: accountOverride', () => {
