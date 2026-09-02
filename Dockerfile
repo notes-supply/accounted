@@ -63,6 +63,7 @@ WORKDIR /app
 # this image: removing npm clears them at the source and shrinks the attack
 # surface.
 RUN apk upgrade --no-cache && \
+    apk add --no-cache 'libcrypto3>=3.5.8-r0' 'libssl3>=3.5.8-r0' && \
     rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 
 ENV NODE_ENV=production
