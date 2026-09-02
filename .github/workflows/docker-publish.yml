@@ -26,7 +26,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: notes-supply/accounted
-  SOURCE_SHA: e2c8fa15f4ae0c90166cf4ca44dd26a10ca1dcbf
+  SOURCE_SHA: a319321b506a92f18e08571715b2cd3f4f579e8d
 
 jobs:
   build:
@@ -291,7 +291,7 @@ jobs:
           set -euo pipefail
           cosign verify \
             --certificate-identity \
-              "https://github.com/notes-supply/accounted/.github/workflows/docker-publish.yml@refs/heads/release/accounted-mfa-hotfix-image-20260816" \
+              "https://github.com/notes-supply/accounted/.github/workflows/docker-publish.yml@refs/heads/release/accounted-mfa-banking-hotfix-image-20260902" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             "${REGISTRY}/${IMAGE_NAME}@${DIGEST}" >/dev/null
 
