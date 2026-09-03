@@ -26,7 +26,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: notes-supply/accounted
-  SOURCE_SHA: 51b68afc870662271438f64b2879193bcdf5ab9d
+  SOURCE_SHA: 828628d8823abf5228b03e4a5f2d640cb6c60fda
 
 jobs:
   build:
